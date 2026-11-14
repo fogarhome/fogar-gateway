@@ -25,6 +25,7 @@ def serve(create_db: bool) -> None:
     os.umask(0o077)  # lo que cree (BD, candado, data/) solo para su dueño
     import uvicorn
     from pydantic import ValidationError
+    from pydantic_settings import SettingsError
 
     try:
         from fogar_gateway.core.config import settings  # construye Settings(): aquí falla
@@ -35,6 +36,11 @@ def serve(create_db: bool) -> None:
         # no lo arregla (RestartPreventExitStatus de la unidad).
         click.echo("Configuración no válida:\n" + "\n".join(f"  {m}" for m in _errors(e)),
                    err=True)
+        raise SystemExit(3) from None
+    except SettingsError as e:  # JSON roto en un campo dict/list (p. ej. TTS_VOICE_MAP)
+        from fogar_gateway.cli.config import _settings_error
+
+        click.echo("Configuración no válida:\n  " + "\n  ".join(_settings_error(e)), err=True)
         raise SystemExit(3) from None
     from fogar_gateway.db import database
 

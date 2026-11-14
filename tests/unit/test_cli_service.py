@@ -16,8 +16,8 @@ StartLimitBurst=5
 
 [Service]
 Type=exec
-ExecStart=/home/u/.local/bin/fogar-gw serve
-Environment=FOGAR_GATEWAY_HOME=/home/u/.fogar-gateway
+ExecStart="/home/u/.local/bin/fogar-gw" serve
+Environment="FOGAR_GATEWAY_HOME=/home/u/.fogar-gateway"
 Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=3
@@ -33,6 +33,21 @@ def test_unit_text_exact():
     text = service.render_unit(Path("/home/u/.local/bin/fogar-gw"), Path("/home/u/.fogar-gateway"))
     assert text == UNIT
     assert "--create-db" not in text and "LOG_FORMAT" not in text
+
+
+def test_unit_quotes_and_escapes_odd_paths():
+    # Espacio, especificador %, variable $, comilla y barra: la unidad no debe partir ni expandir.
+    odd = 'a b%c$d"e\\f'
+    text = service.render_unit(Path(f"/x/{odd}/fogar-gw"), Path(f"/h/{odd}"))
+    # En ExecStart, systemd expande % y $ (se doblan); en Environment= solo % ($ es literal).
+    assert 'ExecStart="/x/a b%%c$$d\\"e\\\\f/fogar-gw" serve\n' in text
+    assert 'Environment="FOGAR_GATEWAY_HOME=/h/a b%%c$d\\"e\\\\f"\n' in text
+
+
+def test_pick_exe_makes_relative_exe_absolute_without_resolving(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    exe = service.pick_exe(Path(".venv/bin/fogar-gw"))
+    assert exe == tmp_path / ".venv/bin/fogar-gw" and exe.is_absolute()
 
 
 def test_stop_timeout_matches_compose_and_exceeds_graceful_shutdown():

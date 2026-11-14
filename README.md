@@ -321,7 +321,7 @@ El gateway se conecta a OpenClaw como `gateway-client`/`backend` pidiendo `opera
 
 Solo en Linux con systemd. `fogar-gw install` crea `~/.config/systemd/user/fogar-gateway.service` y lo arranca. Exige una config válida, la BD ya creada (`fogar-gw init` o `fogar-gw migrate`; `install` nunca la crea) y el puerto 8004 libre (para el contenedor antes). Si el servicio ya es el nuestro y está activo, reinstala, y si la unidad cambia, lo reinicia. `uninstall` y sobrescribir una unidad distinta con `install` piden confirmación (para scripts, `fogar-gw --yes …`).
 
-- **Ejecutable:** usa el `fogar-gw` del PATH. Rechaza uno dentro de un clon o de una instalación editable, porque la unidad se rompería al moverlo: instala con `uv tool install` o pasa `--exe RUTA`.
+- **Ejecutable:** usa el `fogar-gw` del PATH. Rechaza uno dentro de un clon o de una instalación editable, porque la unidad se rompería al moverlo: instala con `uv tool install` o pasa `--exe RUTA` (una ruta relativa se guarda absoluta, sin resolver el enlace).
 - **Linger:** sin `loginctl enable-linger $USER` el servicio se para al cerrar tu sesión; `install` avisa si falta.
 - **Registros:** `fogar-gw logs` lee el journal. `--level` y `--session` filtran por nivel mínimo y por sesión o cliente, tanto con `LOG_FORMAT=json` como con texto.
 

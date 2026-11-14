@@ -158,3 +158,14 @@ def test_serve_invalid_config_exits_3_with_field_and_no_value(tmp_path):
     assert r.returncode == 3
     assert "OPENCLAW_PORT" in r.stderr and "valor-secreto-abc" not in r.stderr + r.stdout
     assert "Traceback" not in r.stderr
+
+
+def test_serve_invalid_json_setting_exits_3_without_traceback(tmp_path):
+    # JSON roto en un dict: pydantic-settings lanza SettingsError, no ValidationError.
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "config.env").write_text("TTS_VOICE_MAP={secreto-no-json\n")
+    r = _cli("--home", str(base), "serve", cwd=tmp_path)
+    assert r.returncode == 3, r.stderr
+    assert "TTS_VOICE_MAP" in r.stderr and "secreto-no-json" not in r.stderr + r.stdout
+    assert "Traceback" not in r.stderr
