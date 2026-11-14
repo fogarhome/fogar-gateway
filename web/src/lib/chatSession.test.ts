@@ -152,6 +152,14 @@ describe('createChatSession', () => {
     expect(s.state.log.lines.at(-1)).toMatchObject({ text: '¿Hola?', unsent: true })
   })
 
+  it('releer lo dicho con un mensaje esperando a la conversación dormida no lo quita', () => {
+    const s = session()
+    last().serverClose(1000)
+    s.send('¿Hola?')
+    s.historyReloaded(s.state.log.endedKeys())
+    expect(s.state.log.lines.map((l) => l.text)).toEqual(['¿Hola?'])
+  })
+
   it('al volver a entrar, el aviso de OpenClaw caído empieza de cero', () => {
     const s = session()
     last().receive({ type: 'status', service: 'orchestrator', state: 'reconnecting' })

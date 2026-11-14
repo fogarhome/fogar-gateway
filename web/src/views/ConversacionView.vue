@@ -33,13 +33,15 @@ const cargando = ref(false)
 async function cargarHistoria(limit = 200): Promise<void> {
   const pedida = id.value // si cambias de conversación mientras llega, esta respuesta ya no vale
   cargando.value = true
+  // Lo terminado antes de pedir ya vendrá en lo leído; lo que termine mientras llega, no.
+  const terminadas = chat.value?.state.log.endedKeys() ?? []
   try {
     const leida = await getConversationMessages(pedida, limit)
     if (pedida !== id.value) return
     historia.value = leida
     historiaError.value = null
     // Lo terminado en vivo ya viene en lo leído: que no salga dos veces.
-    chat.value?.historyReloaded()
+    chat.value?.historyReloaded(terminadas)
   } catch (e) {
     if (pedida !== id.value) return
     historia.value = null

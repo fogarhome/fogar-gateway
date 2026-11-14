@@ -153,9 +153,12 @@ export function createChatSession(options: ChatSessionOptions) {
     connect()
   }
 
-  /** Lo dicho se ha vuelto a leer de OpenClaw: fuera lo terminado aquí, que ya viene en ello. */
-  function historyReloaded(): void {
-    state.log.keepStreaming()
+  /**
+   * Lo dicho se ha vuelto a leer de OpenClaw: fuera lo que ya estaba terminado al pedirlo (`keys`, de
+   * `state.log.endedKeys()` antes de pedir), que ya viene en ello. Lo que espera a salir se queda.
+   */
+  function historyReloaded(keys: string[]): void {
+    state.log.dropReloaded(keys, pending?.key)
   }
 
   /** «Seguir aquí» (o reintentar tras un `stopped`): vuelve a abrir la conversación, que se cierra en el otro sitio. */

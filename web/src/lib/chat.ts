@@ -34,6 +34,8 @@ export interface ChatLine {
   otherConversation?: string | null
   /** Solo en las tuyas: escrita con la conversación dormida y no llegó a salir (falló la reconexión). */
   unsent?: boolean
+  /** Solo en las de Fogar que responden: la clave de la línea tuya a la que responden. */
+  ask?: string
 }
 
 export interface TurnProgress {
@@ -66,12 +68,28 @@ export class ChatLog {
     if (line) line.unsent = true
   }
 
+  /** Las claves de lo terminado: lo que una lectura de lo dicho pedida ahora ya puede traer. */
+  endedKeys(): string[] {
+    return this.lines.filter((l) => l.state === 'ended').map((l) => l.key)
+  }
+
   /**
-   * Se ha vuelto a leer lo dicho de OpenClaw, que ya trae lo terminado: solo se queda lo que sigue
-   * llegando (un turno a medias), para no enseñar nada dos veces.
+   * Se ha vuelto a leer lo dicho de OpenClaw, que ya trae lo terminado antes de pedirlo (`keys`, de
+   * `endedKeys()`): fuera eso, para no enseñarlo dos veces. Se queda lo que OpenClaw no tiene: lo de
+   * otra conversación, lo que no salió (`keep`: además lo que espera a salir) y el turno que no llegó
+   * a OpenClaw (`orchestrator_unavailable`) con tu mensaje.
    */
-  keepStreaming(): void {
-    this.lines = this.lines.filter((l) => l.state === 'streaming')
+  dropReloaded(keys: Iterable<string>, keep?: string | null): void {
+    const drop = new Set(keys)
+    const notInOpenClaw = new Set<string>()
+    for (const l of this.lines) {
+      if (l.error !== 'orchestrator_unavailable') continue
+      notInOpenClaw.add(l.key)
+      if (l.ask) notInOpenClaw.add(l.ask)
+    }
+    this.lines = this.lines.filter(
+      (l) => !drop.has(l.key) || l.otherConversation || l.unsent || l.key === keep || notInOpenClaw.has(l.key),
+    )
   }
 
   private turn(turnId: string): ChatLine | undefined {
@@ -91,6 +109,9 @@ export class ChatLog {
         const old = this.turn(m.turn_id)
         if (old) old.key = `${old.key}-${++this.seq}`
         const other = m.conversation && m.conversation !== this.conversationId ? m.conversation : null
+        // Responde a tu último mensaje que aún no tenía respuesta (un push no responde a nada).
+        const asked = new Set(this.lines.map((l) => l.ask))
+        const ask = m.origin === 'push' ? undefined : [...this.lines].reverse().find((l) => l.role === 'user' && !asked.has(l.key))?.key
         this.lines.push({
           key: `t-${m.turn_id}`,
           role: 'assistant',
@@ -99,6 +120,7 @@ export class ChatLog {
           origin: m.origin === 'push' ? 'push' : 'user',
           state: 'streaming',
           ...(other ? { otherConversation: other } : {}),
+          ...(ask ? { ask } : {}),
         })
         return true
       }

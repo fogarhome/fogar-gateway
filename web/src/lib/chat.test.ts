@@ -67,17 +67,78 @@ describe('ChatLog', () => {
 })
 
 describe('ChatLog al volver a leer lo dicho', () => {
-  it('se queda solo con lo que sigue llegando, para no enseñar nada dos veces', () => {
+  const end = (turn_id: string, reason = 'done') => ({ type: 'turn_end', turn_id, reason })
+  const fail = (turn_id: string, code: string) => ({ type: 'error', code, message: code, fatal: false, turn_id })
+  const texts = (log: ChatLog) => log.lines.map((l) => l.text)
+
+  it('quita lo terminado antes de pedir y deja lo que sigue llegando, para no enseñar nada dos veces', () => {
     const log = new ChatLog('c1')
     log.addUser('uno')
     log.apply(start('t-1'))
-    log.apply({ type: 'turn_end', turn_id: 't-1', reason: 'done' })
+    log.apply(end('t-1'))
     log.addUser('dos')
     log.apply(start('t-2'))
-    log.keepStreaming()
+    log.dropReloaded(log.endedKeys())
     expect(log.lines.map((l) => [l.role, l.state])).toEqual([['assistant', 'streaming']])
     log.apply({ type: 'token', turn_id: 't-2', text: 'sigue' })
     expect(log.lines[0]!.text).toBe('sigue')
+  })
+
+  it('lo que termina mientras llega la lectura se queda: no venía en ella', () => {
+    const log = new ChatLog('c1')
+    log.addUser('uno')
+    log.apply(start('t-1'))
+    const keys = log.endedKeys()
+    log.apply({ type: 'token', turn_id: 't-1', text: 'tarde' })
+    log.apply(end('t-1'))
+    log.addUser('dos')
+    log.dropReloaded(keys)
+    expect(texts(log)).toEqual(['tarde', 'dos'])
+  })
+
+  it('se queda el push de otra conversación y lo que no salió', () => {
+    const log = new ChatLog('c1')
+    log.apply(start('t-1', { conversation: 'c2', origin: 'push' }))
+    log.apply({ type: 'token', turn_id: 't-1', text: 'de otra' })
+    log.apply(end('t-1'))
+    log.markUnsent(log.addUser('no salió'))
+    log.dropReloaded(log.endedKeys())
+    expect(texts(log)).toEqual(['de otra', 'no salió'])
+  })
+
+  it('se queda lo que espera a salir (`keep`)', () => {
+    const log = new ChatLog('c1')
+    log.addUser('ya dicho')
+    const pending = log.addUser('esperando')
+    log.dropReloaded(log.endedKeys(), pending)
+    expect(texts(log)).toEqual(['esperando'])
+  })
+
+  it('se queda el turno que no llegó a OpenClaw con tu mensaje; los demás errores ya están en OpenClaw', () => {
+    const log = new ChatLog('c1')
+    const turns = ['orchestrator_unavailable', 'orchestrator_error', 'turn_timeout']
+    turns.forEach((code, i) => {
+      log.addUser(`pregunta ${code}`)
+      log.apply(start(`t-${i}`))
+      log.apply(fail(`t-${i}`, code))
+      log.apply(end(`t-${i}`, 'error'))
+    })
+    log.addUser('cancelada')
+    log.apply(start('t-9'))
+    log.apply(end('t-9', 'cancelled'))
+    log.dropReloaded(log.endedKeys())
+    expect(log.lines.map((l) => [l.role, l.text, l.error])).toEqual([
+      ['user', 'pregunta orchestrator_unavailable', undefined],
+      ['assistant', '', 'orchestrator_unavailable'],
+    ])
+  })
+
+  it('una respuesta va con tu último mensaje sin responder, aunque un push se cuele en medio', () => {
+    const log = new ChatLog('c1')
+    const u1 = log.addUser('uno')
+    log.apply(start('t-1', { origin: 'push' }))
+    log.apply(start('t-2'))
+    expect(log.lines.map((l) => l.ask)).toEqual([undefined, undefined, u1])
   })
 })
 
