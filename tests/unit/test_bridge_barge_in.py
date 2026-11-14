@@ -342,15 +342,16 @@ async def test_barge_in_before_turn_start_sends_nothing_but_the_partial(make_bri
 # ── _on_transcriber_warning ──────────────────────────────────────────────────
 
 
-async def test_transcriber_warning_forwarded_to_client(bridge):
-    await bridge._on_transcriber_warning("buffer_full", "Buffer full")
+async def test_transcriber_warning_forwarded_to_client_without_its_raw_message(bridge):
+    # Auditoría 3.0, E-3: the transcriber's free text never reaches the client, only the code.
+    await bridge._on_transcriber_warning("buffer_full", "Buffer full (raw upstream text)")
     assert await sent(bridge) == [
         {
             "type": "status",
             "service": "transcriber",
             "state": "degraded",
             "code": "buffer_full",
-            "message": "Buffer full",
+            "message": "buffer_full",
         }
     ]
 

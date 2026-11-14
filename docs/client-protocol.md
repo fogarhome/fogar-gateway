@@ -552,7 +552,7 @@ Por servicio:
 | `transcriber` | Una sesión STT por sesión de audio (con el proveedor `fogar`, una conexión a fogar-transcriber); reconecta en segundo plano. `unavailable` significa que no hay transcripción automática — puedes seguir enviando texto con `send`. Puede llegar desde el arranque mismo de la sesión (ver nota en §1) o en cualquier punto intermedio. Nunca cierra la sesión. |
 | `tts` | Sin conexión persistente — TTS se reconstruye en cada turno por diseño. `reconnecting`/`unavailable` aquí significa "el último intento falló y el siguiente turno con audio puede fallar también hasta que pase el backoff" — no hay un reintento en segundo plano independiente del propio turno. Los `token` de texto siguen llegando igual; solo falta el audio. |
 
-Los mensajes de estado también pueden incluir `code` y `message` con detalles adicionales:
+Los mensajes de estado también pueden incluir `code` y `message` con detalles adicionales. `message` es siempre un texto fijo del gateway (hoy, el mismo `code`), nunca el texto que mande el proveedor de voz:
 
 ```json
 {

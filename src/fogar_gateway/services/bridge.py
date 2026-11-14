@@ -789,10 +789,9 @@ class FogarBridge:
             self._log_send_failed("INVALID_MESSAGE", e)
 
     async def _on_transcriber_warning(self, code: str, message: str | None):
-        """Reenvía warnings del transcriber al cliente (e.g. buffer_full)."""
-        await self.notify_service_status(
-            "transcriber", "degraded", code=code, message=message or code
-        )
+        """Reenvía warnings del transcriber al cliente (e.g. buffer_full). Solo el código
+        saneado: el `message` del transcriber nunca llega al cliente (errores estables)."""
+        await self.notify_service_status("transcriber", "degraded", code=code, message=code)
 
     async def _on_transcriber_status(self, state: str, reason: str | None) -> None:
         """Transcriber capacity signal (#143): `busy` → degraded, `ok` → restored.
