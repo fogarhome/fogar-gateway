@@ -147,8 +147,10 @@ class ClientResponse(BaseModel):
             key_fp=fingerprint_key(r.client_key),
             is_active=r.is_active,
             client_type=r.client_type,
-            default_agent=r.default_agent,
-            allowed_agents=json.loads(r.allowed_agents) if r.allowed_agents else None,
+            # Una fila de la 2.x puede tener "Main": se devuelve como la usa el gateway (C-1).
+            default_agent=r.default_agent.lower() if r.default_agent else r.default_agent,
+            allowed_agents=[a.lower() for a in json.loads(r.allowed_agents)]
+            if r.allowed_agents else None,
             created_at=r.created_at,
             stt_language=r.stt_language,
             stt_vad_thold=r.stt_vad_thold,

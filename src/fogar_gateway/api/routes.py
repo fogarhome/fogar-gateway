@@ -88,7 +88,7 @@ async def _open_conversation(
                 "conversation_not_found", Close.CONVERSATION_NOT_FOUND, "conversation"
             ) from None
         asked = (handshake.agent or "").strip()
-        if asked and asked != existing.agent:
+        if asked and asked != existing.agent.lower():
             raise _Rejected("conversation_agent", Close.CONVERSATION_AGENT_MISMATCH, "conversation")
     try:
         # Una conversación existente fija su agente: se le aplican la lista y el roster.

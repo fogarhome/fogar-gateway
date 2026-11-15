@@ -276,3 +276,10 @@ def test_handshake_empty_agent_still_means_the_cascade(empty):
 
     hs = Handshake(client_key="k", input_mode="text", output_mode=["text"], agent=empty)
     assert resolve_agent(hs.agent, None, None) == "main"
+
+
+def test_model_alias_ignores_case():
+    # Revisión de C-1: el README dice que `model` no distingue mayúsculas.
+    from fogar_gateway.core.agent_policy import agent_from_model
+
+    assert agent_from_model("Fogar-Gateway") is None

@@ -81,13 +81,13 @@ class GatewayInfo:
         if not isinstance(payload, dict) or not isinstance(payload.get("agents"), list):
             return False
         agents = payload["agents"]
-        ids = [a["id"] for a in agents if isinstance(a, dict) and isinstance(a.get("id"), str)]
+        ids = [a["id"].lower() for a in agents if isinstance(a, dict) and isinstance(a.get("id"), str)]
         if agents and not ids:
             return False  # nothing usable: an empty roster would refuse every named agent
         self.agents = ids
         default_id = payload.get("defaultId")
         if isinstance(default_id, str) and default_id:
-            self.default_agent_id = default_id
+            self.default_agent_id = default_id.lower()
         return True
 
     @classmethod

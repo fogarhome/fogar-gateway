@@ -29,7 +29,7 @@ def agent_from_model(model: str | None) -> str | None:
     solo espacios o el alias `MODEL_ALIAS`; en otro caso, el nombre tal cual (un agente).
     """
     name = (model or "").strip()
-    if not name or name == MODEL_ALIAS:
+    if not name or name.lower() == MODEL_ALIAS:
         return None
     return name
 

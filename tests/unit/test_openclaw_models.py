@@ -115,3 +115,10 @@ def test_tool_call_update_phase_returns_none():
 def test_tool_call_missing_required_fields_returns_none():
     assert ToolCallEvent.from_session_tool_payload({"phase": "start"}) is None
     assert ToolCallEvent.from_session_tool_payload({"phase": "start", "name": "exec"}) is None
+
+
+def test_agents_list_ids_are_lowercased_like_the_gateway():
+    # Revisión de C-1: el gateway lo compara todo en minúsculas.
+    info = GatewayInfo.from_hello_ok({})
+    info.update_agents_from_list({"defaultId": "Main", "agents": [{"id": "Main"}]})
+    assert info.agents == ["main"] and info.default_agent_id == "main"

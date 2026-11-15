@@ -195,7 +195,8 @@ class ConversationService:
         c = conversation
         with Session(self._get_engine()) as s:
             record = ConversationRecord(
-                id=c.id, client_id=c.client_id, agent=c.agent, session_key=c.session_key, kind=c.kind
+                id=c.id, client_id=c.client_id, agent=c.agent, session_key=c.session_key, kind=c.kind,
+                day=c.day,
             )
             s.add(record)
             try:
