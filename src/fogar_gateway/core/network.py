@@ -76,6 +76,11 @@ def warn_if_open_proxy_config() -> None:
         )
 
 
+# Headers that only a tunnel sets (tailscale serve, cloudflared): its peer is loopback,
+# so a request carrying them never earns the loopback exemption (auditoría 3.0, D-1).
+_TUNNEL_HEADERS = ("tailscale-user-login", "tailscale-user-name", "cf-connecting-ip")
+
+
 def resolve_client_ip(connection: HTTPConnection) -> str:
     """
     Returns the IP to evaluate with is_trusted_origin().
@@ -87,6 +92,13 @@ def resolve_client_ip(connection: HTTPConnection) -> str:
     return a non-IP sentinel that is_trusted_origin() rejects and /v1 asks for
     a Bearer. Otherwise the peer connected directly — use its address as-is and
     ignore any X-Real-IP it sends.
+
+    D-1: a proxy that passes the client's X-Real-IP through (tailscale serve,
+    cloudflared) still sets X-Forwarded-For with the real address last, while
+    nginx overwriting X-Real-IP with `proxy_add_x_forwarded_for` agrees with it.
+    So when X-Forwarded-For is present its last hop must equal X-Real-IP, and a
+    loopback result next to a tunnel header (Tailscale-User-*, Cf-Connecting-Ip)
+    is never trusted.
     """
     peer = connection.client.host if connection.client else ""
 
@@ -96,10 +108,25 @@ def resolve_client_ip(connection: HTTPConnection) -> str:
             ipaddress.ip_address(real_ip)
         except ValueError:
             return NO_REAL_IP
-        return real_ip
+        xff = ",".join(connection.headers.getlist("x-forwarded-for"))
+        if xff and xff.rsplit(",", 1)[-1].strip() != real_ip:
+            return NO_REAL_IP
+        ip = real_ip
+    else:
+        if connection.headers.get("x-real-ip"):
+            logger.warning(
+                f"Ignoring X-Real-IP header from untrusted peer {peer!r} "
+                "(possible spoofing attempt)"
+            )
+        ip = peer
 
-    if connection.headers.get("x-real-ip"):
-        logger.warning(
-            f"Ignoring X-Real-IP header from untrusted peer {peer!r} (possible spoofing attempt)"
-        )
-    return peer
+    if any(h in connection.headers for h in _TUNNEL_HEADERS) and _is_loopback(ip):
+        return NO_REAL_IP
+    return ip
+
+
+def _is_loopback(ip_str: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip_str).is_loopback
+    except ValueError:
+        return False

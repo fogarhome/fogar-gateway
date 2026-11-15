@@ -69,6 +69,9 @@ async def resolve_ha_caller(request: Request) -> HACaller:
       (igual que el handshake WS). Aplica siempre, sin importar el origen.
     - Sin Authorization -> exige que el origen (ver resolve_client_ip) sea
       confiable (loopback y/o TRUSTED_NETWORKS); si no, 401.
+    - Una petición de navegador (`Origin` o `Sec-Fetch-*`) nunca usa la exención de
+      origen: corta el DNS rebinding desde una página web (auditoría 3.0, D-2). Home
+      Assistant (aiohttp) no manda esas cabeceras.
     """
     auth = request.headers.get("authorization")
     if auth:
@@ -81,8 +84,10 @@ async def resolve_ha_caller(request: Request) -> HACaller:
             raise HTTPException(status_code=401, detail="authentication required") from None
         return HACaller(client=client, config=config)
 
-    ip = resolve_client_ip(request)
-    if is_trusted_origin(ip):
+    from_browser = "origin" in request.headers or any(
+        name.startswith("sec-fetch-") for name in request.headers
+    )
+    if not from_browser and is_trusted_origin(resolve_client_ip(request)):
         return HACaller(client=None, config=None)
 
     raise HTTPException(status_code=401, detail="authentication required")

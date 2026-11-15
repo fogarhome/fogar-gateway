@@ -45,6 +45,9 @@ class ClientConfig(BaseModel):
 # =====================================================================
 
 
+CREDENTIAL_MAX_LEN = 1024
+
+
 class Handshake(BaseModel):
     """
     Configuración inicial que el cliente envía al Gateway al conectar por WebSocket. Define
@@ -53,8 +56,10 @@ class Handshake(BaseModel):
     Credencial: `client_key` o, para el panel web, `admin_token` (M19); una de las dos.
     """
 
-    client_key: str | None = None
-    admin_token: str | None = None
+    # Con tope (como `conversation`): un valor enorme o un surrogate suelto ("\ud800") falla la
+    # validación (cierre 4000) en vez de reventar al codificarlo (auditoría 3.0, D-5).
+    client_key: Annotated[str, StringConstraints(max_length=CREDENTIAL_MAX_LEN)] | None = None
+    admin_token: Annotated[str, StringConstraints(max_length=CREDENTIAL_MAX_LEN)] | None = None
     input_mode: Literal["audio", "text"]
     output_mode: list[OutputMode]
     agent: str | None = None  # OpenClaw agent name; None → gateway default

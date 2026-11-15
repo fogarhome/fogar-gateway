@@ -146,11 +146,13 @@ Opciones globales: van **antes** del subcomando (`fogar-gw --yes clients remove 
 
 Auth: header `X-Admin-Token`. Sin header → 422. Token incorrecto → 401. `ADMIN_TOKEN` vacío → 503.
 
+**Límites de toda la API HTTP:** un cuerpo de más de 1 MiB recibe `413 {"detail": "request body too large"}` antes de cualquier validación o autenticación (cuenta los bytes recibidos, también sin `Content-Length`). Un `422` lista campo, tipo y mensaje de cada error, nunca el valor recibido. No hay `/docs`, `/redoc` ni `/openapi.json`: la referencia es esta página.
+
 ### OpenAI-compatible (`/v1/*`, para Home Assistant)
 
 **Autenticación** (`src/fogar_gateway/core/network.py`, `resolve_ha_caller` en `src/fogar_gateway/api/openai_routes.py`):
 
-- Origen **de confianza** (peer directo en las CIDR de `TRUSTED_NETWORKS`, peer loopback si `TRUST_LOOPBACK=true`, o un cliente avalado por un proxy de `TRUSTED_PROXIES` con `X-Real-IP` válido): no necesita credenciales. **Matiz (#216):** con `TRUSTED_PROXIES` por defecto (`127.0.0.1,::1`) un cliente directo en loopback *sin* `X-Real-IP` ya NO queda exento y debe enviar `Authorization: Bearer <client_key>`; sin proxy, vacía `TRUSTED_PROXIES=` para recuperar el comportamiento anterior (y con proxy, este debe sobrescribir `X-Real-IP`).
+- Origen **de confianza** (peer directo en las CIDR de `TRUSTED_NETWORKS`, peer loopback si `TRUST_LOOPBACK=true`, o un cliente avalado por un proxy de `TRUSTED_PROXIES` con `X-Real-IP` válido y, si hay `X-Forwarded-For`, igual a su último salto): no necesita credenciales. **Matiz (#216):** con `TRUSTED_PROXIES` por defecto (`127.0.0.1,::1`) un cliente directo en loopback *sin* `X-Real-IP` ya NO queda exento y debe enviar `Authorization: Bearer <client_key>`; sin proxy, vacía `TRUSTED_PROXIES=` para recuperar el comportamiento anterior (y con proxy, este debe sobrescribir `X-Real-IP`).
 
   | Escenario (config por defecto) | Antes | Ahora |
   |---|---|---|
@@ -159,10 +161,15 @@ Auth: header `X-Admin-Token`. Sin header → 422. Token incorrecto → 401. `ADM
   | Loopback + `X-Real-IP` en `TRUSTED_NETWORKS` / externo | 200 / 401 | 200 / 401 |
   | Peer LAN directo en `TRUSTED_NETWORKS` | 200 | 200 |
   | `TRUSTED_PROXIES=` vacío, loopback directo | 200 | 200 |
+  | nginx documentado: `X-Real-IP` = último salto de `X-Forwarded-For` (o sin XFF) | 200 / 401 según la IP | igual |
+  | `X-Real-IP` distinto del último salto de `X-Forwarded-For` (`tailscale serve`/cloudflared reenviando el del cliente, o XFF inyectado por el cliente tras un nginx) | 200 si el `X-Real-IP` era de confianza | **401** |
+  | Resultado loopback con `Tailscale-User-*` o `Cf-Connecting-Ip` (túnel en el mismo host, también con `TRUSTED_PROXIES=` vacío) | 200 | **401** |
+  | Petición de navegador (`Origin` o `Sec-Fetch-*`) desde un origen de confianza | 200 | **401** (Bearer) |
 - Cualquier otro origen debe enviar `Authorization: Bearer <client_key>`, validado contra la tabla `clients` (la misma que usa el handshake WebSocket). Sin él, o con una key inválida/inactiva → `401`.
 - Si se envía un Bearer, siempre se valida, también desde un origen de confianza.
-- Detrás de un proxy (nginx), la IP real solo se toma de `X-Real-IP` si el peer está en `TRUSTED_PROXIES`. **Falla cerrado (#216):** un peer de `TRUSTED_PROXIES` sin `X-Real-IP` válido no es origen de confianza (se exige Bearer); el proxy debe *sobrescribir* `X-Real-IP` (`proxy_set_header X-Real-IP $remote_addr;`), nunca reenviar el del cliente. `X-Forwarded-For` nunca concede confianza (`fogar-gw serve` arranca uvicorn sin `proxy_headers`). Consecuencia: un cliente directo en loopback (p. ej. HA en el mismo host, sin proxy) ya no queda exento con la config por defecto; envía Bearer, o vacía `TRUSTED_PROXIES` si no hay proxy.
+- Detrás de un proxy (nginx), la IP real solo se toma de `X-Real-IP` si el peer está en `TRUSTED_PROXIES`. **Falla cerrado (#216):** un peer de `TRUSTED_PROXIES` sin `X-Real-IP` válido no es origen de confianza (se exige Bearer); el proxy debe *sobrescribir* `X-Real-IP` (`proxy_set_header X-Real-IP $remote_addr;`), nunca reenviar el del cliente. `X-Forwarded-For` nunca concede confianza por sí solo (`fogar-gw serve` arranca uvicorn sin `proxy_headers`), pero si llega su último salto debe coincidir con `X-Real-IP`: así un proxy que deja pasar el `X-Real-IP` del cliente y fija él `X-Forwarded-For` (`tailscale serve`, el de `fogar-gw access`, o cloudflared) no avala a nadie, y un nginx con `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` sigue funcionando (sin esa línea, un `X-Forwarded-For` que mande el propio cliente solo le cuesta la exención a él). Un túnel (`Tailscale-User-*`, `Cf-Connecting-Ip`) nunca obtiene la exención de loopback, aunque haya otro proxy detrás. Consecuencia: un cliente directo en loopback (p. ej. HA en el mismo host, sin proxy) ya no queda exento con la config por defecto; envía Bearer, o vacía `TRUSTED_PROXIES` si no hay proxy.
 - Host de escucha de `fogar-gw serve` (también en Docker): `GATEWAY_HOST` (default `0.0.0.0`); detrás de un proxy en el mismo host usa `GATEWAY_HOST=127.0.0.1`.
+- **DNS rebinding (auditoría 3.0):** una petición con `Origin` o cualquier `Sec-Fetch-*` viene de un navegador y nunca usa la exención de origen de confianza: necesita Bearer. Home Assistant (aiohttp) no manda esas cabeceras. No hay lista de `Host` permitidos: HA puede llegar por cualquier nombre o IP.
 - `TRUSTED_NETWORKS` vacío = fail-closed: solo loopback puede quedar exento (sujeto al matiz de `TRUSTED_PROXIES` de arriba).
 - `HANDSHAKE_MAX_BYTES` mide **caracteres**, no bytes (con caracteres multibyte el tope real puede ser hasta 4x mayor). El tope de 1 MiB por mensaje WebSocket lo pone `fogar-gw serve`: con `uvicorn` a mano rige el de uvicorn (16 MiB).
 - Con Bearer válido, `model` selecciona el agente y se aplican `default_agent`/`allowed_agents` del cliente (violación → `403`). Sin `model`, la cascada: `default_agent` del cliente, `DEFAULT_AGENT`, el agente por defecto de OpenClaw y `main`.

@@ -1,6 +1,7 @@
 """Tests para WebSocket handshake (/ws/stream)."""
 
 import asyncio
+import json
 import logging
 import queue
 import re
@@ -306,6 +307,20 @@ def test_handshake_conversation_is_validated(client, conversation):
              "conversation": conversation}
         )
         ws.receive_text()
+
+
+@pytest.mark.parametrize("field", ["client_key", "admin_token"])
+@pytest.mark.parametrize("value", ["\ud800", "k" * 1025], ids=["surrogate", "huge"])
+def test_handshake_credential_is_validated(client, caplog, field, value):
+    """Auditoría 3.0, D-5: un surrogate suelto o un valor enorme es un handshake inválido
+    (4000), no un UnicodeEncodeError con traceback."""
+    raw = json.dumps({field: value, "input_mode": "text", "output_mode": ["text"]})
+    with caplog.at_level(logging.ERROR), pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect("/ws/stream") as ws:
+            ws.send_text(raw)
+            ws.receive_text()
+    assert exc.value.code == 4000
+    assert "Traceback" not in caplog.text and "UnicodeEncodeError" not in caplog.text
 
 
 # ── Primer frame binario (#232) y ClientGone en el health check (#205) ────────

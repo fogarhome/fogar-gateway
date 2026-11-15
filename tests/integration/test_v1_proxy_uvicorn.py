@@ -83,10 +83,24 @@ def test_tailscale_serve_headers_never_grant_trust(live_url):
     h = {"X-Forwarded-For": "100.64.0.7", "Tailscale-User-Login": "a@b.c",
          "Tailscale-User-Name": "A", "X-Forwarded-Proto": "https"}
     assert _get(live_url, h).status_code == 401
+    # D-1: tailscale serve passes the client's X-Real-IP through but sets XFF itself.
+    assert _get(live_url, {**h, "X-Real-IP": "127.0.0.1"}).status_code == 401
+
+
+def test_cloudflared_with_forged_x_real_ip_is_not_trusted(live_url):
+    h = {"X-Real-IP": "127.0.0.1", "X-Forwarded-For": "127.0.0.1, 203.0.113.5",
+         "Cf-Connecting-Ip": "203.0.113.5"}
+    assert _get(live_url, h).status_code == 401
+    # Chained cloudflared -> nginx: both headers say loopback, the tunnel header still bars it.
+    h = {"X-Real-IP": "127.0.0.1", "X-Forwarded-For": "127.0.0.1", "Cf-Connecting-Ip": "203.0.113.5"}
+    assert _get(live_url, h).status_code == 401
 
 
 def test_proxy_vouching_for_loopback_client_is_trusted(live_url):
+    # nginx documented in the README, with or without proxy_add_x_forwarded_for.
     assert _get(live_url, {"X-Real-IP": "127.0.0.1"}).status_code == 200
+    h = {"X-Real-IP": "127.0.0.1", "X-Forwarded-For": "127.0.0.1"}
+    assert _get(live_url, h).status_code == 200
 
 
 def test_x_forwarded_for_spoof_of_trusted_network_fails_closed(monkeypatch):
