@@ -638,6 +638,12 @@ class FogarBridge:
         log_send_failed(self.client_id, what, e)
 
     async def run(self):
+        if self._policy_close is not None:
+            # Desplazada o revocada antes de arrancar (durante claim_conversation, A-4): nada
+            # que lanzar. Se espera a su cierre, que manda (su código y su status), en vez de
+            # dejar que el close_all(status="error") de routes.py gane.
+            await asyncio.wait({self._policy_close})
+            return
         self._session_start = time.monotonic()
         self._last_client_activity = time.monotonic()
         await self.tracker.record(
