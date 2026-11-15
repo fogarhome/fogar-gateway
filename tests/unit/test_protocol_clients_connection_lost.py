@@ -66,7 +66,9 @@ async def test_tts_close_failure_is_logged_not_raised(caplog):
 # ── Transcriber ──────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize(("code", "dropped"), [(1011, True), (1000, False)])
+# 1000/1001 too (auditoría 3.0, E-1): any server-side close is a drop; only our own
+# close() is not (tests/unit/test_transcriber_clean_close_reconnects.py).
+@pytest.mark.parametrize(("code", "dropped"), [(1011, True), (1001, True), (1000, True)])
 async def test_transcriber_listen_loop_flags_only_an_unexpected_drop(code, dropped):
     async def handler(ws):
         await ws.recv()  # config handshake

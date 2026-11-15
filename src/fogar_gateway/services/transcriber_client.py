@@ -39,6 +39,7 @@ class TranscriberClient:
         self._is_ready = False
         self._session_id: str | None = None  # recibido en el mensaje "ready"
         self._dropped_unexpectedly: bool = False
+        self._closing = False  # solo close(): send_audio también baja _is_ready al ver el socket cerrado
         self._last_transcription_at: float | None = None
 
     async def connect(self, language: str = "es", token: str = "", vad_thold: float = 0.0):
@@ -166,14 +167,16 @@ class TranscriberClient:
 
                 elif t_msg.type == "error":
                     logger.error(f"[{self.client_id}] Transcriber error [{safe_code(t_msg.code)}]")
-        except ConnectionClosed as e:
-            clean_close = e.rcvd is not None and e.rcvd.code == 1000
-            if self._is_ready and not clean_close:
-                self._dropped_unexpectedly = True
-            self._is_ready = False
-            logger.info(
-                f"[{self.client_id}] Loop de escucha del Transcriber finalizado (code={e.rcvd.code if e.rcvd else 'none'})."
-            )
+        except ConnectionClosed:
+            pass  # 1000/1001 (ConnectionClosedOK) ni llegan aquí: el `async for` termina sin más
+        # Si el socket se cerró sin un close() nuestro, el transcriber se ha ido, con el
+        # código que sea (fogar manda 1001 al reiniciar): reconectar.
+        if not self._closing:
+            self._dropped_unexpectedly = True
+        self._is_ready = False
+        logger.info(
+            f"[{self.client_id}] Loop de escucha del Transcriber finalizado (code={getattr(self.ws, 'close_code', None)})."
+        )
 
     async def send_end(self):
         """Señaliza al transcriber que el audio terminó, disparando la transcripción final."""
@@ -187,6 +190,7 @@ class TranscriberClient:
     ping = staticmethod(ping_ready)  # GET /ready (503 "busy" con la GPU saturada)
 
     async def close(self):
+        self._closing = True
         self._is_ready = False
         if self.ws:
             # `websockets.asyncio` has no `.closed` (G-01, #214): close() is idempotent,
