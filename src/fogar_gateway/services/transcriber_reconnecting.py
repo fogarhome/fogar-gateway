@@ -138,6 +138,19 @@ class ReconnectingTranscriberClient:
                 # Our own close(): not a failure, don't reconnect. Any server-side
                 # close, 1000/1001 included, sets _dropped_unexpectedly.
                 return
+            if self._client.closed_after_end:
+                # Fin de frase (1000 tras nuestro `end`): se reabre sin avisar al cliente; si no
+                # se puede, sí es una caída y sigue el camino normal con su backoff.
+                try:
+                    await self._client.connect(
+                        language=self._language, token=self._token, vad_thold=self._vad_thold
+                    )
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001 — frontera: el fallo pasa a reconexión con backoff
+                    logger.info("[%s] transcriber: reabrir tras la frase falló (%s)",
+                                self._client_id, describe_error(e))
             self._set_state(ConnectionState.RECONNECTING)
 
     async def _reconnect_loop(self) -> bool:

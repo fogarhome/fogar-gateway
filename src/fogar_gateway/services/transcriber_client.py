@@ -39,12 +39,16 @@ class TranscriberClient:
         self._is_ready = False
         self._session_id: str | None = None  # recibido en el mensaje "ready"
         self._dropped_unexpectedly: bool = False
+        # fogar-transcriber cierra con 1000 tras la final de cada `end`: es fin de frase, no caída.
+        self._end_sent = False
+        self.closed_after_end = False
         self._closing = False  # solo close(): send_audio también baja _is_ready al ver el socket cerrado
         self._last_transcription_at: float | None = None
 
     async def connect(self, language: str = "es", token: str = "", vad_thold: float = 0.0):
         """Abre el socket y manda el Handshake inicial de config."""
         ok = False
+        self._end_sent = self.closed_after_end = False
         try:
             self.ws = await websockets.connect(f"ws://{self.url}/api/stt")
 
@@ -173,6 +177,7 @@ class TranscriberClient:
         # código que sea (fogar manda 1001 al reiniciar): reconectar.
         if not self._closing:
             self._dropped_unexpectedly = True
+            self.closed_after_end = self._end_sent and getattr(self.ws, "close_code", None) == 1000
         self._is_ready = False
         logger.info(
             f"[{self.client_id}] Loop de escucha del Transcriber finalizado (code={getattr(self.ws, 'close_code', None)})."
@@ -184,6 +189,7 @@ class TranscriberClient:
             return
         try:
             await self.ws.send(json.dumps({"type": "end"}))
+            self._end_sent = True
         except ConnectionClosed:
             self._is_ready = False
 

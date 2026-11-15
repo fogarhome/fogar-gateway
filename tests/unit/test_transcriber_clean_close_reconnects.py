@@ -149,3 +149,35 @@ async def test_drop_seen_first_by_send_audio_still_reconnects():
         assert not client._is_ready
         await asyncio.wait_for(client.listen_loop(AsyncMock()), 2.0)
     assert client._dropped_unexpectedly
+
+
+async def test_close_after_end_reopens_quietly_each_utterance():
+    # fogar-transcriber cierra con 1000 tras la final de cada `end` (fin de frase): se reabre
+    # sin pasar por RECONNECTING, así el cliente no ve reconnecting/restored tras cada frase.
+    conns = 0
+
+    async def handler(ws):
+        nonlocal conns
+        conns += 1
+        await ws.recv()
+        await ws.send(json.dumps({"type": "ready", "session_id": f"s{conns}"}))
+        async for msg in ws:
+            if isinstance(msg, str) and json.loads(msg).get("type") == "end":
+                await ws.send(json.dumps({"type": "transcription", "text": "hola", "is_final": True}))
+                await ws.close(1000)
+                return
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        w = _wrap(server.sockets[0].getsockname()[1])
+        await w.start()
+        seen = []
+        w.on_state_change = seen.append
+        run = asyncio.create_task(w.run())
+        for i in range(3):
+            await _until(lambda n=i + 1: w._client._is_ready and conns == n)
+            await w.send_end()
+        await _until(lambda: conns == 4 and w._client._is_ready)
+        assert seen == []
+        assert w._callbacks.on_transcription.await_count == 3
+        await w.close()
+        run.cancel()
