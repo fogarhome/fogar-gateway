@@ -135,8 +135,8 @@ class ReconnectingTranscriberClient:
             if self._closed:
                 return
             if not self._client._dropped_unexpectedly:
-                # Clean close (code 1000) — deliberate (our own close(), or a
-                # normal server-side session end). Not a failure: don't reconnect.
+                # Our own close(): not a failure, don't reconnect. Any server-side
+                # close, 1000/1001 included, sets _dropped_unexpectedly.
                 return
             self._set_state(ConnectionState.RECONNECTING)
 
