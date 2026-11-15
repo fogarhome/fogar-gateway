@@ -52,7 +52,6 @@ def _settings_error(exc: Exception) -> list[str]:
 
 def load(path: Path | None = None) -> tuple[Any, list[str], dict[str, str]]:
     """(settings o None, errores de validación, origen de cada ajuste) de `path` (o config.env)."""
-    from dotenv import dotenv_values
     from pydantic import ValidationError
     from pydantic_settings import SettingsError
 
@@ -60,10 +59,9 @@ def load(path: Path | None = None) -> tuple[Any, list[str], dict[str, str]]:
     from_file: dict[str, Any] = {}
     if path.is_file():
         try:
-            api.read_env_file(path)  # mensaje legible si no hay permiso
+            from_file = api.read_env_file(path)  # mensaje legible si no hay permiso
         except api.ApiError as e:
             return None, [e.message], {}
-        from_file = {k.upper(): v for k, v in dotenv_values(path).items()}
     try:
         settings_cls = _settings_class()
         settings = settings_cls(_env_file=path if path.is_file() else None)

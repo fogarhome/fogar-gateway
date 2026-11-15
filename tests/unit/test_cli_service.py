@@ -16,8 +16,8 @@ StartLimitBurst=5
 
 [Service]
 Type=exec
-ExecStart="/home/u/.local/bin/fogar-gw" serve
-Environment="FOGAR_GATEWAY_HOME=/home/u/.fogar-gateway"
+ExecStart=/home/u/.local/bin/fogar-gw serve
+Environment=FOGAR_GATEWAY_HOME=/home/u/.fogar-gateway
 Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=3
@@ -45,9 +45,25 @@ def test_unit_quotes_and_escapes_odd_paths():
 
 
 def test_pick_exe_makes_relative_exe_absolute_without_resolving(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    exe = service.pick_exe(Path(".venv/bin/fogar-gw"))
+    (tmp_path / "otro").mkdir()
+    monkeypatch.chdir(tmp_path / "otro")
+    # systemd rechaza una ruta con `..`: se normaliza sin resolver symlinks.
+    exe = service.pick_exe(Path("../.venv/bin/fogar-gw"))
     assert exe == tmp_path / ".venv/bin/fogar-gw" and exe.is_absolute()
+
+
+def test_pick_exe_bare_name_is_looked_up_on_path(monkeypatch, tmp_path):
+    exe = tmp_path / "fogar-gw"
+    exe.write_text("")
+    monkeypatch.setattr(service.shutil, "which", lambda name: str(exe) if str(name) == "fogar-gw" else None)
+    monkeypatch.chdir(tmp_path.parent)
+    assert service.pick_exe(Path("fogar-gw")) == exe
+
+
+def test_pick_exe_bare_name_not_on_path_fails(monkeypatch):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    with pytest.raises(api.ApiError, match="No encuentro"):
+        service.pick_exe(Path("fogar-gw"))
 
 
 def test_stop_timeout_matches_compose_and_exceeds_graceful_shutdown():

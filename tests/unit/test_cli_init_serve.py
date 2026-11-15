@@ -169,3 +169,13 @@ def test_serve_invalid_json_setting_exits_3_without_traceback(tmp_path):
     assert r.returncode == 3, r.stderr
     assert "TTS_VOICE_MAP" in r.stderr and "secreto-no-json" not in r.stderr + r.stdout
     assert "Traceback" not in r.stderr
+
+
+def test_serve_unreadable_config_exits_3_without_traceback(tmp_path):
+    # config.env no UTF-8: sin traza y exit 3, para que systemd no reintente en bucle.
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "config.env").write_bytes(b"ADMIN_TOKEN=caf\xe9\n")
+    r = _cli("--home", str(base), "serve", cwd=tmp_path)
+    assert r.returncode == 3, r.stderr
+    assert "config.env" in r.stderr and "Traceback" not in r.stderr
