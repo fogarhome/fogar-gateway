@@ -9,6 +9,9 @@
 #       echo "GATEWAY_UID=$(id -u)" >> .env && echo "GATEWAY_GID=$(id -g)" >> .env
 #   (UID/GID de la shell no se exportan, por eso variables propias). Si ./data ya existía
 #   de un despliegue anterior como root:  sudo chown -R "$(id -u):$(id -g)" data
+# - TZ: zona horaria del contenedor (la imagen trae tzdata). Sin ella sería UTC y el día de las
+#   conversaciones (CONVERSATION_DAY_START_HOUR, hora local) empezaría a las 05:00 UTC. Por
+#   defecto Europe/Madrid; cámbiala con TZ=... en el .env de al lado.
 services:
   fogar-gateway:
     build:
@@ -19,6 +22,8 @@ services:
     user: "${GATEWAY_UID:-1000}:${GATEWAY_GID:-1000}"
     env_file:
       - .env
+    environment:
+      - TZ=${TZ:-Europe/Madrid}
     restart: unless-stopped
     stop_grace_period: 45s
     volumes:

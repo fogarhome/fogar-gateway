@@ -150,6 +150,13 @@ def test_serve_constants_match_the_shutdown_budget():
     assert serve_mod.GRACEFUL_SHUTDOWN_S < 45
 
 
+def test_compose_sets_the_container_time_zone():
+    """Auditoría 3.0, C-4: el corte del día de las conversaciones usa la hora local; sin TZ el
+    contenedor está en UTC. La imagen base (python:*-slim) ya trae tzdata."""
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "- TZ=${TZ:-Europe/Madrid}" in compose
+
+
 def test_serve_invalid_config_exits_3_with_field_and_no_value(tmp_path):
     base = tmp_path / "base"
     base.mkdir()
