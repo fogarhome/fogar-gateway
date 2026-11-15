@@ -23,8 +23,8 @@ from fogar_gateway.cli import api, doctor
 from fogar_gateway.cli import config as cfg
 from fogar_gateway.cli.output import Out
 
-# Solo los usa compose, o los fija la base nativa.
-DROP = ("DATABASE_URL", "GATEWAY_UID", "GATEWAY_GID")
+# Solo los usa compose, o los fija la base nativa (TZ: la nativa usa la zona del host).
+DROP = ("DATABASE_URL", "GATEWAY_UID", "GATEWAY_GID", "TZ")
 DOCKER_BASE = "/app"  # FOGAR_GATEWAY_HOME de la imagen
 ADD = ("LOG_FORMAT", "json")  # la imagen lo fijaba con ENV: los logs siguen igual
 

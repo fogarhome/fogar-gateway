@@ -25,6 +25,7 @@ ENV = (
     "DATABASE_URL=sqlite:////app/data/gateway.db\n"
     "GATEWAY_UID=1000\n"
     "  gateway_gid = 1000\n"
+    "TZ=Europe/Madrid\n"
     "HANDSHAKE_MAX_BYTES=4096\n"
 )
 
@@ -102,9 +103,10 @@ def test_same_client_ids(env):
 def test_drops_database_url_and_uid_gid(env):
     docker, native = env
     out = json.loads(run(docker).output)
-    assert out["config"]["dropped"] == ["DATABASE_URL", "GATEWAY_UID", "gateway_gid"]
+    assert out["config"]["dropped"] == ["DATABASE_URL", "GATEWAY_UID", "gateway_gid", "TZ"]
     text = (native / "config.env").read_text()
     assert "DATABASE_URL" not in text and "UID" not in text and "gid" not in text
+    assert "TZ" not in text  # la nativa usa la zona del host; Settings rechaza claves ajenas
     # el resto se conserva tal cual: export, comentario, comillas, línea vacía
     assert text.startswith("# Docker\nexport ADMIN_TOKEN='tok en'\n\nOPENCLAW_HOST=\"host:1\"\n")
 
