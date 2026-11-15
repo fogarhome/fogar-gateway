@@ -203,8 +203,8 @@ class TurnTts:
                 first = False
                 await self._tracker.record("tts_first_chunk", **self._meta())
             async for frame in pacer.frames(chunk):
-                if self._turn.ended:
-                    return  # nada después de su turn_end
+                if self._turn.ended or self._turn.cancel_reason is not None:
+                    return  # nada después de su turn_end, ni desde que se cancela
                 try:
                     await self._sender.send_bytes(header + frame)
                 except Exception as e:  # noqa: BLE001 — frontera: envío a un cliente que puede haberse ido
@@ -739,6 +739,8 @@ class TurnController:
             # Abrirlo, bajo el lock: un `send` (start_user_turn) o un corte lo ven entero,
             # registrado y con su turn_start ya en cola, nunca a medias (#202).
             async with self._lock:
+                if self._closing:
+                    return  # su turn_start ya no saldría (restrict) y su turn_end sí
                 if self._user_task is not None and not self._user_task.done():
                     continue  # un turno que se estaba sustituyendo: el usuario gana
                 if self._push is not None:
@@ -1023,10 +1025,11 @@ class TurnController:
     ) -> bool:
         """El único que envía un turn_end: exactamente uno por turno, quien llegue primero.
 
-        Lo marca terminado antes de cualquier await (su audio deja de salir), libera su TTS
-        (con su evento `push_tts`), aborta el push en OpenClaw si se pide y es de nuestra
-        session_key, y envía turn_end. Cada paso termina aunque cancelen a quien cierra
-        (#221, `Teardown`); esa cancelación se relanza después del turn_end.
+        Lo marca terminado y encola su turn_end sin ningún await entre medias (su audio deja
+        de salir, y nada abre otro turno antes: A-1); después libera su TTS (con su evento
+        `push_tts`) y aborta el push en OpenClaw si se pide y es de nuestra session_key. Cada
+        paso termina aunque cancelen a quien cierra (#221, `Teardown`); esa cancelación se
+        relanza al final.
         """
         if turn.ended:
             return False
@@ -1036,11 +1039,6 @@ class TurnController:
         if turn.progress_flush is not None:
             turn.progress_flush.cancel()  # no hace falta esperarla: ya ve `ended`
         logger.debug(f"[{self._client_id}] turno {turn.turn_id} ({turn.origin}) terminado: {reason}")
-        td = Teardown(f"[{self._client_id}] fin del turno {turn.turn_id}")
-        if release and turn.tts is not None:
-            await td.step(self._release_tts(turn.tts, reason), "TTS del turno")
-        if abort and turn.session_key is not None and self._may_abort(turn.session_key):
-            await td.step(self._orchestrator.abort(turn.session_key), "chat.abort del push")
         if self._push is turn:
             self._push = None
         if turn.opened:
@@ -1050,6 +1048,11 @@ class TurnController:
                 )
             except Exception as e:  # noqa: BLE001 — frontera: envío a un cliente que puede haberse ido
                 self._log_send_failed("turn_end", e)
+        td = Teardown(f"[{self._client_id}] fin del turno {turn.turn_id}")
+        if release and turn.tts is not None:
+            await td.step(self._release_tts(turn.tts, reason), "TTS del turno")
+        if abort and turn.session_key is not None and self._may_abort(turn.session_key):
+            await td.step(self._orchestrator.abort(turn.session_key), "chat.abort del push")
         td.raise_if_cancelled()
         return True
 
