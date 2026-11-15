@@ -389,13 +389,15 @@ class OpenClawClient:
             agents_req_id = str(uuid.uuid4())
             await self._ws.send(json.dumps(frames.agents_list(agents_req_id)))
             agents_res = await self._recv_matching(agents_req_id, timeout=10.0)
-            if agents_res.get("ok"):
-                self.gateway_info.update_agents_from_list(agents_res.get("payload", {}))
-            else:
+            # A malformed payload counts as `ok:false` (B-1): keep the last roster.
+            if not (
+                agents_res.get("ok")
+                and self.gateway_info.update_agents_from_list(agents_res.get("payload"))
+            ):
                 # Only the short code, never OpenClaw's error text (#228).
                 logger.warning(
                     "agents.list failed at connect (code=%s)",
-                    _safe_error_code(agents_res.get("error")),
+                    _safe_error_code(agents_res.get("error")) if not agents_res.get("ok") else "malformed",
                 )
                 if previous_agents:
                     # Wiping the roster would make has_agent() reject every named

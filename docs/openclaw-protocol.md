@@ -105,7 +105,12 @@ Call `agents.list` right after `hello-ok` (`OpenClawClient.connect()` does this)
 Note the field is `id`, not `agentId` (the older `hello-ok.snapshot.agents[]` shape — now gone
 — used `agentId` + per-item `isDefault`; `agents.list`'s shape uses `id` + a top-level
 `defaultId` to compare against instead). `GatewayInfo.update_agents_from_list()`
-(`src/fogar_gateway/services/openclaw/models.py`) parses this.
+(`src/fogar_gateway/services/openclaw/models.py`) parses this. Since 2026-11-15 (audit 3.0, B-1)
+an `ok:true` answer outside this shape (payload not an object, `agents` not a list, or a list with
+no entry carrying a string `id`) is treated like `ok:false`: the connection goes on and keeps the
+last known roster (#151) instead of failing every reconnect; entries without a string `id` are
+skipped and a non-string `defaultId` is ignored. OpenClaw has always sent `id`; this only guards
+against a server outside the schema.
 
 **No per-agent `tools` field is included.** There is currently no known API method that
 returns an agent's *resolved* tool list. `config.get` with no params returns the entire raw
