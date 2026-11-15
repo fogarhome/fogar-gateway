@@ -97,8 +97,9 @@ def resolve_client_ip(connection: HTTPConnection) -> str:
     cloudflared) still sets X-Forwarded-For with the real address last, while
     nginx overwriting X-Real-IP with `proxy_add_x_forwarded_for` agrees with it.
     So when X-Forwarded-For is present its last hop must equal X-Real-IP, and a
-    loopback result next to a tunnel header (Tailscale-User-*, Cf-Connecting-Ip)
-    is never trusted.
+    loopback result is never trusted next to a tunnel header (Tailscale-User-*,
+    Cf-Connecting-Ip) or a non-loopback hop anywhere in X-Forwarded-For (a tunnel
+    without identity headers, or tailscale serve in front of nginx).
     """
     peer = connection.client.host if connection.client else ""
 
@@ -120,7 +121,11 @@ def resolve_client_ip(connection: HTTPConnection) -> str:
             )
         ip = peer
 
-    if any(h in connection.headers for h in _TUNNEL_HEADERS) and _is_loopback(ip):
+    # Loopback solo si nadie de fuera aparece en la cadena: un túnel sin cabeceras de identidad
+    # (nodo etiquetado, Funnel) o un tailscale serve delante de nginx dejan su salto en XFF.
+    hops = [h.strip() for h in ",".join(connection.headers.getlist("x-forwarded-for")).split(",")]
+    foreign_hop = any(h and not _is_loopback(h) for h in hops)
+    if _is_loopback(ip) and (foreign_hop or any(h in connection.headers for h in _TUNNEL_HEADERS)):
         return NO_REAL_IP
     return ip
 

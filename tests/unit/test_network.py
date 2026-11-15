@@ -141,3 +141,26 @@ def test_resolve_client_ip_accepts_websocket_connection():
     )
 
     assert resolve_client_ip(websocket) == "192.168.1.50"
+
+
+def test_tunnel_without_identity_headers_and_no_proxies_is_not_loopback(monkeypatch):
+    # D-1 (revisión): tailscale serve desde un nodo etiquetado o Funnel no manda Tailscale-User-*;
+    # con TRUSTED_PROXIES vacío el peer 127.0.0.1 no basta si XFF trae un salto de fuera.
+    monkeypatch.setattr(settings, "TRUSTED_PROXIES", "")
+    ip = resolve_client_ip(_FakeRequest("127.0.0.1", headers={"x-forwarded-for": "100.101.102.103"}))
+    assert not is_trusted_origin(ip)
+
+
+def test_tunnel_in_front_of_nginx_is_not_loopback():
+    # D-1 (revisión): tailscale serve -> nginx -> gateway: nginx pone X-Real-IP 127.0.0.1 y
+    # deja el salto del túnel en XFF.
+    request = _FakeRequest(
+        "127.0.0.1", headers={"x-real-ip": "127.0.0.1", "x-forwarded-for": "100.101.102.103, 127.0.0.1"}
+    )
+    assert not is_trusted_origin(resolve_client_ip(request))
+
+
+def test_loopback_client_behind_same_host_nginx_still_trusted():
+    # Home Assistant en el mismo equipo detrás del nginx documentado: toda la cadena es loopback.
+    request = _FakeRequest("127.0.0.1", headers={"x-real-ip": "127.0.0.1", "x-forwarded-for": "127.0.0.1"})
+    assert is_trusted_origin(resolve_client_ip(request))
