@@ -309,7 +309,7 @@ class FakeOpenClawServer:
             payload = {"count": len(sessions), "totalCount": len(rows), "hasMore": more,
                        "nextOffset": offset + limit if more else None, "sessions": sessions}
         else:  # chat.history
-            messages = self.sessions.get(params["sessionKey"], {}).get("messages", [])
+            messages = self.sessions.get(params["sessionKey"].lower(), {}).get("messages", [])
             limit = params.get("limit", 200)
             payload = {"sessionKey": params["sessionKey"], "messages": messages[-limit:],
                        "hasMore": len(messages) > limit, "totalMessages": len(messages)}
@@ -483,7 +483,7 @@ class FakeOpenClawServer:
                     await self._read(ws, rid, method, params)
                 elif method == "chat.abort":
                     self.calls.append((method, params["sessionKey"]))
-                    await self._chat_abort(ws, rid, params["sessionKey"])
+                    await self._chat_abort(ws, rid, params["sessionKey"].lower())
                 elif method == "chat.send":
                     self.calls.append((method, params["sessionKey"]))
                     task = asyncio.create_task(self._chat_send(ws, rid, params))
@@ -524,7 +524,11 @@ class FakeOpenClawServer:
         await ws.send(self._res(rid, {"ok": True, "aborted": True, "runIds": [run_id]}))
 
     async def _chat_send(self, ws, rid, params):
-        sk, text = params["sessionKey"], params["message"]
+        # OpenClaw 2026.10.5 pasa la clave entera a minúsculas: los eventos llevan la canónica y
+        # el ack, `sessionKeyAliases` con la que se pidió (auditoría 3.0, C-1).
+        raw, text = params["sessionKey"], params["message"]
+        sk = raw.lower()
+        aliases = {"sessionKeyAliases": [raw]} if raw != sk else {}
         run_id = self._new_run()
         self._record(sk, "user", text)
         try:
@@ -536,9 +540,9 @@ class FakeOpenClawServer:
                 await ws.send(json.dumps({"type": "res", "id": rid, "ok": False, "error": error}))
                 return
             if text == "accepted":
-                await ws.send(self._res(rid, {"runId": run_id, "status": "accepted"}))
+                await ws.send(self._res(rid, {"runId": run_id, "status": "accepted", **aliases}))
             else:
-                await ws.send(self._res(rid, {"runId": run_id, "status": "started"}))
+                await ws.send(self._res(rid, {"runId": run_id, "status": "started", **aliases}))
             if text.startswith("wait"):
                 go, done = asyncio.Event(), asyncio.Event()
                 self._held.append((go, done))

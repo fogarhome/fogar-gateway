@@ -53,7 +53,8 @@ _LIST_MAX_PAGES = 20
 
 
 def session_key_for(agent: str, conversation_id: str) -> str:
-    return f"agent:{agent}:{_KEY_PREFIX}{conversation_id}"
+    # En minúsculas, como la guarda OpenClaw (core/session_key.py).
+    return f"agent:{agent}:{_KEY_PREFIX}{conversation_id}".lower()
 
 
 def conversation_day(now: datetime | None = None) -> date:

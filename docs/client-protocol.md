@@ -117,7 +117,7 @@ El **primer mensaje** que envíes DEBE ser el handshake. Es el único mensaje si
 | `admin_token` | string | — | Solo el panel web del gateway: el `ADMIN_TOKEN` en lugar de `client_key` (una de las dos, nunca las dos). Entra como el cliente «Panel web» (`panel-web`), una ficha normal que el gateway crea la primera vez. Tiene la misma potencia que el `X-Admin-Token` de `/admin`: no lo guardes en un aparato |
 | `input_mode` | `"audio"` \| `"text"` | ✓ | Cómo enviará datos este cliente |
 | `output_mode` | array | ✓ | Qué quiere recibir: `"text"` (mensajes `token`), `"audio"` (frames TTS), `"status"` (mensajes `turn_progress`, §5, y `pipeline_event`, §15). Los `status` de servicios, `error`, `transcription*` y el control de turnos llegan siempre |
-| `agent` | string | — | Agente OpenClaw a usar; omitir para usar el agente por defecto (ver "Selección de agente" abajo) |
+| `agent` | string | — | Agente OpenClaw a usar; omitir (o vacío) para usar el agente por defecto (ver "Selección de agente" abajo). Un id de OpenClaw: letra o cifra y luego letras, cifras, `_` o `-`, hasta 64; otro valor (con `:`, espacios…) es 4000. Sin distinguir mayúsculas: el gateway lo pasa a minúsculas, como OpenClaw (`"Main"` es `main`, y así llega en `ready.agent`) |
 | `conversation` | string (1–64) | — | La conversación de la sesión (§14): el id de una conversación **de este cliente** para retomarla, o `"new"` para empezar una. Sin él, la conversación del día. Nuevo en M19 |
 
 ### Selección de agente
@@ -134,7 +134,7 @@ El código es el contrato; el `reason` es un texto en inglés para logs y person
 
 | Situación | Código WS | `reason` |
 |-----------|-----------|----------|
-| JSON inválido o campos incorrectos; `client_key` y `admin_token` a la vez, o ninguna de las dos | 4000 | `invalid handshake` |
+| JSON inválido o campos incorrectos (también un `agent` que no es un id de agente válido); `client_key` y `admin_token` a la vez, o ninguna de las dos | 4000 | `invalid handshake` |
 | El primer mensaje es binario, no texto | 4001 | `handshake must be a text frame` |
 | El handshake supera `HANDSHAKE_MAX_BYTES` (4096 caracteres) | 4002 | `handshake too large` |
 | No se recibe el handshake JSON en los primeros `HANDSHAKE_TIMEOUT_S` (5s por defecto) | 4900 | `handshake timeout` |

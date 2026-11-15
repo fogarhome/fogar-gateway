@@ -89,7 +89,7 @@ def _check_agent_consistency(default_agent: str | None, allowed_agents: list[str
     """
     if default_agent is None or allowed_agents is None:
         return
-    if default_agent not in allowed_agents:
+    if default_agent.lower() not in [a.lower() for a in allowed_agents]:  # filas de la 2.x (C-1)
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="default_agent must be one of allowed_agents",

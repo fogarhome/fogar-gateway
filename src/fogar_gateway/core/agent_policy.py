@@ -6,9 +6,11 @@ FastAPI, no WebSocket. Translation of AgentPolicyError into wire formats
 (close 4020/4021 / 403 JSON body) happens at the call sites.
 """
 
+import re
 from typing import TYPE_CHECKING, Literal, Optional
 
 from fogar_gateway.core.config import settings
+from fogar_gateway.core.session_key import AGENT_ID_PATTERN
 
 if TYPE_CHECKING:
     from fogar_gateway.models.schemas import ClientConfig
@@ -83,7 +85,11 @@ def resolve_agent(
     # Normalize once, here, so every caller (WS handshake.agent, REST body.model)
     # gets identical whitespace-only-is-absent handling instead of duplicating
     # (and potentially diverging on) `.strip() or None` at each call site.
-    requested = (requested or "").strip() or None
+    # Ids en minúsculas, como los usa OpenClaw (auditoría 3.0, C-1). Un id que OpenClaw no
+    # admite no está disponible, haya roster o no (C-2: `model` de /v1, OpenClaw caído).
+    requested = (requested or "").strip().lower() or None
+    if requested is not None and not re.fullmatch(AGENT_ID_PATTERN, requested):
+        raise AgentPolicyError("not_available", None, "Agent not available.")
 
     # 1. Cascade — pick the effective agent.
     if requested:
@@ -96,6 +102,7 @@ def resolve_agent(
         effective = gateway_info.default_agent_id
     else:
         effective = "main"
+    effective = effective.lower()
 
     # 2a. Allowlist check (only when an explicit list is configured).
     if (

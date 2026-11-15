@@ -32,7 +32,10 @@ _Text = Annotated[str, StringConstraints(min_length=1, max_length=200)]
 # Mismo tope que el handshake: una clave importada más larga no podría autenticarse nunca.
 _ImportedKey = Annotated[str, StringConstraints(min_length=32, max_length=CREDENTIAL_MAX_LEN)]
 # La regla de OpenClaw para un id de agente (core/session_key.py, AGENT_ID_PATTERN).
-AgentName = Annotated[str, StringConstraints(strip_whitespace=True, pattern=AGENT_ID_PATTERN)]
+# En minúsculas, como lo usa OpenClaw (auditoría 3.0, C-1).
+AgentName = Annotated[
+    str, StringConstraints(strip_whitespace=True, to_lower=True, pattern=AGENT_ID_PATTERN)
+]
 _VadThold = Annotated[float, Field(ge=0.0, le=1.0)]
 _Speed = Annotated[float, Field(gt=0.0, le=10.0)]
 _Seconds = Annotated[float, Field(gt=0.0, le=86_400.0)]
