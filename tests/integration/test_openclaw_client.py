@@ -319,6 +319,40 @@ async def test_reconnect_keeps_last_known_roster_when_agents_list_fails():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad", [None, [], {"agents": None}, {"agents": "main"}, {"agents": ["main"]}]
+)
+async def test_reconnect_with_malformed_agents_list_connects_and_keeps_roster(bad):
+    """Auditoría 3.0, B-1: un agents.list `ok:true` mal formado (payload null, `agents` que no
+    es una lista de objetos) contaba como roster y rompía el connect para siempre
+    (AttributeError/TypeError en cada reintento). Ahora vale como `ok:false`: conecta y
+    conserva el roster anterior (#151)."""
+    fake_ws = SmartFakeWS(hello_ok_payload=HELLO_OK_PAYLOAD_NO_SNAPSHOT_AGENTS)
+    client = await connected_client(fake_ws)
+
+    fake_ws2 = SmartFakeWS(hello_ok_payload=HELLO_OK_PAYLOAD_NO_SNAPSHOT_AGENTS)
+    fake_ws2.agents_list_payload = bad
+    await fake_ws2.start()
+    with patch("websockets.connect", return_value=fake_ws2):
+        info = await client.connect()
+
+    assert info.agents == ["main", "assistant", "ci-tester"]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_agents_list_entries_without_a_string_id_are_skipped():
+    fake_ws = SmartFakeWS(
+        hello_ok_payload=HELLO_OK_PAYLOAD_NO_SNAPSHOT_AGENTS,
+        agents_list_payload={"defaultId": None, "agents": [{"id": "main"}, {"name": "x"}, {"id": 3}, "y"]},
+    )
+    client = await connected_client(fake_ws)
+    assert client.gateway_info.agents == ["main"]
+    assert client.gateway_info.default_agent_id == "main"
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_first_connect_with_failed_agents_list_has_empty_roster():
     """No previous roster to fall back to: behaviour unchanged (empty, warning)."""
     fake_ws = SmartFakeWS(hello_ok_payload=HELLO_OK_PAYLOAD_NO_SNAPSHOT_AGENTS)

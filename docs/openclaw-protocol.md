@@ -105,12 +105,18 @@ Call `agents.list` right after `hello-ok` (`OpenClawClient.connect()` does this)
 Note the field is `id`, not `agentId` (the older `hello-ok.snapshot.agents[]` shape — now gone
 — used `agentId` + per-item `isDefault`; `agents.list`'s shape uses `id` + a top-level
 `defaultId` to compare against instead). `GatewayInfo.update_agents_from_list()`
-(`src/fogar_gateway/services/openclaw/models.py`) parses this.
+(`src/fogar_gateway/services/openclaw/models.py`) parses this. Since 2026-11-15 (audit 3.0, B-1)
+an `ok:true` answer outside this shape (payload not an object, `agents` not a list, or a list with
+no entry carrying a string `id`) is treated like `ok:false`: the connection goes on and keeps the
+last known roster (#151) instead of failing every reconnect; entries without a string `id` are
+skipped and a non-string `defaultId` is ignored. OpenClaw has always sent `id`; this only guards
+against a server outside the schema.
 
 **No per-agent `tools` field is included.** There is currently no known API method that
 returns an agent's *resolved* tool list. `config.get` with no params returns the entire raw
-`openclaw.json` (requires `operator.admin` scope, which fogar-gateway's token does not
-currently request), including `agents.list[].tools.allow`/`.deny` — but that's the config-level
+`openclaw.json` (`operator.read` in 2026.10.5, see "Method → scope" below; the gateway asks for
+read, write and admin since 2026-11-13, see "Device identity, pairing and `operator.admin`", but
+calls neither `config.get` nor any admin method), including `agents.list[].tools.allow`/`.deny` — but that's the config-level
 allow/deny, not the resolved set after profile expansion. The only reliable way found so far:
 ask the agent to do something and watch for `session.tool` events (below).
 
@@ -495,6 +501,17 @@ OpenClaw server enforces or validates. Consequences observable on the wire:
   `ha` (`agent:{agent}:ha`) and is not a conversation.
 - Since server 2026.11.1, `chat.send` rejects session keys that do not identify an agent; ours
   always do (see "Connect deadline and `chat.send` session keys" below).
+- **The whole key is lower-cased by OpenClaw** (2026-11-15, server 2026.10.5, read in the
+  installed package; audit 3.0, C-1): `normalizeSessionKeyPreservingOpaquePeerIds` applies
+  `toLowerCase` to the entire key, so `resolveSessionStoreKey("agent:Main:fogar-AbC123")` is
+  `agent:main:fogar-abc123`. `chat.send` with a mixed-case key stores and runs the session under the
+  canonical key, **emits every `chat`/`agent` event with the canonical key**, and its ack carries
+  `sessionKeyAliases: ["<the key as sent>"]`. A gateway that matched events by the key it sent
+  would never see them (turn `turn_timeout`, pushes lost). The gateway therefore never sends a
+  mixed-case key: agent ids are lower-cased wherever they enter (`DEFAULT_AGENT`, admin
+  `default_agent`/`allowed_agents`, handshake `agent`, `/v1` `model`, and client rows saved by 2.x
+  when read), and `make_session_key`/`session_key_for` lower-case the key (client and conversation
+  ids are lower-case UUIDs, or `panel-web`/`ha`, anyway). `sessionKeyAliases` is not read.
 
 How the `agent` segment is resolved and validated lives in `src/fogar_gateway/core/agent_policy.py`
 (summarised for clients in `docs/client-protocol.md` §1, "Selección de agente").
@@ -936,6 +953,14 @@ The gateway uses them only through `OpenClawClient.request`, which refuses any m
   it from cold storage) and the `deltaCursor` catch-up. The gateway does not use the cursor.
 
 ## Change log of this file
+
+- **2026-11-15**: "Discovering Available Agents" no longer says the gateway does not request
+  `operator.admin` (it does since 2026-11-13; audit 3.0, B-3) and gives `config.get`'s scope from
+  the "Method → scope" table (`operator.read`).
+- **2026-11-15**: "Session key carries the conversation" gains "The whole key is lower-cased by
+  OpenClaw" (server 2026.10.5, audit 3.0, C-1): events come back with the lower-case key and the
+  `chat.send` ack lists the key as sent in `sessionKeyAliases`; the gateway lower-cases agent ids
+  and keys before sending.
 
 - **2026-11-13**: added "Device identity, pairing and `operator.admin`" (server 2026.10.5, read in
   the package source; the local admin path probed live): the gateway asks for `operator.admin`,

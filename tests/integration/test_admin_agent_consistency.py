@@ -188,3 +188,24 @@ def test_rotate_key_persistent_collision_is_409_without_leaking_key(http, monkey
     # La fila conserva su clave anterior
     again = http.get(f"/admin/clients/{created['id']}", headers=HEADERS).json()
     assert again["key_fp"] == fingerprint_key(created["client_key"])
+
+
+def test_agent_names_are_stored_lowercase_and_old_rows_still_match(http, db_engine):
+    """Auditoría 3.0, C-1: OpenClaw usa los ids en minúsculas; "Main" se guarda como "main".
+    Una fila de la 2.x con `allowed_agents: ["Main"]` sigue casando con un `default_agent`
+    nuevo (ya en minúsculas) en vez de dar un 422 falso."""
+    from fogar_gateway.db.models import ClientRecord
+
+    r = _create(http, default_agent="Main", allowed_agents=["Main", "Otro"])
+    assert r.status_code == 201
+    assert (r.json()["default_agent"], r.json()["allowed_agents"]) == ("main", ["main", "otro"])
+
+    cid = _create(http).json()["id"]
+    with Session(db_engine) as s:
+        record = s.get(ClientRecord, cid)
+        assert record is not None
+        record.allowed_agents = json.dumps(["Main"])
+        s.add(record)
+        s.commit()
+    r = http.patch(f"/admin/clients/{cid}", json={"default_agent": "Main"}, headers=HEADERS)
+    assert (r.status_code, r.json()["default_agent"]) == (200, "main")

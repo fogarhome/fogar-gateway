@@ -211,7 +211,7 @@ def test_default_agent_accepts_valid_agent_ids(good):
     from fogar_gateway.core.config import Settings
 
     configured = Settings(DEFAULT_AGENT=good).DEFAULT_AGENT  # type: ignore[call-arg]
-    assert configured == good
+    assert configured == good.lower()  # OpenClaw guarda los ids en minúsculas (C-1)
 
 
 @pytest.mark.parametrize("bad", ["a:b", "j assistant", "x" * 65])
@@ -228,3 +228,51 @@ def test_client_agent_names_follow_the_same_rule(bad):
     ):
         with pytest.raises(ValidationError):
             build()
+
+
+# --- Mayúsculas y ids inválidos (auditoría 3.0, C-1 y C-2) -------------------
+
+
+def test_agent_ids_are_lowercased_everywhere():
+    """OpenClaw pasa la clave de sesión entera a minúsculas (2026.10.5): un "Main" del
+    handshake, de `model`, de una fila antigua o de DEFAULT_AGENT acaba como "main"."""
+    from fogar_gateway.core.config import Settings
+    from fogar_gateway.models.admin_schemas import ClientCreate, ClientUpdate, ConversationCreate
+    from fogar_gateway.models.schemas import ClientConfig, Handshake
+
+    gi = _StubGatewayInfo(agents={"main": None})
+    assert resolve_agent("Main", None, gi) == "main"
+    assert resolve_agent(None, ClientConfig(default_agent="Main"), None) == "main"
+    assert resolve_agent("main", ClientConfig(allowed_agents=["Main"]), gi) == "main"
+    assert Settings(DEFAULT_AGENT="Main").DEFAULT_AGENT == "main"  # type: ignore[call-arg]
+    assert ClientCreate(name="n", default_agent="Main", allowed_agents=["Main"]).allowed_agents == ["main"]
+    assert ClientUpdate(default_agent="Main").default_agent == "main"
+    assert ConversationCreate(agent="Main").agent == "main"
+    hs = Handshake(client_key="k", input_mode="text", output_mode=["text"], agent=" Main ")
+    assert hs.agent == "main"
+
+
+@pytest.mark.parametrize("bad", ["x:y z/", "a:b", "x" * 65, "é"])
+def test_invalid_requested_agent_is_not_available_even_without_roster(bad):
+    """C-2: sin roster (OpenClaw caído) un id que OpenClaw no admite tampoco pasa."""
+    with pytest.raises(AgentPolicyError) as exc:
+        resolve_agent(bad, None, None)
+    assert exc.value.kind == "not_available"
+
+
+@pytest.mark.parametrize("bad", ["x:y z/", "a b", "x" * 65])
+def test_handshake_rejects_invalid_agent_ids(bad):
+    from pydantic import ValidationError
+
+    from fogar_gateway.models.schemas import Handshake
+
+    with pytest.raises(ValidationError):
+        Handshake(client_key="k", input_mode="text", output_mode=["text"], agent=bad)
+
+
+@pytest.mark.parametrize("empty", ["", "   "])
+def test_handshake_empty_agent_still_means_the_cascade(empty):
+    from fogar_gateway.models.schemas import Handshake
+
+    hs = Handshake(client_key="k", input_mode="text", output_mode=["text"], agent=empty)
+    assert resolve_agent(hs.agent, None, None) == "main"

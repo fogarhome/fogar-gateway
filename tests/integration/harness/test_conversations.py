@@ -176,6 +176,33 @@ async def test_a_new_session_that_fails_its_health_check_leaves_the_live_one_alo
     assert of_type(msgs, "turn_start")[0]["conversation"] == live.ready["conversation"]["id"]
 
 
+async def test_a_new_conversation_is_saved_only_if_the_session_opens(harness, db_engine):
+    """Auditoría 3.0, C-3: un handshake con `"new"` que acaba en 1011 (OpenClaw caído) no deja
+    una conversación vacía en `/admin/conversations` ni en el índice del push."""
+    from fogar_gateway.main import app
+
+    async def down() -> bool:
+        return False
+
+    openclaw = app.state.openclaw
+    openclaw.ping = down
+    try:
+        for _ in range(3):
+            failed = await harness.open(handshake={"conversation": "new"})
+            closed = await closed_by_gateway(failed)
+            assert closed.rcvd.code == 1011
+    finally:
+        del openclaw.ping
+    assert await ConversationService(db_engine).list_rows() == []
+    assert len(app.state.conversations.index) == 0
+
+    client = await harness.connect(handshake={"conversation": "new"})
+    (row,) = await ConversationService(db_engine).list_rows()
+    assert row.record.id == client.ready["conversation"]["id"]
+    msgs = await run_turn(client, "hola")
+    assert of_type(msgs, "turn_start")[0]["conversation"] == row.record.id
+
+
 async def test_a_revoked_session_ends_its_open_turn_before_the_close(harness, monkeypatch):
     monkeypatch.setattr(settings, "SESSION_REVALIDATE_INTERVAL_S", 0.1)
     client = await harness.connect()
@@ -229,6 +256,41 @@ async def test_a_conversation_keeps_its_agent(harness):
     other = await harness.open(handshake={"conversation": chosen, "agent": "otro-agente"})
     closed = await closed_by_gateway(other)
     assert (closed.rcvd.code, closed.rcvd.reason) == (4101, "conversation agent mismatch")
+
+
+async def test_an_uppercase_agent_talks_in_openclaws_lowercase_key(harness, db_engine):
+    """Auditoría 3.0, C-1: OpenClaw 2026.10.5 pasa la clave entera a minúsculas y emite los
+    eventos con ella. Un `default_agent` "Main" (fila de la 2.x) no puede dejar sin respuesta
+    los turnos ni perder el push: el gateway usa ya el id y la clave en minúsculas."""
+    with Session(db_engine) as s:
+        record = s.get(ClientRecord, CLIENT_ID)
+        assert record is not None
+        record.default_agent = "Main"
+        s.add(record)
+        s.commit()
+
+    client = await harness.connect()
+    assert client.ready["agent"] == client.ready["conversation"]["agent"] == "main"
+    msgs = await run_turn(client, "hola")
+    assert [t["text"] for t in of_type(msgs, "token")] == ["reply-hola"]
+    await harness.push("aviso")
+    await client.collect(lambda m: len(of_type(m, "turn_end")) >= 2)
+    assert [t["text"] for t in of_type(client.messages, "token")] == ["reply-hola", "aviso"]
+    assert_turns_paired(client.messages)
+    await client.ws.close()
+
+    # Pedir "Main" en una conversación de "main" no es otro agente.
+    chosen = client.ready["conversation"]["id"]
+    again = await harness.connect(handshake={"conversation": chosen, "agent": "Main"})
+    assert again.ready["conversation"]["id"] == chosen
+
+
+async def test_an_agent_id_openclaw_would_not_accept_is_an_invalid_handshake(harness, db_engine):
+    """Auditoría 3.0, C-2: `:` o espacios romperían la clave `agent:{agente}:…`."""
+    client = await harness.open(handshake={"agent": "x:y z/"})
+    closed = await closed_by_gateway(client)
+    assert closed.rcvd.code == 4000
+    assert await ConversationService(db_engine).list_rows() == []
 
 
 # ── turn_end.reason en cada camino ───────────────────────────────────────────

@@ -117,7 +117,8 @@ class Settings(BaseSettings):
     # Misma regla que el `default_agent` de un cliente (admin_schemas.AgentName), la de un id de
     # agente de OpenClaw (AGENT_ID_PATTERN); vacío = sin agente de instalación.
     DEFAULT_AGENT: Annotated[
-        str, StringConstraints(strip_whitespace=True, pattern=f"^$|{AGENT_ID_PATTERN}")
+        str,
+        StringConstraints(strip_whitespace=True, to_lower=True, pattern=f"^$|{AGENT_ID_PATTERN}"),
     ] = ""
 
     # Hora local del host (0-23) a la que empieza el día de las conversaciones por defecto (M19):

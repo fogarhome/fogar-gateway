@@ -53,7 +53,8 @@ _LIST_MAX_PAGES = 20
 
 
 def session_key_for(agent: str, conversation_id: str) -> str:
-    return f"agent:{agent}:{_KEY_PREFIX}{conversation_id}"
+    # En minúsculas, como la guarda OpenClaw (core/session_key.py).
+    return f"agent:{agent}:{_KEY_PREFIX}{conversation_id}".lower()
 
 
 def conversation_day(now: datetime | None = None) -> date:
@@ -181,19 +182,27 @@ class ConversationService:
 
     async def create(self, client_id: str, agent: str) -> Conversation:
         """Una conversación nueva (`kind: created`) del cliente."""
-        conv = await asyncio.to_thread(self._create, client_id, agent)
+        return await self.save(new_conversation(client_id, agent))
+
+    async def save(self, conversation: Conversation) -> Conversation:
+        """Guarda una conversación de `new_conversation` (el handshake con `"new"` la guarda
+        solo si la sesión pasa el health check: auditoría 3.0, C-3)."""
+        conv = await asyncio.to_thread(self._save, conversation)
         self.index.add(conv)
         return conv
 
-    def _create(self, client_id: str, agent: str) -> Conversation:
+    def _save(self, conversation: Conversation) -> Conversation:
+        c = conversation
         with Session(self._get_engine()) as s:
-            record = _new_record(client_id, agent, "created", None)
+            record = ConversationRecord(
+                id=c.id, client_id=c.client_id, agent=c.agent, session_key=c.session_key, kind=c.kind
+            )
             s.add(record)
             try:
                 s.commit()
             except IntegrityError:
                 s.rollback()
-                _require_client(s, client_id)
+                _require_client(s, c.client_id)
                 raise
             s.refresh(record)
             return Conversation.from_record(record)
@@ -297,6 +306,11 @@ class ConversationService:
                     s.refresh(record)
                 imported.extend(Conversation.from_record(r) for r in records)
         return imported
+
+
+def new_conversation(client_id: str, agent: str) -> Conversation:
+    """Una conversación nueva (`created`), aún sin guardar (`ConversationService.save`)."""
+    return Conversation.from_record(_new_record(client_id, agent, "created", None))
 
 
 def _require_client(s: Session, client_id: str) -> None:

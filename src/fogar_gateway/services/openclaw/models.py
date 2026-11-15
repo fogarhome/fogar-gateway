@@ -73,11 +73,22 @@ class GatewayInfo:
     def has_agent(self, agent_id: str) -> bool:
         return agent_id in self.agents
 
-    def update_agents_from_list(self, payload: dict) -> None:
+    def update_agents_from_list(self, payload: object) -> bool:
         """Populate agents from an agents.list response (the only roster source since
-        OpenClaw server 2026.6.11, the minimum supported)."""
-        self.agents = [a["id"] for a in payload.get("agents", [])]
-        self.default_agent_id = payload.get("defaultId", self.default_agent_id)
+        OpenClaw server 2026.6.11, the minimum supported). False, without touching anything,
+        if the payload is not `{"agents": [...]}` with some usable entry; entries without a
+        string `id` are skipped (audit 3.0, B-1: a malformed answer must not break the connection)."""
+        if not isinstance(payload, dict) or not isinstance(payload.get("agents"), list):
+            return False
+        agents = payload["agents"]
+        ids = [a["id"] for a in agents if isinstance(a, dict) and isinstance(a.get("id"), str)]
+        if agents and not ids:
+            return False  # nothing usable: an empty roster would refuse every named agent
+        self.agents = ids
+        default_id = payload.get("defaultId")
+        if isinstance(default_id, str) and default_id:
+            self.default_agent_id = default_id
+        return True
 
     @classmethod
     def from_hello_ok(cls, payload: dict) -> "GatewayInfo":

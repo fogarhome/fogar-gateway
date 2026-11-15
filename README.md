@@ -172,7 +172,7 @@ Auth: header `X-Admin-Token`. Sin header → 422. Token incorrecto → 401. `ADM
 - **DNS rebinding (auditoría 3.0):** una petición con `Origin` o cualquier `Sec-Fetch-*` viene de un navegador y nunca usa la exención de origen de confianza: necesita Bearer. Home Assistant (aiohttp) no manda esas cabeceras. No hay lista de `Host` permitidos: HA puede llegar por cualquier nombre o IP.
 - `TRUSTED_NETWORKS` vacío = fail-closed: solo loopback puede quedar exento (sujeto al matiz de `TRUSTED_PROXIES` de arriba).
 - `HANDSHAKE_MAX_BYTES` mide **caracteres**, no bytes (con caracteres multibyte el tope real puede ser hasta 4x mayor). El tope de 1 MiB por mensaje WebSocket lo pone `fogar-gw serve`: con `uvicorn` a mano rige el de uvicorn (16 MiB).
-- Con Bearer válido, `model` selecciona el agente y se aplican `default_agent`/`allowed_agents` del cliente (violación → `403`). Sin `model`, la cascada: `default_agent` del cliente, `DEFAULT_AGENT`, el agente por defecto de OpenClaw y `main`.
+- Con Bearer válido, `model` selecciona el agente (sin distinguir mayúsculas) y se aplican `default_agent`/`allowed_agents` del cliente (violación → `403`; un `model` que no es un id de agente válido, con `:` o espacios, es `403 agent_not_available` aunque OpenClaw no esté conectado). Sin `model`, la cascada: `default_agent` del cliente, `DEFAULT_AGENT`, el agente por defecto de OpenClaw y `main`.
 - Con Bearer, cada petición va a la **conversación por defecto del día** del cliente para ese agente (M19), como un cliente WebSocket que no elige conversación. El origen de confianza sin Bearer no tiene ficha de cliente: conserva su sesión `agent:{agente}:ha` y no sale en `/admin/conversations`.
 
 | Endpoint | Método | Descripción |
@@ -386,7 +386,7 @@ Qué hace `migrate` (`src/fogar_gateway/cli/migrate.py`):
 - Copia la BD con la API de backup de sqlite3, comprueba `integrity_check` y que los clientes coinciden; **nunca escribe el origen** (lo abre en solo lectura). Si algo falla, no queda nada a medias, salvo un corte brusco (SIGKILL, corte de luz) entre la copia de la BD y la de `config.env`: entonces borra a mano lo creado en `<base>` y repite.
 - Exige la misma revisión de Alembic a los dos lados; si no, se niega y dice qué desplegar.
 - Se niega si el contenedor sigue en marcha mientras el gateway de Docker tenga el candado sobre `data/gateway.lock` (por defecto sí; no con `SINGLE_PROCESS_LOCK=false`), si `<base>` ya tiene `config.env` o BD (o restos `-journal`/`-wal`/`-shm`), o si el `DATABASE_URL` del `.env` no apunta a `/app/data/gateway.db`.
-- Del `.env` quita `DATABASE_URL`, `GATEWAY_UID` y `GATEWAY_GID`, y añade `LOG_FORMAT=json` si falta (la imagen lo fijaba). Una clave del `.env` que no sea un ajuste del gateway hace que se niegue ("La configuración migrada no es válida"): quítala antes y repite.
+- Del `.env` quita `DATABASE_URL`, `GATEWAY_UID`, `GATEWAY_GID` y `TZ` (la nativa usa la zona del host), y añade `LOG_FORMAT=json` si falta (la imagen lo fijaba). Una clave del `.env` que no sea un ajuste del gateway hace que se niegue ("La configuración migrada no es válida"): quítala antes y repite.
 - Crea `<base>` y `data/` con permisos 700 y `config.env` y la BD con 600. No migra los datos más allá de `data/gateway.db`: si montabas más cosas en el volumen, cópialas a mano.
 
 ### Desarrollo en la misma máquina que producción
@@ -413,6 +413,9 @@ docker compose up
 > define `GATEWAY_UID`/`GATEWAY_GID` en `.env` con el dueño de `./data`
 > (`echo "GATEWAY_UID=$(id -u)" >> .env && echo "GATEWAY_GID=$(id -g)" >> .env`).
 > Si `./data` viene de un despliegue anterior como root: `sudo chown -R "$(id -u):$(id -g)" data`.
+> El contenedor no ve la zona horaria del host: la fija `TZ` (por defecto `Europe/Madrid`; otra con
+> `TZ=America/Bogota` en el `.env`). De ella depende el corte del día de las conversaciones
+> (`CONVERSATION_DAY_START_HOUR`, hora local); sin `TZ` sería UTC.
 > Detalles en `docker-compose.yml`. Para pasar a nativo, ver [Pasar de Docker a nativo](#pasar-de-docker-a-nativo).
 
 ---
@@ -435,8 +438,8 @@ Variables de entorno o, si no, de `<base>/config.env` (instalación nativa). En 
 | `OPENCLAW_TLS` | `false` | `true` = conecta por `wss://` (OpenClaw de otra máquina tras TLS, p. ej. Tailscale) |
 | `OPENCLAW_TOKEN` | — | Token de OpenClaw. Sin él el gateway arranca con un aviso, pero OpenClaw rechaza la conexión (`/ready` 503) |
 | `ADMIN_TOKEN` | — | Token para endpoints `/admin/*` y para el panel web en el WebSocket (`admin_token`); vacío deshabilita los dos |
-| `DEFAULT_AGENT` | — | Agente por defecto de la instalación (#245): en la cascada, después del `default_agent` del cliente y antes del de OpenClaw; también el de una conversación nueva. Vacío = el de OpenClaw. Si no está en OpenClaw, avisa al conectar. Es un id de agente de OpenClaw (letras, cifras, `_` y `-`, hasta 64, empezando por letra o cifra), la misma regla que `default_agent` y `allowed_agents` de un cliente |
-| `CONVERSATION_DAY_START_HOUR` | `5` | Hora local (0–23) a la que empieza el día de las conversaciones por defecto |
+| `DEFAULT_AGENT` | — | Agente por defecto de la instalación (#245): en la cascada, después del `default_agent` del cliente y antes del de OpenClaw; también el de una conversación nueva. Vacío = el de OpenClaw. Si no está en OpenClaw, avisa al conectar. Es un id de agente de OpenClaw (letras, cifras, `_` y `-`, hasta 64, empezando por letra o cifra), la misma regla que `default_agent` y `allowed_agents` de un cliente. Sin distinguir mayúsculas: se usa en minúsculas, como en OpenClaw (`Main` es `main`); `/admin/clients` guarda y devuelve también en minúsculas `default_agent` y `allowed_agents` |
+| `CONVERSATION_DAY_START_HOUR` | `5` | Hora local (0–23) a la que empieza el día de las conversaciones por defecto. En Docker la hora local es la de `TZ` (ver [Docker](#docker-alternativa)) |
 | `ORCHESTRATOR_RECONNECT_INITIAL_BACKOFF` | `1.0` | Backoff inicial en reconexión del orquestador (s) |
 | `ORCHESTRATOR_RECONNECT_MAX_BACKOFF` | `60.0` | Backoff máximo en reconexión del orquestador (s) (el gateway reintenta sin parar, sin tope de duración) |
 | `SINGLE_PROCESS_LOCK` | `true` | `flock` sobre `gateway.lock` junto a la BD: un segundo proceso (p. ej. `--workers 2`) no arranca. Multi-worker no está soportado |
