@@ -100,6 +100,7 @@ export function createChatSession(options: ChatSessionOptions) {
       state.agent = m.conversation?.agent ?? m.agent
       if (pending != null) {
         ws?.send(JSON.stringify({ type: 'send', text: pending.text }))
+        state.log.sent(pending.key)
         pending = null
       }
       return
@@ -133,7 +134,7 @@ export function createChatSession(options: ChatSessionOptions) {
     if (!clean) return false
     if (state.connection === 'ready' && ws) {
       ws.send(JSON.stringify({ type: 'send', text: clean }))
-      state.log.addUser(clean)
+      state.log.sent(state.log.addUser(clean))
     } else if (state.connection === 'idle') {
       pending = { text: clean, key: state.log.addUser(clean) }
       connect()

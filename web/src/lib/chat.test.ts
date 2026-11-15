@@ -116,29 +116,57 @@ describe('ChatLog al volver a leer lo dicho', () => {
 
   it('se queda el turno que no llegó a OpenClaw con tu mensaje; los demás errores ya están en OpenClaw', () => {
     const log = new ChatLog('c1')
-    const turns = ['orchestrator_unavailable', 'orchestrator_error', 'turn_timeout']
+    const turns = ['orchestrator_unavailable', 'orchestrator_send_failed', 'orchestrator_error', 'turn_timeout']
     turns.forEach((code, i) => {
-      log.addUser(`pregunta ${code}`)
+      log.sent(log.addUser(`pregunta ${code}`))
       log.apply(start(`t-${i}`))
       log.apply(fail(`t-${i}`, code))
       log.apply(end(`t-${i}`, 'error'))
     })
-    log.addUser('cancelada')
+    log.sent(log.addUser('cancelada'))
     log.apply(start('t-9'))
     log.apply(end('t-9', 'cancelled'))
     log.dropReloaded(log.endedKeys())
     expect(log.lines.map((l) => [l.role, l.text, l.error])).toEqual([
       ['user', 'pregunta orchestrator_unavailable', undefined],
       ['assistant', '', 'orchestrator_unavailable'],
+      ['user', 'pregunta orchestrator_send_failed', undefined],
+      ['assistant', '', 'orchestrator_send_failed'],
     ])
   })
 
-  it('una respuesta va con tu último mensaje sin responder, aunque un push se cuele en medio', () => {
+  it('cada respuesta va con tu mensaje más viejo sin responder, aunque un push se cuele en medio', () => {
     const log = new ChatLog('c1')
     const u1 = log.addUser('uno')
+    log.sent(u1)
+    const u2 = log.addUser('dos')
+    log.sent(u2)
     log.apply(start('t-1', { origin: 'push' }))
     log.apply(start('t-2'))
-    expect(log.lines.map((l) => l.ask)).toEqual([undefined, undefined, u1])
+    log.apply(start('t-3'))
+    expect(log.lines.map((l) => l.ask)).toEqual([undefined, undefined, undefined, u1, u2])
+  })
+
+  it('lo enviado sin turn_start todavía no cuenta como leído: OpenClaw quizá aún no lo tiene', () => {
+    const log = new ChatLog('c1')
+    log.sent(log.addUser('recién enviado'))
+    const keys = log.endedKeys()
+    expect(keys).toEqual([])
+    log.dropReloaded([...keys, 'u-1']) // aunque viniera en una lectura anterior
+    expect(texts(log)).toEqual(['recién enviado'])
+  })
+
+  it('al cerrarse el socket, lo enviado sin turn_start queda «no enviado»', () => {
+    const log = new ChatLog('c1')
+    log.sent(log.addUser('respondido'))
+    log.apply(start('t-1'))
+    log.sent(log.addUser('perdido'))
+    log.closeOpenTurns()
+    expect(log.lines.map((l) => [l.text, l.unsent])).toEqual([
+      ['respondido', undefined],
+      ['', undefined],
+      ['perdido', true],
+    ])
   })
 })
 

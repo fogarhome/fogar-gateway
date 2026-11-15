@@ -1,4 +1,4 @@
-import { label, ownText, TURN_ERROR, TURN_PROGRESS } from './labels'
+import { label, NOT_IN_OPENCLAW, ownText, TURN_ERROR, TURN_PROGRESS } from './labels'
 import { reconnectClass, type Reconnect } from './closeCodes'
 
 // El chat del panel por el WebSocket (docs/client-protocol.md): lo que llega, cómo queda en pantalla y
@@ -53,6 +53,8 @@ export function progressText(progress: TurnProgress): string {
 export class ChatLog {
   lines: ChatLine[] = []
   private seq = 0
+  /** Lo que salió hacia el gateway y aún espera su `turn_start`, en orden (el gateway responde en orden). */
+  private awaiting: string[] = []
 
   constructor(private conversationId: string) {}
 
@@ -63,32 +65,40 @@ export class ChatLog {
     return key
   }
 
+  /** Lo escrito salió hacia el gateway: su `turn_start` será el siguiente que no sea push. */
+  sent(key: string): void {
+    this.awaiting.push(key)
+  }
+
   markUnsent(key: string): void {
     const line = this.lines.find((l) => l.key === key)
     if (line) line.unsent = true
   }
 
-  /** Las claves de lo terminado: lo que una lectura de lo dicho pedida ahora ya puede traer. */
+  /**
+   * Las claves de lo terminado: lo que una lectura de lo dicho pedida ahora ya puede traer. Lo tuyo
+   * sin `turn_start` todavía no cuenta: OpenClaw quizá aún no lo tiene.
+   */
   endedKeys(): string[] {
-    return this.lines.filter((l) => l.state === 'ended').map((l) => l.key)
+    return this.lines.filter((l) => l.state === 'ended' && !this.awaiting.includes(l.key)).map((l) => l.key)
   }
 
   /**
    * Se ha vuelto a leer lo dicho de OpenClaw, que ya trae lo terminado antes de pedirlo (`keys`, de
    * `endedKeys()`): fuera eso, para no enseñarlo dos veces. Se queda lo que OpenClaw no tiene: lo de
    * otra conversación, lo que no salió (`keep`: además lo que espera a salir) y el turno que no llegó
-   * a OpenClaw (`orchestrator_unavailable`) con tu mensaje.
+   * a OpenClaw (`NOT_IN_OPENCLAW`) con tu mensaje.
    */
   dropReloaded(keys: Iterable<string>, keep?: string | null): void {
     const drop = new Set(keys)
     const notInOpenClaw = new Set<string>()
     for (const l of this.lines) {
-      if (l.error !== 'orchestrator_unavailable') continue
+      if (!l.error || !NOT_IN_OPENCLAW.has(l.error)) continue
       notInOpenClaw.add(l.key)
       if (l.ask) notInOpenClaw.add(l.ask)
     }
     this.lines = this.lines.filter(
-      (l) => !drop.has(l.key) || l.otherConversation || l.unsent || l.key === keep || notInOpenClaw.has(l.key),
+      (l) => !drop.has(l.key) || l.otherConversation || l.unsent || l.key === keep || notInOpenClaw.has(l.key) || this.awaiting.includes(l.key),
     )
   }
 
@@ -109,9 +119,8 @@ export class ChatLog {
         const old = this.turn(m.turn_id)
         if (old) old.key = `${old.key}-${++this.seq}`
         const other = m.conversation && m.conversation !== this.conversationId ? m.conversation : null
-        // Responde a tu último mensaje que aún no tenía respuesta (un push no responde a nada).
-        const asked = new Set(this.lines.map((l) => l.ask))
-        const ask = m.origin === 'push' ? undefined : [...this.lines].reverse().find((l) => l.role === 'user' && !asked.has(l.key))?.key
+        // Responde a tu mensaje más viejo aún sin respuesta (un push no responde a nada).
+        const ask = m.origin === 'push' ? undefined : this.awaiting.shift()
         this.lines.push({
           key: `t-${m.turn_id}`,
           role: 'assistant',
@@ -160,8 +169,13 @@ export class ChatLog {
     }
   }
 
-  /** El socket se cerró: lo que seguía abierto ya no va a terminar (su `turn_end` no llegará). */
+  /**
+   * El socket se cerró: lo que seguía abierto ya no va a terminar (su `turn_end` no llegará) y lo
+   * tuyo sin `turn_start` no llegó a empezar.
+   */
   closeOpenTurns(): void {
+    for (const key of this.awaiting) this.markUnsent(key)
+    this.awaiting = []
     for (const line of this.lines) {
       if (line.state === 'streaming') {
         line.state = 'ended'

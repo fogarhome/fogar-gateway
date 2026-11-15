@@ -160,6 +160,25 @@ describe('createChatSession', () => {
     expect(s.state.log.lines.map((l) => l.text)).toEqual(['¿Hola?'])
   })
 
+  it('lo pendiente que sale en el ready durante una recarga no se quita', () => {
+    const s = session()
+    last().serverClose(1000)
+    s.send('¿Hola?')
+    const keys = s.state.log.endedKeys() // se pide la historia ahora…
+    last().open()
+    last().receive(READY) // …y sale mientras llega
+    s.historyReloaded(keys)
+    expect(s.state.log.lines.map((l) => l.text)).toEqual(['¿Hola?'])
+  })
+
+  it('una caída con un mensaje sin turn_start lo deja «no enviado»', () => {
+    const s = session()
+    s.send('¿Llegas?')
+    last().serverClose(1006)
+    expect(s.state.connection).toBe('reconnecting')
+    expect(s.state.log.lines.at(-1)).toMatchObject({ text: '¿Llegas?', unsent: true })
+  })
+
   it('al volver a entrar, el aviso de OpenClaw caído empieza de cero', () => {
     const s = session()
     last().receive({ type: 'status', service: 'orchestrator', state: 'reconnecting' })

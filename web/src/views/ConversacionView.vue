@@ -30,27 +30,29 @@ const texto = ref('')
 const historia = shallowRef<ConversationMessages | null>(null)
 const historiaError = ref<string | null>(null)
 const cargando = ref(false)
+let peticiones = 0
 async function cargarHistoria(limit = 200): Promise<void> {
   const pedida = id.value // si cambias de conversación mientras llega, esta respuesta ya no vale
+  const mia = ++peticiones // ni si se pidió otra después (las claves del chat pueden ser ya otras)
   cargando.value = true
   // Lo terminado antes de pedir ya vendrá en lo leído; lo que termine mientras llega, no.
   const terminadas = chat.value?.state.log.endedKeys() ?? []
   try {
     const leida = await getConversationMessages(pedida, limit)
-    if (pedida !== id.value) return
+    if (pedida !== id.value || mia !== peticiones) return
     historia.value = leida
     historiaError.value = null
     // Lo terminado en vivo ya viene en lo leído: que no salga dos veces.
     chat.value?.historyReloaded(terminadas)
   } catch (e) {
-    if (pedida !== id.value) return
+    if (pedida !== id.value || mia !== peticiones) return
     historia.value = null
     if (e instanceof ApiError && e.status === 503) historiaError.value = 'OpenClaw no responde: ahora no puedo leer lo que se dijo.'
     else if (e instanceof ApiError && e.status === 502) historiaError.value = 'OpenClaw no ha querido dar lo que se dijo en esta conversación.'
     else if (e instanceof ApiError && e.kind === 'not-found') historiaError.value = 'Esta conversación ya no existe: se borró su aparato.'
     else historiaError.value = 'No llego al gateway.'
   } finally {
-    if (pedida === id.value) cargando.value = false
+    if (pedida === id.value && mia === peticiones) cargando.value = false
   }
 }
 
@@ -76,9 +78,9 @@ watch(
     historiaError.value = null
     texto.value = ''
     if (!nuevo) return
+    abrirChat() // antes de leer: así lo que termine mientras llega la lectura se ve y no se pierde
     void cargarHistoria()
     if (!conversations.byId.has(nuevo)) void conversations.refresh()
-    abrirChat()
   },
   { immediate: true },
 )

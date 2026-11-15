@@ -83,6 +83,9 @@ export const TURN_ERROR: Record<string, string> = {
   internal_error: 'Error interno del gateway',
 }
 
+/** Errores de turno con los que la pregunta no llegó a OpenClaw: no vendrá al releer lo dicho. */
+export const NOT_IN_OPENCLAW: ReadonlySet<string> = new Set(['orchestrator_unavailable', 'orchestrator_send_failed'])
+
 /** En qué está un turno (`turn_progress`, docs/client-protocol.md §5); la herramienta va aparte. */
 export const TURN_PROGRESS: Record<string, string> = {
   preparing: 'Preparando…',
