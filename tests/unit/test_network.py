@@ -1,4 +1,5 @@
 import pytest
+from starlette.datastructures import Headers
 from starlette.websockets import WebSocket
 
 from fogar_gateway.core.config import settings
@@ -13,7 +14,7 @@ class _FakeClient:
 class _FakeRequest:
     def __init__(self, host, headers=None):
         self.client = _FakeClient(host)
-        self.headers = headers or {}
+        self.headers = Headers(headers or {})
 
 
 @pytest.fixture(autouse=True)
@@ -72,6 +73,41 @@ def test_resolve_client_ip_trusted_proxy_with_invalid_header_fails_closed():
     for bad in ("", "  ", "garbage", "1.2.3.4, 5.6.7.8"):
         request = _FakeRequest("127.0.0.1", headers={"x-real-ip": bad})
         assert is_trusted_origin(resolve_client_ip(request)) is False
+
+
+def test_nginx_overwriting_x_real_ip_with_matching_xff_is_honored():
+    # nginx: X-Real-IP $remote_addr + proxy_add_x_forwarded_for (real IP last).
+    request = _FakeRequest(
+        "127.0.0.1", headers={"x-real-ip": "192.168.1.50", "x-forwarded-for": "10.9.9.9, 192.168.1.50"}
+    )
+    assert resolve_client_ip(request) == "192.168.1.50"
+
+
+def test_proxy_passing_client_x_real_ip_through_fails_closed():
+    # D-1: tailscale serve / cloudflared keep the client's X-Real-IP but put the real
+    # address last in X-Forwarded-For; a disagreement is never trusted.
+    request = _FakeRequest(
+        "127.0.0.1", headers={"x-real-ip": "127.0.0.1", "x-forwarded-for": "100.64.0.7"}
+    )
+    assert is_trusted_origin(resolve_client_ip(request)) is False
+
+
+def test_nginx_with_client_injected_xff_fails_closed():
+    # nginx that only overwrites X-Real-IP forwards the client's XFF untouched.
+    request = _FakeRequest(
+        "127.0.0.1", headers={"x-real-ip": "203.0.113.5", "x-forwarded-for": "127.0.0.1"}
+    )
+    assert is_trusted_origin(resolve_client_ip(request)) is False
+
+
+@pytest.mark.parametrize("header", ["tailscale-user-login", "tailscale-user-name", "cf-connecting-ip"])
+def test_tunnel_headers_never_earn_loopback_exemption(monkeypatch, header):
+    vouched = _FakeRequest("127.0.0.1", headers={"x-real-ip": "127.0.0.1", header: "x"})
+    assert is_trusted_origin(resolve_client_ip(vouched)) is False
+    # Also without a proxy list (`TRUSTED_PROXIES=` with `fogar-gw access`).
+    monkeypatch.setattr(settings, "TRUSTED_PROXIES", "")
+    direct = _FakeRequest("127.0.0.1", headers={header: "x"})
+    assert is_trusted_origin(resolve_client_ip(direct)) is False
 
 
 def test_resolve_client_ip_direct_peer_unchanged():

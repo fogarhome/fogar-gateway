@@ -266,3 +266,12 @@ def test_pair_logs_never_contain_code_or_key(http, caplog):
     assert "Emparejamiento: cliente" in text
     assert item["code"] not in text and key not in text
     assert _wrong(item["code"]) not in text
+
+
+def test_pair_oversized_body_is_413_and_not_counted(http):
+    """Auditoría 3.0, D-3: el tope corta antes de la ruta; no quema los códigos abiertos."""
+    item = _open(http)
+    big = {"code": "1" * (1024 * 1024)}
+    for _ in range(pairing.MAX_FAILED + 1):
+        assert http.post("/pair", json=big).status_code == 413
+    assert http.post("/pair", json={"code": item["code"]}).status_code == 201

@@ -19,6 +19,7 @@ from fogar_gateway.api.pairing_routes import public_router as pairing_public_rou
 from fogar_gateway.api.routes import router as stream_router
 from fogar_gateway.api.web_routes import WEB_DIR, web_available
 from fogar_gateway.api.web_routes import router as web_router
+from fogar_gateway.core.body_limit import BodySizeLimitMiddleware
 from fogar_gateway.core.config import settings
 from fogar_gateway.core.logging import configure_logging
 from fogar_gateway.core.network import warn_if_open_proxy_config
@@ -216,6 +217,11 @@ app = FastAPI(
     title="Fogar Gateway",
     description="Puerta de entrada de Fogar en casa: aparatos, OpenClaw, voz y administración.",
     lifespan=lifespan,
+    # Sin /docs, /redoc ni /openapi.json: el mapa de /admin no se publica y Swagger no carga
+    # scripts de un CDN en el origen del panel (auditoría 3.0, D-4).
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 
@@ -234,16 +240,20 @@ def _json_safe(value):
 @app.exception_handler(RequestValidationError)
 async def _validation_error_handler(request: Request, exc: RequestValidationError):
     # Mismo cuerpo que el handler por defecto de FastAPI ({"detail": [...]}), pero un
-    # `NaN`/`Infinity` en la entrada (el 'input' del error) ya no convierte el 422 en 500 (#217).
+    # `NaN`/`Infinity` en la entrada ya no convierte el 422 en 500 (#217). Sin `input`: el 422
+    # nunca refleja el cuerpo (claves, códigos o megas de basura; auditoría 3.0, D-3).
+    errors = [{k: v for k, v in e.items() if k != "input"} for e in exc.errors()]
     return JSONResponse(
         status_code=422,
-        content=jsonable_encoder({"detail": _json_safe(exc.errors())}),
+        content=jsonable_encoder({"detail": _json_safe(errors)}),
     )
 
 
 app.add_middleware(RequestIdMiddleware)
 # Captures uvicorn's transport per WebSocket so a slow client can be dropped (issue #130 S2).
 app.add_middleware(TransportCaptureMiddleware)
+# La última que se añade es la más externa: corta el cuerpo antes de cualquier parseo (D-3).
+app.add_middleware(BodySizeLimitMiddleware)
 
 app.include_router(stream_router)  # WS /ws/stream
 app.include_router(openai_router)  # HTTP /v1/*

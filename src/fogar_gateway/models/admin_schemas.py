@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 from fogar_gateway.core.logging import fingerprint_key
 from fogar_gateway.core.session_key import AGENT_ID_PATTERN
 from fogar_gateway.db.models import ClientRecord
-from fogar_gateway.models.schemas import OutputMode
+from fogar_gateway.models.schemas import CREDENTIAL_MAX_LEN, OutputMode
 
 # Etiqueta de cliente. Solo se valida la ENTRADA (create/update/CLI); la respuesta
 # sigue siendo `str` para no romper la lectura de filas antiguas con valores libres (#122).
@@ -29,7 +29,8 @@ ClientType = Literal["ha", "esp32", "web", "app", "screen"]
 _Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
 _Text = Annotated[str, StringConstraints(min_length=1, max_length=200)]
 # Solo para importar una clave existente (#293): "" no equivale a omitirla.
-_ImportedKey = Annotated[str, StringConstraints(min_length=32)]
+# Mismo tope que el handshake: una clave importada más larga no podría autenticarse nunca.
+_ImportedKey = Annotated[str, StringConstraints(min_length=32, max_length=CREDENTIAL_MAX_LEN)]
 # La regla de OpenClaw para un id de agente (core/session_key.py, AGENT_ID_PATTERN).
 AgentName = Annotated[str, StringConstraints(strip_whitespace=True, pattern=AGENT_ID_PATTERN)]
 _VadThold = Annotated[float, Field(ge=0.0, le=1.0)]
