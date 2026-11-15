@@ -31,19 +31,15 @@ class ApiError(click.ClickException):
 
 
 def read_env_file(path: Path) -> dict[str, str]:
-    # shortcut: KEY=VALUE con comillas opcionales; sin export, escapes ni multilínea.
+    """config.env como lo lee el gateway (python-dotenv; claves sin distinguir mayúsculas)."""
     try:
-        text = path.read_text()
+        path.read_text()  # mensaje legible si no hay permiso
     except OSError as e:
         raise ApiError(f"No se puede leer {path} ({type(e).__name__}); revisa sus permisos.") from None
-    values: dict[str, str] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip().strip("\"'")
-    return values
+    from dotenv import dotenv_values  # perezoso: --help < 150 ms
+
+    # Una clave sin `=` da None: como si no estuviera.
+    return {k.upper(): v for k, v in dotenv_values(path).items() if v is not None}
 
 
 def resolve_token(explicit: str | None) -> str:

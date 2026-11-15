@@ -42,7 +42,7 @@ StartLimitBurst=5
 [Service]
 Type=exec
 ExecStart={exe} serve
-Environment=FOGAR_GATEWAY_HOME={home}
+Environment={env}
 Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=3
@@ -59,8 +59,16 @@ def unit_path() -> Path:
     return Path(config) / "systemd" / "user" / UNIT_NAME
 
 
+def _quote(value: str) -> str:
+    # Comillas de systemd con escapes C; % es un especificador en ExecStart= y Environment=.
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return '"' + escaped.replace("%", "%%") + '"'
+
+
 def render_unit(exe: Path, home: Path) -> str:
-    return _UNIT.format(exe=exe, home=home)
+    # $ solo se expande en ExecStart=; en Environment= es literal.
+    return _UNIT.format(exe=_quote(str(exe)).replace("$", "$$"),
+                        env=_quote(f"FOGAR_GATEWAY_HOME={home}"))
 
 
 def _in_checkout(exe: Path) -> bool:
@@ -78,7 +86,7 @@ def _in_checkout(exe: Path) -> bool:
 def pick_exe(explicit: Path | None) -> Path:
     """El `fogar-gw` de uv tool. Sin resolver el symlink: así sobrevive a `uv tool upgrade`."""
     if explicit is not None:
-        return explicit
+        return explicit.absolute()  # systemd exige ruta absoluta; absolute() conserva el symlink
     found = shutil.which("fogar-gw")
     if found is None:
         raise ApiError("No encuentro `fogar-gw` en el PATH; instálalo con `uv tool install` "
