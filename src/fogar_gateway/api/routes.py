@@ -23,6 +23,7 @@ from fogar_gateway.services.conversations import (
     ConversationNotFound,
     ConversationService,
     SessionConversation,
+    new_conversation,
 )
 from fogar_gateway.services.db_client import db_client
 from fogar_gateway.services.openclaw.models import GatewayInfo
@@ -101,7 +102,8 @@ async def _open_conversation(
     if existing is not None:
         conversation = existing
     elif requested == NEW:
-        conversation = await service.create(client_id, agent)
+        # Se guarda tras el health check, junto a claim_conversation (C-3).
+        conversation = new_conversation(client_id, agent)
     else:
         conversation = await service.default_for(client_id, agent)
     return SessionConversation(conversation, explicit=requested is not None, service=service)
@@ -301,6 +303,20 @@ async def gateway_websocket(websocket: WebSocket):
 
         # 3.55 CONVERSACIÓN (M19): solo una sesión que pasó el health check la abre; la que la
         # tuviera se cierra (4102) y se espera a que suelte sus turnos antes de `ready`.
+        if handshake.conversation == NEW:
+            # Solo ahora: un handshake que acaba en 1011 no deja una conversación vacía (C-3).
+            try:
+                await app_state.conversations.save(conversation.current)
+            except ConversationClientMissing:
+                logger.warning(f"[{client.id}] Handshake rechazado: el cliente ya no existe.")
+                gateway_stats.handshake_rejected("invalid_key")
+                await send_close(websocket, Close.INVALID_CREDENTIAL)
+                return
+            except Exception as e:  # noqa: BLE001 — frontera: sin conversación no hay sesión (1011)
+                logger.error(f"[{client.id}] Fallo al abrir la conversación: {describe_error(e)}")
+                logger.debug(f"[{client.id}] conversación: {traceback_no_message(e)}")
+                await send_close(websocket, Close.SETUP_FAILED)
+                return
         await bridge.claim_conversation()
 
         # 3.6 SEND READY — confirms session is established and announces capabilities

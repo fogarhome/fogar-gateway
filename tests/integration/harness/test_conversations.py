@@ -176,6 +176,33 @@ async def test_a_new_session_that_fails_its_health_check_leaves_the_live_one_alo
     assert of_type(msgs, "turn_start")[0]["conversation"] == live.ready["conversation"]["id"]
 
 
+async def test_a_new_conversation_is_saved_only_if_the_session_opens(harness, db_engine):
+    """Auditoría 3.0, C-3: un handshake con `"new"` que acaba en 1011 (OpenClaw caído) no deja
+    una conversación vacía en `/admin/conversations` ni en el índice del push."""
+    from fogar_gateway.main import app
+
+    async def down() -> bool:
+        return False
+
+    openclaw = app.state.openclaw
+    openclaw.ping = down
+    try:
+        for _ in range(3):
+            failed = await harness.open(handshake={"conversation": "new"})
+            closed = await closed_by_gateway(failed)
+            assert closed.rcvd.code == 1011
+    finally:
+        del openclaw.ping
+    assert await ConversationService(db_engine).list_rows() == []
+    assert len(app.state.conversations.index) == 0
+
+    client = await harness.connect(handshake={"conversation": "new"})
+    (row,) = await ConversationService(db_engine).list_rows()
+    assert row.record.id == client.ready["conversation"]["id"]
+    msgs = await run_turn(client, "hola")
+    assert of_type(msgs, "turn_start")[0]["conversation"] == row.record.id
+
+
 async def test_a_revoked_session_ends_its_open_turn_before_the_close(harness, monkeypatch):
     monkeypatch.setattr(settings, "SESSION_REVALIDATE_INTERVAL_S", 0.1)
     client = await harness.connect()
