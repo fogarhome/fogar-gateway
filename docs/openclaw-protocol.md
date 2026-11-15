@@ -114,8 +114,9 @@ against a server outside the schema.
 
 **No per-agent `tools` field is included.** There is currently no known API method that
 returns an agent's *resolved* tool list. `config.get` with no params returns the entire raw
-`openclaw.json` (requires `operator.admin` scope, which fogar-gateway's token does not
-currently request), including `agents.list[].tools.allow`/`.deny` — but that's the config-level
+`openclaw.json` (`operator.read` in 2026.10.5, see "Method → scope" below; the gateway asks for
+read, write and admin since 2026-11-13, see "Device identity, pairing and `operator.admin`", but
+calls neither `config.get` nor any admin method), including `agents.list[].tools.allow`/`.deny` — but that's the config-level
 allow/deny, not the resolved set after profile expansion. The only reliable way found so far:
 ask the agent to do something and watch for `session.tool` events (below).
 
@@ -953,6 +954,9 @@ The gateway uses them only through `OpenClawClient.request`, which refuses any m
 
 ## Change log of this file
 
+- **2026-11-15**: "Discovering Available Agents" no longer says the gateway does not request
+  `operator.admin` (it does since 2026-11-13; audit 3.0, B-3) and gives `config.get`'s scope from
+  the "Method → scope" table (`operator.read`).
 - **2026-11-15**: "Session key carries the conversation" gains "The whole key is lower-cased by
   OpenClaw" (server 2026.10.5, audit 3.0, C-1): events come back with the lower-case key and the
   `chat.send` ack lists the key as sent in `sessionKeyAliases`; the gateway lower-cases agent ids
