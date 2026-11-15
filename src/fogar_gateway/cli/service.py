@@ -8,6 +8,7 @@ de las funciones que lo usan (`--help` < 150 ms).
 
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -59,8 +60,14 @@ def unit_path() -> Path:
     return Path(config) / "systemd" / "user" / UNIT_NAME
 
 
+# Lo que systemd lee igual sin comillas: así una unidad de una versión anterior sigue idéntica.
+_BARE = re.compile(r"[A-Za-z0-9_./:@+,=-]+")
+
+
 def _quote(value: str) -> str:
     # Comillas de systemd con escapes C; % es un especificador en ExecStart= y Environment=.
+    if _BARE.fullmatch(value):
+        return value
     escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
     return '"' + escaped.replace("%", "%%") + '"'
 
@@ -86,7 +93,12 @@ def _in_checkout(exe: Path) -> bool:
 def pick_exe(explicit: Path | None) -> Path:
     """El `fogar-gw` de uv tool. Sin resolver el symlink: así sobrevive a `uv tool upgrade`."""
     if explicit is not None:
-        return explicit.absolute()  # systemd exige ruta absoluta; absolute() conserva el symlink
+        # Un nombre suelto se busca en el PATH; una ruta se hace absoluta y normalizada (systemd
+        # rechaza `..`) con abspath, que no resuelve el symlink.
+        found = shutil.which(explicit) if os.sep not in str(explicit) else os.path.abspath(explicit)
+        if found is None:
+            raise ApiError(f"No encuentro `{explicit}` en el PATH; indica su ruta con --exe.", 1)
+        return Path(found)
     found = shutil.which("fogar-gw")
     if found is None:
         raise ApiError("No encuentro `fogar-gw` en el PATH; instálalo con `uv tool install` "

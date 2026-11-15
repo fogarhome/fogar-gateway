@@ -32,22 +32,24 @@ class ApiError(click.ClickException):
 
 def read_env_file(path: Path) -> dict[str, str]:
     """config.env como lo lee el gateway (python-dotenv; claves sin distinguir mayúsculas)."""
-    try:
-        path.read_text()  # mensaje legible si no hay permiso
-    except OSError as e:
-        raise ApiError(f"No se puede leer {path} ({type(e).__name__}); revisa sus permisos.") from None
     from dotenv import dotenv_values  # perezoso: --help < 150 ms
 
+    try:
+        values = dotenv_values(path)
+    except (OSError, UnicodeDecodeError) as e:
+        raise ApiError(f"No se puede leer {path} ({type(e).__name__}); revisa sus permisos.") from None
     # Una clave sin `=` da None: como si no estuviera.
-    return {k.upper(): v for k, v in dotenv_values(path).items() if v is not None}
+    return {k.upper(): v for k, v in values.items() if v is not None}
 
 
 def resolve_token(explicit: str | None) -> str:
     """--token / FOGAR_GW_TOKEN (ya en `explicit`), ADMIN_TOKEN y <base>/config.env."""
     if explicit:
         return explicit
-    if os.environ.get("ADMIN_TOKEN"):
-        return os.environ["ADMIN_TOKEN"]
+    # Sin distinguir mayúsculas, como Settings; vacío cuenta como no puesto.
+    env = next((v for k, v in os.environ.items() if k.upper() == "ADMIN_TOKEN" and v), None)
+    if env:
+        return env
     config = paths.config_file()
     if config.is_file():
         token = read_env_file(config).get("ADMIN_TOKEN")

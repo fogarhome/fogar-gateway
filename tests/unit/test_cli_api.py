@@ -124,6 +124,13 @@ def test_token_falls_back_to_admin_token_env(monkeypatch, tmp_path):
     assert api.resolve_token(None) == "env"
 
 
+def test_token_env_ignores_case_like_settings(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    monkeypatch.setenv("admin_token", "minusculas")
+    assert api.resolve_token(None) == "minusculas"
+
+
 def test_token_from_home_config_env(monkeypatch, tmp_path):
     monkeypatch.delenv("FOGAR_GATEWAY_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
