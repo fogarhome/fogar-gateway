@@ -326,17 +326,18 @@ async def test_partial_with_active_turn_barges_in_from_the_client_threshold(
     turn.cancel()
 
 
-async def test_barge_in_before_turn_start_sends_nothing_but_the_partial(make_bridge):
-    """A turn cancelled before it sent its turn_start: no turn_end (M19: nor `interrupted`)."""
+async def test_barge_in_before_turn_start_still_gives_the_send_its_pair(make_bridge):
+    """A send cancelled before its task started still gets its turn_start/turn_end pair
+    (auditoría 3.0 ronda 2, G-r2-1), ended `interrupted`."""
     bridge, ws = make_bridge(**_AUDIO, transcriber=_transcriber())
     bridge.orchestrator.stream_response = blocking()
     await bridge.turns.start_user_turn("x")  # the task has not run yet
 
     await bridge._on_transcription("hello world", False)
 
-    assert [m for m in await sent(bridge) if isinstance(m, dict)] == [
-        {"type": "transcription_partial", "text": "hello world"},
-    ]
+    msgs = [m for m in await sent(bridge) if isinstance(m, dict)]
+    assert [m["type"] for m in msgs] == ["transcription_partial", "turn_start", "turn_end"]
+    assert msgs[2] == {"type": "turn_end", "turn_id": "t-1", "reason": "interrupted"}
 
 
 # ── _on_transcriber_warning ──────────────────────────────────────────────────

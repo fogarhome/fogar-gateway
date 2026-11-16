@@ -305,7 +305,7 @@ Los tokens llegan en orden; concaténalos para reconstruir la respuesta completa
 { "type": "turn_end", "turn_id": "t-1", "reason": "done" }
 ```
 
-Señala que el turno terminó. **Todo turno con `turn_start` recibe exactamente un `turn_end`** — también si falla (tras un `error`), si se cancela (`cancel`, barge-in, transcripción final, un `send` que lo sustituye) o si el cierre de sesión lo corta. Después del `turn_end` no se envía más audio de ese turno; lo que sigue es la reproducción del audio que ya recibiste (como mucho `AUDIO_LEAD_S`, unos 2 s, por delante del tiempo real).
+Señala que el turno terminó. **Todo turno con `turn_start` recibe exactamente un `turn_end`** — también si falla (tras un `error`), si se cancela (`cancel`, barge-in, transcripción final, un `send` que lo sustituye) o si el cierre de sesión lo corta. **Mientras la sesión siga abierta, todo `send` aceptado produce exactamente un par `turn_start`/`turn_end`**, aunque se cancele o se sustituya antes de empezar: dos `send` seguidos dan dos pares (el primero con `replaced`), y un `send` seguido de un `cancel`, un par con `cancelled`. Después del `turn_end` no se envía más audio de ese turno; lo que sigue es la reproducción del audio que ya recibiste (como mucho `AUDIO_LEAD_S`, unos 2 s, por delante del tiempo real).
 
 `reason` (nuevo en M19) dice por qué terminó:
 
@@ -313,9 +313,9 @@ Señala que el turno terminó. **Todo turno con `turn_start` recibe exactamente 
 |---|---|
 | `done` | Terminó solo: la respuesta completa (o el push, con su fin) |
 | `error` | Falló: va precedido de su `error` `TURN_ERROR` (§9), salvo un push cuyo agente falla |
-| `cancelled` | Tu `cancel` |
+| `cancelled` | Tu `cancel` (también el de un `send` que aún no había empezado: recibe su par igual) |
 | `interrupted` | Hablaste encima: un barge-in (§7) o una transcripción final con el turno en curso. Sustituye al antiguo mensaje `interrupted` |
-| `replaced` | Un `send` nuevo lo sustituyó (también corta un push que sonaba) |
+| `replaced` | Un `send` nuevo lo sustituyó (también corta un push que sonaba, y un `send` anterior que aún no había empezado: recibe su par igual) |
 | `timeout` | `TURN_TIMEOUT_S` sin progreso del orquestador (§13), tras su `error` `turn_timeout` |
 | `closed` | La sesión se cierra (o te fuiste) con el turno abierto |
 
@@ -510,14 +510,14 @@ El gateway detecta la parcial de transcripción y cancela el turno activo si el 
 { "type": "turn_end", "turn_id": "t-1", "reason": "interrupted" }
 ```
 
-El orden es `turn_end` (t-1, `interrupted`) → `turn_start` (t-2). Un turno cancelado antes de enviar su `turn_start` no manda nada.
+El orden es `turn_end` (t-1, `interrupted`) → `turn_start` (t-2). Un `send` cancelado antes de empezar recibe igualmente su par `turn_start`/`turn_end`, con el motivo de la cancelación.
 
 > **Incompatibilidad de protocolo — M19**
 > El mensaje `{"type":"interrupted","turn_id":...}` **ya no existe**: lo sustituye `turn_end.reason: "interrupted"` del mismo turno. Un cliente que esperaba `interrupted` para parar el audio o limpiar la respuesta debe mirar `reason` en el `turn_end`.
 
 **Un push que está sonando también se corta** (§10): el barge-in, un `send` y un `cancel` lo cierran igual que a un turno normal. Recibes su `turn_end` (exactamente uno) antes de cualquier otra cosa del turno nuevo, con `reason` `interrupted`, `replaced` o `cancelled`. Su audio deja de llegar. La transcripción final por sí sola no lo corta: lo corta el `send` que la sigue.
 
-El audio del turno cancelado deja de salir en cuanto el gateway procesa la cancelación, sin esperar a que se libere su TTS; lo que ya estaba en camino (como mucho `AUDIO_LEAD_S` por delante) puede llegar antes del `turn_end`. Nada del turno cancelado llega después de su `turn_end`: ni tokens ni audio, tampoco la respuesta que OpenClaw ya tuviera en camino al abortarlo, que no cierra tu turno siguiente ni vuelve como un push (#285).
+El audio del turno cancelado deja de salir en cuanto el gateway procesa la cancelación, sin esperar a que se libere su TTS, y su `turn_end` tampoco espera a que se cierre la conexión con el servidor de voz; lo que ya estaba en camino (como mucho `AUDIO_LEAD_S` por delante) puede llegar antes del `turn_end`. Nada del turno cancelado llega después de su `turn_end`: ni tokens ni audio, tampoco la respuesta que OpenClaw ya tuviera en camino al abortarlo, que no cierra tu turno siguiente ni vuelve como un push (#285).
 
 Tras un `turn_end` con `reason: "interrupted"`:
 - Limpia la UI de la respuesta en curso
@@ -849,7 +849,7 @@ No requiere ningún cambio de cliente si ya reconectas tras un cierre inesperado
 
 - **Turno en curso:** si el gateway cierra la sesión con un turno abierto, el turno se **cancela**, no se espera a que termine, y recibes igualmente su `turn_end` antes del cierre si el socket sigue abierto. Nunca queda un `turn_start` sin su `turn_end` mientras puedas recibirlo. La inactividad (`IDLE_TIMEOUT_S`) y el silencio no cortan un turno en curso. Un push huérfano (abierto sin su fin) no la retiene: a los `TURN_TIMEOUT_S` sin progreso se cierra solo, con su `turn_end` (§10).
 - **Reinicio o parada del gateway:** el servidor cierra cada WebSocket con el código **1012** (*service restart*) en cuanto empieza a apagarse; un turno en curso se corta en ese momento y su `turn_end` ya no te llega (el socket está cerrado). No hay ventana de gracia para terminar el turno. Trata el 1012 como un cierre esperado: reconecta (con una pequeña espera y reintentos, el gateway tarda unos segundos en volver) y abre una sesión nueva con handshake completo.
-- **Revocación y conversación abierta en otra sesión:** desde ese momento no te llega nada más (ni audio, ni tokens, ni avisos; tampoco lo que ya estaba en cola) salvo el `turn_end` del turno en curso (y de un push abierto), con `reason: "closed"`; después, el cierre 4200 (revocada) o 4102 (conversación abierta en otra sesión). Antes de M19 la revocación cerraba sin ese `turn_end`.
+- **Revocación y conversación abierta en otra sesión:** desde ese momento no te llega nada más (ni audio, ni tokens, ni avisos; tampoco lo que ya estaba en cola) salvo el `turn_end` del turno en curso (y de un push abierto), con `reason: "closed"`, y el `turn_start` de ese turno si aún no había salido (nunca un `turn_end` sin su `turn_start`); después, el cierre 4200 (revocada) o 4102 (conversación abierta en otra sesión). Antes de M19 la revocación cerraba sin ese `turn_end`.
 
 `SHUTDOWN_DRAIN_S` (antes 30 s) prometía esperar al turno en curso en un reinicio; en la práctica eso no ocurría (el servidor ya había cerrado el socket). Desde #221 ya no se usa: el gateway lo ignora y avisa en el log si sigue en su `.env`.
 

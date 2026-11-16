@@ -505,6 +505,7 @@ class TurnController:
             if current is not None and not current.done():
                 self._mark_cancel(current, "replaced")
                 await self._cancel_and_wait(current)
+                await self._end_unstarted(current, "replaced")
             # Dentro del lock: el abort del push termina antes de que salga el chat.send.
             await self._cut_push(None, "replaced")
             # Después de cortar (el push de la conversación de ayer se aborta en su clave) y
@@ -549,9 +550,24 @@ class TurnController:
                 return False, None
             self._mark_cancel(task, reason)
             await self._cancel_and_wait(task)
+            await self._end_unstarted(task, reason)
             turn = self._user_turn
             opened = turn is not None and turn.task is task and turn.opened
             return True, turn.turn_id if opened and turn is not None else None
+
+    async def _end_unstarted(self, task: asyncio.Task, reason: EndReason) -> None:
+        """G-r2-1: todo `send` aceptado recibe su par turn_start/turn_end, también el que se
+        cancela antes de que su tarea llegue a crear el turno (dos `send` seguidos, o `send` y
+        `cancel`): se abre y se cierra aquí con `reason`, bajo el lock de quien llama."""
+        turn = self._user_turn
+        if turn is not None and turn.task is task:
+            return
+        turn = self._new_turn("user")
+        turn.conversation_id = self._conversation.id
+        turn.task = task
+        self._user_turn = turn
+        if await self._open(turn):
+            await self._end(turn, reason)
 
     async def _abort_other_runs(self) -> None:
         """Ningún otro run activo en nuestra session_key cuando sale el chat.send del
@@ -620,6 +636,10 @@ class TurnController:
         try:
             try:
                 reason = await self._stream(turn, text, pending)
+            except asyncio.CancelledError:
+                # A-r2-2: el turn_end de un turno cortado no espera a que cierre el TTS.
+                await self._end(turn, turn.cancel_reason or "cancelled")
+                raise
             except BaseException:
                 if pending.tts is not None:
                     await pending.tts.end()  # el servidor TTS sabe que no hay más

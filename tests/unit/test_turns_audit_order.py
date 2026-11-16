@@ -136,3 +136,88 @@ async def test_run_after_a_displacement_spawns_nothing_and_keeps_4102(make_bridg
     statuses = [c.kwargs.get("status") for c in bridge.tracker.close.await_args_list]
     assert statuses and "error" not in statuses
 
+
+
+class GatedClosingWS(ClosingWS):
+    """Un cliente lento: su escritura espera a `gate`, así lo encolado sigue en la cola."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate = asyncio.Event()
+
+    async def send_json(self, p):
+        await self.gate.wait()
+        self.sent.append(p)
+
+
+async def test_a_displaced_slow_client_gets_the_whole_pair_or_nothing(make_bridge):
+    """A-r2-1: con el turn_start aún en la cola al desplazar, no sale su turn_end solo."""
+    bridge, ws = make_bridge(GatedClosingWS())
+    bridge.orchestrator.stream_response = blocking()
+    await bridge._sender.send_json({"type": "status", "service": "tts", "state": "ok"})
+    await start_turn(bridge)  # su turn_start espera detrás del status
+    displace = asyncio.create_task(bridge.displace())
+    await asyncio.sleep(0.05)
+    ws.gate.set()
+    await asyncio.wait_for(displace, 2)
+    await asyncio.wait_for(bridge._policy_close, 2)
+    assert turn_marks(ws) == [("turn_start", "t-1"), ("turn_end", "t-1")]
+
+
+async def test_turn_end_of_a_cancelled_turn_does_not_wait_for_the_tts_close(make_bridge, monkeypatch):
+    """A-r2-2: tras cancel("interrupted") el turn_end sale enseguida, sin esperar a cerrar el
+    TTS; después, ni audio ni otro turn_end."""
+    monkeypatch.setattr(settings, "AUDIO_PACING_ENABLED", False)
+
+    async def endless_audio():
+        while True:
+            yield b"\x00\x01" * 160
+            await asyncio.sleep(0.002)
+
+    stream = tts_stream(endless_audio)
+    release_close = asyncio.Event()
+
+    async def slow_close():
+        await release_close.wait()
+
+    stream.close = slow_close
+    bridge, ws = make_bridge(output_mode=("text", "audio"), tts=tts_provider(stream))
+    bridge.orchestrator.stream_response = blocking()
+    await start_turn(bridge)
+    await wait_until(lambda: any(isinstance(m, bytes) for m in ws.sent))
+    cancel = asyncio.create_task(bridge.turns.cancel("interrupted"))
+    try:
+        await wait_until(lambda: ws.of("turn_end"), timeout=1.0)
+    finally:
+        release_close.set()
+        await asyncio.wait_for(cancel, 2)
+    await sent(bridge)
+    ends = [i for i, m in enumerate(ws.sent) if isinstance(m, dict) and m["type"] == "turn_end"]
+    assert len(ends) == 1 and ws.sent[ends[0]]["reason"] == "interrupted"
+    assert not any(isinstance(m, bytes) for m in ws.sent[ends[0]:])
+
+
+async def test_a_send_replaced_before_it_starts_still_gets_its_pair(make_bridge):
+    """G-r2-1: dos `send` seguidos → dos pares; el del primero, `replaced`."""
+    bridge, ws = make_bridge()
+    bridge.orchestrator.stream_response = tokens("ok")
+    await bridge.turns.start_user_turn("uno")
+    await bridge.turns.start_user_turn("dos")
+    await asyncio.wait({bridge.turns.user_task}, timeout=2)
+    await sent(bridge)
+    assert turn_marks(ws) == [
+        ("turn_start", "t-1"), ("turn_end", "t-1"), ("turn_start", "t-2"), ("turn_end", "t-2"),
+    ]
+    assert [m["reason"] for m in ws.of("turn_end")] == ["replaced", "done"]
+    assert {m["conversation"] for m in ws.of("turn_start")} == {bridge.conversation.id}
+
+
+async def test_a_send_cancelled_before_it_starts_still_gets_its_pair(make_bridge):
+    """G-r2-1: `send` y `cancel` seguidos → un par `cancelled`."""
+    bridge, ws = make_bridge()
+    bridge.orchestrator.stream_response = tokens("ok")
+    await bridge.turns.start_user_turn("uno")
+    assert await bridge.turns.cancel("cancelled") == (True, "t-1")
+    await sent(bridge)
+    assert turn_marks(ws) == [("turn_start", "t-1"), ("turn_end", "t-1")]
+    assert ws.of("turn_end")[0]["reason"] == "cancelled"

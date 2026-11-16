@@ -48,8 +48,9 @@ _sleep = asyncio.sleep
 # Lo que espera una sesión nueva a que la que desplaza suelte su clave (M19): SESSION_TEARDOWN_S
 # para que su turno suelte la clave, más esto para sus chat.abort (cada uno con tope de 1 s).
 _ABORT_SLACK_S = 3.0
-# Revocada o desplazada, la sesión solo manda ya el turn_end de lo que tenga abierto (G-18).
-_ONLY_TURN_END = frozenset({"turn_end"})
+# Revocada o desplazada, la sesión solo manda ya los turn_start/turn_end de sus turnos (G-18):
+# el turn_start pasa también (A-r2-1), o uno aún en la cola se tiraría y su turn_end saldría solo.
+_ONLY_TURN_END = frozenset({"turn_start", "turn_end"})
 
 _REASON_BY_STATUS: dict[str, CloseReason] = {
     "revoked": "revoked",
@@ -565,7 +566,8 @@ class FogarBridge:
     ) -> None:
         """Cierre por política (4200 revocada, 4102 conversación abierta en otra sesión).
 
-        1. Desde ya no sale nada más que turn_end (G-18: ni audio, ni tokens, ni avisos).
+        1. Desde ya no sale nada más que turn_start/turn_end (G-18: ni audio, ni tokens, ni
+           avisos); el par entero, nunca un turn_end sin su turn_start (A-r2-1).
         2. Antes que nada, que nada suyo siga corriendo en OpenClaw en su clave (`let_go`): lo
            espera quien la desplaza (`_released`), pase lo que pase.
         3. Exactamente un turn_end por turn_start (G-10): el turno abierto y el push se cierran

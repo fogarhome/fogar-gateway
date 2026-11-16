@@ -76,6 +76,15 @@ describe('createChatSession', () => {
     ])
   })
 
+  it('limpia el texto como el gateway: lo que allí queda vacío no se manda', () => {
+    const s = session()
+    const before = last().sent.length
+    expect(s.send('\x85\x1c \x1f')).toBe(false)
+    expect(last().sent.length).toBe(before)
+    expect(s.send('\x1dHola\x85')).toBe(true)
+    expect(last().sent.at(-1)).toEqual({ type: 'send', text: 'Hola' })
+  })
+
   it('enseña en qué está la respuesta hasta el primer token; los pipeline_event no cambian nada', () => {
     const s = session()
     s.send('enciende la luz')
