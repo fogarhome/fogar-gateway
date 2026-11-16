@@ -1,4 +1,3 @@
-import ipaddress
 import logging
 from typing import Annotated, Any, Literal
 
@@ -77,20 +76,6 @@ class Settings(BaseSettings):
         ""  # CSV of CIDRs, e.g. "192.168.1.0/24". Empty = only loopback trusted.
     )
     TRUSTED_PROXIES: str = "127.0.0.1,::1"  # CSV of IPs/CIDRs allowed to set X-Real-IP
-
-    # Una entrada mal escrita no se ignora (F-r3-1): con TRUSTED_PROXIES vacío por error, un proxy
-    # del mismo host que solo pone X-Real-IP abriría /v1. Mismo recorrido que network._parse_networks.
-    @field_validator("TRUSTED_NETWORKS", "TRUSTED_PROXIES")
-    @classmethod
-    def _valid_networks(cls, v: str) -> str:
-        for raw in v.split(","):
-            raw = raw.strip()
-            if raw:
-                try:
-                    ipaddress.ip_network(raw, strict=False)
-                except ValueError:
-                    raise ValueError("each entry must be an IP or CIDR") from None
-        return v
 
     # Servicios externos
     TRANSCRIBER_WS_URL: str = "localhost:9000"

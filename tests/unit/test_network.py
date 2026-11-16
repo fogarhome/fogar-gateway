@@ -1,15 +1,17 @@
+import logging
+
 import pytest
-from pydantic import ValidationError
 from starlette.datastructures import Headers
 from starlette.websockets import WebSocket
 
-from fogar_gateway.core.config import Settings, settings
+from fogar_gateway.core.config import settings
 from fogar_gateway.core.network import (
     NO_REAL_IP,
     client_ip_for_log,
     is_trusted_origin,
     is_trusted_proxy,
     resolve_client_ip,
+    warn_if_open_proxy_config,
 )
 
 
@@ -234,16 +236,37 @@ def test_x_real_ip_with_ipv6_scope_id_fails_closed(caplog):
     assert "FORGED" not in caplog.text
 
 
-@pytest.mark.parametrize("value", ["", " 127.0.0.1 , ::1 ", "10.0.0.0/8,fd00::/8", "192.168.1.5/24", ",,"])
-@pytest.mark.parametrize("field", ["TRUSTED_NETWORKS", "TRUSTED_PROXIES"])
-def test_settings_accept_valid_network_lists(field, value):
-    assert getattr(Settings(_env_file=None, **{field: value}), field) == value
+
+@pytest.mark.parametrize("bad", ["127.0.0.1;::1", "localhost", "192.168.1.0/33", "::1%eth0", "0.0.0.0/0"])
+def test_invalid_trusted_proxies_fail_closed_for_everyone(monkeypatch, caplog, bad):
+    # F-r3-1: antes la entrada se ignoraba (lista vacía) y un proxy del mismo host que solo pone
+    # X-Real-IP abría /v1. Ahora nadie es proxy ni origen exento, y el aviso sale al arrancar.
+    monkeypatch.setattr(settings, "TRUSTED_PROXIES", f"127.0.0.1,{bad}")
+    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "192.168.1.0/24")
+    with caplog.at_level(logging.WARNING):
+        for request in (
+            _FakeRequest("127.0.0.1", headers={"x-real-ip": "192.168.1.9"}),
+            _FakeRequest("127.0.0.1"),
+            _FakeRequest("192.168.1.5"),
+        ):
+            assert resolve_client_ip(request) == NO_REAL_IP
+        assert not caplog.records  # nada por petición
+        warn_if_open_proxy_config()
+    assert len(caplog.records) == 1 and "TRUSTED_PROXIES" in caplog.text and bad in caplog.text
 
 
-@pytest.mark.parametrize("value", ["127.0.0.1;::1", "localhost", "192.168.1.0/33", "10.0.0.1,nope"])
-@pytest.mark.parametrize("field", ["TRUSTED_NETWORKS", "TRUSTED_PROXIES"])
-def test_settings_reject_invalid_network_lists(field, value):
-    # F-r3-1: antes se ignoraba con un WARNING por petición y TRUSTED_PROXIES quedaba vacío.
-    with pytest.raises(ValidationError) as exc:
-        Settings(_env_file=None, **{field: value})
-    assert [e["loc"] for e in exc.value.errors()] == [(field,)]
+@pytest.mark.parametrize("bad", ["nope", "0.0.0.0/0", "::/0"])
+def test_invalid_or_catch_all_trusted_networks_are_ignored(monkeypatch, caplog, bad):
+    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", f"{bad},192.168.1.0/24")
+    assert is_trusted_origin("192.168.1.5")
+    assert not is_trusted_origin("203.0.113.9") and not is_trusted_origin("2001:db8::1")
+    with caplog.at_level(logging.WARNING):
+        warn_if_open_proxy_config()
+    assert "TRUSTED_NETWORKS" in caplog.text and bad in caplog.text
+
+
+def test_valid_lists_with_spaces_ipv6_and_host_bits_still_work(monkeypatch):
+    monkeypatch.setattr(settings, "TRUSTED_PROXIES", " 127.0.0.1 , ::1 ,, fd00::/8")
+    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "10.0.0.0/8, 192.168.1.5/24")
+    assert resolve_client_ip(_FakeRequest("::1", headers={"x-real-ip": "192.168.1.7"})) == "192.168.1.7"
+    assert is_trusted_origin("192.168.1.7") and is_trusted_origin("10.1.2.3")

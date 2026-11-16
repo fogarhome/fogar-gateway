@@ -24,17 +24,30 @@ _IpNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 NO_REAL_IP = "proxy-without-real-ip"
 
 
+def _entries(csv: str) -> list[str]:
+    return [raw.strip() for raw in csv.split(",") if raw.strip()]
+
+
+def entry_problem(raw: str, *, strict: bool = False) -> str | None:
+    """Why `raw` is not a usable IP/CIDR entry, or None. The CLI checks with strict=True."""
+    if "%" in raw:  # zone id: free text, never a network
+        return "lleva identificador de zona (%)"
+    try:
+        net = ipaddress.ip_network(raw, strict=strict)
+    except ValueError:
+        return "no es una IP ni un CIDR" + (" válido (¿bits de host?)" if strict else "")
+    if net.prefixlen == 0:
+        return "/0 abarca todas las direcciones"
+    return None
+
+
+def invalid_entries(csv: str, *, strict: bool = False) -> list[str]:
+    return [raw for raw in _entries(csv) if entry_problem(raw, strict=strict)]
+
+
 def _parse_networks(csv: str) -> list[_IpNetwork]:
-    networks: list[_IpNetwork] = []
-    for raw in csv.split(","):
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            networks.append(ipaddress.ip_network(raw, strict=False))
-        except ValueError:
-            logger.warning(f"Ignoring invalid CIDR/IP in network config: {raw!r}")
-    return networks
+    # Invalid entries are skipped silently here; warn_if_open_proxy_config() reports them once.
+    return [ipaddress.ip_network(raw, strict=False) for raw in _entries(csv) if not entry_problem(raw)]
 
 
 def _ip_in_networks(ip_str: str, networks: list[_IpNetwork]) -> bool:
@@ -61,12 +74,26 @@ def is_trusted_origin(ip_str: str) -> bool:
     return _ip_in_networks(ip_str, _parse_networks(settings.TRUSTED_NETWORKS))
 
 
-def warn_if_open_proxy_config() -> None:
-    """WARNING at startup for TRUST_LOOPBACK with an empty TRUSTED_PROXIES (#216).
+def _proxies_invalid() -> bool:
+    return bool(invalid_entries(settings.TRUSTED_PROXIES))
 
-    A same-host reverse proxy would then look like a loopback client for everyone behind
-    it (its X-Real-IP is ignored), leaving /v1/* open to the Internet.
+
+def warn_if_open_proxy_config() -> None:
+    """Startup WARNINGs: invalid TRUSTED_* entries (F-r3-1) and TRUST_LOOPBACK with an empty
+    TRUSTED_PROXIES (#216).
+
+    A same-host reverse proxy with no TRUSTED_PROXIES would look like a loopback client for
+    everyone behind it (its X-Real-IP is ignored), leaving /v1/* open to the Internet.
     """
+    if bad := invalid_entries(settings.TRUSTED_PROXIES):
+        logger.warning(
+            f"TRUSTED_PROXIES has invalid entries {bad!r}: no peer is a trusted proxy and no "
+            "origin is exempt from /v1/* auth (fail closed) until it is fixed "
+            "(`fogar-gw config validate`)."
+        )
+        return
+    if bad := invalid_entries(settings.TRUSTED_NETWORKS):
+        logger.warning(f"TRUSTED_NETWORKS: ignoring invalid entries {bad!r}.")
     if settings.TRUST_LOOPBACK and not _parse_networks(settings.TRUSTED_PROXIES):
         logger.warning(
             "TRUST_LOOPBACK is on and TRUSTED_PROXIES is empty: a reverse proxy on this "
@@ -103,6 +130,8 @@ def resolve_client_ip(connection: HTTPConnection) -> str:
     X-Real-IP must arrive exactly once (D-r2-2).
     """
     peer = connection.client.host if connection.client else ""
+    if _proxies_invalid():  # fail closed: we can't tell which peer is the proxy (F-r3-1)
+        return NO_REAL_IP
 
     if is_trusted_proxy(peer):
         real_ips = connection.headers.getlist("x-real-ip")

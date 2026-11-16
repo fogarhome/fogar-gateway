@@ -164,14 +164,31 @@ def test_set_invalid_writes_nothing(home):
     assert [p.name for p in home.iterdir()] == ["config.env"]
 
 
-@pytest.mark.parametrize("value", ["127.0.0.1;::1", "localhost"])
-def test_set_invalid_trusted_proxies_writes_nothing(home, value):
-    # F-r3-1: una entrada que no es IP ni CIDR ya no se ignora en silencio.
+@pytest.mark.parametrize("field", ["TRUSTED_PROXIES", "TRUSTED_NETWORKS"])
+@pytest.mark.parametrize(
+    "value", ["127.0.0.1;::1", "localhost", "192.168.1.0/0", "192.168.1.5/24", "::1%eth0", "::/0"]
+)
+def test_set_invalid_network_list_writes_nothing(home, field, value):
+    # F-r3-1: no son secretos, así que se dice qué entrada falla.
     before = _env(home).read_bytes()
-    r = run("config", "set", "TRUSTED_PROXIES", value)
+    r = run("config", "set", field, f"127.0.0.1, {value}")
     assert r.exit_code == 1
-    assert "TRUSTED_PROXIES" in r.output and value not in r.output
+    assert field in r.output and f"«{value}»" in r.output and "«127.0.0.1»" not in r.output
     assert _env(home).read_bytes() == before
+
+
+def test_set_valid_network_list(home):
+    r = run("config", "set", "TRUSTED_NETWORKS", " 192.168.1.0/24 , fd00::/8 ")
+    assert r.exit_code == 0, r.output
+
+
+def test_validate_marks_invalid_network_list(home):
+    # Una entrada mala en config.env no rompe la carga: validate (y doctor) la señalan.
+    (home / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nTRUSTED_PROXIES=127.0.0.1;::1\n")
+    r = run("config", "validate")
+    assert r.exit_code == 1
+    assert "TRUSTED_PROXIES" in r.output and "«127.0.0.1;::1»" in r.output
+    assert "fallo cerrado" in r.output
 
 
 def test_set_new_failing_check_aborts(home):

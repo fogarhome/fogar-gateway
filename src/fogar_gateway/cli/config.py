@@ -130,9 +130,27 @@ def validation_checks(settings: Any) -> list[dict[str, str]]:
         )
     except SpeechConfigError as e:
         checks.append(_check("fail", e.setting, "Inválido o ausente para el proveedor elegido."))
+    for name, effect in _NETWORK_FIELDS.items():
+        if bad := _bad_network_entries(getattr(settings, name)):
+            checks.append(_check("fail", name, f"Entradas no válidas: {bad}. {effect}"))
     for name in deprecated_settings(settings):
         checks.append(_check("warn", name, "Obsoleto e ignorado; bórralo de la configuración."))
     return checks
+
+
+# Listas de IP/CIDR: sus entradas no son secretas y se muestran (F-r3-1).
+_NETWORK_FIELDS = {
+    "TRUSTED_PROXIES": "Mientras tanto ningún origen queda exento de Bearer en /v1 (fallo cerrado).",
+    "TRUSTED_NETWORKS": "El gateway las ignora.",
+}
+
+
+def _bad_network_entries(csv: str) -> str:
+    from fogar_gateway.core.network import entry_problem, invalid_entries
+
+    return "; ".join(
+        f"«{raw}» ({entry_problem(raw, strict=True)})" for raw in invalid_entries(csv, strict=True)
+    )
 
 
 def _check(level: str, name: str, detail: str) -> dict[str, str]:
@@ -281,6 +299,9 @@ def _apply(out: Out, key: str, value: str | None) -> bool:
     path = paths.config_file()
     if not path.is_file():
         raise api.ApiError(f"No hay {path}. Prepara la instalación con `fogar-gw init`.", 1)
+    if key in _NETWORK_FIELDS and value is not None and (bad := _bad_network_entries(value)):
+        raise api.ApiError(f"{key}: entradas no válidas: {bad}. Usa IPs o CIDRs separadas por "
+                           "comas. No se ha escrito nada.", 1)
     old = path.read_text()
     new = _edit(old, key, value)
     if new == old:
