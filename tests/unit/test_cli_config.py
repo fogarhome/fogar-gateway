@@ -191,6 +191,15 @@ def test_validate_marks_invalid_network_list(home):
     assert "fallo cerrado" in r.output
 
 
+def test_validate_only_warns_on_host_bits(home):
+    # El gateway acepta 192.168.1.5/24 (= 192.168.1.0/24): aviso, no fallo; `config set` sí lo rechaza.
+    (home / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nTRUSTED_NETWORKS=192.168.1.5/24\n")
+    r = run("--json", "config", "validate")
+    assert r.exit_code == 0, r.output
+    checks = [c for c in json.loads(r.output) if c["check"] == "TRUSTED_NETWORKS"]
+    assert [c["level"] for c in checks] == ["warn"] and "192.168.1.5/24" in checks[0]["detail"]
+
+
 def test_set_new_failing_check_aborts(home):
     # Vaciar ADMIN_TOKEN crea un check `fail` nuevo (el sin definir no lo era).
     before = _env(home).read_bytes()

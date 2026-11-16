@@ -131,8 +131,12 @@ def validation_checks(settings: Any) -> list[dict[str, str]]:
     except SpeechConfigError as e:
         checks.append(_check("fail", e.setting, "Inválido o ausente para el proveedor elegido."))
     for name, effect in _NETWORK_FIELDS.items():
-        if bad := _bad_network_entries(getattr(settings, name)):
+        csv = getattr(settings, name)
+        if bad := _bad_network_entries(csv, strict=False):  # lo que el gateway rechaza
             checks.append(_check("fail", name, f"Entradas no válidas: {bad}. {effect}"))
+        elif loose := _bad_network_entries(csv):
+            checks.append(_check("warn", name, f"Entradas con bits de host: {loose}. El gateway "
+                                 "las usa como su red (p. ej. 192.168.1.5/24 = 192.168.1.0/24)."))
     for name in deprecated_settings(settings):
         checks.append(_check("warn", name, "Obsoleto e ignorado; bórralo de la configuración."))
     return checks
@@ -145,11 +149,12 @@ _NETWORK_FIELDS = {
 }
 
 
-def _bad_network_entries(csv: str) -> str:
+def _bad_network_entries(csv: str, *, strict: bool = True) -> str:
     from fogar_gateway.core.network import entry_problem, invalid_entries
 
     return "; ".join(
-        f"«{raw}» ({entry_problem(raw, strict=True)})" for raw in invalid_entries(csv, strict=True)
+        f"«{raw}» ({entry_problem(raw, strict=strict)})"
+        for raw in invalid_entries(csv, strict=strict)
     )
 
 
