@@ -5,6 +5,8 @@ mientras conecta se le manda en orden en cuanto conecta.
 """
 
 import asyncio
+import gc
+import warnings
 from unittest.mock import AsyncMock, MagicMock
 
 from tests.fakes.bridge import sent, start_turn, tokens
@@ -74,4 +76,21 @@ async def test_cancel_while_tts_connects_cancels_the_connect(make_bridge):
     release.set()
     await asyncio.sleep(0.01)
     stream.close.assert_not_awaited()  # la conexión se canceló: no quedó ningún stream abierto
+    assert [m["type"] for m in await sent(bridge)].count("turn_end") == 1
+
+
+async def test_orchestrator_failing_at_once_leaves_no_unawaited_connect(make_bridge):
+    stream, _ = _stream()
+    bridge, _ws = make_bridge(output_mode=("audio", "text"), tts=_slow_tts(stream, asyncio.Event()))
+
+    def boom(*a, **k):
+        raise ValueError("x")
+
+    bridge.orchestrator.stream_response = boom
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        task = await start_turn(bridge)
+        await asyncio.wait({task}, timeout=2)
+        gc.collect()
+    assert not any("never awaited" in str(x.message) for x in w)
     assert [m["type"] for m in await sent(bridge)].count("turn_end") == 1

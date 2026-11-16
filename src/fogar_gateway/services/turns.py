@@ -315,7 +315,9 @@ class _PendingTts:
     """El TTS de un turno del usuario mientras conecta (auditoría 3.0, E-2): el texto que llega
     antes de conectar se guarda y se le da en orden en cuanto conecta."""
 
-    def __init__(self, connect: "Coroutine[Any, Any, TurnTts | None]", voice: str, client_id: str):
+    def __init__(
+        self, connect: "Callable[[], Coroutine[Any, Any, TurnTts | None]]", voice: str, client_id: str
+    ):
         self._voice = voice
         self._client_id = client_id
         self._buffer: list[str] = []
@@ -324,8 +326,9 @@ class _PendingTts:
         self.tts: TurnTts | None = None
         self._task = asyncio.create_task(self._open(connect), name="tts_connect")
 
-    async def _open(self, connect: "Coroutine[Any, Any, TurnTts | None]") -> None:
-        self.tts = await connect  # sin await hasta aquí: release() lo ve aunque cancelen
+    async def _open(self, connect: "Callable[[], Coroutine[Any, Any, TurnTts | None]]") -> None:
+        # La corrutina se crea aquí: una tarea cancelada antes de empezar no deja una sin esperar.
+        self.tts = await connect()  # sin await hasta aquí: release() lo ve aunque cancelen
         async with self._lock:
             self._ready = True
             if self.tts is not None:
@@ -612,7 +615,7 @@ class TurnController:
         texto; solo el `turn_end`, que espera a la voz como antes."""
         if not self._wants_audio:
             return await self._stream(turn, text, None)
-        pending = _PendingTts(self._connect_tts(turn), self._config.tts_voice or "", self._client_id)
+        pending = _PendingTts(lambda: self._connect_tts(turn), self._config.tts_voice or "", self._client_id)
         # Sin await entre crearlo y el try: una cancelación no deja el stream huérfano.
         try:
             try:
