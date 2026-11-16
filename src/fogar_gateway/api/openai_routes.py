@@ -26,6 +26,7 @@ from fogar_gateway.services.orchestration import OrchestratorError, call_orchest
 from fogar_gateway.services.pipeline_tracker import PipelineTracker
 from fogar_gateway.services.reconnection import describe_error
 from fogar_gateway.services.session_registry import SessionStatus
+from fogar_gateway.services.text import without_lone_surrogates
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,7 @@ async def list_models(request: Request, caller: HACaller = Depends(resolve_ha_ca
 def _extract_last_user_message(messages: list[_ChatMessage]) -> str:
     for msg in reversed(messages):
         if msg.role == "user":
-            return msg.content.encode("utf-8", "replace").decode()  # G-r3-1: sin surrogates sueltos
+            return without_lone_surrogates(msg.content)  # G-r3-1: OpenClaw lo guardaría tal cual
     return ""
 
 

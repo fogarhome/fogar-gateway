@@ -240,3 +240,17 @@ def test_growth_after_retraction_emits_only_new_tail():
     t.feed({"state": "delta", "deltaText": "Hola mundo"})
     assert t.feed({"state": "delta", "deltaText": "Hola", "replace": True}) == ""
     assert t.feed({"state": "delta", "deltaText": " mundo!"}) == "!"
+
+
+def test_emoji_split_between_two_snapshots_is_not_emitted_twice():
+    """G-r3-1 (revisión): «Hola \\ud83d» y luego «Hola 😀 amigo». Sin el surrogate suelto (ni
+    sustituto) el primero sigue siendo prefijo del segundo: nada se repite."""
+    import json
+
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    t = ChatTextTracker()
+    first = _loads_frame(json.dumps({"payload": _delta("", message="Hola \ud83d")}))
+    second = _loads_frame(json.dumps({"payload": _delta("", message="Hola \U0001f600 amigo")}))
+    out = t.feed(first["payload"]) + t.feed(second["payload"])
+    assert out == "Hola \U0001f600 amigo"

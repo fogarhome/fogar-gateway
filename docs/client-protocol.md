@@ -258,7 +258,7 @@ Envía texto al orquestador — ya sea una transcripción confirmada o texto esc
 
 El campo `text` puede diferir de la transcripción original si el usuario la editó.
 
-Un surrogate UTF-16 suelto escapado en `text` (`"\ud800"`, JSON válido pero no UTF-8) se sustituye por `?` antes de enviarlo al orquestador; lo mismo con el último mensaje del usuario en `/v1/chat/completions` y con el texto que llega de OpenClaw. Si aun así el gateway no puede serializar un mensaje hacia ti, cierra la sesión con 1011 `internal error` (§13) en vez de dejarla abierta sin salida; en ese caso el `turn_end` del turno abierto puede no llegar: el cierre lo termina.
+Un surrogate UTF-16 suelto escapado en `text` (`"\ud800"`, JSON válido pero no UTF-8) se quita antes de enviarlo al orquestador; lo mismo con el último mensaje del usuario en `/v1/chat/completions`, con el texto que llega de OpenClaw y con cualquier mensaje que el gateway te envíe (una transcripción, por ejemplo). Se quita sin sustituto: un emoji que OpenClaw parte entre dos fragmentos no hace que se repita el texto.
 
 ### Cancelar turno activo
 

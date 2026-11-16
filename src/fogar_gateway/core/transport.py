@@ -14,7 +14,7 @@ from typing import Any
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from fogar_gateway.models.close_codes import Close, send_close
+from fogar_gateway.models.close_codes import Close, CloseFrame, send_close
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,16 @@ def abort_client_transport(websocket: Any) -> bool:
         logger.warning("abort_client_transport: abort falló (%s).", type(e).__name__)
         return False
     return True
+
+
+async def close_or_abort(websocket: Any, frame: CloseFrame) -> None:
+    """Cierre `frame` con tope SLOW_CLOSE_GRACE_S; si no sale a tiempo (o falla), abort del
+    transporte, que es la salida garantizada. Nunca lanza `Exception`."""
+    try:
+        await asyncio.wait_for(send_close(websocket, frame), timeout=SLOW_CLOSE_GRACE_S)
+    except Exception as e:  # noqa: BLE001 — frontera: el abort de abajo es la salida
+        logger.debug("close_or_abort: close(%d) falló (%s).", frame.code, type(e).__name__)
+        abort_client_transport(websocket)
 
 
 async def drop_slow_client(

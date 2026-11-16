@@ -191,3 +191,27 @@ async def test_drop_slow_client_without_transport_does_not_raise(caplog):
         await drop_slow_client(ws)
     assert [c for c, _ in ws.closed_with] == [1013]
     assert any(r.levelname == "WARNING" for r in caplog.records)
+
+
+async def test_close_or_abort_closes_and_aborts_only_if_the_close_hangs(monkeypatch):
+    """G-r3-1: cierre 1011 de una sesión que no puede serializar, con tope como un cliente lento."""
+    from fogar_gateway.core.transport import close_or_abort
+    from fogar_gateway.models.close_codes import Close
+
+    monkeypatch.setattr(transport_mod, "SLOW_CLOSE_GRACE_S", 0.05)
+
+    class WS:
+        def __init__(self, hang):
+            self.scope = {"state": {"transport": _Transport()}}
+            self.hang, self.closed = hang, None
+
+        async def close(self, code, reason):
+            if self.hang:
+                await asyncio.Event().wait()
+            self.closed = (code, reason)
+
+    ok, stuck = WS(hang=False), WS(hang=True)
+    await close_or_abort(ok, Close.INTERNAL_ERROR)
+    await close_or_abort(stuck, Close.INTERNAL_ERROR)
+    assert ok.closed == (1011, "internal error") and ok.scope["state"]["transport"].aborted == 0
+    assert stuck.scope["state"]["transport"].aborted == 1

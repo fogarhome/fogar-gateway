@@ -4,8 +4,6 @@ venga del cliente o de OpenClaw, no deja la sesión sin salida ni la conversaci�
 import json
 
 import httpx
-import pytest
-import websockets
 
 from tests.integration.conftest import VALID_KEY
 from tests.integration.harness.conftest import assert_turns_paired, of_type, turn_ended
@@ -20,7 +18,7 @@ async def test_send_with_lone_surrogate_gets_a_normal_turn(harness):
     await client.ws.send('{"type": "send", "text": "a\\ud800b"}')  # escapado: JSON válido
     msgs = await client.collect(turn_ended)
     (start,) = of_type(msgs, "turn_start")
-    assert tokens(msgs, start["turn_id"]) == "reply-a?b"
+    assert tokens(msgs, start["turn_id"]) == "reply-ab"
 
     await client.send({"type": "send", "text": "hola"})  # la sesión sigue viva
     msgs = await client.collect(lambda m: len(of_type(m, "turn_end")) >= 2)
@@ -33,12 +31,12 @@ async def test_send_with_lone_surrogate_gets_a_normal_turn(harness):
     assert res.status_code == 200
 
 
-async def test_lone_surrogate_from_openclaw_is_replaced(harness):
+async def test_lone_surrogate_from_openclaw_is_dropped(harness):
     client = await harness.connect()
     await harness.push("x\ud800y")  # el falso lo escapa en JSON, como Node
     msgs = await client.collect(turn_ended)
     (start,) = of_type(msgs, "turn_start")
-    assert tokens(msgs, start["turn_id"]) == "x?y"
+    assert tokens(msgs, start["turn_id"]) == "xy"
 
     harness.openclaw.add_session(
         harness.session_key(), messages=[{"role": "user", "content": "c\udc00d", "timestamp": 1}]
@@ -46,7 +44,7 @@ async def test_lone_surrogate_from_openclaw_is_replaced(harness):
     async with harness.admin() as admin:
         res = await admin.get(f"/admin/conversations/{client.ready['conversation']['id']}/messages")
     assert res.status_code == 200
-    assert "c?d" in [m["text"] for m in res.json()["messages"]]
+    assert "cd" in [m["text"] for m in res.json()["messages"]]
 
     await client.send({"type": "send", "text": "hola"})
     await client.collect(lambda m: len(of_type(m, "turn_end")) >= 2)
@@ -62,7 +60,7 @@ async def test_v1_chat_with_lone_surrogate(harness):
     ) as http:
         res = await http.post("/v1/chat/completions", content=body % "")
         assert res.status_code == 200
-        assert res.json()["choices"][0]["message"]["content"] == "reply-?"
+        assert res.json()["choices"][0]["message"]["content"] == "reply-"
 
         async with http.stream("POST", "/v1/chat/completions", content=body % ', "stream": true') as res:
             assert res.status_code == 200
@@ -70,17 +68,20 @@ async def test_v1_chat_with_lone_surrogate(harness):
     text = "".join(
         json.loads(c.removeprefix("data: "))["choices"][0]["delta"].get("content", "") for c in chunks
     )
-    assert text == "reply-?"
+    assert text == "reply-"
 
 
-async def test_a_message_that_cannot_be_encoded_closes_the_session_with_1011(harness):
-    """G-r3-1: si un mensaje hacia el cliente no se puede serializar (aquí, una transcripción con
-    un surrogate suelto: el adaptador STT no lo sanea), la sesión se cierra con 1011 en vez de
-    quedar abierta sin salida."""
+async def test_lone_surrogate_from_the_transcriber_does_not_break_the_session(harness):
+    """G-r3-1: lo que no se sanea a la entrada (aquí la transcripción del STT) se sanea al salir:
+    el mensaje llega sin el surrogate y la sesión sigue."""
     harness.transcriber.on_end = [("a\ud800b", True)]
     client = await harness.connect(input_mode="audio", output_mode=("audio", "text"))
     await client.send_audio(b"\x00" * 3200)
     await client.send({"type": "end"})
-    with pytest.raises(websockets.ConnectionClosed):
-        await client.collect(timeout=5)
-    assert (client.ws.close_code, client.ws.close_reason) == (1011, "internal error")
+    msgs = await client.collect(lambda m: bool(of_type(m, "transcription")))
+    assert of_type(msgs, "transcription")[0]["text"] == "ab"
+
+    await client.send({"type": "send", "text": "hola"})
+    msgs = await client.collect(turn_ended)
+    assert tokens(msgs, of_type(msgs, "turn_start")[0]["turn_id"]) == "reply-hola"
+    assert_turns_paired(msgs)

@@ -13,7 +13,7 @@ from fogar_gateway.core.config import settings
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
 from fogar_gateway.core.logging import fingerprint_key
 from fogar_gateway.core.network import client_ip_for_log
-from fogar_gateway.core.transport import drop_slow_client
+from fogar_gateway.core.transport import close_or_abort, drop_slow_client
 from fogar_gateway.models.close_codes import Close, CloseFrame, close_sent, send_close
 from fogar_gateway.models.schemas import Client, ClientConfig, Handshake
 from fogar_gateway.services.bridge import FogarBridge
@@ -222,7 +222,7 @@ async def gateway_websocket(websocket: WebSocket):
 
     async def _on_send_error() -> None:
         bridge.note_close_reason("error")
-        await send_close(websocket, Close.INTERNAL_ERROR)
+        await close_or_abort(websocket, Close.INTERNAL_ERROR)
 
     sender = QueuedSender(websocket, on_slow=_on_slow_client, on_error=_on_send_error)
     # G-24 (#221): the writer task is already running; if building the rest fails, close

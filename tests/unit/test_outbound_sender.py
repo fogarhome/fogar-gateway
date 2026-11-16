@@ -1,6 +1,7 @@
 """Tests for OutboundSender implementations (issue #130 S1)."""
 
 import asyncio
+import json
 
 import pytest
 from starlette.websockets import WebSocketDisconnect
@@ -378,20 +379,44 @@ async def test_queued_slow_client_logs_one_warning_without_payload(monkeypatch, 
     assert "SECRETO" not in records[0].getMessage()
 
 
+async def test_queued_strips_lone_surrogates_and_keeps_going():
+    """G-r3-1: un mensaje con un surrogate suelto sale sin él, y la cola sigue (turn_end incluido)."""
+    calls = []
+
+    class StrictWS(FakeWS):
+        async def send_json(self, payload):
+            json.dumps(payload, ensure_ascii=False).encode()  # como el encode del socket real
+            await super().send_json(payload)
+
+    async def on_error():
+        calls.append(True)
+
+    s = QueuedSender(StrictWS(), on_error=on_error)
+    await s.send_json({"type": "token", "text": "a\ud800b", "n": [1, "\udc00"]})
+    await s.send_json({"type": "turn_end"})
+    await s.flush()
+    assert [p for _, p in s._ws.sent] == [
+        {"type": "token", "text": "ab", "n": [1, ""]},
+        {"type": "turn_end"},
+    ]
+    assert calls == []
+    await s.aclose(1.0)
+
+
 async def test_queued_closes_the_session_on_a_message_it_cannot_serialize():
-    """G-r3-1: un error que no es de socket (UnicodeEncodeError) con el socket sano no se salta
-    el mensaje (rompería el par turn_start/turn_end) ni deja la sesión viva sin salida: on_error."""
+    """G-r3-1: un mensaje que no se puede serializar (TypeError, bug del gateway) con el socket
+    sano no se salta (rompería el par turn_start/turn_end) ni deja la sesión sin salida: on_error."""
     calls = []
 
     class BadWS(FakeWS):
         async def send_json(self, payload):
-            "x\ud800".encode()
+            json.dumps(payload)
 
     async def on_error():
         calls.append(True)
 
     s = QueuedSender(BadWS(), on_error=on_error)
-    await s.send_json({"type": "token"})
+    await s.send_json({"type": "token", "x": object()})
     await s.send_json({"type": "turn_end"})
     with pytest.raises(ClientGone):
         await s.flush()

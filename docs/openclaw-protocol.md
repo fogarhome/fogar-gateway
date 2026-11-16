@@ -540,8 +540,9 @@ Observed/decided while hardening the gateway's boundary with OpenClaw (audit G-0
 - **Lone surrogates (2026-11-16, audit 3.0 r3, G-r3-1).** OpenClaw (Node) can send a string
   with an unpaired surrogate escaped in JSON (`"\ud800"`: a half-stored emoji, a delta that
   splits a pair, a user message saved that way). It is valid JSON but cannot be encoded as
-  UTF-8. The gateway replaces each lone surrogate with `?` when it parses a frame that carries a
-  `\ud`/`\uD` escape (paired surrogates, i.e. normal emoji, are untouched).
+  UTF-8. The gateway drops each lone surrogate (no replacement character) when it parses a frame
+  that carries a `\ud`/`\uD` escape, so a snapshot that ends in half an emoji stays a prefix of
+  the next one; paired surrogates (normal emoji) are untouched.
 
 ---
 
@@ -960,7 +961,7 @@ The gateway uses them only through `OpenClawClient.request`, which refuses any m
 ## Change log of this file
 
 - **2026-11-16**: "Frame size, malformed frames and connection end" gains lone surrogates
-  (audit 3.0 r3, G-r3-1): replaced with `?` on parse.
+  (audit 3.0 r3, G-r3-1): dropped on parse, without a replacement character.
 - **2026-11-15**: "Discovering Available Agents" no longer says the gateway does not request
   `operator.admin` (it does since 2026-11-13; audit 3.0, B-3) and gives `config.get`'s scope from
   the "Method → scope" table (`operator.read`).

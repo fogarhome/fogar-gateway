@@ -33,6 +33,7 @@ from fogar_gateway.services.speech.ports import (
 from fogar_gateway.services.speech.registry import SpeechProviders
 from fogar_gateway.services.stats import CloseReason, gateway_stats
 from fogar_gateway.services.teardown import Teardown, cancel_requested
+from fogar_gateway.services.text import without_lone_surrogates
 from fogar_gateway.services.turns import TurnController
 
 logger = logging.getLogger(__name__)
@@ -754,9 +755,8 @@ class FogarBridge:
                         if not isinstance(raw_text, str):
                             await self._send_invalid_message()
                         else:
-                            # G-r3-1: un `\ud800` escapado deja un surrogate suelto que
-                            # rompería el envío UTF-8 al cliente y a /admin.
-                            text = raw_text.encode("utf-8", "replace").decode().strip()
+                            # G-r3-1: sin surrogates sueltos, que OpenClaw guardaría tal cual.
+                            text = without_lone_surrogates(raw_text).strip()
                             if text:
                                 logger.info(f"[{self.client_id}] send recibido: len={len(text)}")
                                 await self.turns.start_user_turn(text)

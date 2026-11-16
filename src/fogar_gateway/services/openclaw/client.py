@@ -40,6 +40,7 @@ from fogar_gateway.services.openclaw.registry import (
 from fogar_gateway.services.protocol import ACCEPTED, OrchestratorEvent
 from fogar_gateway.services.reconnection import describe_error, traceback_no_message
 from fogar_gateway.services.teardown import Teardown
+from fogar_gateway.services.text import without_lone_surrogates
 from fogar_gateway.services.turn_progress import chat_status_phase
 
 logger = logging.getLogger(__name__)
@@ -231,13 +232,13 @@ def _safe_error_code(error: object) -> str:
 
 
 def _loads_frame(raw: str | bytes):
-    """json.loads de una trama de OpenClaw sin surrogates sueltos (G-r3-1): un `\\ud800`
-    escapado sin pareja rompería después todo encode a UTF-8 (la salida al cliente, las
-    respuestas de /admin y /v1). Solo re-codifica si la trama trae un escape de surrogate."""
+    """json.loads de una trama de OpenClaw sin surrogates sueltos (G-r3-1): romperían después
+    todo encode a UTF-8 (la salida al cliente, /admin, /v1). Solo re-codifica si la trama trae
+    un escape de surrogate."""
     frame = json.loads(raw)
     text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
     if "\\ud" in text or "\\uD" in text:
-        frame = json.loads(json.dumps(frame, ensure_ascii=False).encode("utf-8", "replace"))
+        frame = without_lone_surrogates(frame)
     return frame
 
 

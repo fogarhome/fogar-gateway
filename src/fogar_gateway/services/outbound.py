@@ -14,6 +14,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from fogar_gateway.core.config import settings
 from fogar_gateway.services.reconnection import describe_error
+from fogar_gateway.services.text import without_lone_surrogates
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +82,8 @@ class QueuedSender:
     ):
         self._ws = ws
         self._on_slow = on_slow
-        # G-r3-1: un mensaje que no se puede serializar con el socket sano; quien crea el
-        # sender cierra la sesión (1011) para que no quede viva sin salida.
+        # G-r3-1: un mensaje que no se puede serializar (bug del gateway) con el socket sano;
+        # quien crea el sender cierra la sesión (1011) para que no quede viva sin salida.
         self._on_error = on_error
         self._queue: asyncio.Queue = asyncio.Queue()
         self._failure: Exception | None = None
@@ -185,7 +186,13 @@ class QueuedSender:
             try:
                 async with timeout:
                     if kind == "json":
-                        await self._ws.send_json(item)
+                        try:
+                            await self._ws.send_json(item)
+                        except UnicodeEncodeError:
+                            # G-r3-1: un surrogate suelto (texto del STT, de OpenClaw…). El encode
+                            # falla antes de escribir nada: sale el mismo mensaje sin ellos.
+                            logger.warning("Outbound: surrogate suelto en un mensaje — se quita.")
+                            await self._ws.send_json(without_lone_surrogates(item))
                     else:
                         await self._ws.send_bytes(item)
             except Exception as e:  # noqa: BLE001 — frontera: el writer registra y para
@@ -195,9 +202,9 @@ class QueuedSender:
                     await self._fail_slow()
                     return
                 self._failure = e
-                # ValueError/TypeError: el mensaje no se pudo serializar (p. ej. UnicodeEncodeError)
-                # y el socket sigue abierto. Saltarlo rompería el par turn_start/turn_end: se
-                # cierra la sesión en vez de dejarla sin salida.
+                # ValueError/TypeError: el mensaje no se puede serializar (un bug del gateway) y
+                # el socket sigue abierto. Saltarlo rompería el par turn_start/turn_end: se
+                # cierra la sesión (1011) en vez de dejarla sin salida.
                 unencodable = isinstance(e, (ValueError, TypeError))
                 # One line, never the payload (it may hold user text).
                 level = logging.INFO if _is_routine_disconnect(e) else logging.WARNING
