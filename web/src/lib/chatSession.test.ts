@@ -85,6 +85,19 @@ describe('createChatSession', () => {
     expect(last().sent.at(-1)).toEqual({ type: 'send', text: 'Hola' })
   })
 
+  it('quita los surrogates sueltos como el gateway, antes de los espacios (G-r4-1)', () => {
+    const s = session()
+    const before = last().sent.length
+    expect(s.send('\uD800 \uDC00')).toBe(false)
+    expect(last().sent.length).toBe(before)
+    expect(s.send(' \uD800Hola \uDFFF')).toBe(true)
+    expect(last().sent.at(-1)).toEqual({ type: 'send', text: 'Hola' })
+    expect(s.send('\u{1F600}')).toBe(true) // un par válido no es un surrogate suelto
+    last().serverClose(1000) // camino pending: la conversación dormida tampoco lo guarda
+    expect(s.send('\uDC00')).toBe(false)
+    expect(FakeSocket.all).toHaveLength(1)
+  })
+
   it('enseña en qué está la respuesta hasta el primer token; los pipeline_event no cambian nada', () => {
     const s = session()
     s.send('enciende la luz')
