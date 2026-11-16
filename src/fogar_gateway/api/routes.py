@@ -12,7 +12,7 @@ from fogar_gateway.core.agent_policy import AgentPolicyError, AgentPolicyKind, r
 from fogar_gateway.core.config import settings
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
 from fogar_gateway.core.logging import fingerprint_key
-from fogar_gateway.core.network import resolve_client_ip
+from fogar_gateway.core.network import client_ip_for_log
 from fogar_gateway.core.transport import drop_slow_client
 from fogar_gateway.models.close_codes import Close, CloseFrame, close_sent, send_close
 from fogar_gateway.models.schemas import Client, ClientConfig, Handshake
@@ -167,7 +167,7 @@ async def gateway_websocket(websocket: WebSocket):
         # El admin_token nunca va al log, ni su huella; la client_key solo como huella.
         who = "panel" if handshake.client_key is None else f"fp={fingerprint_key(handshake.client_key)}"
         logger.warning(
-            f"request_id={request_id} source_ip={resolve_client_ip(websocket)} "
+            f"request_id={request_id} source_ip={client_ip_for_log(websocket)} "
             f"{who} Handshake rechazado: credencial inválida o cliente inactivo."
         )
         gateway_stats.handshake_rejected("invalid_key")

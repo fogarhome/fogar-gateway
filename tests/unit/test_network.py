@@ -5,6 +5,7 @@ from starlette.websockets import WebSocket
 from fogar_gateway.core.config import settings
 from fogar_gateway.core.network import (
     NO_REAL_IP,
+    client_ip_for_log,
     is_trusted_origin,
     is_trusted_proxy,
     resolve_client_ip,
@@ -104,6 +105,27 @@ def test_tunnel_on_trusted_network_host_is_not_trusted(monkeypatch, tunnel):
         headers={"x-real-ip": "192.168.1.10", "x-forwarded-for": "203.0.113.9, 192.168.1.10", **tunnel},
     )
     assert not is_trusted_origin(resolve_client_ip(proxied))
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"cf-connecting-ip": "203.0.113.9"},
+        {"tailscale-user-login": "a@b", "x-forwarded-for": "192.168.1.5"},
+        {"forwarded": "for=203.0.113.9"},  # RFC 7239
+    ],
+)
+def test_tunnel_or_forwarded_header_alone_on_trusted_network_is_not_trusted(monkeypatch, headers):
+    # Sin XFF (o con XFF igual al peer): la cabecera de túnel o Forwarded basta para negar.
+    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "192.168.1.0/24")
+    assert not is_trusted_origin(resolve_client_ip(_FakeRequest("192.168.1.5", headers=headers)))
+
+
+def test_client_ip_for_log_keeps_the_peer_on_sentinel():
+    # Una cabecera no borra del log la IP del atacante.
+    request = _FakeRequest("203.0.113.5", headers={"cf-connecting-ip": "1.2.3.4"})
+    assert client_ip_for_log(request) == f"{NO_REAL_IP}(peer=203.0.113.5)"
+    assert client_ip_for_log(_FakeRequest("203.0.113.5")) == "203.0.113.5"
 
 
 def test_direct_trusted_network_peer_without_proxy_headers_is_trusted(monkeypatch):

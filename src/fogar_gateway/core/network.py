@@ -76,9 +76,10 @@ def warn_if_open_proxy_config() -> None:
         )
 
 
-# Headers that only a tunnel sets (tailscale serve, cloudflared): a request carrying them
-# never earns the trusted-origin exemption, whatever its address (auditoría 3.0, D-1, D-r2-1).
-_TUNNEL_HEADERS = ("tailscale-user-login", "tailscale-user-name", "cf-connecting-ip")
+# Headers that only a tunnel or proxy sets (tailscale serve, cloudflared, RFC 7239 `Forwarded`):
+# a request carrying them never earns the trusted-origin exemption, whatever its address
+# (auditoría 3.0, D-1, D-r2-1).
+_TUNNEL_HEADERS = ("tailscale-user-login", "tailscale-user-name", "cf-connecting-ip", "forwarded")
 
 
 def resolve_client_ip(connection: HTTPConnection) -> str:
@@ -96,9 +97,8 @@ def resolve_client_ip(connection: HTTPConnection) -> str:
     D-1: a proxy that passes the client's X-Real-IP through (tailscale serve,
     cloudflared) still sets X-Forwarded-For with the real address last, while
     nginx overwriting X-Real-IP with `proxy_add_x_forwarded_for` agrees with it.
-    So when X-Forwarded-For is present its last hop must equal X-Real-IP, and no
-    result is trusted next to a tunnel header (Tailscale-User-*, Cf-Connecting-Ip)
-    or any X-Forwarded-For hop other than itself (a tunnel without identity headers,
+    So no result is trusted next to a tunnel header (Tailscale-User-*,
+    Cf-Connecting-Ip, Forwarded) or any X-Forwarded-For hop other than itself (a tunnel without identity headers,
     tailscale serve in front of nginx, a tunnel on another TRUSTED_NETWORKS host).
     X-Real-IP must arrive exactly once (D-r2-2).
     """
@@ -112,9 +112,6 @@ def resolve_client_ip(connection: HTTPConnection) -> str:
         try:
             ipaddress.ip_address(real_ip)
         except ValueError:
-            return NO_REAL_IP
-        xff = ",".join(connection.headers.getlist("x-forwarded-for"))
-        if xff and xff.rsplit(",", 1)[-1].strip() != real_ip:
             return NO_REAL_IP
         ip = real_ip
     else:
@@ -132,4 +129,12 @@ def resolve_client_ip(connection: HTTPConnection) -> str:
     foreign_hop = any(h and h != ip for h in hops)
     if foreign_hop or any(h in connection.headers for h in _TUNNEL_HEADERS):
         return NO_REAL_IP
+    return ip
+
+
+def client_ip_for_log(connection: HTTPConnection) -> str:
+    """resolve_client_ip() for logs: a sentinel also names the TCP peer, so a header can't erase it."""
+    ip = resolve_client_ip(connection)
+    if ip == NO_REAL_IP:
+        return f"{ip}(peer={connection.client.host if connection.client else ''})"
     return ip

@@ -268,6 +268,15 @@ def test_pair_logs_never_contain_code_or_key(http, caplog):
     assert _wrong(item["code"]) not in text
 
 
+def test_pair_invalid_code_log_keeps_peer_behind_tunnel_header(make_client, caplog):
+    """Revisión D-r2-1: una cabecera de túnel no borra la IP del peer del WARNING de /pair."""
+    http = make_client(("203.0.113.5", 54321))
+    item = _open(http)
+    caplog.set_level(logging.WARNING)
+    http.post("/pair", json={"code": _wrong(item["code"])}, headers={"cf-connecting-ip": "1.2.3.4"})
+    assert any("peer=203.0.113.5" in r.getMessage() for r in caplog.records)
+
+
 def test_pair_oversized_body_is_413_and_not_counted(http):
     """Auditoría 3.0, D-3: el tope corta antes de la ruta; no quema los códigos abiertos."""
     item = _open(http)
