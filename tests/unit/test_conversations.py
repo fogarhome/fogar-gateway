@@ -159,6 +159,24 @@ async def test_load_fills_the_index(service, engine):
     assert fresh.index.get(conv.session_key) == conv
 
 
+async def test_rows_saved_with_an_uppercase_agent_are_read_in_lowercase(service, engine, clock):
+    """Auditoría 3.0 ronda 2, B-r2-1/C-r2-1: filas de antes de C-1 con el agente en mayúsculas.
+    OpenClaw guarda la clave en minúsculas: el gateway las lee así y no duplica la del día."""
+    record = ConversationRecord(client_id="tv", agent="Main", kind="default", day=conversation_day(), session_key="")
+    record.session_key = f"agent:Main:fogar-{record.id}"
+    with Session(engine, expire_on_commit=False) as s:
+        s.add(record)
+        s.commit()
+    lower_key = f"agent:main:fogar-{record.id}"
+
+    conv = await service.default_for("tv", "main")
+    assert (conv.id, conv.agent, conv.session_key) == (record.id, "main", lower_key)
+    assert (await service.get(record.id)).session_key == lower_key
+    fresh = ConversationService(engine)
+    await fresh.load()
+    assert fresh.index.get(lower_key).id == record.id
+
+
 async def test_deleting_a_client_cascades_to_its_conversations(service, engine):
     """PRAGMA foreign_keys=ON en cada conexión (db/database.py): ON DELETE CASCADE vale."""
     conv = await service.create("web", "main")

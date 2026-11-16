@@ -65,6 +65,23 @@ def test_list_has_titles_from_openclaw(client, admin_headers, conversations, moc
     ).json() == []
 
 
+def test_list_finds_the_title_of_a_row_saved_with_an_uppercase_agent(
+    client, admin_headers, conversations, mock_orchestrator, db_engine
+):
+    """Auditoría 3.0 ronda 2, B-r2-1: fila de antes de C-1 (agente "Main"); OpenClaw lista la
+    clave en minúsculas."""
+    record = ConversationRecord(client_id=CLIENT_ID, agent="Main", kind="created", session_key="", turn_count=1)
+    record.session_key = f"agent:Main:fogar-{record.id}"
+    with Session(db_engine, expire_on_commit=False) as s:
+        s.add(record)
+        s.commit()
+    mock_orchestrator.request = AsyncMock(wraps=_sessions(
+        {"key": record.session_key.lower(), "derivedTitle": "La cena"}
+    ))
+    (row,) = client.get("/admin/conversations", headers=admin_headers).json()
+    assert (row["agent"], row["title"]) == ("main", "La cena")
+
+
 def test_list_never_fails_when_openclaw_is_down(client, admin_headers, conversations, mock_orchestrator):
     import asyncio
 

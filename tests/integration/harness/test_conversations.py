@@ -14,7 +14,7 @@ import websockets
 from sqlmodel import Session
 
 from fogar_gateway.core.config import settings
-from fogar_gateway.db.models import ClientRecord
+from fogar_gateway.db.models import ClientRecord, ConversationRecord
 from fogar_gateway.services import conversations as conv_mod
 from fogar_gateway.services.conversations import ConversationService, session_key_for
 from tests.integration.conftest import ADMIN_TOKEN, CLIENT_ID
@@ -283,6 +283,22 @@ async def test_an_uppercase_agent_talks_in_openclaws_lowercase_key(harness, db_e
     chosen = client.ready["conversation"]["id"]
     again = await harness.connect(handshake={"conversation": chosen, "agent": "Main"})
     assert again.ready["conversation"]["id"] == chosen
+
+
+async def test_a_conversation_saved_with_an_uppercase_agent_still_talks(harness, db_engine):
+    """Auditoría 3.0 ronda 2, B-r2-1: una fila de antes de C-1 (agente "Main") se reabre por id
+    con la clave en minúsculas, la que usa OpenClaw en sus eventos."""
+    record = ConversationRecord(client_id=CLIENT_ID, agent="Main", kind="created", session_key="")
+    record.session_key = f"agent:Main:fogar-{record.id}"
+    with Session(db_engine, expire_on_commit=False) as s:
+        s.add(record)
+        s.commit()
+
+    client = await harness.connect(handshake={"conversation": record.id})
+    assert client.ready["conversation"]["agent"] == "main"
+    msgs = await run_turn(client, "hola")
+    assert [t["text"] for t in of_type(msgs, "token")] == ["reply-hola"]
+    assert said(harness, session_key_for("main", record.id)) == ["hola"]
 
 
 async def test_an_agent_id_openclaw_would_not_accept_is_an_invalid_handshake(harness, db_engine):

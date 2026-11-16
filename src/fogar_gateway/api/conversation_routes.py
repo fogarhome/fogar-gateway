@@ -62,7 +62,7 @@ def _response(row: ConversationRow, title: str | None = None) -> ConversationRes
         id=r.id,
         client_id=r.client_id,
         client_name=row.client_name,
-        agent=r.agent,
+        agent=r.agent.lower(),
         kind=r.kind,
         day=r.day,
         created_at=_utc(r.created_at),
@@ -79,7 +79,7 @@ async def list_conversations(
     rows = await request.app.state.conversations.list_rows(client_id)
     cache = request.app.state.conversation_titles
     titles = await cache.get(request.app.state.openclaw) if rows else {}
-    return [_response(row, titles.get(row.record.session_key)) for row in rows]
+    return [_response(row, titles.get(row.record.session_key.lower())) for row in rows]
 
 
 @router.get("/agents", response_model=ConversationAgents)

@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal, Protocol
 
-from sqlalchemy import or_, update
+from sqlalchemy import func, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
@@ -74,7 +74,8 @@ class Conversation:
 
     @classmethod
     def from_record(cls, r: ConversationRecord) -> "Conversation":
-        return cls(r.id, r.client_id, r.agent, r.session_key, r.kind, r.day)  # type: ignore[arg-type]
+        # Filas de antes de C-1 pueden tener el agente en mayúsculas; OpenClaw usa minúsculas.
+        return cls(r.id, r.client_id, r.agent.lower(), r.session_key.lower(), r.kind, r.day)  # type: ignore[arg-type]
 
 
 class ConversationNotFound(Exception):
@@ -174,7 +175,7 @@ class ConversationService:
         return s.exec(
             select(ConversationRecord).where(
                 ConversationRecord.client_id == client_id,
-                ConversationRecord.agent == agent,
+                func.lower(ConversationRecord.agent) == agent.lower(),
                 ConversationRecord.day == day,
                 ConversationRecord.kind == "default",
             )
@@ -279,7 +280,7 @@ class ConversationService:
         tumba la importación de los demás; las suyas, simplemente, no se importan."""
         with Session(self._get_engine()) as s:
             client_ids = set(s.exec(select(ClientRecord.id)).all())
-            known = set(s.exec(select(ConversationRecord.session_key)).all())
+            known = {k.lower() for k in s.exec(select(ConversationRecord.session_key)).all()}
         by_client: dict[str, list[ConversationRecord]] = {}
         for row in rows:
             parsed = _legacy_key(row.get("key"), client_ids)
