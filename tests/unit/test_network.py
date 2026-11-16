@@ -7,11 +7,13 @@ from starlette.websockets import WebSocket
 from fogar_gateway.core.config import settings
 from fogar_gateway.core.network import (
     NO_REAL_IP,
+    _parsed,
     client_ip_for_log,
     is_trusted_origin,
     is_trusted_proxy,
     resolve_client_ip,
     warn_if_open_proxy_config,
+    wide_entries,
 )
 
 
@@ -270,3 +272,39 @@ def test_valid_lists_with_spaces_ipv6_and_host_bits_still_work(monkeypatch):
     monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "10.0.0.0/8, 192.168.1.5/24")
     assert resolve_client_ip(_FakeRequest("::1", headers={"x-real-ip": "192.168.1.7"})) == "192.168.1.7"
     assert is_trusted_origin("192.168.1.7") and is_trusted_origin("10.1.2.3")
+
+
+def test_invalid_proxies_and_networks_both_warn_and_skip_the_empty_proxies_warning(monkeypatch, caplog):
+    monkeypatch.setattr(settings, "TRUSTED_PROXIES", "localhost")
+    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "nope")
+    with caplog.at_level(logging.WARNING):
+        warn_if_open_proxy_config()
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 2
+    assert messages[0].startswith("TRUSTED_PROXIES") and messages[1].startswith("TRUSTED_NETWORKS")
+
+
+@pytest.mark.parametrize(
+    "wide", ["0.0.0.0/1,128.0.0.0/1", "10.0.0.0/7", "::/1,8000::/1", "::ffff:0:0/96", "::/80", "::ffff:0:0/97"]
+)
+def test_wide_networks_still_work_at_runtime_but_warn(monkeypatch, caplog, wide):
+    # No rompe instalaciones al actualizar: solo /0 se rechaza en tiempo de ejecución.
+    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", wide)
+    assert resolve_client_ip(_FakeRequest("127.0.0.1", headers={"x-real-ip": "10.1.2.3"})) == "10.1.2.3"
+    with caplog.at_level(logging.WARNING):
+        warn_if_open_proxy_config()
+    assert "TRUSTED_NETWORKS" in caplog.text and wide.split(",")[0] in caplog.text
+
+
+@pytest.mark.parametrize("ok", ["10.0.0.0/8", "fd00::/16", "::ffff:10.0.0.0/104", "::1"])
+def test_networks_at_the_width_limit_are_not_wide(ok):
+    assert wide_entries(ok) == []
+
+
+def test_parsing_is_cached_per_string(monkeypatch):
+    _parsed.cache_clear()
+    for _ in range(3):
+        resolve_client_ip(_FakeRequest("127.0.0.1", headers={"x-real-ip": "10.1.2.3"}))
+    assert _parsed.cache_info().misses <= 2  # TRUSTED_PROXIES y TRUSTED_NETWORKS, una vez cada una
+    monkeypatch.setattr(settings, "TRUSTED_PROXIES", "localhost")  # la clave es la cadena
+    assert resolve_client_ip(_FakeRequest("127.0.0.1", headers={"x-real-ip": "10.1.2.3"})) == NO_REAL_IP

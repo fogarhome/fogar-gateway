@@ -9,6 +9,7 @@ resolve_client_ip(conn)  -> str   — IP real a evaluar, respetando X-Real-IP
                                     Compartido por HTTP y WebSocket.
 """
 
+import functools
 import ipaddress
 import logging
 
@@ -28,29 +29,79 @@ def _entries(csv: str) -> list[str]:
     return [raw.strip() for raw in csv.split(",") if raw.strip()]
 
 
+_IPV4_MAPPED = ipaddress.IPv6Network("::ffff:0:0/96")
+
+
+def _too_wide(net: _IpNetwork) -> bool:
+    """Wider than /8 (IPv4) or /16 (IPv6), or covering all IPv4-mapped addresses."""
+    if isinstance(net, ipaddress.IPv4Network):
+        return net.prefixlen < 8
+    if net.supernet_of(_IPV4_MAPPED) or (net.subnet_of(_IPV4_MAPPED) and net.prefixlen < 104):
+        return True
+    return net.prefixlen < 16
+
+
 def entry_problem(raw: str, *, strict: bool = False) -> str | None:
-    """Why `raw` is not a usable IP/CIDR entry, or None. The CLI checks with strict=True."""
+    """Why `raw` is not a usable IP/CIDR entry, or None.
+
+    Runtime (strict=False) rejects only what can't be a network or is /0, so an upgrade never
+    breaks an install. The CLI (strict=True) also rejects networks that are too wide; host bits
+    (192.168.1.5/24) are reported apart by host_bits().
+    """
     if "%" in raw:  # zone id: free text, never a network
         return "lleva identificador de zona (%)"
     try:
-        net = ipaddress.ip_network(raw, strict=strict)
+        net = ipaddress.ip_network(raw, strict=False)
     except ValueError:
-        return "no es una IP ni un CIDR" + (" válido (¿bits de host?)" if strict else "")
+        return "no es una IP ni un CIDR"
     if net.prefixlen == 0:
         return "/0 abarca todas las direcciones"
+    if strict and _too_wide(net):
+        return "red demasiado amplia (más que /8 en IPv4 o /16 en IPv6, o todo ::ffff:0:0/96)"
     return None
 
 
+def host_bits(raw: str) -> bool:
+    """A valid entry written with host bits set (192.168.1.5/24 = 192.168.1.0/24)."""
+    if entry_problem(raw):
+        return False
+    try:
+        ipaddress.ip_network(raw)
+    except ValueError:
+        return True
+    return False
+
+
 def invalid_entries(csv: str, *, strict: bool = False) -> list[str]:
-    return [raw for raw in _entries(csv) if entry_problem(raw, strict=strict)]
+    if not strict:
+        return list(_parsed(csv)[1])
+    return [raw for raw in _entries(csv) if entry_problem(raw, strict=True)]
 
 
-def _parse_networks(csv: str) -> list[_IpNetwork]:
+def wide_entries(csv: str) -> list[str]:
+    """Entries the gateway uses but that cover too much (warned at startup)."""
+    return [raw for raw in _entries(csv) if not entry_problem(raw) and entry_problem(raw, strict=True)]
+
+
+@functools.lru_cache(maxsize=16)
+def _parsed(csv: str) -> tuple[tuple[_IpNetwork, ...], tuple[str, ...]]:
+    """(usable networks, invalid entries) of a CSV, parsed once per distinct string."""
+    nets: list[_IpNetwork] = []
+    bad: list[str] = []
+    for raw in _entries(csv):
+        if entry_problem(raw):
+            bad.append(raw)
+        else:
+            nets.append(ipaddress.ip_network(raw, strict=False))
+    return tuple(nets), tuple(bad)
+
+
+def _parse_networks(csv: str) -> tuple[_IpNetwork, ...]:
     # Invalid entries are skipped silently here; warn_if_open_proxy_config() reports them once.
-    return [ipaddress.ip_network(raw, strict=False) for raw in _entries(csv) if not entry_problem(raw)]
+    return _parsed(csv)[0]
 
 
-def _ip_in_networks(ip_str: str, networks: list[_IpNetwork]) -> bool:
+def _ip_in_networks(ip_str: str, networks: tuple[_IpNetwork, ...]) -> bool:
     try:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
@@ -75,7 +126,7 @@ def is_trusted_origin(ip_str: str) -> bool:
 
 
 def _proxies_invalid() -> bool:
-    return bool(invalid_entries(settings.TRUSTED_PROXIES))
+    return bool(_parsed(settings.TRUSTED_PROXIES)[1])
 
 
 def warn_if_open_proxy_config() -> None:
@@ -85,15 +136,23 @@ def warn_if_open_proxy_config() -> None:
     A same-host reverse proxy with no TRUSTED_PROXIES would look like a loopback client for
     everyone behind it (its X-Real-IP is ignored), leaving /v1/* open to the Internet.
     """
-    if bad := invalid_entries(settings.TRUSTED_PROXIES):
+    proxies_bad = invalid_entries(settings.TRUSTED_PROXIES)
+    if proxies_bad:
         logger.warning(
-            f"TRUSTED_PROXIES has invalid entries {bad!r}: no peer is a trusted proxy and no "
-            "origin is exempt from /v1/* auth (fail closed) until it is fixed "
+            f"TRUSTED_PROXIES has invalid entries {proxies_bad!r}: no peer is a trusted proxy and "
+            "no origin is exempt from /v1/* auth (fail closed) until it is fixed "
             "(`fogar-gw config validate`)."
         )
-        return
     if bad := invalid_entries(settings.TRUSTED_NETWORKS):
         logger.warning(f"TRUSTED_NETWORKS: ignoring invalid entries {bad!r}.")
+    for name in ("TRUSTED_PROXIES", "TRUSTED_NETWORKS"):
+        if wide := wide_entries(getattr(settings, name)):
+            logger.warning(
+                f"{name}: {wide!r} cover far more than a LAN or a proxy; "
+                "check them with `fogar-gw config validate`."
+            )
+    if proxies_bad:  # fail closed already: the empty-proxies warning below would mislead
+        return
     if settings.TRUST_LOOPBACK and not _parse_networks(settings.TRUSTED_PROXIES):
         logger.warning(
             "TRUST_LOOPBACK is on and TRUSTED_PROXIES is empty: a reverse proxy on this "

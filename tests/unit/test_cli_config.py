@@ -166,7 +166,11 @@ def test_set_invalid_writes_nothing(home):
 
 @pytest.mark.parametrize("field", ["TRUSTED_PROXIES", "TRUSTED_NETWORKS"])
 @pytest.mark.parametrize(
-    "value", ["127.0.0.1;::1", "localhost", "192.168.1.0/0", "192.168.1.5/24", "::1%eth0", "::/0"]
+    "value",
+    [
+        "127.0.0.1;::1", "localhost", "192.168.1.0/0", "192.168.1.5/24", "::1%eth0", "::/0",
+        "0.0.0.0/1", "128.0.0.0/1", "10.0.0.0/7", "::/1", "8000::/1", "::ffff:0:0/96", "::/80",
+    ],
 )
 def test_set_invalid_network_list_writes_nothing(home, field, value):
     # F-r3-1: no son secretos, así que se dice qué entrada falla.
@@ -178,7 +182,7 @@ def test_set_invalid_network_list_writes_nothing(home, field, value):
 
 
 def test_set_valid_network_list(home):
-    r = run("config", "set", "TRUSTED_NETWORKS", " 192.168.1.0/24 , fd00::/8 ")
+    r = run("config", "set", "TRUSTED_NETWORKS", " 192.168.1.0/24 , fd12:3456::/48 ")
     assert r.exit_code == 0, r.output
 
 
@@ -191,6 +195,22 @@ def test_validate_marks_invalid_network_list(home):
     assert "fallo cerrado" in r.output
 
 
+def test_validate_fails_on_wide_networks(home):
+    (home / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nTRUSTED_NETWORKS=0.0.0.0/1,128.0.0.0/1\n")
+    r = run("--json", "config", "validate")
+    assert r.exit_code == 1
+    checks = [c for c in json.loads(r.output) if c["check"] == "TRUSTED_NETWORKS"]
+    assert [c["level"] for c in checks] == ["fail"]
+    assert "«0.0.0.0/1»" in checks[0]["detail"] and "«128.0.0.0/1»" in checks[0]["detail"]
+
+
+def test_host_bits_hint_only_for_host_bits(home):
+    r = run("config", "set", "TRUSTED_NETWORKS", "192.168.1.5/24,localhost")
+    assert r.exit_code == 1
+    assert "«192.168.1.5/24» (bits de host: 192.168.1.0/24)" in r.output
+    assert "«localhost» (no es una IP ni un CIDR)" in r.output
+
+
 def test_validate_only_warns_on_host_bits(home):
     # El gateway acepta 192.168.1.5/24 (= 192.168.1.0/24): aviso, no fallo; `config set` sí lo rechaza.
     (home / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nTRUSTED_NETWORKS=192.168.1.5/24\n")
@@ -198,6 +218,7 @@ def test_validate_only_warns_on_host_bits(home):
     assert r.exit_code == 0, r.output
     checks = [c for c in json.loads(r.output) if c["check"] == "TRUSTED_NETWORKS"]
     assert [c["level"] for c in checks] == ["warn"] and "192.168.1.5/24" in checks[0]["detail"]
+    assert "válid" not in checks[0]["detail"]
 
 
 def test_set_new_failing_check_aborts(home):

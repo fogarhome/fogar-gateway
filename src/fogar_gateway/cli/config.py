@@ -134,9 +134,12 @@ def validation_checks(settings: Any) -> list[dict[str, str]]:
         csv = getattr(settings, name)
         if bad := _bad_network_entries(csv, strict=False):  # lo que el gateway rechaza
             checks.append(_check("fail", name, f"Entradas no válidas: {bad}. {effect}"))
-        elif loose := _bad_network_entries(csv):
-            checks.append(_check("warn", name, f"Entradas con bits de host: {loose}. El gateway "
-                                 "las usa como su red (p. ej. 192.168.1.5/24 = 192.168.1.0/24)."))
+        if wide := _bad_network_entries(csv, only_wide=True):  # el gateway las usa
+            checks.append(_check("fail", name, f"Redes demasiado amplias: {wide}. El gateway las "
+                                 "usa: acótalas a tu proxy o a tu LAN."))
+        if hosts := _host_bit_entries(csv):
+            checks.append(_check("warn", name, f"{hosts}. El gateway usa la red indicada; "
+                                 "escríbela así."))
     for name in deprecated_settings(settings):
         checks.append(_check("warn", name, "Obsoleto e ignorado; bórralo de la configuración."))
     return checks
@@ -149,12 +152,23 @@ _NETWORK_FIELDS = {
 }
 
 
-def _bad_network_entries(csv: str, *, strict: bool = True) -> str:
-    from fogar_gateway.core.network import entry_problem, invalid_entries
+def _bad_network_entries(csv: str, *, strict: bool = True, only_wide: bool = False) -> str:
+    from fogar_gateway.core.network import entry_problem, invalid_entries, wide_entries
 
+    entries = wide_entries(csv) if only_wide else invalid_entries(csv, strict=strict)
+    return "; ".join(f"«{raw}» ({entry_problem(raw, strict=strict)})" for raw in entries)
+
+
+def _host_bit_entries(csv: str) -> str:
+    import ipaddress
+
+    from fogar_gateway.core.network import host_bits
+
+    entries = (raw.strip() for raw in csv.split(","))
     return "; ".join(
-        f"«{raw}» ({entry_problem(raw, strict=strict)})"
-        for raw in invalid_entries(csv, strict=strict)
+        f"«{raw}» (bits de host: {ipaddress.ip_network(raw, strict=False)})"
+        for raw in entries
+        if host_bits(raw)
     )
 
 
@@ -304,9 +318,10 @@ def _apply(out: Out, key: str, value: str | None) -> bool:
     path = paths.config_file()
     if not path.is_file():
         raise api.ApiError(f"No hay {path}. Prepara la instalación con `fogar-gw init`.", 1)
-    if key in _NETWORK_FIELDS and value is not None and (bad := _bad_network_entries(value)):
-        raise api.ApiError(f"{key}: entradas no válidas: {bad}. Usa IPs o CIDRs separadas por "
-                           "comas. No se ha escrito nada.", 1)
+    if key in _NETWORK_FIELDS and value is not None:
+        if bad := "; ".join(filter(None, (_bad_network_entries(value), _host_bit_entries(value)))):
+            raise api.ApiError(f"{key}: entradas no válidas: {bad}. Usa IPs o CIDRs separadas "
+                               "por comas. No se ha escrito nada.", 1)
     old = path.read_text()
     new = _edit(old, key, value)
     if new == old:
