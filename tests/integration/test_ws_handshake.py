@@ -22,6 +22,7 @@ from fogar_gateway.core.logging import fingerprint_key
 from fogar_gateway.core.request_id import RequestIdMiddleware
 from fogar_gateway.main import app
 from fogar_gateway.services.outbound import ClientGone, QueuedSender
+from fogar_gateway.services.stats import gateway_stats
 from tests.integration.conftest import CLIENT_ID, VALID_KEY
 
 
@@ -37,6 +38,16 @@ def test_malformed_json_closes_ws(client):
         ws.send_text("not-json{{")
         ws.receive_text()  # debe lanzar excepción al recibir close frame
     assert (exc.value.code, exc.value.reason) == (4000, "invalid handshake")
+
+
+@pytest.mark.parametrize("payload", ["[]", '"x"', "1", "null"])
+def test_valid_json_that_is_not_an_object_closes_4000(client, payload):
+    """D-r4-1: JSON válido que no es objeto → 4000 y cuenta como invalid, no TypeError/1006."""
+    with pytest.raises(WebSocketDisconnect) as exc, client.websocket_connect("/ws/stream") as ws:
+        ws.send_text(payload)
+        ws.receive_text()
+    assert (exc.value.code, exc.value.reason) == (4000, "invalid handshake")
+    assert gateway_stats.snapshot()["handshake_rejected"] == {"invalid": 1}
 
 
 def test_handshake_timeout_closes_ws(client, monkeypatch):
