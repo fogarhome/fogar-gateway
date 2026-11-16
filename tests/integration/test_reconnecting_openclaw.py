@@ -73,7 +73,9 @@ async def test_stream_response_when_not_connected_yields_error():
 @pytest.mark.asyncio
 async def test_disconnect_triggers_reconnect():
     inner = make_mock_client(GATEWAY_INFO)
-    roc = ReconnectingOpenClawClient(inner, "test")
+    # The drop comes right after connecting, so the flap guard (E-r2-1) waits initial_backoff
+    # first: keep it short for the retry to land inside the 50 ms window.
+    roc = ReconnectingOpenClawClient(inner, "test", initial_backoff=0.01)
     await roc.connect()
     inner.on_disconnect()  # simulate disconnect via the callback we assigned
     await asyncio.sleep(0.05)
