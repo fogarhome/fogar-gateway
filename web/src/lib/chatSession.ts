@@ -130,8 +130,8 @@ export function createChatSession(options: ChatSessionOptions) {
 
   /** Manda un mensaje. Con la conversación dormida, la reabre y lo manda al entrar. */
   function send(text: string): boolean {
-    // Como str.strip() del gateway, que también quita \x1c-\x1f y \x85: lo que allí queda
-    // vacío no se manda (no tendría turn_start y descolocaría la cola de mensajes). Antes, los
+    // Aproxima el str.strip() del gateway (que también quita \x1c-\x1f y \x85; el \s de JS
+    // quita además U+FEFF, que el gateway conserva): lo que allí queda vacío no se manda (no tendría turn_start y descolocaría la cola de mensajes). Antes, los
     // surrogates sueltos, que el gateway también quita (G-r4-1).
     const clean = text.replace(/\p{Cs}/gu, '').replace(/^[\s\x1c-\x1f\x85]+|[\s\x1c-\x1f\x85]+$/g, '')
     if (!clean) return false
