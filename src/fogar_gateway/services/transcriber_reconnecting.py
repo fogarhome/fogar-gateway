@@ -145,6 +145,7 @@ class ReconnectingTranscriberClient:
                     await self._client.connect(
                         language=self._language, token=self._token, vad_thold=self._vad_thold
                     )
+                    self._health.mark_connected()  # mide la vida de esta conexión (E-r2-1)
                     continue
                 except asyncio.CancelledError:
                     raise

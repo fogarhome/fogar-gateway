@@ -173,11 +173,14 @@ async def test_close_after_end_reopens_quietly_each_utterance():
         seen = []
         w.on_state_change = seen.append
         run = asyncio.create_task(w.run())
+        first_connect = w._health.connected_mono
         for i in range(3):
             await _until(lambda n=i + 1: w._client._is_ready and conns == n)
             await w.send_end()
         await _until(lambda: conns == 4 and w._client._is_ready)
         assert seen == []
+        # E-r2-1: each reopen restarts the clock that tells a flap from a lasting connection.
+        await _until(lambda: w._health.connected_mono > first_connect)
         assert w._callbacks.on_transcription.await_count == 3
         await w.close()
         run.cancel()
