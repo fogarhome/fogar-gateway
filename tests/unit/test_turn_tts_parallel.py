@@ -87,6 +87,7 @@ async def test_orchestrator_failing_at_once_leaves_no_unawaited_connect(make_bri
         raise ValueError("x")
 
     bridge.orchestrator.stream_response = boom
+    gc.collect()  # lo que dejaron sin esperar otros tests (mocks de TTS) no cuenta aquí
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         task = await start_turn(bridge)
