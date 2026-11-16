@@ -311,6 +311,54 @@ class TurnTts:
         td.raise_if_cancelled()
 
 
+class _PendingTts:
+    """El TTS de un turno del usuario mientras conecta (auditoría 3.0, E-2): el texto que llega
+    antes de conectar se guarda y se le da en orden en cuanto conecta."""
+
+    def __init__(
+        self, connect: "Callable[[], Coroutine[Any, Any, TurnTts | None]]", voice: str, client_id: str
+    ):
+        self._voice = voice
+        self._client_id = client_id
+        self._buffer: list[str] = []
+        self._lock = asyncio.Lock()  # el vaciado del buffer y los tokens nuevos, en orden
+        self._ready = False
+        self.tts: TurnTts | None = None
+        self._task = asyncio.create_task(self._open(connect), name="tts_connect")
+
+    async def _open(self, connect: "Callable[[], Coroutine[Any, Any, TurnTts | None]]") -> None:
+        # La corrutina se crea aquí: una tarea cancelada antes de empezar no deja una sin esperar.
+        self.tts = await connect()  # sin await hasta aquí: release() lo ve aunque cancelen
+        async with self._lock:
+            self._ready = True
+            if self.tts is not None:
+                await self.tts.start(self._voice)
+                for text in self._buffer:
+                    await self.tts.feed(text)
+            self._buffer.clear()
+
+    async def feed(self, text: str) -> None:
+        async with self._lock:
+            if not self._ready:
+                self._buffer.append(text)
+            elif self.tts is not None:
+                await self.tts.feed(text)
+
+    async def connected(self) -> "TurnTts | None":
+        """Espera a la conexión (acotada por el proveedor) y a que reciba el texto pendiente."""
+        await asyncio.wait({self._task})
+        self._task.result()  # un fallo inesperado sigue rompiendo el turno, como antes
+        return self.tts
+
+    async def release(self) -> None:
+        """Cancela la conexión si sigue en marcha y libera el TTS que haya abierto (#221)."""
+        td = Teardown(f"[{self._client_id}] TTS del turno")
+        await td.cancel(self._task, "conexión del TTS", settings.PUSH_TTS_DRAIN_TIMEOUT_S)
+        if self.tts is not None:
+            await td.step(self.tts.release(), "TTS del turno")
+        td.raise_if_cancelled()
+
+
 @dataclass
 class _PushBacklog:
     """Eventos de push encolados y aún sin procesar (#130 S3a)."""
@@ -561,25 +609,31 @@ class TurnController:
             await self._end(turn, reason)
 
     async def _converse(self, turn: Turn, text: str) -> EndReason:
-        """El texto va al orquestador; sus tokens y eventos, al cliente y al TTS del turno."""
-        tts = await self._connect_tts(turn) if self._wants_audio else None
-        # Sin await entre el connect y el try: una cancelación no deja el stream huérfano.
+        """El texto va al orquestador; sus tokens y eventos, al cliente y al TTS del turno.
+
+        El TTS se conecta a la vez (auditoría 3.0, E-2): un fogar-speaker colgado no retrasa el
+        texto; solo el `turn_end`, que espera a la voz como antes."""
+        if not self._wants_audio:
+            return await self._stream(turn, text, None)
+        pending = _PendingTts(lambda: self._connect_tts(turn), self._config.tts_voice or "", self._client_id)
+        # Sin await entre crearlo y el try: una cancelación no deja el stream huérfano.
         try:
-            if tts is not None:
-                await tts.start(self._config.tts_voice or "")
             try:
-                reason = await self._stream(turn, text, tts)
-            finally:
-                if tts is not None:
-                    await tts.end()  # en todo camino: el servidor TTS sabe que no hay más
-            if tts is not None and not self.client_gone:  # G-18: nadie a quien sonárselo
-                await tts.drain()
+                reason = await self._stream(turn, text, pending)
+            except BaseException:
+                if pending.tts is not None:
+                    await pending.tts.end()  # el servidor TTS sabe que no hay más
+                raise
+            tts = pending.tts if self.client_gone else await pending.connected()
+            if tts is not None:
+                await tts.end()
+                if not self.client_gone:  # G-18: nadie a quien sonárselo
+                    await tts.drain()
             return reason
         finally:
-            if tts is not None:
-                await tts.release()
+            await pending.release()
 
-    async def _stream(self, turn: Turn, text: str, tts: "TurnTts | None") -> EndReason:
+    async def _stream(self, turn: Turn, text: str, tts: "_PendingTts | None") -> EndReason:
         async def on_token(token_text: str) -> None:
             # G-18: un cliente ido aborta el turno (al deshacer aclosing() el stream manda
             # chat.abort) en vez de seguir hasta que close_all() lo cancele.

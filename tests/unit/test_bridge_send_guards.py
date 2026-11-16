@@ -1,5 +1,6 @@
 """Tests for send guards in _call_orchestrator closures."""
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -174,6 +175,7 @@ async def test_tts_end_called_when_orchestrator_raises_non_runtime_error(make_br
     b, _ = make_bridge(input_mode="audio", output_mode=("audio", "text"), tts=tts_wrapper)
 
     async def _crashing_stream(*args, **kwargs):
+        await asyncio.sleep(0.01)  # E-2: el TTS conecta a la vez; aquí ya está conectado
         raise OSError("connection reset by peer")
         yield
 
