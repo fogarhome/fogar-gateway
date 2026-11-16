@@ -79,6 +79,13 @@ def missing_tail(emitted: str, final_text: str) -> str:
     return final_text
 
 
+def _paired(text: str) -> str:
+    """Junta las mitades de surrogate que forman pareja y quita las sueltas (B-r4-1): un emoji
+    partido entre dos deltas solo se completa al llegar su segunda mitad; mientras, un surrogate
+    alto al final no se emite (sigue en `current`, pendiente de su pareja)."""
+    return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "ignore")
+
+
 class ChatTextTracker:
     """Aplica la semantica oficial de OpenClaw 2026.10.5 a los eventos `chat` (#243).
 
@@ -106,13 +113,16 @@ class ChatTextTracker:
         self.all_out = ""
 
     def _emit_missing(self) -> str:
-        if not self.current:
+        # `current` guarda el texto tal cual llega (con surrogates sueltos, B-r4-1); se
+        # compara y se emite ya limpio.
+        current = _paired(self.current)
+        if not current:
             return ""
-        hit = _tail(self.emitted, self.current) or _tail(self.all_out, self.current)
+        hit = _tail(self.emitted, current) or _tail(self.all_out, current)
         if hit is None:
             if self.all_out.strip():
                 logger.warning(_DIVERGED_MSG)
-            out = self.current
+            out = current
         elif hit[0] == "retract":
             # Lo enviado no se puede retirar: se conserva `emitted` para no duplicar
             # si el texto vuelve a crecer.
@@ -120,7 +130,7 @@ class ChatTextTracker:
             return ""
         else:
             out = hit[1]
-        self.emitted = self.current
+        self.emitted = current
         self.all_out += out
         return out
 

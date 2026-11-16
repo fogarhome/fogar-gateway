@@ -47,6 +47,7 @@ from fogar_gateway.services.reconnection import (
     traceback_no_message,
 )
 from fogar_gateway.services.session_registry import SessionRegistry
+from fogar_gateway.services.speech.elevenlabs.common import pin_websockets_logging
 from fogar_gateway.services.speech.factory import build_stt_provider, build_tts_provider
 from fogar_gateway.services.speech.registry import SpeechProviders
 from fogar_gateway.services.teardown import Teardown
@@ -90,6 +91,9 @@ async def _lifespan_body(app: FastAPI):
     warn_if_open_proxy_config()
     warn_insecure_tokens(settings)
     warn_deprecated_settings(settings)
+    # B-r4-2: `websockets` a DEBUG volcaría las tramas de OpenClaw (el connect lleva el token),
+    # no solo las de ElevenLabs.
+    pin_websockets_logging()
     # Fatal en arranque: un proveedor de pago mal configurado no debe esperar al primer uso.
     check_speech_settings(
         settings, stt_provider=settings.STT_PROVIDER, tts_provider=settings.TTS_PROVIDER

@@ -51,6 +51,33 @@ async def test_lone_surrogate_from_openclaw_is_dropped(harness):
     assert_turns_paired(client.messages)
 
 
+async def test_push_with_emoji_split_between_deltas_is_delivered_once(harness):
+    """B-r4-1: las mitades de un emoji en dos deltas solo-deltaText se juntan; el final con el
+    texto entero no se reemite."""
+    client = await harness.connect()
+    oc, sk = harness.openclaw, harness.session_key()
+    run_id = oc._new_run()
+
+    def chat(**payload):
+        return json.dumps(
+            {"type": "event", "event": "chat", "payload": {"sessionKey": sk, "runId": run_id, **payload}}
+        )
+
+    msg = {"role": "assistant", "content": [{"type": "text", "text": "Hola "}]}
+    final = {"role": "assistant", "content": [{"type": "text", "text": "Hola amigo \U0001f600 qué tal"}]}
+    (ws,) = oc._conns
+    await ws.send(oc._agent(sk, "start", run_id))
+    await ws.send(chat(state="delta", deltaText="Hola ", message=msg))
+    await ws.send(chat(state="delta", deltaText="amigo \ud83d"))
+    await ws.send(chat(state="delta", deltaText="\ude00 qué tal"))
+    await ws.send(chat(state="final", message=final))
+    await ws.send(oc._agent(sk, "end", run_id))
+    msgs = await client.collect(turn_ended)
+    (start,) = of_type(msgs, "turn_start")
+    assert tokens(msgs, start["turn_id"]) == "Hola amigo \U0001f600 qué tal"
+    assert_turns_paired(msgs)
+
+
 async def test_v1_chat_with_lone_surrogate(harness):
     body = '{"model": "fogar-gateway", "messages": [{"role": "user", "content": "\\ud800"}]%s}'
     async with httpx.AsyncClient(

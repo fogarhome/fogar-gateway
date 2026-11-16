@@ -234,11 +234,20 @@ def _safe_error_code(error: object) -> str:
 def _loads_frame(raw: str | bytes):
     """json.loads de una trama de OpenClaw sin surrogates sueltos (G-r3-1): romperían después
     todo encode a UTF-8 (la salida al cliente, /admin, /v1). Solo re-codifica si la trama trae
-    un escape de surrogate."""
+    un escape de surrogate. El texto de un evento `chat` (`deltaText`, `message`) queda intacto:
+    un emoji puede llegar partido entre dos deltas y lo junta y limpia ChatTextTracker (B-r4-1)."""
+    if isinstance(raw, bytes):
+        # C-r4-1: bytes UTF-8 de un surrogate crudo no llevan el escape "\ud" del filtro.
+        raw = raw.decode("utf-8", "replace")
     frame = json.loads(raw)
-    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
-    if "\\ud" in text or "\\uD" in text:
-        frame = without_lone_surrogates(frame)
+    if "\\ud" not in raw and "\\uD" not in raw:
+        return frame
+    payload = frame.get("payload") if isinstance(frame, dict) else None
+    if not isinstance(payload, dict) or frame.get("event") != "chat":
+        return without_lone_surrogates(frame)
+    text = {k: payload.pop(k) for k in ("deltaText", "message") if k in payload}
+    frame = without_lone_surrogates(frame)
+    frame["payload"].update(text)
     return frame
 
 

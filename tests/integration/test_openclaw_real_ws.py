@@ -284,7 +284,7 @@ async def test_fail_ends_turn_with_stable_orchestrator_error(server):
 
 async def test_agent_error_after_ack_ends_turn_with_stable_error(server, caplog):
     # #300: el chat state:error termina el turno ya, sin esperar a turn_timeout.
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="fogar_gateway")  # B-r4-2: no el de websockets
     client, turns = make_client(server.port)
     await client.connect()
     try:
@@ -376,6 +376,11 @@ class Scripted2026_10_5(FakeOpenClawServer):
             await ws.send(_delta(sk, "1, 2, 3,", 6))
             await ws.send(_delta(sk, "", 9, replace=True))
             await ws.send(_final(sk, "1, 2, 3, 4, 5"))
+        elif scenario == "split_emoji":  # B-r4-1: solo el 1.er delta trae `message`
+            await ws.send(_delta(sk, "Hola ", 1))
+            await ws.send(_ev(sk, state="delta", seq=2, deltaText="amigo \ud83d"))
+            await ws.send(_ev(sk, state="delta", seq=3, deltaText="\ude00 qué tal"))
+            await ws.send(_final(sk, "Hola amigo \U0001f600 qué tal"))
         elif scenario == "multi_message":
             await ws.send(_delta(sk, "Voy a buscar. ", 1))
             await ws.send(_final(sk, f"Resultado: {TEXT}"))
@@ -404,6 +409,12 @@ async def test_captured_sequence_delivers_full_text_then_done(scripted_server):
     events = await _turn(scripted_server, "captured")
     assert _toks(events) == ["1, 2, 3,", " 4, 5"]
     assert events[-1].type == "status" and events[-1].content == "done"
+    assert errors(events) == []
+
+
+async def test_emoji_split_between_deltas_is_delivered_once(scripted_server):
+    events = await _turn(scripted_server, "split_emoji")
+    assert "".join(_toks(events)) == "Hola amigo \U0001f600 qué tal"
     assert errors(events) == []
 
 
