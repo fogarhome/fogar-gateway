@@ -51,7 +51,7 @@ async def test_fogar_session_run_passes_callbacks():
     session._client.listen_loop = AsyncMock()
     await session.run()
     session._client.listen_loop.assert_awaited_once_with(
-        session._on_transcription, cb.on_warning, cb.on_status, cb.on_incomplete
+        session._on_transcription, cb.on_warning, cb.on_status, session._on_incomplete
     )  # transcriptions go through the wrapper (it may withhold a cut final, E-r3-1)
 
 

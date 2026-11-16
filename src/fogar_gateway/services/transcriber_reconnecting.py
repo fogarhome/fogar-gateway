@@ -57,7 +57,7 @@ class ReconnectingTranscriberClient:
         self._vad_thold = params.vad_threshold
         # E-r3-1 review: a drop mid-phrase loses its head; its tail must not pass as an order.
         self._phrase_open = False  # audio sent since the last final
-        self._drop_next_final = False
+        self._lost = False  # this phrase lost audio: its final (and partials) are withheld
 
     @property
     def last_transcript_at(self) -> float | None:
@@ -90,28 +90,35 @@ class ReconnectingTranscriberClient:
     async def send_audio(self, audio_bytes: bytes) -> None:
         self._phrase_open = True
         await self._client.send_audio(audio_bytes)
+        if not self._client._is_ready:  # the inner client dropped this frame
+            self._lost = True
 
     async def send_end(self) -> None:
-        if self._drop_next_final and not self._client._is_ready:
-            await self._phrase_lost()  # this end is discarded: the truncated phrase is over
         await self._client.send_end()
+        if self._phrase_open and not self._client._is_ready:
+            await self._phrase_lost()  # this end was dropped: no final will ever come
 
     async def _phrase_lost(self) -> None:
         """The phrase in flight when the connection dropped is gone: tell the client to
         repeat it (a fixed code, never the text) instead of passing on a truncated final."""
-        self._phrase_open = self._drop_next_final = False
+        self._phrase_open = self._lost = False
         logger.warning("[%s] transcriber: phrase cut by a reconnect, final withheld",
                        self._client_id)
         await self._callbacks.on_incomplete(PHRASE_INTERRUPTED)
         await self._callbacks.on_warning(PHRASE_INTERRUPTED, None)
 
     async def _on_transcription(self, text: str, is_final: bool) -> None:
-        if is_final:
-            if self._drop_next_final:
+        if self._lost:
+            if is_final:
                 await self._phrase_lost()
-                return
+            return  # partials of a cut phrase could trigger a barge-in
+        if is_final:
             self._phrase_open = False
         await self._callbacks.on_transcription(text, is_final)
+
+    async def _on_incomplete(self, reason: str | None) -> None:
+        if not self._lost:  # a withheld final reports phrase_interrupted instead: one per phrase
+            await self._callbacks.on_incomplete(reason)
 
     async def close(self) -> None:
         self._closed = True
@@ -140,7 +147,7 @@ class ReconnectingTranscriberClient:
             try:
                 cb = self._callbacks
                 await self._client.listen_loop(
-                    self._on_transcription, cb.on_warning, cb.on_status, cb.on_incomplete
+                    self._on_transcription, cb.on_warning, cb.on_status, self._on_incomplete
                 )
             except asyncio.CancelledError:
                 raise
@@ -165,9 +172,9 @@ class ReconnectingTranscriberClient:
                 # close, 1000/1001 included, sets _dropped_unexpectedly.
                 return
             if self._client.closed_after_end:
-                if self._drop_next_final:  # the truncated phrase ended with no final
-                    await self._phrase_lost()
-                self._phrase_open = False
+                # Fin de frase: la cierra. Sin aviso: audio de cola tras el `end` que ya vio el
+                # socket cerrado también marca _lost, y esa frase sí se entregó.
+                self._phrase_open = self._lost = False
                 # Fin de frase (1000 tras nuestro `end`): se reabre sin avisar al cliente; si no
                 # se puede, sí es una caída y sigue el camino normal con su backoff.
                 try:
@@ -188,7 +195,7 @@ class ReconnectingTranscriberClient:
                 if self._client._end_sent:  # cut after our end, before the final: all lost
                     await self._phrase_lost()
                 else:  # the rest of the phrase goes to the new connection, without its head
-                    self._drop_next_final = True
+                    self._lost = True
             self._set_state(ConnectionState.RECONNECTING)
 
     async def _reconnect_loop(self) -> bool:

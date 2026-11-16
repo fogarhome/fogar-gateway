@@ -208,8 +208,10 @@ async def _until(cond, timeout=3.0):
 
 
 def _fogar_handler(script):
-    """fogar-transcriber: `ready`, audio, and on `end` the final + close 1000. `script(n)`
-    says how connection n misbehaves: "cut_on_audio", "cut_on_end" or None (normal)."""
+    """fogar-transcriber: `ready`, a partial on the first audio, and on `end` the final + close
+    1000. `script(n)` says how connection n behaves: "cut_on_audio", "cut_on_end",
+    "cut_idle" (closes 1011 right after `ready`), "slow_ready" (`ready` after 0.3 s),
+    "incomplete" (final with complete=false) or None (normal)."""
     state = {"conns": 0, "audio": {}, "connected_at": [], "cut_at": []}
 
     async def handler(ws):
@@ -218,7 +220,13 @@ def _fogar_handler(script):
         state["connected_at"].append(time.monotonic())
         state["audio"][n] = 0
         await ws.recv()  # config handshake
+        if script(n) == "slow_ready":
+            await asyncio.sleep(0.3)
         await ws.send(json.dumps({"type": "ready", "session_id": f"s{n}"}))
+        if script(n) == "cut_idle":
+            await asyncio.sleep(0.05)
+            await ws.close(1011)
+            return
         async for msg in ws:
             if isinstance(msg, bytes):
                 if script(n) == "cut_on_audio":
@@ -226,13 +234,18 @@ def _fogar_handler(script):
                     await ws.close(1011)  # transient server error mid-phrase
                     return
                 state["audio"][n] += 1
+                if state["audio"][n] == 1:
+                    await ws.send(json.dumps(
+                        {"type": "transcription", "text": "parcial", "is_final": False}
+                    ))
             elif json.loads(msg).get("type") == "end":
                 if script(n) == "cut_on_end":
                     await ws.close(1011)
                     return
-                await ws.send(json.dumps(
-                    {"type": "transcription", "text": f"frase {n}", "is_final": True}
-                ))
+                final = {"type": "transcription", "text": f"frase {n}", "is_final": True}
+                if script(n) == "incomplete":
+                    final |= {"complete": False, "reason": "gpu_saturated"}
+                await ws.send(json.dumps(final))
                 await ws.close(1000)
                 return
 
@@ -255,7 +268,7 @@ async def test_cut_mid_phrase_withholds_the_truncated_final():
     backoffs. The reconnect is immediate, so the tail of the phrase reaches the new connection,
     but its final lacks the head ("no enciendas…" -> "enciendas…"): it is withheld and the
     client is told to repeat. The next phrase goes through normally."""
-    handler, st = _fogar_handler(lambda n: "cut_on_audio" if n == 1 else None)
+    handler, st = _fogar_handler({1: "cut_on_audio", 2: "incomplete"}.get)
     async with websockets.serve(handler, "127.0.0.1", 0) as server:
         w = _wrap(server.sockets[0].getsockname()[1])
         await w.start()
@@ -264,11 +277,12 @@ async def test_cut_mid_phrase_withholds_the_truncated_final():
             await _phrase(w, 40)
             await _until(lambda: w._callbacks.on_warning.await_count)
             w._callbacks.on_warning.assert_awaited_once_with("phrase_interrupted", None)
+            # One incomplete per phrase: the final's own complete=false is not reported twice.
             w._callbacks.on_incomplete.assert_awaited_once_with("phrase_interrupted")
             assert st["audio"][2] >= 20  # the reconnect did not wait: the tail got through
-            assert _finals(w) == []
+            w._callbacks.on_transcription.assert_not_awaited()  # nor its partials (barge-in)
 
-            await _until(lambda: st["conns"] == 3)  # quiet reopen after the phrase
+            await _until(lambda: st["conns"] == 3 and w._client._is_ready)  # quiet reopen
             await _phrase(w, 5)
             await _until(lambda: _finals(w))
             assert _finals(w) == ["frase 3"]
@@ -294,6 +308,58 @@ async def test_cut_after_end_reports_the_phrase_at_once():
             await _phrase(w, 5)
             await _until(lambda: _finals(w))
             assert _finals(w) == ["frase 2"]
+        finally:
+            await w.close()
+            await asyncio.wait([run], timeout=2.0)
+
+
+
+async def test_end_dropped_in_the_gap_closes_the_phrase():
+    """Review 2, case 1: send_audio sees the dead socket before the listen loop does and the
+    `end` lands in that gap. The `end` is dropped, so the warning goes out at once and nothing
+    is left armed: the next good phrase is delivered."""
+    handler, st = _fogar_handler(lambda n: "cut_on_audio" if n == 1 else None)
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        w = _wrap(server.sockets[0].getsockname()[1])
+        await w.start()
+        await w.send_audio(b"\0" * 640)  # the server cuts on it
+        await _until(lambda: w._client.ws.state.name == "CLOSED")
+        await w.send_audio(b"\0" * 640)  # sees the dead socket first
+        await w.send_end()  # before run() notices the drop
+        w._callbacks.on_warning.assert_awaited_once_with("phrase_interrupted", None)
+        run = asyncio.create_task(w.run())
+        try:
+            await _until(lambda: st["conns"] == 2 and w.state == ConnectionState.CONNECTED)
+            await _phrase(w, 5)
+            await _until(lambda: _finals(w))
+            assert _finals(w) == ["frase 2"]
+            assert w._callbacks.on_warning.await_count == 1
+        finally:
+            await w.close()
+            await asyncio.wait([run], timeout=2.0)
+
+
+async def test_reconnect_landing_mid_phrase_withholds_its_final():
+    """Review 2, case 2: cut while idle, and the reconnect completes while the user speaks.
+    The frames sent before it were dropped, so the final lacks its head: withheld. The next
+    phrase is delivered."""
+    handler, st = _fogar_handler({1: "cut_idle", 2: "slow_ready"}.get)
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        w = _wrap(server.sockets[0].getsockname()[1])
+        await w.start()
+        run = asyncio.create_task(w.run())
+        try:
+            await _until(lambda: st["conns"] == 2)  # reconnecting, `ready` still 0.3 s away
+            await _phrase(w, 30)
+            await _until(lambda: w._callbacks.on_warning.await_count)
+            w._callbacks.on_warning.assert_awaited_once_with("phrase_interrupted", None)
+            assert st["audio"][2] >= 5  # part of the phrase did reach the new connection
+            w._callbacks.on_transcription.assert_not_awaited()
+
+            await _until(lambda: st["conns"] == 3 and w._client._is_ready)
+            await _phrase(w, 5)
+            await _until(lambda: _finals(w))
+            assert _finals(w) == ["frase 3"]
         finally:
             await w.close()
             await asyncio.wait([run], timeout=2.0)
