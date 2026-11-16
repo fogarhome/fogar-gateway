@@ -1,8 +1,9 @@
 import pytest
+from pydantic import ValidationError
 from starlette.datastructures import Headers
 from starlette.websockets import WebSocket
 
-from fogar_gateway.core.config import settings
+from fogar_gateway.core.config import Settings, settings
 from fogar_gateway.core.network import (
     NO_REAL_IP,
     client_ip_for_log,
@@ -223,3 +224,26 @@ def test_loopback_client_behind_same_host_nginx_still_trusted():
     # Home Assistant en el mismo equipo detrás del nginx documentado: toda la cadena es loopback.
     request = _FakeRequest("127.0.0.1", headers={"x-real-ip": "127.0.0.1", "x-forwarded-for": "127.0.0.1"})
     assert is_trusted_origin(resolve_client_ip(request))
+
+
+def test_x_real_ip_with_ipv6_scope_id_fails_closed(caplog):
+    # D-r3-1: ip_address acepta "::1%<texto libre>"; ese texto acabaría en los logs como loopback.
+    request = _FakeRequest("127.0.0.1", headers={"x-real-ip": "::1%x request_id=FORGED"})
+    assert resolve_client_ip(request) == NO_REAL_IP
+    assert "FORGED" not in client_ip_for_log(request)
+    assert "FORGED" not in caplog.text
+
+
+@pytest.mark.parametrize("value", ["", " 127.0.0.1 , ::1 ", "10.0.0.0/8,fd00::/8", "192.168.1.5/24", ",,"])
+@pytest.mark.parametrize("field", ["TRUSTED_NETWORKS", "TRUSTED_PROXIES"])
+def test_settings_accept_valid_network_lists(field, value):
+    assert getattr(Settings(_env_file=None, **{field: value}), field) == value
+
+
+@pytest.mark.parametrize("value", ["127.0.0.1;::1", "localhost", "192.168.1.0/33", "10.0.0.1,nope"])
+@pytest.mark.parametrize("field", ["TRUSTED_NETWORKS", "TRUSTED_PROXIES"])
+def test_settings_reject_invalid_network_lists(field, value):
+    # F-r3-1: antes se ignoraba con un WARNING por petición y TRUSTED_PROXIES quedaba vacío.
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, **{field: value})
+    assert [e["loc"] for e in exc.value.errors()] == [(field,)]

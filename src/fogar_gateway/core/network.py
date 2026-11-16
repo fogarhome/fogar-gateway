@@ -109,6 +109,8 @@ def resolve_client_ip(connection: HTTPConnection) -> str:
         if len(real_ips) != 1:  # a proxy that appends instead of overwriting (D-r2-2)
             return NO_REAL_IP
         real_ip = real_ips[0].strip()
+        if "%" in real_ip:  # ip_address acepta un scope id IPv6 con texto libre (D-r3-1)
+            return NO_REAL_IP
         try:
             ipaddress.ip_address(real_ip)
         except ValueError:

@@ -164,6 +164,16 @@ def test_set_invalid_writes_nothing(home):
     assert [p.name for p in home.iterdir()] == ["config.env"]
 
 
+@pytest.mark.parametrize("value", ["127.0.0.1;::1", "localhost"])
+def test_set_invalid_trusted_proxies_writes_nothing(home, value):
+    # F-r3-1: una entrada que no es IP ni CIDR ya no se ignora en silencio.
+    before = _env(home).read_bytes()
+    r = run("config", "set", "TRUSTED_PROXIES", value)
+    assert r.exit_code == 1
+    assert "TRUSTED_PROXIES" in r.output and value not in r.output
+    assert _env(home).read_bytes() == before
+
+
 def test_set_new_failing_check_aborts(home):
     # Vaciar ADMIN_TOKEN crea un check `fail` nuevo (el sin definir no lo era).
     before = _env(home).read_bytes()
