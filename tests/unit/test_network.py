@@ -308,3 +308,12 @@ def test_parsing_is_cached_per_string(monkeypatch):
     assert _parsed.cache_info().misses <= 2  # TRUSTED_PROXIES y TRUSTED_NETWORKS, una vez cada una
     monkeypatch.setattr(settings, "TRUSTED_PROXIES", "localhost")  # la clave es la cadena
     assert resolve_client_ip(_FakeRequest("127.0.0.1", headers={"x-real-ip": "10.1.2.3"})) == NO_REAL_IP
+
+
+@pytest.mark.parametrize("real_ip", ["127.0.0.1", "::1"])
+def test_loopback_x_real_ip_from_remote_proxy_is_not_loopback(monkeypatch, real_ip):
+    # D-r4-2: a trusted proxy on another machine forwarding a loopback X-Real-IP is not this host.
+    monkeypatch.setattr(settings, "TRUSTED_PROXIES", "192.168.1.0/24")
+    request = _FakeRequest("192.168.1.10", headers={"x-real-ip": real_ip})
+    assert resolve_client_ip(request) == NO_REAL_IP
+    assert is_trusted_origin(resolve_client_ip(request)) is False

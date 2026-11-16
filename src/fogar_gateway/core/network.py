@@ -109,6 +109,13 @@ def _ip_in_networks(ip_str: str, networks: tuple[_IpNetwork, ...]) -> bool:
     return any(ip in net for net in networks)
 
 
+def _is_loopback(ip_str: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip_str).is_loopback
+    except ValueError:
+        return False
+
+
 def is_trusted_proxy(ip_str: str) -> bool:
     """True if ip_str is allowed to set X-Real-IP (settings.TRUSTED_PROXIES)."""
     return _ip_in_networks(ip_str, _parse_networks(settings.TRUSTED_PROXIES))
@@ -202,6 +209,9 @@ def resolve_client_ip(connection: HTTPConnection) -> str:
         try:
             ipaddress.ip_address(real_ip)
         except ValueError:
+            return NO_REAL_IP
+        # Un loopback reenviado por un proxy de otra máquina no es este host (D-r4-2).
+        if _is_loopback(real_ip) and not _is_loopback(peer):
             return NO_REAL_IP
         ip = real_ip
     else:
