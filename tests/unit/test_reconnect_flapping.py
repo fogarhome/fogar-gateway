@@ -58,8 +58,9 @@ async def _run_against(handler, seconds: float, **kw) -> list[float]:
 
 @pytest.mark.parametrize(("code", "hold"), [(1000, 0), (1001, 0), (1011, 0), (1001, 0.25)])
 async def test_flapping_server_gets_growing_waits(code, hold):
-    """`hold` > initial_backoff: a server cutting just after the first wait (review 1) still
-    counts as a flap, since the bar is STABLE_CONNECTION_S, not initial_backoff."""
+    """The first early drop reconnects at once, the next ones wait a growing backoff.
+    `hold` > initial_backoff: a server cutting just after a wait (review 1) still counts as
+    a flap, since the bar is STABLE_CONNECTION_S, not initial_backoff."""
 
     async def handler(ws, _n):
         await ws.recv()  # config handshake
@@ -178,7 +179,8 @@ async def test_flap_wait_counts_towards_max_duration(monkeypatch):
 
 
 async def test_wake_during_flap_wait_resets_it():
-    """Review 4: a wake (trigger_reconnect, direct connect) ends the wait and resets it."""
+    """Review 4: a wake (trigger_reconnect, direct connect) ends the wait; the next early drop
+    still waits initial_backoff (no two free reconnects against a server closing at once)."""
     h = ServiceHealth("x", ConnectionState.RECONNECTING)
     h.mark_connected()
     h.flap_backoff = 30.0
@@ -194,55 +196,133 @@ async def test_wake_during_flap_wait_resets_it():
     assert not task.done()
     wake.set()
     assert await asyncio.wait_for(task, 1.0) is True
-    assert h.flap_backoff == 0.0
+    assert h.flap_backoff == 1.0
 
 
 
-async def test_lone_cut_mid_phrase_keeps_the_phrase():
-    """E-r3-1: one 1011 while the user speaks, healthy server afterwards. Before the fix the
-    cut waited initial_backoff (1 s) and send_audio/send_end dropped the rest of the phrase
-    silently: no final transcription. Default backoffs, as in production."""
-    conns = 0
-    audio_after_cut = 0
+
+async def _until(cond, timeout=3.0):
+    async with asyncio.timeout(timeout):
+        while not cond():
+            await asyncio.sleep(0.01)
+
+
+def _fogar_handler(script):
+    """fogar-transcriber: `ready`, audio, and on `end` the final + close 1000. `script(n)`
+    says how connection n misbehaves: "cut_on_audio", "cut_on_end" or None (normal)."""
+    state = {"conns": 0, "audio": {}, "connected_at": [], "cut_at": []}
 
     async def handler(ws):
-        nonlocal conns, audio_after_cut
-        conns += 1
-        n = conns
+        state["conns"] += 1
+        n = state["conns"]
+        state["connected_at"].append(time.monotonic())
+        state["audio"][n] = 0
         await ws.recv()  # config handshake
         await ws.send(json.dumps({"type": "ready", "session_id": f"s{n}"}))
         async for msg in ws:
             if isinstance(msg, bytes):
-                if n == 1:
-                    await ws.close(1011)  # transient server error on the first audio
+                if script(n) == "cut_on_audio":
+                    state["cut_at"].append(time.monotonic())
+                    await ws.close(1011)  # transient server error mid-phrase
                     return
-                audio_after_cut += 1
+                state["audio"][n] += 1
             elif json.loads(msg).get("type") == "end":
+                if script(n) == "cut_on_end":
+                    await ws.close(1011)
+                    return
                 await ws.send(json.dumps(
-                    {"type": "transcription", "text": "hola", "is_final": True}
+                    {"type": "transcription", "text": f"frase {n}", "is_final": True}
                 ))
+                await ws.close(1000)
+                return
 
+    return handler, state
+
+
+async def _phrase(w, frames: int) -> None:
+    for _ in range(frames):  # 20 ms frames, then end
+        await w.send_audio(b"\0" * 640)
+        await asyncio.sleep(0.02)
+    await w.send_end()
+
+
+def _finals(w) -> list[str]:
+    return [c.args[0] for c in w._callbacks.on_transcription.await_args_list if c.args[1]]
+
+
+async def test_cut_mid_phrase_withholds_the_truncated_final():
+    """E-r3-1 and its review: one 1011 while the user speaks, healthy server afterwards, default
+    backoffs. The reconnect is immediate, so the tail of the phrase reaches the new connection,
+    but its final lacks the head ("no enciendas…" -> "enciendas…"): it is withheld and the
+    client is told to repeat. The next phrase goes through normally."""
+    handler, st = _fogar_handler(lambda n: "cut_on_audio" if n == 1 else None)
     async with websockets.serve(handler, "127.0.0.1", 0) as server:
         w = _wrap(server.sockets[0].getsockname()[1])
         await w.start()
         run = asyncio.create_task(w.run())
         try:
-            for _ in range(40):  # 0.8 s of 20 ms frames, then end
-                await w.send_audio(b"\0" * 640)
-                await asyncio.sleep(0.02)
-            await w.send_end()
-            await asyncio.sleep(0.3)
-            w._callbacks.on_transcription.assert_awaited_with("hola", True)
-            assert conns == 2
-            assert audio_after_cut >= 30  # only the frames around the cut are lost
+            await _phrase(w, 40)
+            await _until(lambda: w._callbacks.on_warning.await_count)
+            w._callbacks.on_warning.assert_awaited_once_with("phrase_interrupted", None)
+            w._callbacks.on_incomplete.assert_awaited_once_with("phrase_interrupted")
+            assert st["audio"][2] >= 20  # the reconnect did not wait: the tail got through
+            assert _finals(w) == []
+
+            await _until(lambda: st["conns"] == 3)  # quiet reopen after the phrase
+            await _phrase(w, 5)
+            await _until(lambda: _finals(w))
+            assert _finals(w) == ["frase 3"]
+            assert w._callbacks.on_warning.await_count == 1
+        finally:
+            await w.close()
+            await asyncio.wait([run], timeout=2.0)
+
+
+async def test_cut_after_end_reports_the_phrase_at_once():
+    """Cut after our `end`, before the final: nothing of the phrase reaches the new connection,
+    so the warning goes out right away and the next phrase is not withheld."""
+    handler, st = _fogar_handler(lambda n: "cut_on_end" if n == 1 else None)
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        w = _wrap(server.sockets[0].getsockname()[1])
+        await w.start()
+        run = asyncio.create_task(w.run())
+        try:
+            await _phrase(w, 5)
+            await _until(lambda: w._callbacks.on_warning.await_count and st["conns"] == 2
+                         and w.state == ConnectionState.CONNECTED)
+            w._callbacks.on_warning.assert_awaited_once_with("phrase_interrupted", None)
+            await _phrase(w, 5)
+            await _until(lambda: _finals(w))
+            assert _finals(w) == ["frase 2"]
+        finally:
+            await w.close()
+            await asyncio.wait([run], timeout=2.0)
+
+
+async def test_lone_cuts_between_normal_phrases_do_not_add_up():
+    """Review point 2: cut -> normal phrase (closed 1000 after our end) -> cut. The phrase in
+    between resets the flap backoff, so the second cut also reconnects at once (1 s before)."""
+    handler, st = _fogar_handler(lambda n: "cut_on_audio" if n in (1, 3) else None)
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        w = _wrap(server.sockets[0].getsockname()[1])
+        await w.start()
+        run = asyncio.create_task(w.run())
+        try:
+            await w.send_audio(b"\0" * 640)  # cut 1
+            await _until(lambda: st["conns"] == 2 and w.state == ConnectionState.CONNECTED)
+            await _phrase(w, 3)  # its final is withheld (truncated), then the quiet reopen
+            await _until(lambda: st["conns"] == 3)
+            await w.send_audio(b"\0" * 640)  # cut 2
+            await _until(lambda: st["conns"] == 4)
+            assert st["connected_at"][3] - st["cut_at"][1] < 0.5
         finally:
             await w.close()
             await asyncio.wait([run], timeout=2.0)
 
 
 async def test_server_closing_after_ready_still_backs_off():
-    """E-r2-1 with production backoffs: `ready` and a close 0.1 s later. The second connect
-    is immediate, then waits of 1 s, 2 s... (≈1000 connections/s without protection)."""
+    """E-r2-1: `ready` and a close 0.1 s later. The second connect is immediate, then waits of
+    0.1 s, 0.2 s, 0.4 s... (≈1000 connections/s without protection)."""
 
     async def handler(ws, _n):
         await ws.recv()
@@ -250,11 +330,10 @@ async def test_server_closing_after_ready_still_backs_off():
         await asyncio.sleep(0.1)
         await ws.close(1011)
 
-    times = await _run_against(handler, 4.0)
+    times = await _run_against(handler, 2.0, initial_backoff=0.1)
 
-    # Connections near 0, 0.1, 1.2, 3.3 s.
-    assert 3 <= len(times) <= 5
+    # Connections near 0, 0.1, 0.3, 0.6, 1.1, 1.9 s.
+    assert 4 <= len(times) <= 7
     gaps = [b - a for a, b in itertools.pairwise(times)]
-    assert gaps[0] < 0.5
-    assert gaps[1] >= 1.0
+    assert gaps[0] < 0.18  # hold only, no wait
     assert all(later > earlier for earlier, later in itertools.pairwise(gaps))

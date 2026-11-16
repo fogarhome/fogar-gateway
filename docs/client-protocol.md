@@ -543,7 +543,7 @@ Los tres microservicios downstream (orquestador, Transcriber, TTS) tienen recone
 | `unavailable` | El servicio está caído. Puede o no estar reintentando activamente en segundo plano (ver tabla siguiente). |
 | `reconnecting` | Reintentando activamente ahora mismo. |
 | `restored` | Volvió a la normalidad tras haber estado `unavailable`/`reconnecting`. |
-| `degraded` | Solo para `transcriber` — señal de **calidad**, no de conectividad (silencio prolongado **mientras envías audio** — con un turno en curso o sin mandar audio, p. ej. sesión persistente en reposo con solo `keepalive`, no se cuenta silencio; buffer lleno, GPU saturada con `code: "gpu_saturated"`, o proveedor externo sin capacidad momentánea con `code: "provider_capacity"`). No forma parte del ciclo unavailable→reconnecting→restored. Cuando la causa es saturación del transcriber (`gpu_saturated` o `provider_capacity`), el aviso de recuperación es `restored`; el resto de causas de `degraded` no tienen aviso de recuperación. |
+| `degraded` | Solo para `transcriber` — señal de **calidad**, no de conectividad (silencio prolongado **mientras envías audio** — con un turno en curso o sin mandar audio, p. ej. sesión persistente en reposo con solo `keepalive`, no se cuenta silencio; buffer lleno, GPU saturada con `code: "gpu_saturated"`, proveedor externo sin capacidad momentánea con `code: "provider_capacity"`, o frase perdida con `code: "phrase_interrupted"`: la conexión con el transcriptor `fogar` se cortó mientras el usuario hablaba y el gateway no entrega esa transcripción final, que llegaría sin su principio y podría decir lo contrario de lo dicho; pide al usuario que la repita). No forma parte del ciclo unavailable→reconnecting→restored. Cuando la causa es saturación del transcriber (`gpu_saturated` o `provider_capacity`), el aviso de recuperación es `restored`; el resto de causas de `degraded` no tienen aviso de recuperación. |
 
 Por servicio:
 
@@ -740,7 +740,7 @@ El cliente escribe; el gateway sintetiza audio con el texto de la respuesta.
 | `tool_call` | `{"type":"tool_call","turn_id":"t-N","phase":"start"\|"result","name":"...","tool_call_id":"...","args":{...}\|null,"result":"..."\|null,"is_error":bool\|null}` | Solo si `tool_calls_enabled=True` para el cliente — uso de herramientas del agente |
 | `turn_progress` | `{"type":"turn_progress","turn_id":"t-N","phase":"preparing"\|"thinking"\|"tool","tool":"..."\|null}` | Solo con `"status"` en `output_mode`: en qué está el turno mientras no llega texto (§5). Nuevo en #254 |
 | `transcription_partial` | `{"type":"transcription_partial","text":"..."}` | `input_mode="audio"` — parciales en tiempo real |
-| `transcription` | `{"type":"transcription","text":"..."}` | `input_mode="audio"` — transcripción final, espera `send` |
+| `transcription` | `{"type":"transcription","text":"..."}` | `input_mode="audio"` — transcripción final, espera `send`. Si el transcriptor se reconecta a mitad de frase, esa final no llega y en su lugar llega `status` `transcriber` `degraded` con `code: "phrase_interrupted"` (§8) |
 | `status` | `{"type":"status","service":"...","state":"..."}` | Cambio de estado de un microservicio |
 | `error` | `{"type":"error","code":"...","message":"...","fatal":bool,"turn_id":"..."}` | Error (turno o sesión) |
 | `pipeline_event` | `{"type":"pipeline_event","stage":"...","elapsed_ms":N,"turn":N}` | Solo con `"status"` en `output_mode`: cada etapa del pipeline con los ms desde la etapa anterior (§15). Diagnóstico; no lleva texto |
@@ -897,7 +897,7 @@ No lleva texto (ni del usuario ni de la respuesta) ni los detalles que el gatewa
 | `transcription_partial` | Cada parcial de transcripción (`input_mode: "audio"`), después de su `transcription_partial` |
 | `barge_in` | Un parcial cortó el turno en curso (§7), después de su `turn_end` |
 | `transcription_final` | La transcripción final, antes de su `transcription` |
-| `transcription_incomplete` | El transcriptor cortó una final por saturación (`complete: false`) |
+| `transcription_incomplete` | El transcriptor cortó una final por saturación (`complete: false`, `reason` del transcriptor) o una reconexión cortó la frase en curso (`reason: "phrase_interrupted"`, la final no se entrega) |
 | `llm_start` | Un turno del usuario sale hacia el orquestador (después de su `turn_start`) |
 | `llm_first_token` | Llega el primer texto del orquestador, justo antes del primer `token` |
 | `llm_done` | El orquestador terminó la respuesta |

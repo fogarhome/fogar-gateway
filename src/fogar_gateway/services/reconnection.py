@@ -14,7 +14,8 @@ logger = logging.getLogger(__name__)
 # Tests swap this name; patching asyncio.sleep would change it process-wide.
 _sleep = asyncio.sleep
 
-# E-r2-1: a connection that lived less than this is a flap and the next reconnect waits.
+# E-r2-1: a connection that lived less than this is a flap; from the second flap in a row
+# the reconnect waits (the first one reconnects at once, E-r3-1).
 STABLE_CONNECTION_S = 10.0
 
 
@@ -195,7 +196,7 @@ async def reconnect_with_backoff(
     If the last connection lived less than `STABLE_CONNECTION_S` (a server that accepts and
     closes soon), it first waits `health.flap_backoff`: nothing on the first such flap, then
     `initial_backoff` doubled on each further one up to `max_backoff`, reset by a connection
-    that lasts or by `wake` (E-r2-1, E-r3-1); that wait counts towards `max_duration`.
+    that lasts (`wake` cuts it short, back to `initial_backoff`) (E-r2-1, E-r3-1); that wait counts towards `max_duration`.
     Cancellation propagates."""
     start = time.monotonic()
     if health.connected_mono is not None:
@@ -204,13 +205,15 @@ async def reconnect_with_backoff(
             # flight, E-r3-1); only a second one in a row starts waiting.
             delay = health.flap_backoff
             health.flap_backoff = min(max(delay * 2, initial_backoff), max_backoff)
+            logger.warning("[%s] connection dropped soon after connecting%s.", label,
+                           f" — waiting {delay:.1f}s" if delay else "")
             if delay:
-                logger.warning("[%s] connection dropped soon after connecting — waiting %.1fs.",
-                               label, delay)
                 if wake is None:
                     await _sleep(delay)
                 elif await _wait_or_wake(wake, delay):
-                    health.flap_backoff = 0.0
+                    # A manual reconnect skips this wait, but not the next one: a server that
+                    # keeps closing at once still gets a wait on the following drop.
+                    health.flap_backoff = initial_backoff
             health.flap_at = time.monotonic()
         else:
             health.flap_backoff = 0.0
