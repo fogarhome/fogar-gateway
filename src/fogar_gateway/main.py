@@ -21,7 +21,7 @@ from fogar_gateway.api.web_routes import WEB_DIR, web_available
 from fogar_gateway.api.web_routes import router as web_router
 from fogar_gateway.core.body_limit import BodySizeLimitMiddleware
 from fogar_gateway.core.config import settings
-from fogar_gateway.core.logging import configure_logging
+from fogar_gateway.core.logging import configure_logging, pin_websockets_logging
 from fogar_gateway.core.network import warn_if_open_proxy_config
 from fogar_gateway.core.request_id import RequestIdMiddleware
 from fogar_gateway.core.startup_checks import (
@@ -47,7 +47,6 @@ from fogar_gateway.services.reconnection import (
     traceback_no_message,
 )
 from fogar_gateway.services.session_registry import SessionRegistry
-from fogar_gateway.services.speech.elevenlabs.common import pin_websockets_logging
 from fogar_gateway.services.speech.factory import build_stt_provider, build_tts_provider
 from fogar_gateway.services.speech.registry import SpeechProviders
 from fogar_gateway.services.teardown import Teardown

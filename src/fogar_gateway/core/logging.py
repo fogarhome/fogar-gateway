@@ -12,6 +12,14 @@ def fingerprint_key(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
 
 
+def pin_websockets_logging() -> None:
+    """`websockets` a DEBUG vuelca cabeceras (`xi-api-key`) y cada frame de texto (el `connect`
+    de OpenClaw lleva el token): se fija el logger en INFO como mínimo. Idempotente; nunca baja un nivel ya más alto."""
+    for name in ("websockets", "websockets.client"):
+        lg = logging.getLogger(name)
+        lg.setLevel(max(lg.level, logging.INFO))
+
+
 _STD_ATTRS = frozenset(
     logging.LogRecord("", 0, "", 0, "", None, None).__dict__
 ) | {"message", "asctime", "taskName", "color_message"}

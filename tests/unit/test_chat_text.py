@@ -282,8 +282,26 @@ def test_loads_frame_keeps_chat_text_halves_but_cleans_the_rest():
 
 
 def test_loads_frame_bytes_with_raw_surrogate_are_valid_utf8():
-    """C-r4-1: bytes UTF-8 de un surrogate crudo (sin el escape \\ud) también se sanean."""
+    """C-r4-1: bytes UTF-8 de un surrogate crudo (sin el escape \\ud) también se sanean, sin
+    carácter de sustitución."""
     from fogar_gateway.services.openclaw.client import _loads_frame
 
     frame = _loads_frame(b'{"type": "res", "payload": {"title": "t\xed\xa0\x80"}}')
-    frame["payload"]["title"].encode()
+    assert frame["payload"]["title"] == "t"  # sin U+FFFD ni surrogate
+
+
+def test_text_without_surrogates_is_not_reencoded(monkeypatch):
+    """Revisión r4: sin surrogates no se re-codifica `current` en cada delta (O(n²))."""
+    from fogar_gateway.services.openclaw import chat_text
+
+    calls = []
+    monkeypatch.setattr(chat_text, "_paired", lambda s: calls.append(s) or s)
+    t = ChatTextTracker()
+    for word in ("Hola ", "amigo ", "qué tal"):
+        t.feed({"state": "delta", "deltaText": word})
+    assert calls == []
+    t.feed({"state": "delta", "deltaText": " \ud83d"})
+    t.feed({"state": "delta", "deltaText": "\ude00"})
+    assert len(calls) == 2
+    t.feed({"state": "final", "message": {"content": "otro"}})
+    assert len(calls) == 2  # un snapshot nuevo sin surrogates

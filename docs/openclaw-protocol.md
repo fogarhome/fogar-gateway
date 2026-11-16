@@ -546,7 +546,8 @@ Observed/decided while hardening the gateway's boundary with OpenClaw (audit G-0
   (`deltaText`, `message`) is the exception (audit 3.0 r4, B-r4-1): an emoji can arrive split
   between two `deltaText`-only deltas, so it is kept as received and cleaned only when the reply
   text is compared and emitted, after joining the halves; a high surrogate at the end waits for
-  its pair. A binary frame is decoded as UTF-8 with replacement before parsing (C-r4-1).
+  its pair. A binary frame (OpenClaw sends text) is always cleaned the same way, since a raw
+  surrogate there carries no `\ud` escape (C-r4-1); its encoding is left to `json.loads`.
 
 ---
 
@@ -965,7 +966,7 @@ The gateway uses them only through `OpenClawClient.request`, which refuses any m
 ## Change log of this file
 
 - **2026-11-16**: lone surrogates: the halves of an emoji split between two `chat` deltas are
-  joined before cleaning; binary frames are decoded with replacement (audit 3.0 r4, B-r4-1, C-r4-1).
+  joined before cleaning; binary frames are always cleaned (audit 3.0 r4, B-r4-1, C-r4-1).
 - **2026-11-16**: "Frame size, malformed frames and connection end" gains lone surrogates
   (audit 3.0 r3, G-r3-1): dropped on parse, without a replacement character.
 - **2026-11-15**: "Discovering Available Agents" no longer says the gateway does not request

@@ -21,10 +21,10 @@ SK_A = "agent:main:client-a"
 SK_B = "agent:main:client-b"
 
 
-def make_client(port):
+def make_client(port, token="tok"):
     turns = TurnRegistry()
     dispatcher = FrameDispatcher(turns, ClientRegistry())
-    client = OpenClawClient("127.0.0.1", port, "tok", turns, dispatcher)
+    client = OpenClawClient("127.0.0.1", port, token, turns, dispatcher)
     return client, turns
 
 
@@ -284,14 +284,18 @@ async def test_fail_ends_turn_with_stable_orchestrator_error(server):
 
 async def test_agent_error_after_ack_ends_turn_with_stable_error(server, caplog):
     # #300: el chat state:error termina el turno ya, sin esperar a turn_timeout.
-    caplog.set_level(logging.DEBUG, logger="fogar_gateway")  # B-r4-2: no el de websockets
-    client, turns = make_client(server.port)
+    # B-r4-2: `websockets` a DEBUG volcaría las tramas (el connect con el token): connect lo fija.
+    caplog.set_level(logging.DEBUG)
+    for name in ("websockets", "websockets.client"):
+        caplog.set_level(logging.DEBUG, logger=name)
+    client, turns = make_client(server.port, token="SECRET-OC-TOKEN")
     await client.connect()
     try:
         events = await asyncio.wait_for(run_turn(client, SK_A, "agent_error"), 3)
         assert errors(events) == ["orchestrator_error"] and tokens(events) == ""
         assert turns.get_queue_by_session(SK_A) is None
         assert "No API key" not in caplog.text
+        assert "SECRET-OC-TOKEN" not in caplog.text
     finally:
         await client.close()
 
@@ -351,6 +355,12 @@ def _ev(sk, **kw):
     return json.dumps({"type": "event", "event": "chat", "payload": {"sessionKey": sk, **kw}})
 
 
+def _binary(sk, **kw):
+    """Trama binaria con los surrogates crudos en UTF-8 (sin escapes)."""
+    frame = {"type": "event", "event": "chat", "payload": {"sessionKey": sk, **kw}}
+    return json.dumps(frame, ensure_ascii=False).encode("utf-8", "surrogatepass")
+
+
 def _delta(sk, text, seq, replace=False):
     kw = {"state": "delta", "seq": seq, "deltaText": text, "message": _msg(text)}
     if replace:
@@ -381,6 +391,10 @@ class Scripted2026_10_5(FakeOpenClawServer):
             await ws.send(_ev(sk, state="delta", seq=2, deltaText="amigo \ud83d"))
             await ws.send(_ev(sk, state="delta", seq=3, deltaText="\ude00 qué tal"))
             await ws.send(_final(sk, "Hola amigo \U0001f600 qué tal"))
+        elif scenario == "split_emoji_binary":  # revisión r4: snapshots en tramas binarias
+            for text in ("Hola amigo \ud83d", "Hola amigo \U0001f600 qué tal"):
+                await ws.send(_binary(sk, state="delta", seq=1, message=_msg(text)))
+            await ws.send(_binary(sk, state="final", seq=2, message=_msg("Hola amigo \U0001f600 qué tal")))
         elif scenario == "multi_message":
             await ws.send(_delta(sk, "Voy a buscar. ", 1))
             await ws.send(_final(sk, f"Resultado: {TEXT}"))
@@ -414,6 +428,12 @@ async def test_captured_sequence_delivers_full_text_then_done(scripted_server):
 
 async def test_emoji_split_between_deltas_is_delivered_once(scripted_server):
     events = await _turn(scripted_server, "split_emoji")
+    assert "".join(_toks(events)) == "Hola amigo \U0001f600 qué tal"
+    assert errors(events) == []
+
+
+async def test_emoji_split_in_binary_snapshots_is_delivered_once(scripted_server):
+    events = await _turn(scripted_server, "split_emoji_binary")
     assert "".join(_toks(events)) == "Hola amigo \U0001f600 qué tal"
     assert errors(events) == []
 

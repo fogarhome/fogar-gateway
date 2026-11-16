@@ -5,10 +5,10 @@ import pytest
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 from websockets.frames import Close
 
+from fogar_gateway.core.logging import pin_websockets_logging
 from fogar_gateway.services.speech.elevenlabs.common import (
     classify_close,
     classify_exception,
-    pin_websockets_logging,
     ws_url,
 )
 from fogar_gateway.services.speech.factory import build_tts_provider

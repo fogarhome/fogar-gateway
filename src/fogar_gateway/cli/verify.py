@@ -139,8 +139,8 @@ async def _check(
     """Un intento con plazo total. `connect` traduce los fallos de su cliente a `_Rejected`,
     `_Unexpected`, `_Pending`, `_Invalid` o `TimeoutError`; el resto es «no responde». `ok_detail` da la
     frase del éxito (por defecto, «responde en …»)."""
+    from fogar_gateway.core.logging import pin_websockets_logging
     from fogar_gateway.services.reconnection import describe_error
-    from fogar_gateway.services.speech.elevenlabs.common import pin_websockets_logging
 
     pin_websockets_logging()  # `websockets` a DEBUG volcaría el frame que lleva el token
     try:

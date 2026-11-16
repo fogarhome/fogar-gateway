@@ -6,6 +6,7 @@ que en cada actualización se emite únicamente la parte que falta.
 """
 
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,9 @@ def missing_tail(emitted: str, final_text: str) -> str:
     return final_text
 
 
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
 def _paired(text: str) -> str:
     """Junta las mitades de surrogate que forman pareja y quita las sueltas (B-r4-1): un emoji
     partido entre dos deltas solo se completa al llegar su segunda mitad; mientras, un surrogate
@@ -103,19 +107,24 @@ class ChatTextTracker:
     """
 
     def __init__(self) -> None:
-        self.emitted = ""
-        self.current = ""
-        self.all_out = ""
+        self.reset()
 
     def reset(self) -> None:
         self.emitted = ""
         self.current = ""
         self.all_out = ""
+        self._surrogates = False  # `current` trae alguna mitad de surrogate
+
+    def _set(self, text: str, append: bool = False) -> None:
+        """Cambia `current` mirando solo el texto nuevo: sin surrogates no se re-codifica
+        `current` entero en cada delta (sería O(n²))."""
+        self._surrogates = (append and self._surrogates) or bool(_SURROGATE.search(text))
+        self.current = self.current + text if append else text
 
     def _emit_missing(self) -> str:
         # `current` guarda el texto tal cual llega (con surrogates sueltos, B-r4-1); se
         # compara y se emite ya limpio.
-        current = _paired(self.current)
+        current = _paired(self.current) if self._surrogates else self.current
         if not current:
             return ""
         hit = _tail(self.emitted, current) or _tail(self.all_out, current)
@@ -146,9 +155,9 @@ class ChatTextTracker:
 
         if state == "final":
             if has_snapshot and (snapshot or delta is None):
-                self.current = snapshot
+                self._set(snapshot)
             elif delta:
-                self.current += delta
+                self._set(delta, append=True)
             out = self._emit_missing()
             self.reset()
             return out
@@ -158,15 +167,15 @@ class ChatTextTracker:
             # legacy de deltaText: nunca emiten cola a partir de `message`.
             if not delta:
                 return ""
-            self.current += delta
+            self._set(delta, append=True)
             return self._emit_missing()
 
         if has_snapshot:
-            self.current = snapshot  # autoritativo: ya incluye deltaText
+            self._set(snapshot)  # autoritativo: ya incluye deltaText
         elif delta is not None and payload.get("replace") is True:
-            self.current = delta
+            self._set(delta)
         elif delta:
-            self.current += delta
+            self._set(delta, append=True)
         else:
             return ""
         return self._emit_missing()

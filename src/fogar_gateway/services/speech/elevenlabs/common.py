@@ -17,6 +17,7 @@ from urllib.parse import quote, urlencode
 
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+from fogar_gateway.core.logging import pin_websockets_logging
 from fogar_gateway.services.reconnection import describe_error
 
 logger = logging.getLogger(__name__)
@@ -37,14 +38,6 @@ _AUTH_WORDS = (
     "invalid key",
     "permission",
 )
-
-
-def pin_websockets_logging() -> None:
-    """`websockets` a DEBUG vuelca cabeceras (incluida `xi-api-key`) y cada frame de texto:
-    se fija el logger en INFO como mínimo. Idempotente; nunca baja un nivel ya más alto."""
-    for name in ("websockets", "websockets.client"):
-        lg = logging.getLogger(name)
-        lg.setLevel(max(lg.level, logging.INFO))
 
 
 def api_key(settings) -> str:

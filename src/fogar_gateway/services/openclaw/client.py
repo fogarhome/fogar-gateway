@@ -12,7 +12,7 @@ from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
 from fogar_gateway.core.config import settings
-from fogar_gateway.core.logging import fingerprint_key
+from fogar_gateway.core.logging import fingerprint_key, pin_websockets_logging
 from fogar_gateway.services.openclaw import frames
 from fogar_gateway.services.openclaw.chat_text import ChatTextTracker
 from fogar_gateway.services.openclaw.device import (
@@ -234,13 +234,12 @@ def _safe_error_code(error: object) -> str:
 def _loads_frame(raw: str | bytes):
     """json.loads de una trama de OpenClaw sin surrogates sueltos (G-r3-1): romperían después
     todo encode a UTF-8 (la salida al cliente, /admin, /v1). Solo re-codifica si la trama trae
-    un escape de surrogate. El texto de un evento `chat` (`deltaText`, `message`) queda intacto:
+    un escape de surrogate o es binaria. El texto de un evento `chat` (`deltaText`, `message`) queda intacto:
     un emoji puede llegar partido entre dos deltas y lo junta y limpia ChatTextTracker (B-r4-1)."""
-    if isinstance(raw, bytes):
-        # C-r4-1: bytes UTF-8 de un surrogate crudo no llevan el escape "\ud" del filtro.
-        raw = raw.decode("utf-8", "replace")
-    frame = json.loads(raw)
-    if "\\ud" not in raw and "\\uD" not in raw:
+    frame = json.loads(raw)  # bytes: json.loads detecta la codificación y conserva los surrogates
+    # C-r4-1: una trama binaria puede traer un surrogate crudo sin el escape \ud: se limpia
+    # siempre (OpenClaw manda texto; el binario es raro).
+    if not isinstance(raw, bytes) and "\\ud" not in raw and "\\uD" not in raw:
         return frame
     payload = frame.get("payload") if isinstance(frame, dict) else None
     if not isinstance(payload, dict) or frame.get("event") != "chat":
@@ -303,6 +302,7 @@ class OpenClawClient:
         self.on_disconnect: Callable[[], None] | None = None
 
     async def connect(self) -> GatewayInfo:
+        pin_websockets_logging()  # `websockets` a DEBUG volcaría el `connect` con el token
         async with self._connect_lock:
             await self._cancel_and_close()
             try:
