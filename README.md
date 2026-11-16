@@ -344,7 +344,7 @@ Las migraciones de la BD se aplican solas al arrancar y no hay vuelta atrás aut
 curl -fsSL https://github.com/fogarhome/fogar-gateway/releases/latest/download/install.sh | sh
 ```
 
-**Al actualizar a 3.0:** una entrada inválida en `TRUSTED_PROXIES` (también un `/0`, que antes se aceptaba) ya no se ignora: el gateway falla cerrado y Home Assistant sin Bearer recibe 401 en `/v1`. Antes de actualizar, `fogar-gw config validate` (o `doctor`) te dice si tu configuración lo tiene.
+**Al actualizar a 3.0:** una entrada inválida en `TRUSTED_PROXIES` (también un `/0`, que antes se aceptaba) ya no se ignora: el gateway falla cerrado y Home Assistant sin Bearer recibe 401 en `/v1`. La CLI 2.x aún no lo comprueba: antes de actualizar, revisa `TRUSTED_PROXIES` y `TRUSTED_NETWORKS` a mano en `<base>/config.env` (solo IPs o CIDRs separados por comas, sin `/0` ni `%`). Después, `fogar-gw doctor` (el instalador lo pasa al terminar) o `fogar-gw config validate` te dicen si queda alguna entrada mal.
 
 A mano: instala la nueva versión sobre la anterior y reinicia (pregunta; en scripts, `fogar-gw --yes restart`).
 
