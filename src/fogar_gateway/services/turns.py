@@ -1208,6 +1208,8 @@ class TurnController:
         if task is not None and not task.done():
             self._mark_cancel(task, "closed")
         await td.cancel(task, "turno activo", limit)
+        if task is not None and task.done():  # A-r3-1: un send que no llegó a arrancar, su par
+            await self._end_unstarted(task, "closed")
         if task is not None and not task.done() and turn is not None and turn.task is task:
             # Abandonado en el tope (TTS lento al limpiar): su finally enviaría turn_end
             # después de session_end, a un sender cerrado. Se envía ahora.

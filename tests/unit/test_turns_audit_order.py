@@ -280,3 +280,14 @@ async def test_let_go_gives_an_unstarted_send_its_pair(make_bridge):
     await sent(bridge)
     assert turn_marks(ws) == [("turn_start", "t-1"), ("turn_end", "t-1")]
     assert ws.of("turn_end")[0]["reason"] == "closed"
+
+
+async def test_close_all_gives_an_unstarted_send_its_pair(make_bridge):
+    """A-r3-1: un send aceptado cuya tarea aún no corrió y close_all → su par `closed`."""
+    bridge, ws = make_bridge()
+    bridge.orchestrator.stream_response = blocking()
+    await bridge.turns.start_user_turn("uno")  # su tarea aún no corrió
+    await bridge.close_all()
+    await sent(bridge)
+    assert turn_marks(ws) == [("turn_start", "t-1"), ("turn_end", "t-1")]
+    assert ws.of("turn_end")[0]["reason"] == "closed"
