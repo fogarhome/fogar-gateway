@@ -177,6 +177,20 @@ async def test_rows_saved_with_an_uppercase_agent_are_read_in_lowercase(service,
     assert fresh.index.get(lower_key).id == record.id
 
 
+def test_with_both_main_and_Main_the_default_is_the_one_with_history(service, engine):
+    """Revisión de B-r2-1: el índice único distingue mayúsculas; se elige siempre la usada."""
+    day = date(2026, 11, 14)
+    with Session(engine, expire_on_commit=False) as s:
+        rows = [
+            ConversationRecord(client_id="tv", agent=a, kind="default", day=day, session_key=f"k-{a}", turn_count=n)
+            for a, n in (("main", 0), ("Main", 3))
+        ]
+        s.add_all(rows)
+        s.commit()
+    for _ in range(3):
+        assert service._default_for("tv", "main", day).id == rows[1].id
+
+
 async def test_deleting_a_client_cascades_to_its_conversations(service, engine):
     """PRAGMA foreign_keys=ON en cada conexión (db/database.py): ON DELETE CASCADE vale."""
     conv = await service.create("web", "main")

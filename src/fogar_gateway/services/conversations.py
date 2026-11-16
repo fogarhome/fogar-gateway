@@ -179,6 +179,8 @@ class ConversationService:
                 ConversationRecord.day == day,
                 ConversationRecord.kind == "default",
             )
+            # "Main" y "main" pueden convivir (filas de antes de C-1): siempre la misma, la usada.
+            .order_by(col(ConversationRecord.turn_count).desc(), col(ConversationRecord.created_at))
         ).first()
 
     async def create(self, client_id: str, agent: str) -> Conversation:
@@ -284,7 +286,7 @@ class ConversationService:
         by_client: dict[str, list[ConversationRecord]] = {}
         for row in rows:
             parsed = _legacy_key(row.get("key"), client_ids)
-            if parsed is None or row["key"] in known:
+            if parsed is None or row["key"].lower() in known:
                 continue
             agent, client_id = parsed
             record = _new_record(client_id, agent, "legacy", None, session_key=row["key"])
@@ -292,7 +294,7 @@ class ConversationService:
             if created is not None:
                 record.created_at = created
             record.last_turn_at = _ms_to_datetime(row.get("lastInteractionAt") or row.get("updatedAt"))
-            known.add(record.session_key)
+            known.add(record.session_key.lower())
             by_client.setdefault(client_id, []).append(record)
         imported: list[Conversation] = []
         for client_id, records in by_client.items():
