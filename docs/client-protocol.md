@@ -536,7 +536,7 @@ El gateway notifica cambios en el estado de sus microservicios durante la sesió
 { "type": "status", "service": "tts", "state": "degraded" }
 ```
 
-Los tres microservicios downstream (orquestador, Transcriber, TTS) tienen reconexión automática con backoff exponencial. Si el orquestador o el transcriber aceptan la conexión y la cortan enseguida (en menos de 10 s), el siguiente reintento espera, y esa espera se dobla en cada corte así: los pares `reconnecting`/`restored` llegan cada vez más espaciados en vez de en ráfaga, y la espera vuelve a la inicial en cuanto una conexión aguanta. El vocabulario de conectividad es:
+Los tres microservicios downstream (orquestador, Transcriber, TTS) tienen reconexión automática con backoff exponencial. Si el orquestador o el transcriber aceptan la conexión y la cortan enseguida (en menos de 10 s), el primer reintento es inmediato (un corte suelto no pierde la frase en curso), pero desde el segundo corte seguido el reintento espera, y esa espera se dobla en cada corte: los pares `reconnecting`/`restored` llegan cada vez más espaciados en vez de en ráfaga, y la espera vuelve a cero en cuanto una conexión aguanta. El vocabulario de conectividad es:
 
 | `state` | Significado |
 |---------|-------------|

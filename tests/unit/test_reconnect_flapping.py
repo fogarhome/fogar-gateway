@@ -1,7 +1,9 @@
 """Auditoría 3.0 ronda 2, E-r2-1: a server that accepts (`ready`) and closes at once must
 not drive a reconnect loop with no wait (~1000 connections/s before the fix). A connection
-that dies younger than `initial_backoff` waits a growing backoff; one that lasts reconnects
-straight away. Real `websockets` servers on 127.0.0.1, port 0."""
+that dies younger than `STABLE_CONNECTION_S` waits a growing backoff from the second such
+drop in a row (ronda 3, E-r3-1: the first one reconnects at once, so a lone cut does not
+lose the phrase in flight); one that lasts reconnects straight away. Real `websockets`
+servers on 127.0.0.1, port 0."""
 
 import asyncio
 import itertools
@@ -67,10 +69,11 @@ async def test_flapping_server_gets_growing_waits(code, hold):
 
     times = await _run_against(handler, 2.0, initial_backoff=0.2, max_backoff=1.0)
 
-    # Waits 0.2, 0.4, 0.8, 1.0 (+hold) -> connections near 0, 0.2, 0.6, 1.4 s (thousands before).
-    assert 2 + (hold == 0) <= len(times) <= 6
+    # Waits 0, 0.2, 0.4, 0.8 (+hold) -> connections near 0, 0, 0.2, 0.6, 1.4 s (thousands
+    # before the fix).
+    assert 3 <= len(times) <= 6
     gaps = [b - a for a, b in itertools.pairwise(times)]
-    assert gaps[0] >= 0.15
+    assert gaps[1] >= 0.15 + hold
     assert all(later > earlier for earlier, later in itertools.pairwise(gaps))
 
 
@@ -112,13 +115,14 @@ async def test_lasting_connection_resets_the_flap_backoff(monkeypatch):
             ok, h, initial_backoff=1.0, max_backoff=4.0, max_duration=None, label="x"
         )
 
-    for _ in range(4):  # each reconnect "dies" at once: mark_connected was just now
+    for _ in range(5):  # each reconnect "dies" at once: mark_connected was just now
         await reconnect()
-    assert sleeps == [1.0, 2.0, 4.0, 4.0]
+    assert sleeps == [1.0, 2.0, 4.0, 4.0]  # the first early drop does not wait (E-r3-1)
 
     h.connected_mono = time.monotonic() - STABLE_CONNECTION_S - 1  # this one lasted
     await reconnect()
     h.connected_mono = time.monotonic()
+    await reconnect()
     await reconnect()
     assert sleeps == [1.0, 2.0, 4.0, 4.0, 1.0]
 
@@ -143,13 +147,14 @@ async def test_reopen_long_after_a_flap_starts_clean(monkeypatch):
             ok, h, initial_backoff=1.0, max_backoff=8.0, max_duration=None, label="x"
         )
 
-    for _ in range(3):
+    for _ in range(4):
         await reconnect()
     assert sleeps == [1.0, 2.0, 4.0]
     assert h.flap_backoff == 8.0  # the connect right after a flap wait keeps it
 
     h.flap_at = time.monotonic() - STABLE_CONNECTION_S - 1
     h.mark_connected()  # direct reopen, long after the last flap
+    await reconnect()
     await reconnect()
     assert sleeps == [1.0, 2.0, 4.0, 1.0]
 
@@ -159,6 +164,7 @@ async def test_flap_wait_counts_towards_max_duration(monkeypatch):
     monkeypatch.setattr("fogar_gateway.services.reconnection._sleep", asyncio.sleep)
     h = ServiceHealth("x", ConnectionState.RECONNECTING)
     h.mark_connected()
+    h.flap_backoff = 0.2  # a second early drop in a row
 
     async def fail() -> None:
         raise OSError
@@ -189,3 +195,66 @@ async def test_wake_during_flap_wait_resets_it():
     wake.set()
     assert await asyncio.wait_for(task, 1.0) is True
     assert h.flap_backoff == 0.0
+
+
+
+async def test_lone_cut_mid_phrase_keeps_the_phrase():
+    """E-r3-1: one 1011 while the user speaks, healthy server afterwards. Before the fix the
+    cut waited initial_backoff (1 s) and send_audio/send_end dropped the rest of the phrase
+    silently: no final transcription. Default backoffs, as in production."""
+    conns = 0
+    audio_after_cut = 0
+
+    async def handler(ws):
+        nonlocal conns, audio_after_cut
+        conns += 1
+        n = conns
+        await ws.recv()  # config handshake
+        await ws.send(json.dumps({"type": "ready", "session_id": f"s{n}"}))
+        async for msg in ws:
+            if isinstance(msg, bytes):
+                if n == 1:
+                    await ws.close(1011)  # transient server error on the first audio
+                    return
+                audio_after_cut += 1
+            elif json.loads(msg).get("type") == "end":
+                await ws.send(json.dumps(
+                    {"type": "transcription", "text": "hola", "is_final": True}
+                ))
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        w = _wrap(server.sockets[0].getsockname()[1])
+        await w.start()
+        run = asyncio.create_task(w.run())
+        try:
+            for _ in range(40):  # 0.8 s of 20 ms frames, then end
+                await w.send_audio(b"\0" * 640)
+                await asyncio.sleep(0.02)
+            await w.send_end()
+            await asyncio.sleep(0.3)
+            w._callbacks.on_transcription.assert_awaited_with("hola", True)
+            assert conns == 2
+            assert audio_after_cut >= 30  # only the frames around the cut are lost
+        finally:
+            await w.close()
+            await asyncio.wait([run], timeout=2.0)
+
+
+async def test_server_closing_after_ready_still_backs_off():
+    """E-r2-1 with production backoffs: `ready` and a close 0.1 s later. The second connect
+    is immediate, then waits of 1 s, 2 s... (≈1000 connections/s without protection)."""
+
+    async def handler(ws, _n):
+        await ws.recv()
+        await ws.send(json.dumps({"type": "ready", "session_id": "s"}))
+        await asyncio.sleep(0.1)
+        await ws.close(1011)
+
+    times = await _run_against(handler, 4.0)
+
+    # Connections near 0, 0.1, 1.2, 3.3 s.
+    assert 3 <= len(times) <= 5
+    gaps = [b - a for a, b in itertools.pairwise(times)]
+    assert gaps[0] < 0.5
+    assert gaps[1] >= 1.0
+    assert all(later > earlier for earlier, later in itertools.pairwise(gaps))
