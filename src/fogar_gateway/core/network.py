@@ -76,8 +76,8 @@ def warn_if_open_proxy_config() -> None:
         )
 
 
-# Headers that only a tunnel sets (tailscale serve, cloudflared): its peer is loopback,
-# so a request carrying them never earns the loopback exemption (auditoría 3.0, D-1).
+# Headers that only a tunnel sets (tailscale serve, cloudflared): a request carrying them
+# never earns the trusted-origin exemption, whatever its address (auditoría 3.0, D-1, D-r2-1).
 _TUNNEL_HEADERS = ("tailscale-user-login", "tailscale-user-name", "cf-connecting-ip")
 
 
@@ -96,15 +96,19 @@ def resolve_client_ip(connection: HTTPConnection) -> str:
     D-1: a proxy that passes the client's X-Real-IP through (tailscale serve,
     cloudflared) still sets X-Forwarded-For with the real address last, while
     nginx overwriting X-Real-IP with `proxy_add_x_forwarded_for` agrees with it.
-    So when X-Forwarded-For is present its last hop must equal X-Real-IP, and a
-    loopback result is never trusted next to a tunnel header (Tailscale-User-*,
-    Cf-Connecting-Ip) or a non-loopback hop anywhere in X-Forwarded-For (a tunnel
-    without identity headers, or tailscale serve in front of nginx).
+    So when X-Forwarded-For is present its last hop must equal X-Real-IP, and no
+    result is trusted next to a tunnel header (Tailscale-User-*, Cf-Connecting-Ip)
+    or any X-Forwarded-For hop other than itself (a tunnel without identity headers,
+    tailscale serve in front of nginx, a tunnel on another TRUSTED_NETWORKS host).
+    X-Real-IP must arrive exactly once (D-r2-2).
     """
     peer = connection.client.host if connection.client else ""
 
     if is_trusted_proxy(peer):
-        real_ip = (connection.headers.get("x-real-ip") or "").strip()
+        real_ips = connection.headers.getlist("x-real-ip")
+        if len(real_ips) != 1:  # a proxy that appends instead of overwriting (D-r2-2)
+            return NO_REAL_IP
+        real_ip = real_ips[0].strip()
         try:
             ipaddress.ip_address(real_ip)
         except ValueError:
@@ -121,17 +125,11 @@ def resolve_client_ip(connection: HTTPConnection) -> str:
             )
         ip = peer
 
-    # Loopback solo si nadie de fuera aparece en la cadena: un túnel sin cabeceras de identidad
-    # (nodo etiquetado, Funnel) o un tailscale serve delante de nginx dejan su salto en XFF.
+    # Confianza solo si nadie más aparece en la cadena, sea cual sea la IP (D-r2-1): un túnel sin
+    # cabeceras de identidad (nodo etiquetado, Funnel), un tailscale serve delante de nginx o un
+    # túnel en otra máquina de TRUSTED_NETWORKS dejan su salto en XFF.
     hops = [h.strip() for h in ",".join(connection.headers.getlist("x-forwarded-for")).split(",")]
-    foreign_hop = any(h and not _is_loopback(h) for h in hops)
-    if _is_loopback(ip) and (foreign_hop or any(h in connection.headers for h in _TUNNEL_HEADERS)):
+    foreign_hop = any(h and h != ip for h in hops)
+    if foreign_hop or any(h in connection.headers for h in _TUNNEL_HEADERS):
         return NO_REAL_IP
     return ip
-
-
-def _is_loopback(ip_str: str) -> bool:
-    try:
-        return ipaddress.ip_address(ip_str).is_loopback
-    except ValueError:
-        return False

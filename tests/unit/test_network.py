@@ -3,7 +3,12 @@ from starlette.datastructures import Headers
 from starlette.websockets import WebSocket
 
 from fogar_gateway.core.config import settings
-from fogar_gateway.core.network import is_trusted_origin, is_trusted_proxy, resolve_client_ip
+from fogar_gateway.core.network import (
+    NO_REAL_IP,
+    is_trusted_origin,
+    is_trusted_proxy,
+    resolve_client_ip,
+)
 
 
 class _FakeClient:
@@ -77,10 +82,42 @@ def test_resolve_client_ip_trusted_proxy_with_invalid_header_fails_closed():
 
 def test_nginx_overwriting_x_real_ip_with_matching_xff_is_honored():
     # nginx: X-Real-IP $remote_addr + proxy_add_x_forwarded_for (real IP last).
+    request = _FakeRequest("127.0.0.1", headers={"x-real-ip": "192.168.1.50", "x-forwarded-for": "192.168.1.50"})
+    assert resolve_client_ip(request) == "192.168.1.50"
+    # D-r2-1: an earlier hop (sent by the client or by a tunnel in front) is no longer accepted.
     request = _FakeRequest(
         "127.0.0.1", headers={"x-real-ip": "192.168.1.50", "x-forwarded-for": "10.9.9.9, 192.168.1.50"}
     )
-    assert resolve_client_ip(request) == "192.168.1.50"
+    assert resolve_client_ip(request) == NO_REAL_IP
+
+
+@pytest.mark.parametrize("tunnel", [{"cf-connecting-ip": "203.0.113.9"}, {"tailscale-user-login": "a@b"}])
+def test_tunnel_on_trusted_network_host_is_not_trusted(monkeypatch, tunnel):
+    # D-r2-1: cloudflared / tailscale serve on another LAN machine inside TRUSTED_NETWORKS.
+    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "192.168.1.0/24")
+    direct = _FakeRequest("192.168.1.5", headers={**tunnel, "x-forwarded-for": "203.0.113.9"})
+    assert not is_trusted_origin(resolve_client_ip(direct))
+    # Same with a LAN proxy in TRUSTED_PROXIES vouching for itself.
+    monkeypatch.setattr(settings, "TRUSTED_PROXIES", "192.168.1.10")
+    proxied = _FakeRequest(
+        "192.168.1.10",
+        headers={"x-real-ip": "192.168.1.10", "x-forwarded-for": "203.0.113.9, 192.168.1.10", **tunnel},
+    )
+    assert not is_trusted_origin(resolve_client_ip(proxied))
+
+
+def test_direct_trusted_network_peer_without_proxy_headers_is_trusted(monkeypatch):
+    # Home Assistant straight to the gateway: no XFF, no tunnel headers.
+    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "192.168.1.0/24")
+    assert is_trusted_origin(resolve_client_ip(_FakeRequest("192.168.1.5")))
+
+
+@pytest.mark.parametrize("values", [["127.0.0.1", "203.0.113.5"], ["203.0.113.5", "127.0.0.1"]])
+def test_repeated_x_real_ip_fails_closed(values):
+    # D-r2-2: a proxy that appends X-Real-IP instead of overwriting it.
+    request = _FakeRequest("127.0.0.1")
+    request.headers = Headers(raw=[(b"x-real-ip", v.encode()) for v in values])
+    assert not is_trusted_origin(resolve_client_ip(request))
 
 
 def test_proxy_passing_client_x_real_ip_through_fails_closed():
