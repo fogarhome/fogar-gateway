@@ -48,7 +48,7 @@ class TranscriberClient:
     async def connect(self, language: str = "es", token: str = "", vad_thold: float = 0.0):
         """Abre el socket y manda el Handshake inicial de config."""
         ok = False
-        self._end_sent = self.closed_after_end = False
+        self.closed_after_end = False  # _end_sent baja con el `ready`: hasta entonces se retiene el audio
         try:
             self.ws = await websockets.connect(f"ws://{self.url}/api/stt")
 
@@ -67,7 +67,7 @@ class TranscriberClient:
             msg = TranscriberMessage(**data)
 
             if msg.type == "ready":
-                self._is_ready = True
+                self._is_ready, self._end_sent = True, False
                 self._session_id = msg.session_id
                 logger.info(
                     f"[{self.client_id}] Transcriber listo. session_id={self._session_id!r}"

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections import deque
 
 from fogar_gateway.services.reconnection import (
     ConnectionState,
@@ -18,6 +19,9 @@ logger = logging.getLogger(__name__)
 
 # Warning code sent to the client when a reconnect cut the phrase in flight (E-r3-1).
 PHRASE_INTERRUPTED = "phrase_interrupted"
+# Audio held between our `end` and the next `ready` (~5 s of 20 ms frames): covers a final
+# slowed by a saturated GPU (3 s) plus the reopen.
+HELD_MAX = 250
 
 
 class ReconnectingTranscriberClient:
@@ -58,6 +62,11 @@ class ReconnectingTranscriberClient:
         # E-r3-1 review: a drop mid-phrase loses its head; its tail must not pass as an order.
         self._phrase_open = False  # audio sent since the last final
         self._lost = False  # this phrase lost audio: its final (and partials) are withheld
+        # fogar-transcriber stops reading a socket at our `end` (handleEnd, then close 1000): audio
+        # from then on is the next phrase and waits here for the new connection (E-r4-1, #358).
+        # None stands for an `end` that arrived while the held frames were being replayed.
+        self._held: deque[bytes | None] = deque(maxlen=HELD_MAX)
+        self._held_cut = False  # the oldest held frames were dropped
 
     @property
     def last_transcript_at(self) -> float | None:
@@ -88,20 +97,57 @@ class ReconnectingTranscriberClient:
             await self._client.close()
 
     async def send_audio(self, audio_bytes: bytes) -> None:
-        self._phrase_open = True
-        await self._client.send_audio(audio_bytes)
-        if not self._client._is_ready:  # the inner client dropped this frame
-            self._lost = True
+        if self._client._end_sent or self._held:  # the latter keeps order while replaying
+            self._hold(audio_bytes)
+            return
+        await self._send_now(audio_bytes)
 
     async def send_end(self) -> None:
+        if self._client._end_sent:  # before the new `ready`: a whole phrase in the gap is not kept
+            if self._held or self._held_cut:  # an `end` with no audio does nothing
+                self._held.clear()
+                self._held_cut = False
+                await self._phrase_lost()
+            return
+        if self._held:  # `ready` came, replay under way: the `end` goes after its frames
+            self._hold(None)
+            return
+        await self._end_now()
+
+    def _hold(self, item: bytes | None) -> None:
+        self._held_cut |= len(self._held) == HELD_MAX
+        self._held.append(item)
+
+    async def _send_now(self, audio_bytes: bytes) -> None:
+        if self.state != ConnectionState.DEGRADED:  # E-r4-3: `unavailable` already told them
+            self._phrase_open = True
+        await self._client.send_audio(audio_bytes)
+        if self._phrase_open and not self._client._is_ready:  # the inner client dropped it
+            self._lost = True
+
+    async def _end_now(self) -> None:
         await self._client.send_end()
         if self._phrase_open and not self._client._is_ready:
             await self._phrase_lost()  # this end was dropped: no final will ever come
+
+    async def _replay_held(self) -> None:
+        if self._held_cut:
+            self._phrase_open = self._lost = True
+        self._held_cut = False
+        while self._held and not self._client._end_sent:  # a replayed `end` stops it
+            if self._held[0] is None:
+                self._held.popleft()
+                await self._end_now()
+            else:  # popped after sending: frames arriving meanwhile queue behind it
+                await self._send_now(self._held[0])
+                self._held.popleft()
 
     async def _phrase_lost(self) -> None:
         """The phrase in flight when the connection dropped is gone: tell the client to
         repeat it (a fixed code, never the text) instead of passing on a truncated final."""
         self._phrase_open = self._lost = False
+        if self.state == ConnectionState.DEGRADED:  # E-r4-3: the client already has `unavailable`
+            return
         logger.warning("[%s] transcriber: phrase cut by a reconnect, final withheld",
                        self._client_id)
         await self._callbacks.on_incomplete(PHRASE_INTERRUPTED)
@@ -142,6 +188,7 @@ class ReconnectingTranscriberClient:
                 recovered = await self._reconnect_loop()
                 if not recovered:
                     return
+                await self._replay_held()
 
             self._client._dropped_unexpectedly = False
             try:
@@ -172,8 +219,10 @@ class ReconnectingTranscriberClient:
                 # close, 1000/1001 included, sets _dropped_unexpectedly.
                 return
             if self._client.closed_after_end:
-                # Fin de frase: la cierra. Sin aviso: audio de cola tras el `end` que ya vio el
-                # socket cerrado también marca _lost, y esa frase sí se entregó.
+                # Fin de frase: la cierra. El audio tras nuestro `end` está retenido, así que
+                # _lost solo viene de un corte de esta frase; su final vacía no lo avisó (E-r4-2).
+                if self._lost:
+                    await self._phrase_lost()
                 self._phrase_open = self._lost = False
                 # Fin de frase (1000 tras nuestro `end`): se reabre sin avisar al cliente; si no
                 # se puede, sí es una caída y sigue el camino normal con su backoff.
@@ -185,6 +234,7 @@ class ReconnectingTranscriberClient:
                     # The server answered fine: a later early drop is a lone one, not a flap
                     # in a row (E-r3-1).
                     self._health.flap_backoff = 0.0
+                    await self._replay_held()
                     continue
                 except asyncio.CancelledError:
                     raise
