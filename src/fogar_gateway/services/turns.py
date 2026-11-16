@@ -566,7 +566,7 @@ class TurnController:
         turn.conversation_id = self._conversation.id
         turn.task = task
         self._user_turn = turn
-        if await self._open(turn):
+        if await self._open(turn, count=False):  # no llegó a OpenClaw: no cuenta en la conversación
             await self._end(turn, reason)
 
     async def _abort_other_runs(self) -> None:
@@ -637,9 +637,7 @@ class TurnController:
             try:
                 reason = await self._stream(turn, text, pending)
             except asyncio.CancelledError:
-                # A-r2-2: el turn_end de un turno cortado no espera a que cierre el TTS.
-                await self._end(turn, turn.cancel_reason or "cancelled")
-                raise
+                raise  # abajo: su turn_end, sin cerrar antes el TTS
             except BaseException:
                 if pending.tts is not None:
                     await pending.tts.end()  # el servidor TTS sabe que no hay más
@@ -650,6 +648,11 @@ class TurnController:
                 if not self.client_gone:  # G-18: nadie a quien sonárselo
                     await tts.drain()
             return reason
+        except asyncio.CancelledError:
+            # A-r2-2: el turn_end de un turno cortado (también mientras su audio suena) no
+            # espera a que cierre el TTS.
+            await self._end(turn, turn.cancel_reason or "cancelled")
+            raise
         finally:
             await pending.release()
 
@@ -814,7 +817,9 @@ class TurnController:
             # registrado y con su turn_start ya en cola, nunca a medias (#202).
             async with self._lock:
                 if self._closing:
-                    return  # su turn_start ya no saldría (restrict) y su turn_end sí
+                    # Cerrándose (let_go ya abortó sus runs y restrict deja pasar el par,
+                    # A-r2-1): un push abierto ahora sería un turno vacío, solo para cerrarlo.
+                    return
                 if self._user_task is not None and not self._user_task.done():
                     continue  # un turno que se estaba sustituyendo: el usuario gana
                 if self._push is not None:
@@ -1054,7 +1059,7 @@ class TurnController:
             session_key=session_key,
         )
 
-    async def _open(self, turn: Turn) -> bool:
+    async def _open(self, turn: Turn, *, count: bool = True) -> bool:
         try:
             await self._sender.send_json(
                 {
@@ -1069,7 +1074,8 @@ class TurnController:
             self._log_send_failed("turn_start", e)
             return False
         turn.opened = True
-        self._conversation.note_turn(turn.conversation_id)
+        if count:
+            self._conversation.note_turn(turn.conversation_id)
         return True
 
     async def _connect_tts(self, turn: Turn) -> TurnTts | None:
@@ -1175,6 +1181,8 @@ class TurnController:
                 )
             finally:
                 released.cancel()
+            if task.done():  # G-r2-1: un send que no llegó a arrancar recibe igual su par
+                await self._end_unstarted(task, "closed")
         runs = self._turn_registry.active_runs(key)
         push = self._push
         if push is not None and not push.ended:

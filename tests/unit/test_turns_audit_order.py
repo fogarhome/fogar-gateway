@@ -221,3 +221,62 @@ async def test_a_send_cancelled_before_it_starts_still_gets_its_pair(make_bridge
     await sent(bridge)
     assert turn_marks(ws) == [("turn_start", "t-1"), ("turn_end", "t-1")]
     assert ws.of("turn_end")[0]["reason"] == "cancelled"
+
+
+async def test_turn_end_of_a_turn_cancelled_while_its_audio_plays_is_not_late(make_bridge, monkeypatch):
+    """A-r2-2 (revisión): OpenClaw ya terminó y el audio suena (drain): tras cancel el turn_end
+    sale sin esperar a cerrar el TTS; después, ni audio ni otro turn_end."""
+    monkeypatch.setattr(settings, "AUDIO_PACING_ENABLED", False)
+
+    async def endless_audio():
+        while True:
+            yield b"\x00\x01" * 160
+            await asyncio.sleep(0.002)
+
+    stream = tts_stream(endless_audio)
+    release_close = asyncio.Event()
+
+    async def slow_close():
+        await release_close.wait()
+
+    stream.close = slow_close
+    bridge, ws = make_bridge(output_mode=("text", "audio"), tts=tts_provider(stream))
+    bridge.orchestrator.stream_response = tokens("hola")
+    await start_turn(bridge)
+    await wait_until(lambda: any(isinstance(m, bytes) for m in ws.sent))
+    await asyncio.sleep(0.1)  # el stream terminó: el turno está drenando el audio
+    cancel = asyncio.create_task(bridge.turns.cancel("interrupted"))
+    try:
+        await wait_until(lambda: ws.of("turn_end"), timeout=1.0)
+    finally:
+        release_close.set()
+        await asyncio.wait_for(cancel, 2)
+    await sent(bridge)
+    ends = [i for i, m in enumerate(ws.sent) if isinstance(m, dict) and m["type"] == "turn_end"]
+    assert len(ends) == 1 and ws.sent[ends[0]]["reason"] == "interrupted"
+    assert not any(isinstance(m, bytes) for m in ws.sent[ends[0]:])
+
+
+async def test_the_pair_of_an_unstarted_send_does_not_count_as_a_turn(make_bridge):
+    """G-r2-1 (revisión): el par de un send que no llegó a OpenClaw no suma en la conversación."""
+    bridge, ws = make_bridge()
+    bridge.orchestrator.stream_response = tokens("ok")
+    noted = []
+    bridge.conversation.note_turn = noted.append
+    await bridge.turns.start_user_turn("uno")
+    await bridge.turns.start_user_turn("dos")
+    await asyncio.wait({bridge.turns.user_task}, timeout=2)
+    await sent(bridge)
+    assert len(ws.of("turn_start")) == 2 and noted == [bridge.conversation.id]
+
+
+async def test_let_go_gives_an_unstarted_send_its_pair(make_bridge):
+    """G-r2-1 (revisión): desplazada o revocada, un send aceptado cuya tarea aún no corrió
+    recibe su par `closed` (let_go)."""
+    bridge, ws = make_bridge()
+    bridge.orchestrator.stream_response = blocking()
+    await bridge.turns.start_user_turn("uno")  # su tarea aún no corrió
+    await bridge.turns.let_go(1.0)
+    await sent(bridge)
+    assert turn_marks(ws) == [("turn_start", "t-1"), ("turn_end", "t-1")]
+    assert ws.of("turn_end")[0]["reason"] == "closed"
