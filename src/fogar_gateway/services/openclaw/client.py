@@ -230,6 +230,17 @@ def _safe_error_code(error: object) -> str:
     return "unspecified"
 
 
+def _loads_frame(raw: str | bytes):
+    """json.loads de una trama de OpenClaw sin surrogates sueltos (G-r3-1): un `\\ud800`
+    escapado sin pareja rompería después todo encode a UTF-8 (la salida al cliente, las
+    respuestas de /admin y /v1). Solo re-codifica si la trama trae un escape de surrogate."""
+    frame = json.loads(raw)
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+    if "\\ud" in text or "\\uD" in text:
+        frame = json.loads(json.dumps(frame, ensure_ascii=False).encode("utf-8", "replace"))
+    return frame
+
+
 def _log_safe(value: object) -> str:
     """Server-provided scalar rendered for a log line: short, single-line."""
     return str(value).replace("\n", " ").replace("\r", " ")[:40]
@@ -614,7 +625,7 @@ class OpenClawClient:
         """A handshake frame that is not a JSON object is a handshake failure with a
         stable reason, never a stray AttributeError/JSONDecodeError (#228)."""
         try:
-            frame = json.loads(raw)
+            frame = _loads_frame(raw)
         except ValueError:
             raise OrchestratorHandshakeError() from None
         if not isinstance(frame, dict):
@@ -658,7 +669,7 @@ class OpenClawClient:
             if remaining <= 0:
                 raise TimeoutError(f"No response for req_id={req_id} within {timeout}s")
             raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
-            frame = json.loads(raw)
+            frame = _loads_frame(raw)
             if frame.get("id") == req_id:
                 return frame
 
@@ -941,7 +952,7 @@ class OpenClawClient:
                 logger.debug("on_disconnect traceback (no message): %s", traceback_no_message(e))
 
     async def _handle_raw_frame(self, raw: str | bytes) -> None:
-        frame = json.loads(raw)
+        frame = _loads_frame(raw)
         if not isinstance(frame, dict):
             raise TypeError("frame is not an object")
         fid = frame.get("id", "")

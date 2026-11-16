@@ -115,7 +115,7 @@ async def list_models(request: Request, caller: HACaller = Depends(resolve_ha_ca
 def _extract_last_user_message(messages: list[_ChatMessage]) -> str:
     for msg in reversed(messages):
         if msg.role == "user":
-            return msg.content
+            return msg.content.encode("utf-8", "replace").decode()  # G-r3-1: sin surrogates sueltos
     return ""
 
 

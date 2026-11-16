@@ -754,7 +754,9 @@ class FogarBridge:
                         if not isinstance(raw_text, str):
                             await self._send_invalid_message()
                         else:
-                            text = raw_text.strip()
+                            # G-r3-1: un `\ud800` escapado deja un surrogate suelto que
+                            # rompería el envío UTF-8 al cliente y a /admin.
+                            text = raw_text.encode("utf-8", "replace").decode().strip()
                             if text:
                                 logger.info(f"[{self.client_id}] send recibido: len={len(text)}")
                                 await self.turns.start_user_turn(text)

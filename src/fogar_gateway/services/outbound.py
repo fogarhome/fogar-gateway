@@ -73,9 +73,17 @@ class QueuedSender:
     timeout bounds memory only for clients below the threshold.
     """
 
-    def __init__(self, ws, on_slow: Callable[[], Awaitable[None]] | None = None):
+    def __init__(
+        self,
+        ws,
+        on_slow: Callable[[], Awaitable[None]] | None = None,
+        on_error: Callable[[], Awaitable[None]] | None = None,
+    ):
         self._ws = ws
         self._on_slow = on_slow
+        # G-r3-1: un mensaje que no se puede serializar con el socket sano; quien crea el
+        # sender cierra la sesión (1011) para que no quede viva sin salida.
+        self._on_error = on_error
         self._queue: asyncio.Queue = asyncio.Queue()
         self._failure: Exception | None = None
         self._closing = False
@@ -187,11 +195,21 @@ class QueuedSender:
                     await self._fail_slow()
                     return
                 self._failure = e
+                # ValueError/TypeError: el mensaje no se pudo serializar (p. ej. UnicodeEncodeError)
+                # y el socket sigue abierto. Saltarlo rompería el par turn_start/turn_end: se
+                # cierra la sesión en vez de dejarla sin salida.
+                unencodable = isinstance(e, (ValueError, TypeError))
                 # One line, never the payload (it may hold user text).
                 level = logging.INFO if _is_routine_disconnect(e) else logging.WARNING
-                logger.log(level, "Outbound: fallo de socket (%s) — descartando lo pendiente.",
+                logger.log(level, "Outbound: %s (%s) — descartando lo pendiente.",
+                           "mensaje no serializable" if unencodable else "fallo de socket",
                            type(e).__name__)
                 self._discard_pending()
+                if unencodable and self._on_error is not None:
+                    try:
+                        await self._on_error()
+                    except Exception as err:  # noqa: BLE001 — frontera: callback externo
+                        logger.warning("Outbound: on_error falló (%s).", type(err).__name__)
                 return
 
     async def _fail_slow(self) -> None:

@@ -220,7 +220,11 @@ async def gateway_websocket(websocket: WebSocket):
             record=lambda: tracker.record("client_slow", timeout_s=settings.CLIENT_SEND_TIMEOUT_S),
         )
 
-    sender = QueuedSender(websocket, on_slow=_on_slow_client)
+    async def _on_send_error() -> None:
+        bridge.note_close_reason("error")
+        await send_close(websocket, Close.INTERNAL_ERROR)
+
+    sender = QueuedSender(websocket, on_slow=_on_slow_client, on_error=_on_send_error)
     # G-24 (#221): the writer task is already running; if building the rest fails, close
     # it and the session instead of leaving them orphaned. Construction is synchronous,
     # so only an Exception can land here.

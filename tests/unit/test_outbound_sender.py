@@ -376,3 +376,39 @@ async def test_queued_slow_client_logs_one_warning_without_payload(monkeypatch, 
     assert len(records) == 1
     assert records[0].levelname == "WARNING"
     assert "SECRETO" not in records[0].getMessage()
+
+
+async def test_queued_closes_the_session_on_a_message_it_cannot_serialize():
+    """G-r3-1: un error que no es de socket (UnicodeEncodeError) con el socket sano no se salta
+    el mensaje (rompería el par turn_start/turn_end) ni deja la sesión viva sin salida: on_error."""
+    calls = []
+
+    class BadWS(FakeWS):
+        async def send_json(self, payload):
+            "x\ud800".encode()
+
+    async def on_error():
+        calls.append(True)
+
+    s = QueuedSender(BadWS(), on_error=on_error)
+    await s.send_json({"type": "token"})
+    await s.send_json({"type": "turn_end"})
+    with pytest.raises(ClientGone):
+        await s.flush()
+    assert calls == [True]
+    with pytest.raises(ClientGone):
+        await s.send_json({"type": "x"})
+    await s.aclose(1.0)
+
+
+async def test_queued_socket_failure_does_not_call_on_error():
+    calls = []
+
+    async def on_error():
+        calls.append(True)
+
+    s = QueuedSender(FakeWS(fail_on=1), on_error=on_error)
+    await s.send_json({"type": "token"})
+    with pytest.raises(ClientGone):
+        await s.flush()
+    assert calls == []

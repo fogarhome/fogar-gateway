@@ -101,8 +101,8 @@ def test_slow_client_reason(client, monkeypatch):
     monkeypatch.setattr(routes, "drop_slow_client", fake_drop)
     real_sender = routes.QueuedSender
 
-    def _sender(ws, on_slow=None):
-        s = real_sender(ws, on_slow=on_slow)
+    def _sender(ws, on_slow=None, on_error=None):
+        s = real_sender(ws, on_slow=on_slow, on_error=on_error)
         captured.append(s)
         return s
 
