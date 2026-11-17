@@ -417,7 +417,7 @@ def test_set_json_yes_is_valid_json(home, systemd):
     r = run("--json", "--yes", "config", "set", "LOG_FORMAT", "text")
     assert r.exit_code == 0, r.output
     assert json.loads(r.output) == {"name": "LOG_FORMAT", "value": "text", "changed": True,
-                                    "restarted": True}
+                                    "restarted": True, "problems": []}
     assert ("restart", "fogar-gateway.service") in systemd.calls
 
 
@@ -514,3 +514,74 @@ def test_set_fixes_an_invalid_value_already_in_config_env(home):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "Traceback" not in r.stdout + r.stderr
     assert _env(home).read_text() == f"ADMIN_TOKEN={SECRET}\nTURN_TIMEOUT_S=120\n"
+
+
+def test_set_only_rejects_its_own_field_and_warns_about_the_rest(home, monkeypatch):
+    """F-r7-1: `set`/`unset` solo rechazan que el propio ajuste quede inválido; corregir uno
+    siempre se puede, y lo que falla en otros ajustes solo se avisa (sin valores)."""
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    good = "a" * 32
+    _env(home).write_text("ADMIN_TOKEN=corto\nTURN_TIMEOUT_S=0\n")
+    r = run("config", "set", "TURN_TIMEOUT_S", "10")
+    assert r.exit_code == 0, r.output
+    assert "Aviso" in r.output and "ADMIN_TOKEN" in r.output and "corto" not in r.output
+
+    _env(home).write_text(f"ADMIN_TOKEN={good}\nTURN_TIMEOUT_S=0\n")
+    r = run("config", "set", "STT_PROVIDER", "elevenlabs")  # sin clave: otro ajuste, avisa
+    assert r.exit_code == 0, r.output
+    assert "TURN_TIMEOUT_S: greater_than" in r.output and "config validate" in r.output
+    r = run("config", "set", "TURN_TIMEOUT_S", "10")  # como `validate`: ahora sale la voz
+    assert r.exit_code == 0, r.output
+    assert "ELEVENLABS_API_KEY" in r.output and "TURN_TIMEOUT_S:" not in r.output
+
+    _env(home).write_text(f"ADMIN_TOKEN={good}\nTTS_VOICE_MAP=no-es-json\n")
+    before = _env(home).read_bytes()
+    r = run("config", "set", "TURN_TIMEOUT_S", "0")  # el propio ajuste queda inválido
+    assert r.exit_code == 1 and "TURN_TIMEOUT_S: greater_than" in r.output
+    r = run("config", "set", "TTS_VOICE_MAP", "-", input="{malo\n")
+    assert r.exit_code == 1 and "TTS_VOICE_MAP" in r.output
+    assert _env(home).read_bytes() == before
+    r = run("config", "unset", "TTS_VOICE_MAP")
+    assert r.exit_code == 0, r.output
+    assert "Aviso" not in r.output
+    assert _env(home).read_text() == f"ADMIN_TOKEN={good}\n"
+    r = run("--json", "config", "set", "TTS_VOICE_MAP", '{"a":"b"}')
+    assert r.exit_code == 0, r.output
+    assert json.loads(r.output)["problems"] == []
+
+
+def test_set_validates_its_field_ignoring_other_bad_environment(home, monkeypatch):
+    """F-r7-1 (revisión): un ajuste malo en el entorno (aquí un JSON que no se lee) no oculta
+    que el propio valor es inválido."""
+    monkeypatch.setenv("TTS_VOICE_MAP", "bad")
+    before = _env(home).read_bytes()
+    r = run("config", "set", "IDLE_TIMEOUT_S", "0")
+    assert r.exit_code == 1 and "IDLE_TIMEOUT_S: greater_than" in r.output
+    assert _env(home).read_bytes() == before
+    assert os.environ["TTS_VOICE_MAP"] == "bad"  # el entorno queda como estaba
+
+
+@pytest.mark.parametrize("extra", ["", "TURN_TIMEOUT_S=0\n"])
+def test_retired_key_warning_once_per_command(home, extra):
+    """F-r7-3: el WARNING de la clave obsoleta sale una vez, también con la configuración
+    inválida (la CLI ejecuta entonces el módulo otra vez). En un proceso nuevo."""
+    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nORCHESTRATOR_RECONNECT_MAX_DURATION=5\n{extra}")
+    r = subprocess.run([sys.executable, "-m", "fogar_gateway.cli", "config", "set",
+                        "TURN_TIMEOUT_S", "10"], cwd=ROOT, capture_output=True, text=True,
+                       env=os.environ)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (r.stdout + r.stderr).count("is obsolete and ignored") == 1
+
+
+@pytest.mark.parametrize("value", ["0", "inf", "nan"])
+@pytest.mark.parametrize(
+    "name",
+    ["ORCHESTRATOR_RECONNECT_INITIAL_BACKOFF", "TTS_RECONNECT_MAX_BACKOFF",
+     "TRANSCRIBER_RECONNECT_MAX_DURATION", "TTS_AUTH_TIMEOUT_S", "TRANSCRIBER_READY_TIMEOUT_S",
+     "HANDSHAKE_TIMEOUT_S"],
+)
+def test_set_rejects_non_positive_or_infinite_deadlines(home, name, value):
+    """D-r7-1: backoffs y plazos > 0 y finitos."""
+    before = _env(home).read_bytes()
+    assert run("config", "set", name, value).exit_code == 1
+    assert _env(home).read_bytes() == before

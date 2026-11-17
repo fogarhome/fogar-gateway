@@ -307,18 +307,37 @@ def _edit(text: str, key: str, value: str | None) -> str:
     return "".join(out)
 
 
-def _fails(path: Path, key: str) -> tuple[set[str], list[str]]:
-    # Sin la variable de NAME en el entorno: el servicio de systemd no hereda esta shell, así
-    # que lo que vale es lo que dice el fichero.
-    names = [n for n in os.environ if n.upper() == key]
-    saved = {n: os.environ.pop(n) for n in names}
+def _own_errors(key: str, value: str) -> list[str]:
+    """Errores de validación de KEY=value solo (campo + tipo, nunca el valor), frente a los
+    valores por defecto: sin ningún otro ajuste del entorno, cuyo error (p. ej. un JSON malo)
+    ocultaría el de KEY. Se valida como variable de entorno, que decodifica el JSON igual que
+    config.env: `set` solo frena lo que deja inválido el propio KEY."""
+    from pydantic import ValidationError
+    from pydantic_settings import SettingsError
+
+    settings_cls = _settings_class()
+    fields = set(settings_cls.model_fields)
+    saved = {n: os.environ.pop(n) for n in [n for n in os.environ if n.upper() in fields]}
     try:
-        settings, errors, _ = load(path)
+        os.environ[key] = value
+        settings_cls(_env_file=None)
+    except ValidationError as e:
+        return _errors(e)
+    except SettingsError as e:
+        return _settings_error(e)
     finally:
+        os.environ.pop(key, None)
         os.environ.update(saved)
+    return []
+
+
+def _problems() -> list[str]:
+    """Lo que `config validate` marca como fallo en config.env, como «campo: motivo»."""
+    settings, errors, _ = load()
     if errors:
-        return set(), errors
-    return {c["check"] for c in validation_checks(settings) if c["level"] == "fail"}, []
+        return errors
+    return [f"{c['check']}: {c['detail']}" for c in validation_checks(settings)
+            if c["level"] == "fail"]
 
 
 def _resolve_name(name: str) -> str:
@@ -332,7 +351,7 @@ def _resolve_name(name: str) -> str:
 
 
 def _apply(out: Out, key: str, value: str | None) -> bool:
-    """Valida el candidato en un temporal 600 y lo mueve sobre config.env. False = sin cambios."""
+    """Valida KEY y escribe config.env por un temporal 600. False = sin cambios."""
     from dotenv import dotenv_values
 
     path = paths.config_file()
@@ -341,7 +360,7 @@ def _apply(out: Out, key: str, value: str | None) -> bool:
     if key == "ADMIN_TOKEN":
         from fogar_gateway.core.startup_checks import ADMIN_TOKEN_MIN_LEN, admin_token_too_short
 
-        # Aunque el actual ya sea corto (_fails solo frena fallos nuevos) (D-r5-1, F-r6-3).
+        # Aunque el actual ya sea corto (D-r5-1, F-r6-3).
         if value is None:
             raise api.ApiError("ADMIN_TOKEN no se puede quitar: sin él /admin queda inutilizable. "
                                "Cámbialo con `fogar-gw config set ADMIN_TOKEN`. No se ha "
@@ -356,6 +375,10 @@ def _apply(out: Out, key: str, value: str | None) -> bool:
         if bad := "; ".join(filter(None, (_bad_network_entries(value), _host_bit_entries(value)))):
             raise api.ApiError(f"{key}: entradas no válidas: {bad}. Usa IPs o CIDRs separadas "
                                "por comas. No se ha escrito nada.", 1)
+    # Solo el propio KEY: corregir un ajuste siempre se puede aunque otros fallen; lo demás lo
+    # avisa _report y lo juzgan `config validate` y `doctor` (#359, F-r7-1).
+    if value is not None and (errors := _own_errors(key, value)):
+        raise api.ApiError(f"Valor no válido: {'; '.join(errors)}. No se ha escrito nada.", 1)
     old = path.read_text()
     new = _edit(old, key, value)
     if new == old:
@@ -368,15 +391,6 @@ def _apply(out: Out, key: str, value: str | None) -> bool:
         if value is not None and dotenv_values(tmp).get(key) != value:
             raise api.ApiError(f"El valor de {key} no se puede guardar en config.env tal cual "
                                "(p. ej. contiene `${...}` o saltos de línea).", 1)
-        before, old_errors = _fails(path, key)
-        after, errors = _fails(tmp, key)
-        # Solo frena errores nuevos: con dos valores inválidos se puede corregir uno (#359).
-        if new_errors := [e for e in errors if e not in old_errors]:
-            raise api.ApiError("Con ese cambio la configuración no sería válida: "
-                               + "; ".join(new_errors) + ". No se ha escrito nada.", 1)
-        if after - before:
-            raise api.ApiError("Con ese cambio fallaría: " + ", ".join(sorted(after - before))
-                               + ". No se ha escrito nada.", 1)
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
@@ -420,9 +434,11 @@ def _restart(ctx: click.Context) -> None:
 def _report(ctx: click.Context, out: Out, key: str, value: str | None, changed: bool) -> None:
     # Siempre el valor guardado (nunca el del entorno), enmascarado si es un secreto.
     saved = None if value is None else shown(key, value)
+    problems = _problems()
     restarted = changed and _offer_restart(ctx, out)
     if out.as_json:
-        out.json({"name": key, "value": saved, "changed": changed, "restarted": restarted})
+        out.json({"name": key, "value": saved, "changed": changed, "restarted": restarted,
+                  "problems": problems})
         return
     if not changed:
         out.message(f"{key}: sin cambios.")
@@ -432,6 +448,9 @@ def _report(ctx: click.Context, out: Out, key: str, value: str | None, changed: 
         out.message(f"{key}={saved}")
     if key in {k.upper() for k in os.environ}:
         out.message(f"Aviso: {key} está en el entorno y en esta shell manda sobre config.env.")
+    if problems:
+        out.error("Aviso: la configuración tiene fallos (no se ha deshecho nada): "
+                  + "; ".join(problems) + ". Revisa `fogar-gw config validate`.")
     if restarted:
         out.message("Servicio reiniciado.")
     elif changed:

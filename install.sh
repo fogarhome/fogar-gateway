@@ -59,6 +59,17 @@ unit_doctor() {
   if [ -n "$unit_base" ]; then fogar-gw --home "$unit_base" doctor; else fogar-gw doctor; fi
 }
 
+# Tras actualizar: reinicia y pasa doctor también si no arranca (p. ej. un ajuste que la versión
+# nueva ya no acepta), para que diga qué corregir (F-r7-2). Deja not_started=1 si no arrancó.
+restart_and_doctor() {
+  not_started=
+  if ! fogar-gw --yes restart; then
+    not_started=1
+    say "$(t "El servicio no arranca con la versión nueva: corrige lo que marca el diagnóstico (abajo) con \`fogar-gw config set\` o \`config unset\` y luego \`fogar-gw restart\`." "The service does not start with the new version: fix what the diagnosis reports (below) with \`fogar-gw config set\` or \`config unset\`, then \`fogar-gw restart\`.")"
+  fi
+  unit_doctor "$1" || say "$(t "El diagnóstico marca algún fallo (arriba); la actualización está hecha." "The diagnosis reports a problem (above); the update is done.")"
+}
+
 # El probe va en un subshell: con dash, una redirección fallida en `:` saldría del script.
 has_tty() { (: </dev/tty) 2>/dev/null; }
 
@@ -169,9 +180,9 @@ main() {
 
   unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/fogar-gateway.service"
   if [ -e "$unit" ]; then
-    fogar-gw --yes restart
-    unit_doctor "$unit" || say "$(t "El diagnóstico marca algún fallo (arriba); la actualización está hecha." "The diagnosis reports a problem (above); the update is done.")"
+    restart_and_doctor "$unit"
     [ -z "$path_note" ] || say "$path_note"
+    [ -z "$not_started" ] || exit 1
     return
   fi
   # shellcheck disable=SC2016 # las comillas invertidas son texto

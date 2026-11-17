@@ -10,14 +10,16 @@ from fogar_gateway.core.session_key import AGENT_ID_PATTERN
 
 _logger = logging.getLogger(__name__)
 
-# Keys that older installs still carry in config.env: accepted and ignored (with one WARNING)
+# Keys that older installs still carry in config.env: accepted and ignored (with one WARNING per
+# process, F-r7-3: the CLI builds Settings many times and may run this module more than once)
 # so an upgrade does not turn them into "Extra inputs are not permitted".
 RETIRED_KEYS = frozenset({"ORCHESTRATOR_RECONNECT_MAX_DURATION"})  # #272: single endless loop
 
 
 class Settings(BaseSettings):
     # Nunca el .env del directorio actual: <base>/config.env (o --home / FOGAR_GATEWAY_HOME).
-    model_config = SettingsConfigDict(env_file=paths.config_file())
+    # Ningún plazo admite inf ni nan (D-r7-1): un HANDSHAKE_TIMEOUT_S=inf no caduca nunca.
+    model_config = SettingsConfigDict(env_file=paths.config_file(), allow_inf_nan=False)
 
     @model_validator(mode="before")
     @classmethod
@@ -25,10 +27,12 @@ class Settings(BaseSettings):
         if not isinstance(data, dict):
             return data
         retired = sorted(k for k in data if isinstance(k, str) and k.upper() in RETIRED_KEYS)
-        if retired:
+        if retired and not getattr(_logger, "retired_warned", False):
+            _logger.retired_warned = True  # type: ignore[attr-defined]  # shared by every copy
             _logger.warning(
                 "Config: %s is obsolete and ignored (remove it from config.env).", ", ".join(retired)
             )
+        if retired:
             data = {k: v for k, v in data.items() if k not in retired}
         return data
 
@@ -124,15 +128,15 @@ class Settings(BaseSettings):
     # Hora local del host (0-23) a la que empieza el día de las conversaciones por defecto (M19):
     # una por cliente, agente y día. Un turno que empieza tras el corte pasa a la del día nuevo.
     CONVERSATION_DAY_START_HOUR: int = Field(default=5, ge=0, le=23)
-    ORCHESTRATOR_RECONNECT_INITIAL_BACKOFF: float = 1.0
-    ORCHESTRATOR_RECONNECT_MAX_BACKOFF: float = 60.0
-    TRANSCRIBER_RECONNECT_INITIAL_BACKOFF: float = 1.0
-    TRANSCRIBER_RECONNECT_MAX_BACKOFF: float = 60.0
-    TRANSCRIBER_RECONNECT_MAX_DURATION: float = 300.0
-    TTS_RECONNECT_INITIAL_BACKOFF: float = 1.0
-    TTS_RECONNECT_MAX_BACKOFF: float = 60.0
-    TTS_AUTH_TIMEOUT_S: float = 10.0
-    TRANSCRIBER_READY_TIMEOUT_S: float = 10.0
+    ORCHESTRATOR_RECONNECT_INITIAL_BACKOFF: float = Field(default=1.0, gt=0)
+    ORCHESTRATOR_RECONNECT_MAX_BACKOFF: float = Field(default=60.0, gt=0)
+    TRANSCRIBER_RECONNECT_INITIAL_BACKOFF: float = Field(default=1.0, gt=0)
+    TRANSCRIBER_RECONNECT_MAX_BACKOFF: float = Field(default=60.0, gt=0)
+    TRANSCRIBER_RECONNECT_MAX_DURATION: float = Field(default=300.0, gt=0)
+    TTS_RECONNECT_INITIAL_BACKOFF: float = Field(default=1.0, gt=0)
+    TTS_RECONNECT_MAX_BACKOFF: float = Field(default=60.0, gt=0)
+    TTS_AUTH_TIMEOUT_S: float = Field(default=10.0, gt=0)
+    TRANSCRIBER_READY_TIMEOUT_S: float = Field(default=10.0, gt=0)
 
     # Deadlines acotados (issue #115)
     # 5 s (antes 10, #216): un handshake es un único mensaje pequeño; el margen largo solo

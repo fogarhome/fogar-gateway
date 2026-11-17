@@ -151,3 +151,26 @@ def test_doctor_after_update_uses_the_base_of_the_unit(home, tmp_path):
     assert r.stdout == f"--home|{home}|doctor|"
     unit.write_text("[Service]\nExecStart=/opt/fogar-gw serve\n", encoding="utf-8")
     assert _sh('unit_doctor "$UNIT"', UNIT=str(unit), PATH=path).stdout == "doctor|"
+
+
+@pytest.mark.parametrize("shell", sorted({s for s in (shutil.which("dash"), shutil.which("sh")) if s}))
+def test_doctor_runs_even_if_the_restart_fails(shell, tmp_path):
+    """F-r7-2: bajo `set -eu`, un `restart` fallido (el gateway nuevo no arranca) no corta antes
+    de `doctor`; deja not_started para que el instalador salga con error al final."""
+    unit = tmp_path / "fogar-gateway.service"
+    unit.write_text("[Service]\nExecStart=/opt/fogar-gw serve\n", encoding="utf-8")
+    stub = tmp_path / "bin" / "fogar-gw"
+    stub.parent.mkdir()
+    stub.write_text('#!/bin/sh\nprintf "%s|" "$@"\n[ "$2" != restart ]\n', encoding="utf-8")
+    stub.chmod(0o755)
+    env = {"PATH": f"{stub.parent}:/usr/bin:/bin", "FOGAR_INSTALL_LIB": "1", "UNIT": str(unit),
+           "LANG": "C"}
+    r = subprocess.run(
+        [shell, "-c", f'. "{INSTALL_SH}"\nset -eu\nlang=es\nrestart_and_doctor "$UNIT"\n'
+         'printf "<%s>" "$not_started"'],
+        env=env, capture_output=True, text=True, encoding="utf-8", timeout=20, check=False,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith("--yes|restart|")
+    assert "no arranca" in r.stdout
+    assert r.stdout.endswith("doctor|<1>")
