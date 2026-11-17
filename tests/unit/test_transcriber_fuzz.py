@@ -92,6 +92,8 @@ async def _run_seed(seed: int) -> list[str]:
         held = sum(len(x) for x in w._held if isinstance(x, bytes))
         if held > HELD_MAX_BYTES:
             errors.append(f"held {held} B > {HELD_MAX_BYTES}")
+        if w._held_bytes != held:  # a drifting counter drops audio early
+            errors.append(f"_held_bytes {w._held_bytes} != {held}")
 
     async with websockets.serve(server.handler, "127.0.0.1", 0) as srv:
         w = ReconnectingTranscriberClient(

@@ -392,3 +392,25 @@ async def test_end_sent_is_raised_before_the_send(fail):
     assert ws.end_sent_at_send is True
     assert client._end_sent is (not fail)
     assert client._is_ready is (not fail)
+
+
+async def test_whole_phrase_in_the_gap_drops_only_itself():
+    """E-r5-1: a replayed `end` stops the replay with c (whole, with its `end`) still queued;
+    d then falls whole before the next `ready`. Only d is dropped and reported; c goes out."""
+    w, inner = _slow(0.01)
+    await w.send_audio(b"b0")
+    inner._end_sent = False  # `ready`
+    replay = asyncio.create_task(w._replay_held())
+    await asyncio.sleep(0)
+    await w.send_end()  # b's
+    await w.send_audio(b"c0")
+    await w.send_end()
+    await w.send_audio(b"d0")
+    await replay  # stops at b's `end`
+    assert list(w._held) == [b"c0", None, b"d0"]
+    await w.send_end()  # d's, before the next `ready`
+    assert list(w._held) == [b"c0", None]
+    w._callbacks.on_warning.assert_awaited_once_with("phrase_interrupted", None)
+    inner._end_sent = False
+    await w._replay_held()
+    assert inner.wire[-2:] == [b"c0", "END"]
