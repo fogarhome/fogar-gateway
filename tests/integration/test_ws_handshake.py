@@ -50,6 +50,31 @@ def test_valid_json_that_is_not_an_object_closes_4000(client, payload):
     assert gateway_stats.snapshot()["handshake_rejected"] == {"invalid": 1}
 
 
+@pytest.mark.parametrize("deep", [False, True])
+def test_huge_int_or_deep_nesting_closes_4000(client, monkeypatch, caplog, deep):
+    """D-r5-2: con HANDSHAKE_MAX_BYTES alto, un entero > 4300 cifras (ValueError) o un
+    anidamiento que agote la pila (RecursionError; el json de este Python no llega, se simula)
+    → 4000 e invalid, no 1006; el log da solo el tipo."""
+    import types
+
+    from fogar_gateway.api import routes
+
+    monkeypatch.setattr(settings, "HANDSHAKE_MAX_BYTES", 1_000_000)
+    payload = '{"n": ' + "9" * 5000 + "}"
+    if deep:
+        def loads(_raw):
+            raise RecursionError("maximum recursion depth exceeded")
+        fake = types.SimpleNamespace(loads=loads, JSONDecodeError=json.JSONDecodeError)
+        monkeypatch.setattr(routes, "json", fake)
+    with pytest.raises(WebSocketDisconnect) as exc, client.websocket_connect("/ws/stream") as ws:
+        ws.send_text(payload)
+        ws.receive_text()
+    assert (exc.value.code, exc.value.reason) == (4000, "invalid handshake")
+    assert gateway_stats.snapshot()["handshake_rejected"] == {"invalid": 1}
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "4300" not in logged and "digits" not in logged
+
+
 def test_handshake_timeout_closes_ws(client, monkeypatch):
     """Cliente conecta pero nunca manda el JSON de handshake → cierre 4900
     tras HANDSHAKE_TIMEOUT_S (issue #115).

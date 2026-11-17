@@ -128,17 +128,21 @@ async def gateway_websocket(websocket: WebSocket):
             return
         msg_data = json.loads(raw_msg)
         handshake = Handshake.model_validate(msg_data)  # JSON que no es objeto → ValidationError (D-r4-1)
-    except (json.JSONDecodeError, ValidationError) as e:
+    except (ValueError, RecursionError) as e:
+        # ValueError cubre JSONDecodeError, ValidationError y el límite de 4300 dígitos de un
+        # entero; RecursionError, un anidamiento profundo (D-r5-2).
         # G-27b (#216): str(ValidationError) incluye `input_value=` con el dict entero
         # (la client_key). Solo campo y tipo de error; de JSONDecodeError, su mensaje
-        # (posición, sin el documento).
+        # (posición, sin el documento); de lo demás, solo el tipo.
         if isinstance(e, ValidationError):
             detail = ", ".join(
                 f"{'.'.join(str(p) for p in err['loc'])}:{err['type']}"
                 for err in e.errors(include_input=False, include_url=False, include_context=False)
             )
-        else:
+        elif isinstance(e, json.JSONDecodeError):
             detail = f"JSON inválido ({e.msg})"
+        else:
+            detail = f"JSON inválido ({type(e).__name__})"
         logger.error(f"Payload inicial inválido de handshake. {detail}")
         gateway_stats.handshake_rejected("invalid")
         await send_close(websocket, Close.HANDSHAKE_INVALID)
