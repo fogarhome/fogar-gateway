@@ -131,6 +131,11 @@ async def _run_seed(seed: int) -> list[str]:
                         await asyncio.sleep(0.02)
             except TimeoutError:
                 errors.append("phrase lost without a warning (timeout)")
+            if w.state == ConnectionState.DEGRADED:  # E-r5-2: audio with no `end` is not kept
+                for j in range(3):
+                    await w.send_audio(f"x.{j}|".encode().ljust(64_000))
+                if w._held or w._held_bytes:
+                    errors.append("audio held while DEGRADED")
             await asyncio.sleep(0.4)  # a late duplicate would show up here
         finally:
             await w.close()

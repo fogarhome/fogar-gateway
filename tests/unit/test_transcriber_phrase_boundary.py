@@ -265,6 +265,38 @@ async def test_whole_phrase_in_the_gap_then_a_cut_before_the_final_reports_both(
     assert w._callbacks.on_incomplete.await_count == 2
 
 
+async def test_degraded_holds_no_audio_without_an_end():
+    """E-r5-2: after a's `end` the reopen never comes (DEGRADED, _end_sent stays up): audio
+    with no closing `end` is not held for the rest of the session."""
+    async def body(w, _st):
+        await _frames(w, "a", 2)
+        await w.send_end()
+        await _until(lambda: w.state == ConnectionState.DEGRADED)
+        for i in range(5):
+            await w.send_audio(f"b{i}|".encode().ljust(HELD_MAX_BYTES // 10))
+        assert not w._held and w._held_bytes == 0
+
+    await _session(
+        lambda n: "refuse" if n > 1 else None, body,
+        initial_backoff=0.01, max_backoff=0.01, max_duration=0.1,
+    )
+
+
+async def test_degrading_drops_a_whole_held_phrase():
+    """E-r5-2: a whole phrase (with its `end`) is held when the reconnect gives up: the
+    buffer is emptied, no reopen will ever replay it."""
+    handler, _st = _handle_end(lambda n: "refuse")
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        w = _wrap(server.sockets[0].getsockname()[1], initial_backoff=0.01, max_backoff=0.01,
+                  max_duration=0.1)
+        w._health.set_state(ConnectionState.RECONNECTING)
+        w._held.extend([b"c0", None])
+        w._held_bytes = 2
+        await asyncio.wait_for(w.run(), timeout=3.0)
+    assert w.state == ConnectionState.DEGRADED
+    assert not w._held and w._held_bytes == 0
+
+
 async def test_degraded_mid_phrase_raises_no_warnings():
     async def body(w, _st):
         await w.send_audio(b"x0")  # the server cuts on it and never comes back
@@ -414,3 +446,19 @@ async def test_whole_phrase_in_the_gap_drops_only_itself():
     inner._end_sent = False
     await w._replay_held()
     assert inner.wire[-2:] == [b"c0", "END"]
+
+
+async def test_listen_loop_crash_drops_the_held_audio():
+    """E-r5-2: a crash in the listen loop degrades for good: the held audio is dropped too."""
+    w, inner = _slow(0)
+
+    async def crash(*_a):
+        raise RuntimeError("bug")
+
+    inner._dropped_unexpectedly = False  # type: ignore[attr-defined]
+    inner.listen_loop = crash  # type: ignore[attr-defined]
+    w._held.extend([b"c0", None, b"d0"])
+    w._held_bytes = 4
+    await w.run()
+    assert w.state == ConnectionState.DEGRADED
+    assert not w._held and w._held_bytes == 0
