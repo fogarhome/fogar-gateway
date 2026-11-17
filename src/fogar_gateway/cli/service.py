@@ -339,13 +339,14 @@ def _purge(ctx: click.Context, out: Out, unit: Path, home: Path) -> None:
         out.json({"unit": str(unit), "exe": None, "home": str(home), "state": "purgado",
                   "program": program})
         return
+    # click.echo, no out.message: tras `uv tool uninstall` ya no está rich (se importa al usarlo).
     if not ours:
-        out.message("El servicio y el programa son de otra base: no se han tocado.")
-    out.message(f"Borrado: {home}{' y el servicio' if removed else ''}.")
+        click.echo("El servicio y el programa son de otra base: no se han tocado.")
+    click.echo(f"Borrado: {home}{' y el servicio' if removed else ''}.")
     if program == "desinstalado":
-        out.message("Programa desinstalado (uv tool uninstall fogar-gateway).")
+        click.echo("Programa desinstalado (uv tool uninstall fogar-gateway).")
     elif ours:
-        out.message("Quita el programa con: uv tool uninstall fogar-gateway")
+        click.echo("Quita el programa con: uv tool uninstall fogar-gateway")
 
 
 def _unit_home(unit: Path) -> Path | None:
