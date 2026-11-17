@@ -39,7 +39,7 @@ const FILTROS: { id: Filtro; texto: string }[] = [
   { id: 'active', texto: 'Abiertas' },
   { id: 'completed', texto: 'Cerradas' },
   { id: 'error', texto: 'Con error' },
-  { id: 'revoked', texto: 'Acceso retirado' },
+  { id: 'revoked', texto: SESSION_STATUS.revoked! },
 ]
 const filtro = ref<Filtro | null>(null)
 const cuenta = (f: Filtro) => (lista.value?.sessions ?? []).filter((s) => f === 'todas' || s.status === f).length

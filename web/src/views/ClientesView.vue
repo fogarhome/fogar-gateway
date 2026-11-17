@@ -11,7 +11,7 @@ import FgEstado from '@/components/FgEstado.vue'
 import FgIcono from '@/components/FgIcono.vue'
 import FondoVivo from '@/components/FondoVivo.vue'
 import PanelEmparejar from '@/components/PanelEmparejar.vue'
-import { frenarRecarga, SALIR_CON_CLAVE, SALIR_EN_VUELO } from '@/lib/clave'
+import { frenarRecarga, releer, SALIR_CON_CLAVE, SALIR_EN_VUELO } from '@/lib/clave'
 import { CLIENT_TYPE, label } from '@/lib/labels'
 import { toast } from '@/lib/toasts'
 import { useClientsStore } from '@/stores/clients'
@@ -75,12 +75,25 @@ async function crear(): Promise<void> {
       nuevoError.value = e.kind === 'invalid' ? 'Ese nombre no vale: entre 1 y 200 caracteres.' : 'No he podido crearlo. Prueba otra vez.'
     } else {
       // G-r6-3: sin respuesta, el gateway pudo crearlo: reintentar daría un duplicado.
-      nuevoError.value = 'No sé si se creó: mira la lista antes de probar otra vez.'
-      void clients.refresh()
+      nuevoError.value = 'No sé si se creó: estoy mirando la lista; no pruebes otra vez todavía.'
+      void comprobarLista(nombre)
     }
   } finally {
     creando.value = false
   }
+}
+/** G-r7-1: relee la lista (con reintentos) antes de pedir que se mire; su clave nunca se vio. */
+async function comprobarLista(nombre: string): Promise<void> {
+  const leida = await releer(async () => {
+    await clients.refresh()
+    if (clients.error) throw new Error(clients.error)
+  })
+  if (creando.value || creado.value) return // ya hay otro intento en marcha
+  const rotala = `Si «${nombre}» sale en la lista, su clave no se ha visto: entra en él y rota la clave.`
+  nuevoError.value =
+    leida === null
+      ? `No sé si se creó y no he podido comprobarlo: recarga la página antes de probar otra vez. ${rotala}`
+      : `No sé si se creó. ${rotala} Si no sale, prueba otra vez.`
 }
 function claveCopiada() {
   const id = creado.value?.id

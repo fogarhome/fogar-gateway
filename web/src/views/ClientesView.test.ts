@@ -1,5 +1,5 @@
 import { createPinia } from 'pinia'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, nextTick } from 'vue'
 import { createMemoryHistory, createRouter, RouterView } from 'vue-router'
 import { ApiError } from '@/api/http'
@@ -43,7 +43,12 @@ const flush = async () => {
   for (let i = 0; i < 5; i++) await nextTick()
 }
 
-beforeEach(() => vi.clearAllMocks())
+beforeEach(() => {
+  vi.clearAllMocks()
+  listClients.mockResolvedValue([])
+})
+
+afterEach(() => vi.useRealTimers())
 
 describe('ClientesView: la clave nueva no se pierde', () => {
   it('mientras se crea, «Cancelar» y las cabeceras están desactivados y la clave sale al terminar', async () => {
@@ -105,6 +110,7 @@ describe('ClientesView: crear sin respuesta (G-r6-3)', () => {
   it('con error de red no invita a reintentar a ciegas y recarga la lista', async () => {
     createClient.mockRejectedValue(new ApiError('network', 0, 'No llego al gateway'))
     const { el, boton } = await mount()
+    vi.useFakeTimers()
     boton('Crear a mano').click()
     await flush()
     const nombre = el.querySelector('form input') as HTMLInputElement
@@ -114,6 +120,29 @@ describe('ClientesView: crear sin respuesta (G-r6-3)', () => {
     el.querySelector('form')!.dispatchEvent(new Event('submit'))
     await flush()
     expect(el.textContent).toContain('No sé si se creó')
+    await vi.advanceTimersByTimeAsync(1000)
+    vi.useRealTimers()
+    await flush()
     expect(listClients).toHaveBeenCalled()
+    expect(el.textContent).toContain('su clave no se ha visto: entra en él y rota la clave')
+  })
+
+  it('si no puede releer la lista, pide recargar antes de reintentar (G-r7-1)', async () => {
+    createClient.mockRejectedValue(new ApiError('network', 0, 'No llego al gateway'))
+    const { el, boton } = await mount()
+    vi.useFakeTimers()
+    boton('Crear a mano').click()
+    await flush()
+    const nombre = el.querySelector('form input') as HTMLInputElement
+    nombre.value = 'Tele'
+    nombre.dispatchEvent(new Event('input'))
+    listClients.mockRejectedValue(new Error('No llego al gateway'))
+    el.querySelector('form')!.dispatchEvent(new Event('submit'))
+    await vi.advanceTimersByTimeAsync(3000)
+    vi.useRealTimers()
+    await flush()
+    expect(listClients).toHaveBeenCalledTimes(4) // al montar y 3 intentos
+    expect(el.textContent).toContain('no he podido comprobarlo: recarga la página')
+    expect(el.textContent).toContain('«Tele» sale en la lista, su clave no se ha visto')
   })
 })

@@ -211,4 +211,21 @@ describe('PanelEmparejar: ningún código queda abierto sin verse', () => {
     await flush()
     expect(cancelPairing).toHaveBeenCalledWith('c8')
   })
+
+  it('al volver de la caché con el código a medio abrir, abre otro y anula el que llegue tarde (G-r7-3)', async () => {
+    const p = pendiente<PairingOpened>()
+    openPairing.mockReturnValueOnce(p.promise).mockResolvedValueOnce(codigo('c7'))
+    const { el } = mount()
+    await flush()
+    window.dispatchEvent(new Event('pagehide'))
+    const vuelta = new Event('pageshow') as PageTransitionEvent
+    Object.defineProperty(vuelta, 'persisted', { value: true })
+    window.dispatchEvent(vuelta)
+    await flush()
+    p.resolve(codigo('c6'))
+    await flush()
+    expect(cancelPairing).toHaveBeenCalledWith('c6')
+    expect(cancelPairing).not.toHaveBeenCalledWith('c7', expect.anything())
+    expect(el.querySelector('.codigo')!.textContent).toBe('123 456')
+  })
 })

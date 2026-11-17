@@ -1,5 +1,5 @@
 import { createPinia } from 'pinia'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, nextTick } from 'vue'
 import { createMemoryHistory, createRouter, RouterView } from 'vue-router'
 import { ApiError } from '@/api/http'
@@ -64,9 +64,12 @@ async function mount() {
 
 beforeEach(() => {
   vi.restoreAllMocks()
+  vi.clearAllMocks()
   clearToasts()
   getClient.mockResolvedValue(cliente)
 })
+
+afterEach(() => vi.useRealTimers())
 
 describe('ClienteView: rotar la clave', () => {
   it('salir o recargar con el POST de rotar en curso pide confirmación', async () => {
@@ -111,18 +114,58 @@ describe('ClienteView: acciones que no se repiten ni engañan (G-r6-2..4)', () =
     expect(rotateClientKey).toHaveBeenCalledTimes(1)
   })
 
-  it('sin respuesta al rotar no dice que la clave de antes vale y recarga la huella', async () => {
+  it('sin respuesta al rotar relee la huella antes de enseñarla (G-r7-1)', async () => {
     rotateClientKey.mockRejectedValue(new ApiError('network', 0, 'No llego al gateway'))
     const { el, boton } = await mount()
-    // el gateway devuelve otro nombre: solo se toma la huella
-    getClient.mockResolvedValue({ ...cliente, name: 'Renombrado', key_fp: 'ffff0000' })
+    vi.useFakeTimers()
+    // la primera lectura se adelanta a la rotación; la segunda ya la ve. Otro nombre: solo se toma la huella
+    getClient.mockResolvedValueOnce(cliente).mockResolvedValue({ ...cliente, name: 'Renombrado', key_fp: 'ffff0000' })
     boton('Rotar clave').click()
     await flush()
     boton('Rotar ahora').click()
     await flush()
     expect(toasts.map((t) => t.title)).toEqual(['No sé si se rotó la clave'])
+    expect(el.textContent).toContain('huella sin comprobar')
+    expect(el.textContent).not.toContain('abcd')
+    await vi.advanceTimersByTimeAsync(3000)
+    vi.useRealTimers()
+    await flush()
+    expect(toasts[0]!.title).toBe('Sí se rotó la clave')
     expect(el.textContent).toContain('ffff')
     expect(el.querySelector('h1')!.textContent).toBe('Tele')
+  })
+
+  it('una lectura que se adelantó y luego fallos no cuentan como comprobada (G-r7-1)', async () => {
+    rotateClientKey.mockRejectedValue(new ApiError('network', 0, 'No llego al gateway'))
+    const { el, boton } = await mount()
+    vi.useFakeTimers()
+    getClient.mockResolvedValueOnce(cliente).mockRejectedValue(new ApiError('network', 0, 'No llego al gateway'))
+    boton('Rotar clave').click()
+    await flush()
+    boton('Rotar ahora').click()
+    await vi.advanceTimersByTimeAsync(3000)
+    vi.useRealTimers()
+    await flush()
+    expect(toasts[0]!.title).toBe('No he podido comprobarlo')
+    expect(el.textContent).toContain('huella sin comprobar')
+  })
+
+  it('si no puede releer la huella, no enseña la vieja y pide recargar (G-r7-1)', async () => {
+    rotateClientKey.mockRejectedValue(new ApiError('network', 0, 'No llego al gateway'))
+    const { el, boton } = await mount()
+    vi.useFakeTimers()
+    getClient.mockRejectedValue(new ApiError('network', 0, 'No llego al gateway'))
+    boton('Rotar clave').click()
+    await flush()
+    boton('Rotar ahora').click()
+    await vi.advanceTimersByTimeAsync(3000)
+    vi.useRealTimers()
+    await flush()
+    expect(getClient).toHaveBeenCalledTimes(4) // la carga y 3 intentos
+    expect(toasts[0]!.title).toBe('No he podido comprobarlo')
+    expect(toasts[0]!.body).toMatch(/Recarga la página/)
+    expect(el.textContent).toContain('huella sin comprobar')
+    expect(el.textContent).not.toContain('abcd')
   })
 
   it('con error HTTP al rotar, la clave de antes sigue valiendo', async () => {
@@ -154,6 +197,22 @@ describe('ClienteView: acciones que no se repiten ni engañan (G-r6-2..4)', () =
     await new Promise((r) => setTimeout(r, 0)) // la navegación resuelve fuera de los ticks de Vue
     expect(deleteClient).toHaveBeenCalled()
     expect(confirm).not.toHaveBeenCalled()
+    expect(router.currentRoute.value.path).toBe('/clientes')
+  })
+
+  it('un 404 al borrar es que ya estaba borrado: sale a la lista (G-r7-4)', async () => {
+    deleteClient.mockRejectedValue(new ApiError('not-found', 404, 'x'))
+    const { el, router, boton } = await mount()
+    boton('Borrar…').click()
+    await flush()
+    const confirmar = el.querySelector('form.confirmar input') as HTMLInputElement
+    confirmar.value = 'Tele'
+    confirmar.dispatchEvent(new Event('input'))
+    await flush()
+    el.querySelector('form.confirmar')!.dispatchEvent(new Event('submit'))
+    await flush()
+    await new Promise((r) => setTimeout(r, 0))
+    expect(toasts.map((t) => t.title)).toEqual(['«Tele» borrado'])
     expect(router.currentRoute.value.path).toBe('/clientes')
   })
 })

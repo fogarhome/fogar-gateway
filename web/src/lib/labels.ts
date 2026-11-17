@@ -130,5 +130,6 @@ export const SESSION_STATUS: Record<string, string> = {
   active: 'Abierta',
   completed: 'Cerrada',
   error: 'Con error',
-  revoked: 'Acceso retirado',
+  // G-r7-5: `revoked` cubre la clave retirada y el agente retirado (4020); la lista no trae el motivo
+  revoked: 'Clave o agente retirado',
 }

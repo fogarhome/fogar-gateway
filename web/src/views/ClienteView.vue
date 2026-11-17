@@ -8,7 +8,7 @@ import ClaveNueva from '@/components/ClaveNueva.vue'
 import FgBoton from '@/components/FgBoton.vue'
 import FgCampo from '@/components/FgCampo.vue'
 import FgEstado from '@/components/FgEstado.vue'
-import { frenarRecarga, SALIR_CON_CLAVE, SALIR_EN_VUELO } from '@/lib/clave'
+import { frenarRecarga, releer, SALIR_CON_CLAVE, SALIR_EN_VUELO } from '@/lib/clave'
 import { diff, toForm, validate, type ClientForm } from '@/lib/clientForm'
 import { parseIso } from '@/lib/format'
 import { CLIENT_TYPE, label } from '@/lib/labels'
@@ -25,11 +25,13 @@ const id = computed(() => String(route.params.id))
 const cliente = shallowRef<ClientResponse | null>(null)
 const form = ref<ClientForm | null>(null)
 const cargaError = ref<string | null>(null)
+const huellaDudosa = ref(false) // G-r7-1: rotar sin respuesta y sin poder releer la huella
 async function cargar(): Promise<void> {
   try {
     cliente.value = await getClient(id.value)
     form.value = toForm(cliente.value)
     cargaError.value = null
+    huellaDudosa.value = false
   } catch (e) {
     cargaError.value = e instanceof ApiError && e.kind === 'not-found' ? 'Ese cliente ya no existe.' : 'No llego al gateway.'
   }
@@ -42,7 +44,8 @@ const meta = computed(() => {
   if (!c) return ''
   const tipo = c.client_type ? label(CLIENT_TYPE, c.client_type) : 'Sin tipo'
   const fecha = parseIso(c.created_at).toLocaleDateString('es-ES', { day: 'numeric', month: 'short', year: 'numeric' })
-  return `${tipo} · creado el ${fecha} · huella ${c.key_fp.slice(0, 4)} ${c.key_fp.slice(4)}`
+  const huella = huellaDudosa.value ? 'sin comprobar' : `${c.key_fp.slice(0, 4)} ${c.key_fp.slice(4)}`
+  return `${tipo} · creado el ${fecha} · huella ${huella}`
 })
 
 const errores = computed(() => (form.value ? validate(form.value) : {}))
@@ -105,21 +108,31 @@ async function rotar(): Promise<void> {
     if (e instanceof ApiError && e.kind !== 'network') {
       toast('bad', 'No he podido rotar la clave', 'La clave de antes sigue valiendo.')
     } else {
-      // G-r6-3: sin respuesta, el gateway pudo rotarla: la huella recargada lo dice. Solo la
-      // huella (no cargar() ni el cliente entero): no pisa el formulario ni los cambios sin guardar.
-      toast('bad', 'No sé si se rotó la clave', 'Mira la huella: si ha cambiado, la clave de antes ya no vale.')
-      void getClient(pedido).then(
-        (c) => {
-          if (id.value === pedido && cliente.value) cliente.value = { ...cliente.value, key_fp: c.key_fp }
-        },
-        () => undefined,
-      )
+      // G-r6-3: sin respuesta, el gateway pudo rotarla: la huella releída lo dice.
+      toast('bad', 'No sé si se rotó la clave', 'Lo compruebo con la huella.')
+      void comprobarHuella(pedido)
     }
   } finally {
     trabajando.value = false
     rotando.value = false
     confirmar.value = null
   }
+}
+/** G-r7-1: hasta releer la huella no se enseña ninguna como actual. Solo la huella (no cargar() ni
+ * el cliente entero): no pisa el formulario ni los cambios sin guardar. */
+async function comprobarHuella(pedido: string): Promise<void> {
+  const antes = cliente.value?.key_fp
+  huellaDudosa.value = true
+  const c = await releer(() => getClient(pedido), (r) => r.key_fp !== antes)
+  if (id.value !== pedido || !cliente.value) return
+  if (!c) {
+    toast('bad', 'No he podido comprobarlo', 'Recarga la página para ver la huella: si ha cambiado, la clave de antes ya no vale.')
+    return
+  }
+  huellaDudosa.value = false
+  cliente.value = { ...cliente.value, key_fp: c.key_fp }
+  if (c.key_fp !== antes) toast('bad', 'Sí se rotó la clave', 'La de antes ya no vale. Rótala otra vez para ver una nueva.')
+  else toast('ok', 'La huella no ha cambiado', 'Parece que no se rotó. Si el aparato deja de entrar, recarga la página y mira la huella.')
 }
 async function cambiarActivo(): Promise<void> {
   const c = cliente.value
@@ -141,14 +154,18 @@ async function borrar(): Promise<void> {
   trabajando.value = true
   try {
     await deleteClient(id.value)
-    toast('ok', `«${c.name}» borrado`)
-    void clients.refresh()
-    form.value = toForm(c) // G-r6-4: ya borrado, los cambios sin guardar no frenan la salida
-    await router.replace('/clientes')
-  } catch {
-    toast('bad', 'No he podido borrarlo', 'Prueba otra vez.')
-    trabajando.value = false
+  } catch (e) {
+    // G-r7-4: 404 es que ya no existe (p. ej. un borrado anterior que se quedó sin respuesta)
+    if (!(e instanceof ApiError && e.kind === 'not-found')) {
+      toast('bad', 'No he podido borrarlo', 'Prueba otra vez.')
+      trabajando.value = false
+      return
+    }
   }
+  toast('ok', `«${c.name}» borrado`)
+  void clients.refresh()
+  form.value = toForm(c) // G-r6-4: ya borrado, los cambios sin guardar no frenan la salida
+  await router.replace('/clientes')
 }
 
 onBeforeRouteLeave(() => {

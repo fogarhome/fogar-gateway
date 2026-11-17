@@ -24,6 +24,7 @@ const clients = useClientsStore()
 const ahora = ref(performance.now())
 let recibido = 0
 let fuera = false // el panel ya se cerró o se desmontó
+let intento = 0 // cada abrir() y cada pagehide lo suben: un POST de antes anula el código que reciba
 let sondeo: ReturnType<typeof setInterval> | undefined
 let reloj: ReturnType<typeof setInterval> | undefined
 
@@ -35,14 +36,22 @@ function anular(): void {
 }
 
 /** Recargar o cerrar la pestaña no desmonta el panel: el código se anula con un DELETE que
- * sobrevive a la página (G-r6-1). Si vuelve de la caché del navegador, ofrece otro código. */
+ * sobrevive a la página (G-r6-1). Si vuelve de la caché del navegador, ofrece otro código.
+ * Con el POST de abrir en vuelo (G-r7-2): si la página vuelve de la caché, abrir() anula el código
+ * que llegue; si se recarga o se cierra, ya no corre JS y ese código queda abierto hasta 10 min
+ * (sin que nadie lo vea). Se anula con «Anular los abiertos» y MAX_FAILED lo protege. */
 function alSalirDeLaPagina(): void {
-  if (estado.value === 'abriendo') fuera = true // POST en vuelo: abrir() anula el código si llega
+  if (estado.value === 'abriendo') intento++
   const p = abierto.value
   if (!p || estado.value === 'used') return
   abierto.value = null
   estado.value = 'cancelled'
   void cancelPairing(p.id, true).catch(() => undefined)
+}
+
+/** G-r7-3: al volver de la caché del navegador con el código a medio abrir, pide otro. */
+function alVolverALaPagina(e: PageTransitionEvent): void {
+  if (e.persisted && estado.value === 'abriendo' && !fuera) void abrir()
 }
 
 /** Con 5 códigos abiertos (p. ej. de pestañas cerradas a destiempo), los anula todos y abre uno. */
@@ -71,9 +80,10 @@ async function siYaSeUso(p: PairingOpened, e: unknown): Promise<void> {
 async function abrir(): Promise<void> {
   anular() // «Otro código» no deja el anterior abierto
   estado.value = 'abriendo'
+  const mio = ++intento
   try {
     const p = await openPairing()
-    if (fuera) {
+    if (fuera || mio !== intento) {
       void cancelPairing(p.id).catch(() => undefined)
       return
     }
@@ -82,7 +92,7 @@ async function abrir(): Promise<void> {
     ahora.value = recibido
     estado.value = 'open'
   } catch (e) {
-    if (fuera) return
+    if (fuera || mio !== intento) return
     estado.value = 'error'
     lleno.value = e instanceof ApiError && e.kind === 'conflict'
     error.value = lleno.value
@@ -122,6 +132,7 @@ async function cerrar(): Promise<void> {
 
 onMounted(() => {
   window.addEventListener('pagehide', alSalirDeLaPagina)
+  window.addEventListener('pageshow', alVolverALaPagina)
   void abrir()
   sondeo = setInterval(() => void comprobar(), 2000)
   reloj = setInterval(() => {
@@ -131,6 +142,7 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   window.removeEventListener('pagehide', alSalirDeLaPagina)
+  window.removeEventListener('pageshow', alVolverALaPagina)
   clearInterval(sondeo)
   clearInterval(reloj)
   fuera = true
