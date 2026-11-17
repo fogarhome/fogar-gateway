@@ -86,6 +86,10 @@ async def resolve_ha_caller(request: Request) -> HACaller:
             client, config = await db_client.get_session(client_key)
         except (ClientNotFound, ClientInactive):
             raise HTTPException(status_code=401, detail="authentication required") from None
+        except ValueError as e:
+            # D-r8-1: `allowed_agents` corrupto (editado a mano), como en el handshake: solo el tipo.
+            logger.error(f"/v1: configuración del cliente ilegible: {describe_error(e)}")
+            raise HTTPException(status_code=500, detail="internal_error") from None
         return HACaller(client=client, config=config)
 
     from_browser = "origin" in request.headers or any(

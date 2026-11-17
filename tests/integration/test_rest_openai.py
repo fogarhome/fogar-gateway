@@ -968,3 +968,21 @@ def test_foreign_runtimeerror_text_never_reaches_v1_stream(client, mock_orchestr
     assert MARK not in "\n".join(
         x.getMessage() for x in caplog.records if x.name.startswith("fogar_gateway")
     )
+
+
+@pytest.mark.parametrize("path", ["/v1/models", "/v1/chat/completions"])
+def test_corrupt_allowed_agents_in_db_returns_stable_500(
+    client_untrusted, ha_bearer_headers, db_engine, caplog, path
+):
+    """D-r8-1: `allowed_agents` ilegible (fila editada a mano): 500 `internal_error` estable,
+    con solo el tipo en el log, no un traceback sin manejar."""
+    with Session(db_engine) as s:
+        s.get(ClientRecord, CLIENT_ID).allowed_agents = '{"no": "lista"}'
+        s.commit()
+    if path == "/v1/models":
+        r = client_untrusted.get(path, headers=ha_bearer_headers)
+    else:
+        r = client_untrusted.post(path, json=BODY, headers=ha_bearer_headers)
+    assert r.status_code == 500
+    assert r.json() == {"detail": "internal_error"}
+    assert "ValueError" in caplog.text and "lista" not in caplog.text

@@ -807,7 +807,7 @@ Los códigos estándar se quedan donde el significado es de transporte y el est�
 | Código | `reason` | Cuándo | Reconectar |
 |---|---|---|---|
 | 1000 | `session ended` | Fin normal: inactividad (`IDLE_TIMEOUT_S`) o silencio del transcriptor (`max_silence_turns`) | Al usarlo |
-| 1011 | `session setup failed` | Handshake: falló un servicio interno al montar la sesión (o al abrir la conversación) | Con espera |
+| 1011 | `session setup failed` | Handshake: falló un servicio interno al montar la sesión (o al abrir la conversación). También con la sesión abierta si la configuración del cliente en la BD es ilegible (`allowed_agents` corrupto, solo editándola a mano) | Con espera |
 | 1011 | `orchestrator unavailable` | Handshake: OpenClaw no responde al health check (antes llega `status` `orchestrator` `unavailable`) | Con espera |
 | 1011 | `internal error` | La sesión termina por un fallo interno del gateway (antes o después del `ready`) | Con espera |
 | 1013 | `client too slow` | No lees al ritmo al que el gateway escribe (`CLIENT_SEND_TIMEOUT_S`); si no reanudas la lectura en 2 s, verás 1006 | Con espera |
@@ -854,7 +854,7 @@ No requiere ningún cambio de cliente si ya reconectas tras un cierre inesperado
 
 - **Turno en curso:** si el gateway cierra la sesión con un turno abierto, el turno se **cancela**, no se espera a que termine, y recibes igualmente su `turn_end` antes del cierre si el socket sigue abierto. Nunca queda un `turn_start` sin su `turn_end` mientras puedas recibirlo. La inactividad (`IDLE_TIMEOUT_S`) y el silencio no cortan un turno en curso. Un push huérfano (abierto sin su fin) no la retiene: a los `TURN_TIMEOUT_S` sin progreso se cierra solo, con su `turn_end` (§10).
 - **Reinicio o parada del gateway:** el servidor cierra cada WebSocket con el código **1012** (*service restart*) en cuanto empieza a apagarse; un turno en curso se corta en ese momento y su `turn_end` ya no te llega (el socket está cerrado). No hay ventana de gracia para terminar el turno. Trata el 1012 como un cierre esperado: reconecta (con una pequeña espera y reintentos, el gateway tarda unos segundos en volver) y abre una sesión nueva con handshake completo.
-- **Revocación, agente retirado y conversación abierta en otra sesión:** desde ese momento no te llega nada más (ni audio, ni tokens, ni avisos; tampoco lo que ya estaba en cola) salvo el `turn_end` del turno en curso (y de un push abierto), con `reason: "closed"`, y el `turn_start` de ese turno si aún no había salido (nunca un `turn_end` sin su `turn_start`; un `send` aceptado que no llegó a empezar recibe también su par, con `closed`); después, el cierre 4200 (revocada), 4020 (el administrador quitó el agente de la sesión de `allowed_agents`) o 4102 (conversación abierta en otra sesión). Antes de M19 la revocación cerraba sin ese `turn_end`.
+- **Revocación, agente retirado y conversación abierta en otra sesión:** desde ese momento no te llega nada más (ni audio, ni tokens, ni avisos; tampoco lo que ya estaba en cola) salvo el `turn_end` del turno en curso (y de un push abierto), con `reason: "closed"`, y el `turn_start` de ese turno si aún no había salido (nunca un `turn_end` sin su `turn_start`; un `send` aceptado que no llegó a empezar recibe también su par, con `closed`); después, el cierre 4200 (revocada), 4020 (el administrador quitó el agente de la sesión de `allowed_agents`) o 4102 (conversación abierta en otra sesión). Igual con el 1011 `session setup failed` de una sesión abierta cuya configuración en la BD resulta ilegible. Antes de M19 la revocación cerraba sin ese `turn_end`.
 
 `SHUTDOWN_DRAIN_S` (antes 30 s) prometía esperar al turno en curso en un reinicio; en la práctica eso no ocurría (el servidor ya había cerrado el socket). Desde #221 ya no se usa: el gateway lo ignora y avisa en el log si sigue en su `.env`.
 
@@ -912,6 +912,6 @@ No lleva texto (ni del usuario ni de la respuesta) ni los detalles que el gatewa
 | `push_tts` | Se cerró el TTS de un push (al terminar o al cortarse) |
 | `session_end` | La sesión se cierra (si el socket aún puede recibirlo) |
 
-Un push no tiene `llm_*`: solo `tts_*` y `push_tts` si hay audio. Las etapas de un cierre forzado (`client_slow`, `session_revoked`, `agent_revoked`, `session_displaced`) quedan en `/admin/sessions` pero no llegan: el socket ya no las puede recibir o solo deja salir el `turn_end` (§13).
+Un push no tiene `llm_*`: solo `tts_*` y `push_tts` si hay audio. Las etapas de un cierre forzado (`client_slow`, `session_revoked`, `agent_revoked`, `session_displaced`, `session_setup_failed`) quedan en `/admin/sessions` pero no llegan: el socket ya no las puede recibir o solo deja salir el `turn_end` (§13).
 
 Van en el mismo orden total que el resto (§5), así que su posición respecto a `turn_start`, `token` y `turn_end` es fiable, y pueden llegar fuera de un turno (`session_start`, `transcription_*`, `session_end`). Son diagnóstico: la lista de etapas puede crecer y un cliente no debe depender de ellas para funcionar (para enseñar en qué está un turno, `turn_progress`, §5). Ignora las etapas que no conozcas.

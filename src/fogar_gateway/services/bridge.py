@@ -511,6 +511,17 @@ class FogarBridge:
             except (ClientNotFound, ClientInactive):
                 await self._revoke_session()
                 return
+            except ValueError as e:
+                # A-r8-1: `allowed_agents` corrupto (editado a mano) no es transitorio: 1011 como
+                # en el handshake (C-r7-2), solo el tipo en el log.
+                logger.error(
+                    f"[{self.client_id}] Configuración del cliente ilegible ({describe_error(e)}); se cierra."
+                )
+                task = self._start_policy_close(
+                    Close.SETUP_FAILED, "error", "session_setup_failed", status="error"
+                )
+                await asyncio.wait({task})
+                return
             except Exception as e:  # noqa: BLE001 — frontera: un fallo transitorio no cierra la sesión
                 logger.warning(
                     f"[{self.client_id}] Revalidación de sesión fallida "

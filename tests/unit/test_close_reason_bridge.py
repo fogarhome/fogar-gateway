@@ -94,6 +94,23 @@ async def test_revoked_reason(make_reason_bridge, monkeypatch):
     assert _closed() == {"revoked": 1}
 
 
+async def test_corrupt_allowed_agents_on_revalidation_closes_1011(make_reason_bridge, monkeypatch, caplog):
+    """A-r8-1: `allowed_agents` corrupto en la BD no es un fallo transitorio: la revalidación
+    cierra con 1011 (como el handshake, C-r7-2), con solo el tipo en el log."""
+    monkeypatch.setattr(settings, "SESSION_REVALIDATE_INTERVAL_S", 0.0)
+    monkeypatch.setattr(
+        "fogar_gateway.services.bridge.db_client.get_session",
+        AsyncMock(side_effect=ValueError("allowed_agents secreto")),
+    )
+    bridge = make_reason_bridge()
+    bridge.client_ws.close = AsyncMock()
+    await asyncio.wait_for(bridge._session_revalidation_loop(), timeout=1.0)
+    bridge.client_ws.close.assert_awaited_once_with(code=1011, reason="session setup failed")
+    assert _end_meta(bridge)["reason"] == "error"
+    assert _closed() == {"error": 1}
+    assert "ValueError" in caplog.text and "secreto" not in caplog.text
+
+
 async def test_client_disconnect_reason(make_reason_bridge):
     bridge = make_reason_bridge()
     bridge.client_ws.receive = AsyncMock(return_value={"type": "websocket.disconnect"})
