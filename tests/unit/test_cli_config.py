@@ -244,6 +244,35 @@ def test_set_short_admin_token_is_refused(home, current):
     assert f"ADMIN_TOKEN={'z' * 32}" in _env(home).read_text()
 
 
+def test_set_admin_token_with_spaces_or_non_ascii_is_refused(home):
+    """D-r6-2: 32 caracteres que no son ASCII imprimible sin espacios no valen."""
+    before = _env(home).read_bytes()
+    for value in ("abc" + " " * 29, "ñ" * 32):
+        r = run("config", "set", "ADMIN_TOKEN", "-", input=value + "\n")
+        assert r.exit_code == 1 and "32" in r.output
+    assert _env(home).read_bytes() == before
+
+
+@pytest.mark.parametrize("current", [SECRET, "corto"])
+def test_unset_admin_token_is_always_refused(home, current):
+    """F-r6-3: aunque el actual ya sea corto (y por tanto no «empeore» ningún check)."""
+    _env(home).write_text(f"ADMIN_TOKEN={current}\n")
+    before = _env(home).read_bytes()
+    r = run("config", "unset", "ADMIN_TOKEN")
+    assert r.exit_code == 1
+    assert _env(home).read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "name", ["HANDSHAKE_TIMEOUT_S", "TURN_TIMEOUT_S", "IDLE_TIMEOUT_S", "PUSH_TTS_DRAIN_TIMEOUT_S"]
+)
+def test_set_zero_timeout_is_refused(home, name):
+    """A-r6-1: un 0 deja el gateway inservible; se rechaza al escribir."""
+    before = _env(home).read_bytes()
+    assert run("config", "set", name, "0").exit_code == 1
+    assert _env(home).read_bytes() == before
+
+
 def test_validate_fails_on_short_admin_token(home):
     _env(home).write_text("ADMIN_TOKEN=corto-pero-no-vacio\n")
     r = run("--json", "config", "validate")

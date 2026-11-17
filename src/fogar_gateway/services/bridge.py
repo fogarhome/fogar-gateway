@@ -483,7 +483,9 @@ class FogarBridge:
         """Revalida la sesión contra la BD cada SESSION_REVALIDATE_INTERVAL_S (G-06, #218).
 
         Si el cliente fue borrado, desactivado o su clave rotada (`ClientNotFound` /
-        `ClientInactive`) se cierra la sesión con `Close.REVOKED` (4200). Cualquier otro error
+        `ClientInactive`) se cierra la sesión con `Close.REVOKED` (4200); si su
+        `allowed_agents` ya no incluye el agente de la conversación, con
+        `Close.AGENT_NOT_PERMITTED` (4020). Cualquier otro error
         (BD ocupada, etc.) es transitorio: se registra solo el tipo y se reintenta en el
         siguiente tick, nunca cierra la sesión. La lectura va directa a la BD (sin caché,
         #265), así que un cambio desde /admin o la CLI se ve en el siguiente tick.
@@ -491,10 +493,20 @@ class FogarBridge:
         while True:
             await _sleep(settings.SESSION_REVALIDATE_INTERVAL_S)
             try:
-                current, _ = await db_client.get_session(self.client.client_key)
+                current, config = await db_client.get_session(self.client.client_key)
                 if current.id != self.client.id:
                     # Borrado y recreado con la MISMA clave: es otro cliente.
                     await self._revoke_session()
+                    return
+                agent = self.conversation.current.agent.lower()
+                allowed = config.allowed_agents
+                if allowed is not None and agent not in {a.lower() for a in allowed}:
+                    # C-r6-1: como en el handshake, 4020 y no 4200: la clave sigue valiendo.
+                    logger.warning(f"[{self.client_id}] El agente ya no está permitido; se cierra.")
+                    task = self._start_policy_close(
+                        Close.AGENT_NOT_PERMITTED, "revoked", "session_revoked", status="revoked"
+                    )
+                    await asyncio.wait({task})  # como en _revoke_session
                     return
             except (ClientNotFound, ClientInactive):
                 await self._revoke_session()

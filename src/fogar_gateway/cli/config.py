@@ -122,7 +122,7 @@ def validation_checks(settings: Any) -> list[dict[str, str]]:
         if name == "ADMIN_TOKEN":
             checks.append(_check("fail", name, f"Vacío: /admin no funciona. Defínelo en {where}."
                                  if empty else f"Valor de ejemplo o de menos de "
-                                 f"{ADMIN_TOKEN_MIN_LEN} caracteres: adivinable. Cámbialo con "
+                                 f"{ADMIN_TOKEN_MIN_LEN} caracteres ASCII sin espacios: adivinable. Cámbialo con "
                                  "`fogar-gw config set ADMIN_TOKEN`."))
         elif name == "TTS_TOKEN":
             checks.append(_check("warn", name, "Es un valor de ejemplo."))
@@ -322,12 +322,17 @@ def _apply(out: Out, key: str, value: str | None) -> bool:
     path = paths.config_file()
     if not path.is_file():
         raise api.ApiError(f"No hay {path}. Prepara la instalación con `fogar-gw init`.", 1)
-    if key == "ADMIN_TOKEN" and value is not None:
-        from fogar_gateway.core.startup_checks import ADMIN_TOKEN_MIN_LEN
+    if key == "ADMIN_TOKEN":
+        from fogar_gateway.core.startup_checks import ADMIN_TOKEN_MIN_LEN, admin_token_too_short
 
-        # Aunque el actual ya sea corto (_fails solo frena fallos nuevos) (D-r5-1).
-        if len(value) < ADMIN_TOKEN_MIN_LEN:
-            raise api.ApiError(f"ADMIN_TOKEN necesita al menos {ADMIN_TOKEN_MIN_LEN} caracteres. "
+        # Aunque el actual ya sea corto (_fails solo frena fallos nuevos) (D-r5-1, F-r6-3).
+        if value is None:
+            raise api.ApiError("ADMIN_TOKEN no se puede quitar: sin él /admin queda inutilizable. "
+                               "Cámbialo con `fogar-gw config set ADMIN_TOKEN`. No se ha "
+                               "escrito nada.", 1)
+        if admin_token_too_short(value):
+            raise api.ApiError(f"ADMIN_TOKEN necesita al menos {ADMIN_TOKEN_MIN_LEN} caracteres "
+                               "ASCII imprimibles, sin espacios. "
                                "Genera uno con `python3 -c \"import "
                                "secrets; print(secrets.token_urlsafe(32))\"`. No se ha escrito "
                                "nada.", 1)

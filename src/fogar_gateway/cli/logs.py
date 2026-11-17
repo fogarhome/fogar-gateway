@@ -43,7 +43,10 @@ def matches(line: str, min_level: str | None, session: str | None) -> bool:
             except ValueError:
                 return True
             if isinstance(data, dict):
-                return session in (data.get("session_id"), data.get("client_id"))
+                # F-r6-1: los avisos del bridge solo llevan «[client_id] …» en el mensaje.
+                return session in (data.get("session_id"), data.get("client_id")) or session in str(
+                    data.get("msg", "")
+                )
             return True
         return session in line
     return True

@@ -36,6 +36,12 @@ def test_matches_session_json_field():
     assert not logs.matches(_json("INFO"), None, "s1")
 
 
+def test_matches_session_json_message():
+    """F-r6-1: los avisos del bridge llevan la sesión solo en el mensaje («[id] …»)."""
+    assert logs.matches(_json("WARNING", msg="[s1] Revalidación de sesión fallida"), None, "s1")
+    assert not logs.matches(_json("WARNING", msg="[s2] Revalidación de sesión fallida"), None, "s1")
+
+
 def test_matches_session_text_substring():
     assert logs.matches(TEXT.format("INFO"), None, "sid-1")
     assert not logs.matches(TEXT.format("INFO"), None, "sid-2")

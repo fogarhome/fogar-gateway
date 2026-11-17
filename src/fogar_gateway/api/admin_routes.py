@@ -518,7 +518,12 @@ async def get_state_stream(request: Request) -> StreamingResponse:
         finally:
             _open_streams -= 1
 
-    return StreamingResponse(state_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        state_stream(),
+        media_type="text/event-stream",
+        # D-r6-5: que un proxy (nginx) no retenga los eventos.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 _ACCESS_TTL_S = 15.0

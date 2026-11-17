@@ -161,3 +161,22 @@ async def test_client_recreated_with_same_key_but_new_id_revokes_the_session(ser
         s.add(ClientRecord(id="otro-id", name="Nuevo", client_key=VALID_KEY, is_active=True))
         s.commit()
     await _expect_revoked(ws)
+
+
+@pytest.mark.parametrize("allowed", [["a"], []])
+async def test_narrowing_allowed_agents_closes_the_live_session_with_4020(server, allowed):
+    """C-r6-1: quitar el agente de la sesión de `allowed_agents` la corta (4020, no 4200: la
+    clave sigue valiendo); ampliarlo o mantenerlo (en otras mayúsculas) no la toca."""
+    ws = await _open(server)
+    async with _admin(server) as admin:
+        r = await admin.patch(f"/admin/clients/{CLIENT_ID}", json={"allowed_agents": ["MAIN", "a"]})
+        assert r.status_code == 200, r.text
+        await asyncio.sleep(INTERVAL_S * 3)
+        assert ws.close_code is None
+        r = await admin.patch(f"/admin/clients/{CLIENT_ID}", json={"allowed_agents": allowed})
+        assert r.status_code == 200, r.text
+    with pytest.raises(websockets.ConnectionClosed) as exc:
+        while True:
+            await asyncio.wait_for(ws.recv(), timeout=CLOSE_DEADLINE_S)
+    assert exc.value.rcvd is not None
+    assert (exc.value.rcvd.code, exc.value.rcvd.reason) == (4020, "agent not permitted")

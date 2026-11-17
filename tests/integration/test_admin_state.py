@@ -93,6 +93,9 @@ async def test_state_stream_emits_and_stops_when_request_reports_disconnect(clie
 
     resp = await admin_routes.get_state_stream(request)
     assert resp.media_type == "text/event-stream"
+    # D-r6-5: que un proxy (nginx) no retenga los eventos.
+    assert resp.headers["cache-control"] == "no-cache"
+    assert resp.headers["x-accel-buffering"] == "no"
     chunks = [c async for c in resp.body_iterator]
 
     assert len(chunks) == 2

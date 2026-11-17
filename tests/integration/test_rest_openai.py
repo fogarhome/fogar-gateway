@@ -2,6 +2,7 @@
 import json
 import logging
 
+import pytest
 from sqlmodel import Session
 
 from fogar_gateway.core.config import settings
@@ -441,16 +442,40 @@ def test_missing_body_returns_422(client):
     assert r.status_code == 422, f"Esperado 422, recibido {r.status_code}: {r.text}"
 
 
-def test_chat_completions_no_user_message_returns_empty(client):
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"role": "system", "content": "Be helpful"}],
+        [{"role": "user", "content": ""}],
+        [{"role": "user", "content": " \n\t "}],
+    ],
+)
+def test_chat_completions_without_user_text_is_400_without_orchestrator(
+    client, mock_orchestrator, messages, stream
+):
+    """D-r6-3: sin texto (o solo espacios) no hay turno: 400 y OpenClaw ni se entera."""
+    called = []
+    mock_orchestrator.stream_response = lambda **kw: called.append(kw)
     r = client.post(
         "/v1/chat/completions",
-        json={
-            "model": "openclaw",
-            "messages": [{"role": "system", "content": "Be helpful"}],
-            "stream": False,
-        },
+        json={"model": "openclaw", "messages": messages, "stream": stream},
     )
-    assert r.status_code == 200
+    assert r.status_code == 400
+    assert r.json() == {"error": "empty_message"}
+    assert called == []
+
+
+def test_sse_responses_disable_proxy_buffering(client):
+    """D-r6-5: nginx no debe retener los fragmentos del stream."""
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={"model": "openclaw", "messages": [{"role": "user", "content": "Hi"}], "stream": True},
+    ) as r:
+        r.read()
+    assert r.headers["cache-control"] == "no-cache"
+    assert r.headers["x-accel-buffering"] == "no"
 
 
 def test_http_session_appears_in_registry(client):

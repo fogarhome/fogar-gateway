@@ -182,7 +182,7 @@ Auth: header `X-Admin-Token`. Sin header → 422. Token incorrecto → 401. `ADM
 | Endpoint | Método | Descripción |
 |----------|--------|-------------|
 | `/v1/models` | GET | Devuelve el alias `fogar-gateway` y los agentes del roster de OpenClaw (filtrados por `allowed_agents`) para un llamante con Bearer; un origen confiable sin Bearer (el chat ignora `model` y usa el agente por defecto) y un gateway sin roster, solo el alias |
-| `/v1/chat/completions` | POST | Chat completion; soporta `stream: true/false` |
+| `/v1/chat/completions` | POST | Chat completion; soporta `stream: true/false`. Si el último mensaje `user` falta o solo tiene espacios → `400 empty_message`, sin llamar a OpenClaw. Si el cliente corta antes de la respuesta (con o sin stream), el turno se aborta en OpenClaw |
 
 ---
 
@@ -244,7 +244,7 @@ Qué hace `install.sh`:
 
    Después te espera hasta que abres el dashboard y pegas el token («Conectado»); Enter sigue sin esperar. El primer cliente se empareja desde Clientes, en el dashboard. También da la dirección `ws://<host>:8004/ws/stream` para quien configure un cliente a mano.
 
-**El token del dashboard:** es la llave del panel y de `/admin`, que no limitan los intentos: necesita al menos 32 caracteres (`fogar-gw init` genera uno aleatorio de 43; `config set ADMIN_TOKEN` rechaza uno más corto y `doctor` lo marca). `fogar-gw token` lo escribe solo en una terminal; en una tubería, un fichero o con `--json` se niega, para que no acabe en un log. No lo pegues en chats ni en capturas. Sin la CLI, está en `config.env` (`ADMIN_TOKEN`), legible solo por tu usuario.
+**El token del dashboard:** es la llave del panel y de `/admin`, que no limitan los intentos: necesita al menos 32 caracteres ASCII imprimibles, sin espacios (`fogar-gw init` genera uno aleatorio de 43; `config set ADMIN_TOKEN` rechaza uno más corto y `doctor` lo marca). `fogar-gw token` lo escribe solo en una terminal; en una tubería, un fichero o con `--json` se niega, para que no acabe en un log. No lo pegues en chats ni en capturas. Sin la CLI, está en `config.env` (`ADMIN_TOKEN`), legible solo por tu usuario.
 
 Si lo cortas a medias, `config.env` queda como estaba más lo ya verificado, y volver a ejecutarlo retoma. También sirve para cambiar de proveedores más adelante (en el menú de `fogar-gw`, «Configurar proveedores»): cada paso que `config.env` ya tiene ofrece primero «Dejar como está», que ni verifica ni escribe nada. Necesita una terminal; para scripts, `fogar-gw onboard --answers respuestas.json` no pregunta nada y un fallo de verificación sale con 1 y su motivo. El fichero lleva secretos: tiene que ser tuyo y con permisos 600. Créalo ya privado, para que no haya un momento en que otros puedan leerlo: `(umask 077; cat > respuestas.json)` y pega el JSON (termina con Ctrl+D), o `install -m 600 /dev/null respuestas.json` antes de editarlo. Escribirlo y después hacer `chmod` deja esa ventana abierta.
 
@@ -344,7 +344,7 @@ Las migraciones de la BD se aplican solas al arrancar y no hay vuelta atrás aut
 curl -fsSL https://github.com/fogarhome/fogar-gateway/releases/latest/download/install.sh | sh
 ```
 
-**Al actualizar a 3.0:** una entrada inválida en `TRUSTED_PROXIES` (también un `/0`, que antes se aceptaba) ya no se ignora: el gateway falla cerrado y Home Assistant sin Bearer recibe 401 en `/v1`. La CLI 2.x aún no lo comprueba: antes de actualizar, revisa `TRUSTED_PROXIES` y `TRUSTED_NETWORKS` a mano en `<base>/config.env` (solo IPs o CIDRs separados por comas, sin `/0` ni `%`). Después, `fogar-gw doctor` (en una actualización nativa, el instalador lo pasa al terminar sobre la base del servicio) o `fogar-gw config validate` te dicen si queda alguna entrada mal. `ADMIN_TOKEN` necesita al menos 32 caracteres: uno más corto sigue funcionando (el gateway arranca y avisa en el log), pero `fogar-gw doctor` y `config validate` lo marcan como fallo y `config set ADMIN_TOKEN` ya no acepta uno así; cámbialo con `fogar-gw config set ADMIN_TOKEN` (`init` y `onboard` ya generan uno de 43). Además, un `X-Real-IP` de loopback ya solo cuenta si el peer del proxy también es loopback: un proxy en este host que llega por la IP de LAN o por el bridge de Docker (p. ej. 172.17.0.1) con `X-Real-IP: 127.0.0.1` ya no queda exento y debe usar Bearer.
+**Al actualizar a 3.0:** una entrada inválida en `TRUSTED_PROXIES` (también un `/0`, que antes se aceptaba) ya no se ignora: el gateway falla cerrado y Home Assistant sin Bearer recibe 401 en `/v1`. La CLI 2.x aún no lo comprueba: antes de actualizar, revisa `TRUSTED_PROXIES` y `TRUSTED_NETWORKS` a mano en `<base>/config.env` (solo IPs o CIDRs separados por comas, sin `/0` ni `%`). Después, `fogar-gw doctor` (en una actualización nativa, el instalador lo pasa al terminar sobre la base del servicio) o `fogar-gw config validate` te dicen si queda alguna entrada mal. `ADMIN_TOKEN` necesita al menos 32 caracteres: uno más corto sigue funcionando (el gateway arranca y avisa en el log), pero `fogar-gw doctor` y `config validate` lo marcan como fallo y `config set ADMIN_TOKEN` ya no acepta uno así; cámbialo con `fogar-gw config set ADMIN_TOKEN`: `init` genera uno de 43, pero si ya tienes `config.env` no lo toca (y `config unset ADMIN_TOKEN` no se acepta). Cuentan solo caracteres ASCII imprimibles sin espacios. Además, un `X-Real-IP` de loopback ya solo cuenta si el peer del proxy también es loopback: un proxy en este host que llega por la IP de LAN o por el bridge de Docker (p. ej. 172.17.0.1) con `X-Real-IP: 127.0.0.1` ya no queda exento y debe usar Bearer.
 
 A mano: instala la nueva versión sobre la anterior y reinicia (pregunta; en scripts, `fogar-gw --yes restart`).
 
@@ -449,7 +449,7 @@ Variables de entorno o, si no, de `<base>/config.env` (instalación nativa). En 
 | `ORCHESTRATOR_RECONNECT_INITIAL_BACKOFF` | `1.0` | Backoff inicial en reconexión del orquestador (s) |
 | `ORCHESTRATOR_RECONNECT_MAX_BACKOFF` | `60.0` | Backoff máximo en reconexión del orquestador (s) (el gateway reintenta sin parar, sin tope de duración) |
 | `SINGLE_PROCESS_LOCK` | `true` | `flock` sobre `gateway.lock` junto a la BD: un segundo proceso (p. ej. `--workers 2`) no arranca. Multi-worker no está soportado |
-| `SESSION_REVALIDATE_INTERVAL_S` | `10.0` | Cada sesión WS se revalida contra la BD; cliente borrado/desactivado/clave rotada → cierre 4200 (`credential revoked`, ver [códigos de cierre](docs/client-protocol.md#códigos-de-cierre)) |
+| `SESSION_REVALIDATE_INTERVAL_S` | `10.0` | Cada sesión WS se revalida contra la BD; cliente borrado/desactivado/clave rotada → cierre 4200 (`credential revoked`); agente de la sesión quitado de su `allowed_agents` → cierre 4020 (`agent not permitted`, la clave sigue valiendo). Ver [códigos de cierre](docs/client-protocol.md#códigos-de-cierre) |
 | `TRANSCRIBER_RECONNECT_INITIAL_BACKOFF` | `1.0` | Backoff inicial en reconexión del transcriptor (s) |
 | `TRANSCRIBER_RECONNECT_MAX_BACKOFF` | `60.0` | Backoff máximo en reconexión del transcriptor (s) |
 | `TRANSCRIBER_RECONNECT_MAX_DURATION` | `300.0` | Tiempo hasta DEGRADED del transcriptor (s) |

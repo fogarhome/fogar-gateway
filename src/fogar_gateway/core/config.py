@@ -137,11 +137,11 @@ class Settings(BaseSettings):
     # Deadlines acotados (issue #115)
     # 5 s (antes 10, #216): un handshake es un único mensaje pequeño; el margen largo solo
     # sirve a quien conecta y se queda callado, reteniendo la conexión sin autenticar.
-    HANDSHAKE_TIMEOUT_S: float = 5.0
+    HANDSHAKE_TIMEOUT_S: float = Field(default=5.0, gt=0)
     # Tope (caracteres) del primer mensaje, comprobado antes de parsear/autenticar (#216).
     HANDSHAKE_MAX_BYTES: int = Field(default=4096, gt=0)
-    TURN_TIMEOUT_S: float = 120.0
-    IDLE_TIMEOUT_S: float = 300.0
+    TURN_TIMEOUT_S: float = Field(default=120.0, gt=0)
+    IDLE_TIMEOUT_S: float = Field(default=300.0, gt=0)
     # Tope de cada paso del cierre de una sesión (cancelar el turno, el push, las tareas,
     # cerrar el transcriber y el tracker) y del drenado de su cola de salida (#221).
     SESSION_TEARDOWN_S: float = Field(default=5.0, gt=0)
@@ -152,7 +152,7 @@ class Settings(BaseSettings):
 
     # Drenado del audio TTS de un push al cerrar su turno (issue #130 S3a): tope de tiempo
     # sin progreso del TTS (se reinicia con cada trozo), no duración total
-    PUSH_TTS_DRAIN_TIMEOUT_S: float = 30.0
+    PUSH_TTS_DRAIN_TIMEOUT_S: float = Field(default=30.0, gt=0)
 
     # Pacing del audio TTS (7e): el gateway envía a ritmo de reproducción, como mucho
     # AUDIO_LEAD_S por delante

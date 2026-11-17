@@ -60,6 +60,12 @@ def test_short_admin_token_warns_without_the_value(caplog):
     assert insecure_tokens(_settings(ADMIN_TOKEN="x" * 32)) == []
 
 
+@pytest.mark.parametrize("value", ["abc" + " " * 29, "ñ" * 32, "\u200b" * 32, "x" * 31 + " "])
+def test_admin_token_needs_32_printable_ascii_without_spaces(value):
+    """D-r6-2: espacios, no ASCII o invisibles no cuentan para el mínimo de 32."""
+    assert insecure_tokens(_settings(ADMIN_TOKEN=value)) == ["ADMIN_TOKEN"]
+
+
 @pytest.mark.parametrize("value", ["", "changeme", "CHANGEME", " changeme ", "secret", "admin"])
 def test_admin_token_empty_or_placeholder_warns(value, caplog):
     caplog.set_level(logging.WARNING)

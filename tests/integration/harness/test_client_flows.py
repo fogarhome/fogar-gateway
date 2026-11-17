@@ -6,6 +6,9 @@ inicia un turno) y comprueba solo lo que recibe el cliente por su WebSocket.
 
 import asyncio
 
+import httpx
+
+from tests.integration.conftest import VALID_KEY
 from tests.integration.harness.conftest import (
     assert_turns_paired,
     audio,
@@ -181,3 +184,26 @@ async def test_failing_push_still_ends_its_turn(harness):
 
     assert len(of_type(msgs, "turn_end")) == 1
     assert_turns_paired(msgs)
+
+
+async def test_v1_without_stream_aborts_the_turn_when_the_client_leaves(harness):
+    """D-r6-1: HA corta (timeout) un /v1 sin stream: el turno se aborta en OpenClaw y la
+    siguiente petición no choca con un `turn_in_progress` hasta TURN_TIMEOUT_S."""
+    body = {"model": "fogar-gateway", "messages": [{"role": "user", "content": "wait"}]}
+    async with httpx.AsyncClient(
+        base_url=f"http://127.0.0.1:{harness.port}",
+        headers={"authorization": f"Bearer {VALID_KEY}"},
+        timeout=10,
+    ) as http:
+        request = asyncio.create_task(http.post("/v1/chat/completions", json=body))
+        await harness.openclaw.wait_held(1)
+        request.cancel()  # el cliente se va: httpx cierra la conexión
+        await asyncio.wait({request})
+        [(_, sk)] = harness.openclaw.calls
+        async with asyncio.timeout(5):
+            while ("chat.abort", sk) not in harness.openclaw.calls:
+                await asyncio.sleep(0.02)
+        body["messages"][0]["content"] = "hola"
+        res = await http.post("/v1/chat/completions", json=body)
+    assert res.status_code == 200, res.text
+    assert res.json()["choices"][0]["message"]["content"] == "reply-hola"

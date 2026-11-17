@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1")
 
+# Cada cuánto mira /v1 sin stream si el cliente sigue ahí (D-r6-1).
+_DISCONNECT_POLL_S = 0.25
+
 
 def _log_unexpected_error(exc: BaseException) -> None:
     """Solo el tipo a ERROR; traceback sin mensaje ni líneas de código a DEBUG (patrón de
@@ -137,6 +140,9 @@ async def chat_completions(
     caller: HACaller = Depends(resolve_ha_caller),
 ):
     text = _extract_last_user_message(body.messages)
+    if not text.strip():
+        # D-r6-3: un turno vacío no va a OpenClaw ni cuenta en la conversación.
+        return JSONResponse({"error": "empty_message"}, status_code=400)
     stream = body.stream
     orchestrator = request.app.state.openclaw
     session_registry = request.app.state.session_registry
@@ -300,7 +306,12 @@ async def chat_completions(
             yield f"data: {json.dumps(final)}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(generate(), media_type="text/event-stream")
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            # D-r6-5: que un proxy (nginx) no retenga los fragmentos.
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     tokens: list[str] = []
 
@@ -309,8 +320,9 @@ async def chat_completions(
 
     orchestrator_error: Exception | None = None
     status: SessionStatus = "error"  # G-26 (#221): una cancelación no es un éxito
-    try:
-        await call_orchestrator(
+    disconnected = False
+    turn = asyncio.create_task(
+        call_orchestrator(
             orchestrator,
             text,
             session_key,
@@ -318,6 +330,17 @@ async def chat_completions(
             on_token=_on_token,
             on_accepted=_count_turn,
         )
+    )
+    try:
+        # D-r6-1: como en la rama de stream, si el cliente se va, el turno se cancela (y con
+        # él, chat.abort); si no, su sessionKey seguiría ocupada hasta TURN_TIMEOUT_S.
+        while not turn.done():
+            await asyncio.wait({turn}, timeout=_DISCONNECT_POLL_S)
+            if not turn.done() and await request.is_disconnected():
+                disconnected = True
+                break
+        if not disconnected:
+            turn.result()
     except OrchestratorError as e:
         logger.error("HTTP orchestrator error (%s)", e)
         orchestrator_error = e
@@ -326,10 +349,20 @@ async def chat_completions(
         _log_unexpected_error(e)
         orchestrator_error = RuntimeError("internal_error")
     else:
-        status = "completed"
+        if not disconnected:
+            status = "completed"
     finally:
+        if not turn.done():
+            # El cliente se fue, o cancelan este handler (#221: esa cancelación sigue su curso).
+            turn.cancel()
+            await asyncio.wait({turn})
+            if not turn.cancelled() and (exc := turn.exception()) is not None:
+                logger.debug("HTTP turn failed while cancelled (%s)", describe_error(exc))
         await tracker.close(status=status)
 
+    if disconnected:
+        logger.info("HTTP client disconnected; turn aborted")
+        return JSONResponse({"error": "client_disconnected"}, status_code=499)
     if orchestrator_error:
         if str(orchestrator_error) == TURN_IN_PROGRESS_ERROR:
             return JSONResponse({"error": str(orchestrator_error)}, status_code=409)

@@ -79,7 +79,8 @@ async def test_push_with_emoji_split_between_deltas_is_delivered_once(harness):
 
 
 async def test_v1_chat_with_lone_surrogate(harness):
-    body = '{"model": "fogar-gateway", "messages": [{"role": "user", "content": "\\ud800"}]%s}'
+    # Con texto alrededor: un surrogate solo se queda en nada, y eso es un 400 (D-r6-3).
+    body = '{"model": "fogar-gateway", "messages": [{"role": "user", "content": "a\\ud800b"}]%s}'
     async with httpx.AsyncClient(
         base_url=f"http://127.0.0.1:{harness.port}",
         headers={"authorization": f"Bearer {VALID_KEY}", "content-type": "application/json"},
@@ -87,7 +88,7 @@ async def test_v1_chat_with_lone_surrogate(harness):
     ) as http:
         res = await http.post("/v1/chat/completions", content=body % "")
         assert res.status_code == 200
-        assert res.json()["choices"][0]["message"]["content"] == "reply-"
+        assert res.json()["choices"][0]["message"]["content"] == "reply-ab"
 
         async with http.stream("POST", "/v1/chat/completions", content=body % ', "stream": true') as res:
             assert res.status_code == 200
@@ -95,7 +96,7 @@ async def test_v1_chat_with_lone_surrogate(harness):
     text = "".join(
         json.loads(c.removeprefix("data: "))["choices"][0]["delta"].get("content", "") for c in chunks
     )
-    assert text == "reply-"
+    assert text == "reply-ab"
 
 
 async def test_lone_surrogate_from_the_transcriber_does_not_break_the_session(harness):
