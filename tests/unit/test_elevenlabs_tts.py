@@ -498,3 +498,26 @@ async def test_capacity_close_after_handshake_advances_backoff_but_not_health():
 )
 def test_ends_sentence_heuristic(text, expected):
     assert tts_mod._ends_sentence(text) is expected
+
+
+async def test_reopen_drops_the_odd_byte_of_the_cut_connection(monkeypatch):
+    """E-r6-2: un byte suelto de la conexión cortada no desplaza el audio de la reabierta."""
+    from tests.fakes import elevenlabs_tts as fake_mod
+
+    monkeypatch.setattr(fake_mod, "CHUNK_BYTES", 961)  # cada chunk deja un byte suelto
+    fake = await start_fake(close_midway_after_n_messages=3)
+    try:
+        p = ElevenLabsTtsProvider(make_settings(fake.url))
+        stream = await p.connect(VOICE, 1.0, "c1")
+        await stream.send_text_chunk("uno dos.")  # flush: un chunk de 961 bytes
+        await stream.send_text_chunk("tres cuatro ")  # tercer mensaje: el upstream cierra
+        await wait_until(lambda: len(fake.connections) == 2)
+        await stream.send_text_chunk("seis siete.")
+        await stream.end()
+        audio = b"".join(await collect(stream))
+        await stream.close()
+        first = fake_mod.pcm_chunk(0)[:960]
+        assert audio[:960] == first  # la conexión cortada (deja 1 byte en _carry)
+        assert audio[960:1920] == first  # la reabierta empieza alineada, sin ese byte
+    finally:
+        await fake.stop()

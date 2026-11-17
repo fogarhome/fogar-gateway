@@ -11,9 +11,18 @@ from websockets.exceptions import ConnectionClosed
 
 from fogar_gateway.core.config import settings
 from fogar_gateway.models.schemas import TranscriberConfig, TranscriberMessage
-from fogar_gateway.services.reconnection import describe_error, ping_ready, safe_code
+from fogar_gateway.services.reconnection import (
+    describe_error,
+    ping_ready,
+    safe_code,
+    send_or_abort,
+)
 
 logger = logging.getLogger(__name__)
+
+# A transcriber that stops reading for this long is hung: the socket is aborted and reconnected
+# (E-r6-1). A healthy one takes a 20 ms frame at once; this only bounds the session's input loop.
+SEND_TIMEOUT_S = 5.0
 
 
 class TranscriberHandshakeError(RuntimeError):
@@ -99,7 +108,7 @@ class TranscriberClient:
             return
 
         try:
-            await self.ws.send(audio_bytes)
+            await send_or_abort(self.ws, audio_bytes, SEND_TIMEOUT_S, f"[{self.client_id}] transcriber")
         except ConnectionClosed:
             self._is_ready = False
             logger.warning(f"[{self.client_id}] Intento de enviar audio a Transcriber cerrado.")
@@ -191,7 +200,9 @@ class TranscriberClient:
         # que llegue en ese hueco ya es de la frase siguiente (lo retiene el wrapper).
         self._end_sent = True
         try:
-            await self.ws.send(json.dumps({"type": "end"}))
+            await send_or_abort(
+                self.ws, json.dumps({"type": "end"}), SEND_TIMEOUT_S, f"[{self.client_id}] transcriber"
+            )
         except ConnectionClosed:
             self._is_ready = self._end_sent = False
 

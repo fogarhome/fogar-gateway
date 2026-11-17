@@ -462,3 +462,19 @@ async def test_listen_loop_crash_drops_the_held_audio():
     await w.run()
     assert w.state == ConnectionState.DEGRADED
     assert not w._held and w._held_bytes == 0
+
+
+async def test_repeated_end_during_the_replay_is_queued_once():
+    """E-r6-5: two `end`s in a row behind the replay are one `end`; a second None would send an
+    empty `end` to the next connection and force one more reopen."""
+    w, inner = _slow(0.01)
+    for i in range(3):
+        await w.send_audio(f"b{i}".encode())
+    inner._end_sent = False  # `ready`
+    replay = asyncio.create_task(w._replay_held())
+    await asyncio.sleep(0)
+    await w.send_end()
+    await w.send_end()
+    await replay
+    assert inner.wire == [b"b0", b"b1", b"b2", "END"]
+    assert not w._held

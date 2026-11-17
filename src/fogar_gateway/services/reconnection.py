@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from enum import Enum
 
 import httpx
+from websockets.exceptions import ConnectionClosedError
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,20 @@ _sleep = asyncio.sleep
 # E-r2-1: a connection that lived less than this is a flap; from the second flap in a row
 # the reconnect waits (the first one reconnects at once, E-r3-1).
 STABLE_CONNECTION_S = 10.0
+
+
+async def send_or_abort(ws, data: str | bytes, timeout: float, label: str) -> None:
+    """`ws.send` with a deadline (E-r6-1). A peer that stops reading (hung process, host gone
+    with TCP open) blocks `send` in drain with no limit of its own, and with it whoever awaits
+    it (the session's input loop). On timeout the transport is aborted, so the reader sees the
+    drop and reconnects, and this raises ConnectionClosed like any other closed socket."""
+    try:
+        async with asyncio.timeout(timeout):
+            await ws.send(data)
+    except TimeoutError:
+        logger.warning("%s: el envío no avanzó en %.1f s; se aborta la conexión", label, timeout)
+        ws.transport.abort()  # not close(): it would wait close_timeout on a peer that doesn't read
+        raise ConnectionClosedError(None, None) from None
 
 
 class ConnectionState(Enum):

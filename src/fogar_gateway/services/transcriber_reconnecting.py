@@ -117,7 +117,8 @@ class ReconnectingTranscriberClient:
                 await self._warn_lost()
             return
         if self._replaying or self._held:  # `ready` came: the `end` goes after the held frames
-            self._held.append(None)
+            if not self._held or self._held[-1] is not None:  # E-r6-5: a repeated `end` is one
+                self._held.append(None)
             return
         await self._end_now()
 
