@@ -120,11 +120,30 @@ describe('ClientesView: crear sin respuesta (G-r6-3)', () => {
     el.querySelector('form')!.dispatchEvent(new Event('submit'))
     await flush()
     expect(el.textContent).toContain('No sé si se creó')
-    await vi.advanceTimersByTimeAsync(1000)
+    await vi.advanceTimersByTimeAsync(3000)
     vi.useRealTimers()
     await flush()
     expect(listClients).toHaveBeenCalled()
     expect(el.textContent).toContain('su clave no se ha visto: entra en él y rota la clave')
+  })
+
+  it('relee hasta que el cliente creado sale en la lista (G-r8-1)', async () => {
+    createClient.mockRejectedValue(new ApiError('network', 0, 'No llego al gateway'))
+    const { el, boton } = await mount()
+    vi.useFakeTimers()
+    boton('Crear a mano').click()
+    await flush()
+    const nombre = el.querySelector('form input') as HTMLInputElement
+    nombre.value = 'Tele'
+    nombre.dispatchEvent(new Event('input'))
+    listClients.mockClear()
+    listClients.mockResolvedValueOnce([]).mockResolvedValue([nuevo])
+    el.querySelector('form')!.dispatchEvent(new Event('submit'))
+    await vi.advanceTimersByTimeAsync(3000)
+    vi.useRealTimers()
+    await flush()
+    expect(listClients).toHaveBeenCalledTimes(2) // la primera se adelantó; la segunda lo trae
+    expect(el.textContent).toContain('«Tele» sale en la lista, su clave no se ha visto')
   })
 
   it('mientras relee la lista no deja crear otra vez (G-r7-1)', async () => {
@@ -142,7 +161,7 @@ describe('ClientesView: crear sin respuesta (G-r6-3)', () => {
     el.querySelector('form')!.dispatchEvent(new Event('submit'))
     await flush()
     expect(createClient).toHaveBeenCalledTimes(1)
-    await vi.advanceTimersByTimeAsync(1000)
+    await vi.advanceTimersByTimeAsync(3000)
     vi.useRealTimers()
     await flush()
     expect(boton('Crear y ver la clave').disabled).toBe(false)

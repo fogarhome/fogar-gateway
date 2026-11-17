@@ -87,10 +87,14 @@ async function crear(): Promise<void> {
 /** G-r7-1: relee la lista (con reintentos) antes de pedir que se mire; su clave nunca se vio. */
 async function comprobarLista(nombre: string): Promise<void> {
   comprobando.value = true
-  const leida = await releer(async () => {
-    await clients.refresh()
-    if (clients.error) throw new Error(clients.error)
-  })
+  // G-r8-1: una lectura que se adelanta a la escritura no lo trae: se relee hasta verlo (o 3 veces).
+  const leida = await releer(
+    async () => {
+      await clients.refresh()
+      if (clients.error) throw new Error(clients.error)
+    },
+    () => clients.items.some((c) => c.name === nombre),
+  )
   comprobando.value = false
   if (creando.value || creado.value) return // ya hay otro intento en marcha
   const rotala = `Si «${nombre}» sale en la lista, su clave no se ha visto: entra en él y rota la clave.`
