@@ -31,11 +31,27 @@ ENVIRON = "entorno"
 def _settings_class() -> Any:
     """`Settings`, importado solo al usarse (`--help` no carga pydantic).
 
-    `fogar_gateway.core.config` construye un `Settings()` global al importarse: una variable de
-    entorno inválida lo rompe y sale como error de validación, igual que al arrancar el gateway.
+    `fogar_gateway.core.config` construye un `Settings()` global al importarse: un valor inválido
+    (entorno o config.env) lo rompe. Entonces se ejecuta el módulo aparte, sin registrarlo, y se
+    toma la clase, definida antes de esa línea: la CLI sigue pudiendo validar y corregir el
+    valor (`config set`/`unset`, #359) sin traceback.
     """
-    from fogar_gateway.core.config import Settings
+    import importlib.util
 
+    from pydantic import ValidationError
+    from pydantic_settings import SettingsError
+
+    try:
+        from fogar_gateway.core.config import Settings
+    except (ValidationError, SettingsError):
+        spec = importlib.util.find_spec("fogar_gateway.core.config")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+        except (ValidationError, SettingsError):
+            pass  # el error lo da load() con campo + tipo
+        return module.Settings
     return Settings
 
 
@@ -352,11 +368,12 @@ def _apply(out: Out, key: str, value: str | None) -> bool:
         if value is not None and dotenv_values(tmp).get(key) != value:
             raise api.ApiError(f"El valor de {key} no se puede guardar en config.env tal cual "
                                "(p. ej. contiene `${...}` o saltos de línea).", 1)
-        before, _ = _fails(path, key)
+        before, old_errors = _fails(path, key)
         after, errors = _fails(tmp, key)
-        if errors:
+        # Solo frena errores nuevos: con dos valores inválidos se puede corregir uno (#359).
+        if new_errors := [e for e in errors if e not in old_errors]:
             raise api.ApiError("Con ese cambio la configuración no sería válida: "
-                               + "; ".join(errors) + ". No se ha escrito nada.", 1)
+                               + "; ".join(new_errors) + ". No se ha escrito nada.", 1)
         if after - before:
             raise api.ApiError("Con ese cambio fallaría: " + ", ".join(sorted(after - before))
                                + ". No se ha escrito nada.", 1)

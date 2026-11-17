@@ -909,6 +909,6 @@ No lleva texto (ni del usuario ni de la respuesta) ni los detalles que el gatewa
 | `push_tts` | Se cerró el TTS de un push (al terminar o al cortarse) |
 | `session_end` | La sesión se cierra (si el socket aún puede recibirlo) |
 
-Un push no tiene `llm_*`: solo `tts_*` y `push_tts` si hay audio. Las etapas de un cierre forzado (`client_slow`, `session_revoked`, `session_displaced`) quedan en `/admin/sessions` pero no llegan: el socket ya no las puede recibir o solo deja salir el `turn_end` (§13).
+Un push no tiene `llm_*`: solo `tts_*` y `push_tts` si hay audio. Las etapas de un cierre forzado (`client_slow`, `session_revoked`, `agent_revoked`, `session_displaced`) quedan en `/admin/sessions` pero no llegan: el socket ya no las puede recibir o solo deja salir el `turn_end` (§13).
 
 Van en el mismo orden total que el resto (§5), así que su posición respecto a `turn_start`, `token` y `turn_end` es fiable, y pueden llegar fuera de un turno (`session_start`, `transcription_*`, `session_end`). Son diagnóstico: la lista de etapas puede crecer y un cliente no debe depender de ellas para funcionar (para enseñar en qué está un turno, `turn_progress`, §5). Ignora las etapas que no conozcas.

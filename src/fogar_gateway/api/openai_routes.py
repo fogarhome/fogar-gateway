@@ -356,8 +356,10 @@ async def chat_completions(
             # El cliente se fue, o cancelan este handler (#221: esa cancelación sigue su curso).
             turn.cancel()
             await asyncio.wait({turn})
-            if not turn.cancelled() and (exc := turn.exception()) is not None:
-                logger.debug("HTTP turn failed while cancelled (%s)", describe_error(exc))
+        # Siempre recogida (también si terminó mientras nos cancelaban): sin «Task exception
+        # was never retrieved», que saldría a ERROR con el texto de la excepción.
+        if turn.done() and not turn.cancelled() and (exc := turn.exception()) is not None:
+            logger.debug("HTTP turn ended with %s", describe_error(exc))
         await tracker.close(status=status)
 
     if disconnected:

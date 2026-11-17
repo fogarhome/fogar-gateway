@@ -504,7 +504,7 @@ class FogarBridge:
                     # C-r6-1: como en el handshake, 4020 y no 4200: la clave sigue valiendo.
                     logger.warning(f"[{self.client_id}] El agente ya no está permitido; se cierra.")
                     task = self._start_policy_close(
-                        Close.AGENT_NOT_PERMITTED, "revoked", "session_revoked", status="revoked"
+                        Close.AGENT_NOT_PERMITTED, "agent_revoked", "agent_revoked", status="revoked"
                     )
                     await asyncio.wait({task})  # como en _revoke_session
                     return

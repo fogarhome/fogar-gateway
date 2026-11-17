@@ -15,7 +15,9 @@ import logging
 
 from starlette.requests import HTTPConnection
 
-from fogar_gateway.core.config import settings
+# `settings` se importa dentro de cada función que lo usa: la CLI usa las funciones puras
+# (validar entradas) aunque config.env no valide y `Settings()` falle al importarse (#359).
+
 
 logger = logging.getLogger(__name__)
 
@@ -118,11 +120,15 @@ def _is_loopback(ip_str: str) -> bool:
 
 def is_trusted_proxy(ip_str: str) -> bool:
     """True if ip_str is allowed to set X-Real-IP (settings.TRUSTED_PROXIES)."""
+    from fogar_gateway.core.config import settings
+
     return _ip_in_networks(ip_str, _parse_networks(settings.TRUSTED_PROXIES))
 
 
 def is_trusted_origin(ip_str: str) -> bool:
     """True if ip_str is exempt from /v1/* auth (loopback and/or TRUSTED_NETWORKS)."""
+    from fogar_gateway.core.config import settings
+
     try:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
@@ -133,6 +139,8 @@ def is_trusted_origin(ip_str: str) -> bool:
 
 
 def _proxies_invalid() -> bool:
+    from fogar_gateway.core.config import settings
+
     return bool(_parsed(settings.TRUSTED_PROXIES)[1])
 
 
@@ -143,6 +151,8 @@ def warn_if_open_proxy_config() -> None:
     A same-host reverse proxy with no TRUSTED_PROXIES would look like a loopback client for
     everyone behind it (its X-Real-IP is ignored), leaving /v1/* open to the Internet.
     """
+    from fogar_gateway.core.config import settings
+
     proxies_bad = invalid_entries(settings.TRUSTED_PROXIES)
     if proxies_bad:
         logger.warning(

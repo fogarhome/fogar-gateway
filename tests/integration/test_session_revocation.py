@@ -16,6 +16,7 @@ from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.main import app
 from fogar_gateway.services.db_client import db_client
+from fogar_gateway.services.stats import gateway_stats
 from tests.integration.conftest import (
     ADMIN_TOKEN,
     CLIENT_ID,
@@ -180,3 +181,9 @@ async def test_narrowing_allowed_agents_closes_the_live_session_with_4020(server
             await asyncio.wait_for(ws.recv(), timeout=CLOSE_DEADLINE_S)
     assert exc.value.rcvd is not None
     assert (exc.value.rcvd.code, exc.value.rcvd.reason) == (4020, "agent not permitted")
+    await asyncio.sleep(0.2)  # deja terminar el teardown del lado del servidor
+    # Distinto de una clave revocada en /admin/sessions (evento) y en las estadísticas.
+    [record] = app.state.session_registry.get_all()
+    assert "agent_revoked" in [e.stage for e in record.events]
+    assert "session_revoked" not in [e.stage for e in record.events]
+    assert gateway_stats.snapshot()["sessions_closed"] == {"agent_revoked": 1}

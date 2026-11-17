@@ -494,3 +494,23 @@ def test_set_secret_dash_with_tty_prompts_hidden(home, systemd, monkeypatch):
     assert seen["hide_input"] is True
     assert "OPENCLAW_TOKEN=tecleado-oculto" in _env(home).read_text()
     assert "tecleado-oculto" not in r.output  # click no hace eco con hide_input
+
+
+def test_set_fixes_an_invalid_value_already_in_config_env(home):
+    """#359: con un valor que ya no valida (aquí un timeout 0) `config set` y `unset` siguen
+    funcionando y lo corrigen, sin traceback ni el valor. En un proceso nuevo: en este,
+    `fogar_gateway.core.config` ya está importado y el fallo no se vería."""
+    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nTURN_TIMEOUT_S=0\nIDLE_TIMEOUT_S=0\n")
+
+    def cli_run(*args):
+        return subprocess.run([sys.executable, "-m", "fogar_gateway.cli", *args], cwd=ROOT,
+                              capture_output=True, text=True, env=os.environ)
+
+    r = cli_run("config", "set", "TURN_TIMEOUT_S", "120")
+    assert r.returncode == 0, r.stdout + r.stderr
+    r = cli_run("config", "set", "HANDSHAKE_TIMEOUT_S", "0")  # un error nuevo no: legible
+    assert r.returncode == 1 and "HANDSHAKE_TIMEOUT_S: greater_than" in r.stdout + r.stderr
+    r = cli_run("config", "unset", "IDLE_TIMEOUT_S")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "Traceback" not in r.stdout + r.stderr
+    assert _env(home).read_text() == f"ADMIN_TOKEN={SECRET}\nTURN_TIMEOUT_S=120\n"
