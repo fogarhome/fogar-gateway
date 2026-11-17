@@ -819,6 +819,11 @@ class TurnController:
             # C-r7-1: push de un agente retirado de allowed_agents (conversación de otro día,
             # clave legacy): no llega al cliente y se para en OpenClaw.
             logger.info(f"[{self._client_id}] push de un agente no permitido: descartado")
+            push = self._push
+            if push is not None and push.session_key == session_key:
+                # Su push ya abierto (retirado a medias) se corta ya, sin esperar a turn_timeout.
+                async with self._lock:
+                    await self._cut_push(push.turn_id, "cancelled")
             self._abort_run(run_id)
             await self._orchestrator.abort(session_key)
             return

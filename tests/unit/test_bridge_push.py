@@ -128,6 +128,21 @@ async def test_push_of_a_retired_agent_is_dropped_and_aborted(make_push_bridge):
     assert [m["type"] for m in await sent(bridge)] == ["turn_start", "token", "turn_end"]
 
 
+
+async def test_an_open_push_of_a_retired_agent_is_cut_at_its_next_start(make_push_bridge):
+    """C-r7-1: push de x ya abierto, la revalidación quita x y llega su `agent start`
+    intermedio: turn_end `cancelled` enseguida, sin esperar a un turn_timeout falso."""
+    bridge, _ = make_push_bridge(output_mode=("text",))
+    sk = "agent:x:hab_sito"
+    await push(bridge, *push_reply("hola", sk=sk, end=False))
+    bridge.turns.allowed_agents = ["main"]  # lo que deja la revalidación
+    await asyncio.wait_for(push(bridge, ("turn_start", sk)), 1)
+    assert _turn_frames(await sent(bridge)) == [
+        {"type": "turn_start", "turn_id": "t-1", "turn_seq": 1, "conversation": None, "origin": "push"},
+        {"type": "turn_end", "turn_id": "t-1", "reason": "cancelled"},
+    ]
+    bridge.orchestrator.abort.assert_awaited_with(sk)
+
 async def test_revalidation_refreshes_allowed_agents_for_pushes(make_push_bridge, monkeypatch):
     """C-r7-1: la revalidación guarda el `allowed_agents` vigente; el push lo consulta sin leer
     la BD."""
