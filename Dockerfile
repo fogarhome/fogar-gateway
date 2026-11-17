@@ -1,7 +1,8 @@
 # La web se compila en una etapa propia: la imagen final no lleva Node (M18).
 FROM node:26-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc AS web
 WORKDIR /web
-RUN corepack enable
+# Node 25+ ya no trae corepack: se instala fijado y lee la versión de pnpm de packageManager.
+RUN npm install -g corepack@0.36.0 && corepack enable
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY web/ ./
