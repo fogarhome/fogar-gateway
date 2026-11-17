@@ -17,8 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.12 = minimum declared in pyproject.toml; 3.14 = the Dockerfile's runtime.
-        python-version: ["3.12", "3.14"]
+        # 3.12 = minimum declared in pyproject.toml; 3.15 = the Dockerfile's runtime.
+        python-version: ["3.12", "3.15"]
 
     steps:
       - uses: actions/checkout@v7
@@ -71,7 +71,7 @@ jobs:
           PYTHONPATH: .
 
   # Aggregate gate: the "production" ruleset requires a check named exactly
-  # "test". The matrix above reports "tests (3.12)"/"tests (3.14)", so this
+  # "test". The matrix above reports "tests (3.12)"/"tests (3.15)", so this
   # job keeps the required name and fails unless every matrix leg and the
   # Docker build succeeded. Add new required jobs to `needs`, not to the ruleset.
   test:
