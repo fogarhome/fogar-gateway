@@ -19,9 +19,11 @@ logger = logging.getLogger(__name__)
 
 # Warning code sent to the client when a reconnect cut the phrase in flight (E-r3-1).
 PHRASE_INTERRUPTED = "phrase_interrupted"
-# Audio held between our `end` and the next `ready` (~5 s of 20 ms frames): covers a final
-# slowed by a saturated GPU (3 s) plus the reopen.
-HELD_MAX = 250
+# Audio held between our `end` and the next `ready`, in bytes (~5 s of Float32 16 kHz): covers a
+# final slowed by a saturated GPU (3 s) plus the reopen, under fogar-transcriber's 600 KB/3 s.
+HELD_MAX_BYTES = 320_000
+# Queued where a frame that didn't fit was dropped: its phrase is marked cut when replayed.
+_CUT = object()
 
 
 class ReconnectingTranscriberClient:
@@ -65,8 +67,8 @@ class ReconnectingTranscriberClient:
         # fogar-transcriber stops reading a socket at our `end` (handleEnd, then close 1000): audio
         # from then on is the next phrase and waits here for the new connection (E-r4-1, #358).
         # None stands for an `end` that arrived while the held frames were being replayed.
-        self._held: deque[bytes | None] = deque(maxlen=HELD_MAX)
-        self._held_cut = False  # the oldest held frames were dropped
+        self._held: deque[bytes | object | None] = deque()
+        self._held_bytes = 0
         self._replaying = False  # frames and `end`s queue behind the replay, in order
 
     @property
@@ -105,23 +107,33 @@ class ReconnectingTranscriberClient:
 
     async def send_end(self) -> None:
         if self._client._end_sent:  # before the new `ready`: a whole phrase in the gap is not kept
-            if self._held or self._held_cut:  # an `end` with no audio does nothing
-                self._held.clear()
-                self._held_cut = False
-                await self._phrase_lost()
+            dropped = False  # only this phrase: earlier queued ones (up to a None) still go out
+            while self._held and self._held[-1] is not None:
+                item = self._held.pop()
+                self._held_bytes -= len(item) if isinstance(item, bytes) else 0
+                dropped = True
+            if dropped:  # an `end` with no audio does nothing
+                # E-r5-1: only warn; _phrase_open/_lost belong to the phrase awaiting its final.
+                await self._warn_lost()
             return
         if self._replaying or self._held:  # `ready` came: the `end` goes after the held frames
-            self._hold(None)
+            self._held.append(None)
             return
         await self._end_now()
 
-    def _hold(self, item: bytes | None) -> None:
-        if len(self._held) == HELD_MAX:  # the oldest held item is dropped
-            if self._replaying:  # it belongs to the phrase being replayed right now
-                self._phrase_open = self._lost = True
-            else:
-                self._held_cut = True
-        self._held.append(item)
+    def _hold(self, frame: bytes) -> None:
+        if self.state == ConnectionState.DEGRADED:  # E-r5-2: no reopen will ever replay it
+            return
+        if self._held_bytes + len(frame) > HELD_MAX_BYTES:  # E-r5-3: the new frame goes, never an end
+            if not self._held or self._held[-1] is not _CUT:
+                self._held.append(_CUT)
+            return
+        self._held.append(frame)
+        self._held_bytes += len(frame)
+
+    def _drop_held(self) -> None:
+        self._held.clear()
+        self._held_bytes = 0
 
     async def _send_now(self, audio_bytes: bytes) -> None:
         if self.state != ConnectionState.DEGRADED:  # E-r4-3: `unavailable` already told them
@@ -136,14 +148,17 @@ class ReconnectingTranscriberClient:
             await self._phrase_lost()  # this end was dropped: no final will ever come
 
     async def _replay_held(self) -> None:
-        if self._held_cut:
-            self._phrase_open = self._lost = True
-        self._held_cut = False
         self._replaying = True
         try:
             while self._held and not self._client._end_sent:  # a replayed `end` stops it
                 item = self._held.popleft()  # before sending: an overflow can't drop it then
-                await (self._end_now() if item is None else self._send_now(item))
+                if item is None:
+                    await self._end_now()
+                elif isinstance(item, bytes):
+                    self._held_bytes -= len(item)
+                    await self._send_now(item)
+                else:  # _CUT: this phrase lost frames to the cap
+                    self._phrase_open = self._lost = True
         finally:
             self._replaying = False
 
@@ -151,6 +166,9 @@ class ReconnectingTranscriberClient:
         """The phrase in flight when the connection dropped is gone: tell the client to
         repeat it (a fixed code, never the text) instead of passing on a truncated final."""
         self._phrase_open = self._lost = False
+        await self._warn_lost()
+
+    async def _warn_lost(self) -> None:
         if self.state == ConnectionState.DEGRADED:  # E-r4-3: the client already has `unavailable`
             return
         logger.warning("[%s] transcriber: phrase cut by a reconnect, final withheld",
@@ -192,6 +210,7 @@ class ReconnectingTranscriberClient:
             if self.state != ConnectionState.CONNECTED:
                 recovered = await self._reconnect_loop()
                 if not recovered:
+                    self._drop_held()  # DEGRADED for good
                     return
                 await self._replay_held()
 
@@ -215,6 +234,7 @@ class ReconnectingTranscriberClient:
                 )
                 logger.debug("[%s] listen loop: %s", self._client_id, traceback_no_message(e))
                 self._set_state(ConnectionState.DEGRADED)
+                self._drop_held()
                 return
 
             if self._closed:

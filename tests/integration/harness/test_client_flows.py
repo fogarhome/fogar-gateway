@@ -4,6 +4,8 @@ Cada test dice qué hace el orquestador (responde, se queda esperando, falla, se
 inicia un turno) y comprueba solo lo que recibe el cliente por su WebSocket.
 """
 
+import asyncio
+
 from tests.integration.harness.conftest import (
     assert_turns_paired,
     audio,
@@ -59,6 +61,29 @@ async def test_voice_turn_transcribes_and_speaks_the_reply(harness):
     assert all(f[0] == 0xA1 and int.from_bytes(f[1:3], "big") == start["turn_seq"] for f in frames)
     assert b"".join(f[3:] for f in frames) == pcm
     assert_turns_paired(msgs)
+
+
+async def test_two_phrases_in_a_row_each_get_their_final(harness):
+    """A-r5-1: el transcriber cierra 1000 tras cada final (como el real); el gateway reabre y
+    la segunda frase recibe su propia final, no `phrase_interrupted`."""
+    harness.transcriber.on_end = [("enciende la luz", True)]
+    client = await harness.connect(input_mode="audio", output_mode=("text",))
+    for n in (1, 2):
+        await _until(lambda n=n: len(harness.transcriber.configs) == n)  # su conexión ya tiene `ready`
+        for _ in range(4):
+            await client.send_audio(AUDIO_FRAME)
+            await asyncio.sleep(0.05)
+        await client.send({"type": "end"})
+        await client.collect(lambda m, n=n: len(of_type(m, "transcription")) == n)
+
+    assert [t["text"] for t in of_type(client.messages, "transcription")] == ["enciende la luz"] * 2
+    assert of_type(client.messages, "status") == []  # ningún phrase_interrupted
+
+
+async def _until(cond, timeout: float = 5.0) -> None:
+    async with asyncio.timeout(timeout):
+        while not cond():
+            await asyncio.sleep(0.01)
 
 
 async def test_speaking_over_a_running_turn_interrupts_it(harness):

@@ -52,10 +52,14 @@ class FakeTranscriber:
                                 json.dumps({"type": "transcription", "text": text, "is_final": final})
                             )
                 elif json.loads(msg).get("type") == "end":
+                    # Como el real (StreamingSession::handleEnd): deja de leer, manda la final y
+                    # cierra 1000; la frase siguiente va por una conexión nueva.
                     for text, final in self.on_end:
                         await ws.send(
                             json.dumps({"type": "transcription", "text": text, "is_final": final})
                         )
+                    await ws.close(1000)
+                    return
         except websockets.ConnectionClosed:
             pass
 

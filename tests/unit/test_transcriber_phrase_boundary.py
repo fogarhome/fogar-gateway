@@ -18,7 +18,7 @@ from fogar_gateway.services.reconnection import ConnectionState
 from fogar_gateway.services.speech.ports import SttCallbacks, SttParams
 from fogar_gateway.services.transcriber_client import TranscriberClient
 from fogar_gateway.services.transcriber_reconnecting import (
-    HELD_MAX,
+    HELD_MAX_BYTES,
     ReconnectingTranscriberClient,
 )
 
@@ -38,7 +38,8 @@ def _wrap(port: int, **kw) -> ReconnectingTranscriberClient:
 
 def _handle_end(script=lambda n: None):
     """`script(n)`: None (normal), "cut_on_audio" (1011 on the first frame), "empty" (final
-    with no text) or "refuse" (closes before `ready`)."""
+    with no text), "cut_before_final" (1011 between our end and the final) or "refuse"
+    (closes before `ready`)."""
     st = {"conns": 0}
 
     async def handler(ws):
@@ -59,6 +60,9 @@ def _handle_end(script=lambda n: None):
             elif json.loads(msg).get("type") == "end":
                 break  # handleEnd: stops reading here
         await asyncio.sleep(INFERENCE_S)
+        if script(n) == "cut_before_final":
+            await ws.close(1011)
+            return
         text = "" if script(n) == "empty" else " ".join(ids)
         await ws.send(json.dumps({"type": "transcription", "text": text, "is_final": True}))
         await ws.close(1000)
@@ -224,6 +228,41 @@ async def test_degraded_after_an_end_raises_no_warnings():
     assert _finals(w) == [_ids("a", 2)]
     w._callbacks.on_warning.assert_not_awaited()
     w._callbacks.on_incomplete.assert_not_awaited()
+    assert not w._held and w._held_bytes == 0  # E-r5-2: nothing is kept for a reopen that won't come
+
+
+async def test_whole_phrase_in_the_gap_keeps_the_cut_previous_phrase_withheld():
+    """E-r5-1 case 1: a loses its head to a 1011 and b falls whole in the gap before a's
+    final. b's end used to clear a's mark and a's truncated final went out as an order."""
+    async def body(w, st):
+        await w.send_audio(b"a0")  # the server cuts on it
+        await _until(lambda: st["conns"] == 2 and w.state == ConnectionState.CONNECTED)
+        await _frames(w, "a", 3)
+        await w.send_end()
+        await _frames(w, "b", 2)
+        await w.send_end()  # before a's final
+        await _until(lambda: st["conns"] == 3 and w._client._is_ready)
+
+    w, _ = await _session({1: "cut_on_audio"}.get, body, initial_backoff=0.01)
+    assert _finals(w) == []
+    assert w._callbacks.on_warning.await_count == 2  # a and b
+    assert w._callbacks.on_incomplete.await_count == 2
+
+
+async def test_whole_phrase_in_the_gap_then_a_cut_before_the_final_reports_both():
+    """E-r5-1 case 2: b falls whole in the gap, then a 1011 lands before a's final. b's end
+    used to clear a's open mark and a was lost without a warning."""
+    async def body(w, st):
+        await _frames(w, "a", 3)
+        await w.send_end()
+        await _frames(w, "b", 2)
+        await w.send_end()
+        await _until(lambda: st["conns"] == 2 and w._client._is_ready)
+
+    w, _ = await _session({1: "cut_before_final"}.get, body, initial_backoff=0.01)
+    assert _finals(w) == []
+    assert w._callbacks.on_warning.await_count == 2
+    assert w._callbacks.on_incomplete.await_count == 2
 
 
 async def test_degraded_mid_phrase_raises_no_warnings():
@@ -274,18 +313,44 @@ async def test_overflow_during_the_replay_marks_the_phrase_lost():
     """Review 1: a full buffer mid-replay drops an unsent frame, never the one in flight, and
     the gap is flagged (final withheld) instead of passing silently."""
     w, inner = _slow(0.05)
-    for i in range(HELD_MAX):
-        await w.send_audio(f"b{i}".encode())
+    size = HELD_MAX_BYTES // 10
+    for i in range(10):
+        await w.send_audio(f"b{i}|".encode().ljust(size))
+    assert w._held_bytes == HELD_MAX_BYTES
     inner._end_sent = False  # `ready`
     replay = asyncio.create_task(w._replay_held())
     await asyncio.sleep(0)
     for i in range(5):
-        await w.send_audio(f"n{i}".encode())
+        await w.send_audio(f"n{i}|".encode().ljust(size))
+    assert w._held_bytes <= HELD_MAX_BYTES
     inner.drain = 0
     await replay
     assert w._lost
-    sent = [int(f[1:]) for f in inner.wire if isinstance(f, bytes) and f.startswith(b"b")]
-    assert sent == sorted(sent) and sent[0] == 0  # in order, the first frame went out
+    sent = [f.split(b"|")[0] for f in inner.wire if isinstance(f, bytes)]
+    assert sent == [f"b{i}".encode() for i in range(10)] + [b"n0"]  # the new frames went
+
+
+async def test_overflow_drops_the_new_frame_never_a_queued_end():
+    """E-r5-3: a full buffer drops the new frame, never a queued `end` (which would merge two
+    phrases), and the cut is marked on the phrase that lost it, not on the one replaying."""
+    w, inner = _slow(0.01)
+    third = HELD_MAX_BYTES // 3
+    for i in range(3):
+        await w.send_audio(f"b{i}|".encode().ljust(third))
+    inner._end_sent = False
+    replay = asyncio.create_task(w._replay_held())
+    await asyncio.sleep(0)
+    await w.send_end()  # queued behind b's frames
+    for i in range(3):  # c: the first fits, the rest don't
+        await w.send_audio(f"c{i}|".encode().ljust(third))
+    await replay  # stops at b's replayed `end`
+    assert [f if isinstance(f, str) else f.split(b"|")[0] for f in inner.wire] == [
+        b"b0", b"b1", b"b2", "END"]
+    assert not w._lost  # b is whole
+    inner._end_sent = False  # the next `ready`
+    await w._replay_held()
+    assert w._lost  # c is the one cut
+    assert w._held_bytes == 0
 
 
 async def test_frames_after_a_replayed_end_wait_for_the_next_ready():
