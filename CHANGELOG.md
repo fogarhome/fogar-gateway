@@ -1,5 +1,15 @@
 # Changelog
 
+## [3.0.0](https://github.com/fogarhome/fogar-gateway/compare/v2.0.0...v3.0.0) (2026-11-17)
+
+### ⚠ BREAKING CHANGES
+
+* Fogar Gateway 3.0 (conversaciones, códigos de cierre, OpenClaw como dispositivo y auditoría previa) ([#391](https://github.com/fogarhome/fogar-gateway/issues/391))
+
+### Features
+
+* Fogar Gateway 3.0 (conversaciones, códigos de cierre, OpenClaw como dispositivo y auditoría previa) ([#391](https://github.com/fogarhome/fogar-gateway/issues/391)) ([d0b7bcb](https://github.com/fogarhome/fogar-gateway/commit/d0b7bcb6b6e6b75d7ef38c201431580353b3960a)), closes [#245](https://github.com/fogarhome/fogar-gateway/issues/245) [#254](https://github.com/fogarhome/fogar-gateway/issues/254) [#271](https://github.com/fogarhome/fogar-gateway/issues/271) [#272](https://github.com/fogarhome/fogar-gateway/issues/272) [#285](https://github.com/fogarhome/fogar-gateway/issues/285) [#286](https://github.com/fogarhome/fogar-gateway/issues/286) [#328](https://github.com/fogarhome/fogar-gateway/issues/328) [#330](https://github.com/fogarhome/fogar-gateway/issues/330) [#358](https://github.com/fogarhome/fogar-gateway/issues/358), references [#329](https://github.com/fogarhome/fogar-gateway/issues/329) [#330](https://github.com/fogarhome/fogar-gateway/issues/330) [#353](https://github.com/fogarhome/fogar-gateway/issues/353) [#358](https://github.com/fogarhome/fogar-gateway/issues/358) [#248](https://github.com/fogarhome/fogar-gateway/issues/248)
+
 # [2.0.0](https://github.com/fogarhome/fogar-gateway/compare/v1.29.0...v2.0.0) (2026-11-13)
 
 
