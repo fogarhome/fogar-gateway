@@ -242,12 +242,21 @@ def _loads_frame(raw: str | bytes):
     if not isinstance(raw, bytes) and "\\ud" not in raw and "\\uD" not in raw:
         return frame
     payload = frame.get("payload") if isinstance(frame, dict) else None
-    if not isinstance(payload, dict) or frame.get("event") != "chat":
+    if not isinstance(payload, dict):
         return without_lone_surrogates(frame)
-    text = {k: payload.pop(k) for k in ("deltaText", "message") if k in payload}
+    routing = [payload.get(k) for k in _ROUTING_KEYS]
+    text = {}
+    if frame.get("event") == "chat":
+        text = {k: payload.pop(k) for k in ("deltaText", "message") if k in payload}
     frame = without_lone_surrogates(frame)
+    # B-r5-1: una clave limpiada sería la de otra sesión; la trama se descarta (_listen).
+    if [frame["payload"].get(k) for k in _ROUTING_KEYS] != routing:
+        raise ValueError("lone surrogate in a routing key")
     frame["payload"].update(text)
     return frame
+
+
+_ROUTING_KEYS = ("sessionKey", "runId")
 
 
 def _log_safe(value: object) -> str:

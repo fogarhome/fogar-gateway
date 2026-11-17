@@ -274,11 +274,42 @@ def test_loads_frame_keeps_chat_text_halves_but_cleans_the_rest():
 
     from fogar_gateway.services.openclaw.client import _loads_frame
 
-    chat = {"sessionKey": "k\ud800", "deltaText": "a\ud83d", "message": {"content": "b\ude00"}}
+    chat = {"sessionKey": "k", "state": "d\ud800", "deltaText": "a\ud83d", "message": {"content": "b\ude00"}}
     frame = _loads_frame(json.dumps({"type": "event", "event": "chat", "payload": chat}))
-    assert frame["payload"] == {"sessionKey": "k", "deltaText": "a\ud83d", "message": {"content": "b\ude00"}}
+    assert frame["payload"] == {"sessionKey": "k", "state": "d", "deltaText": "a\ud83d", "message": {"content": "b\ude00"}}
     other = _loads_frame(json.dumps({"type": "res", "payload": {"title": "t\ud800"}}))
     assert other["payload"]["title"] == "t"
+
+
+@pytest.mark.parametrize("key", ["sessionKey", "runId"])
+@pytest.mark.parametrize("event", ["chat", "agent"])
+def test_loads_frame_drops_a_frame_whose_routing_key_would_change(key, event):
+    """B-r5-1: "k" + surrogate suelto, limpio, sería "k", la clave de otra sesión: la trama se descarta
+    (ValueError, que _listen registra solo por tipo) en vez de enrutarse."""
+    import json
+
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    payload = {"sessionKey": "k", "runId": "r", key: "k\ud800", "deltaText": "hola"}
+    with pytest.raises(ValueError):
+        _loads_frame(json.dumps({"type": "event", "event": event, "payload": payload}))
+
+
+def test_loads_frame_binary_chat_keeps_text_halves():
+    """B-r5-3: trama binaria (utf-16 con surrogates crudos): deltaText conserva la mitad para
+    ChatTextTracker, el resto se limpia y una sessionKey con surrogate descarta la trama."""
+    import json
+
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    def raw(payload):
+        frame = {"type": "event", "event": "chat", "payload": payload}
+        return json.dumps(frame, ensure_ascii=False).encode("utf-16", "surrogatepass")
+
+    frame = _loads_frame(raw({"sessionKey": "k", "state": "d\ud800", "deltaText": "a\ud83d"}))
+    assert frame["payload"] == {"sessionKey": "k", "state": "d", "deltaText": "a\ud83d"}
+    with pytest.raises(ValueError):
+        _loads_frame(raw({"sessionKey": "k\ud800", "deltaText": "a"}))
 
 
 def test_loads_frame_bytes_with_raw_surrogate_are_valid_utf8():
