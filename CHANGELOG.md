@@ -1,5 +1,11 @@
 # Changelog
 
+## [3.0.1](https://github.com/fogarhome/fogar-gateway/compare/v3.0.0...v3.0.1) (2026-11-17)
+
+### Bug Fixes
+
+* **cli:** uninstall --purge no falla en el mensaje final tras desinstalar el programa ([#393](https://github.com/fogarhome/fogar-gateway/issues/393)) ([089595b](https://github.com/fogarhome/fogar-gateway/commit/089595b9d93281b4dc8bb80e8eb6be125f143fcc))
+
 ## [3.0.0](https://github.com/fogarhome/fogar-gateway/compare/v2.0.0...v3.0.0) (2026-11-17)
 
 ### ⚠ BREAKING CHANGES
