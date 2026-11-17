@@ -51,7 +51,8 @@ jobs:
           @semantic-release/changelog \
           @semantic-release/exec \
           @semantic-release/git \
-          @semantic-release/github
+          @semantic-release/github \
+          conventional-changelog-conventionalcommits
 
       - name: Run Semantic Release
         env:
