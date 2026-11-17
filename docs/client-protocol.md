@@ -651,6 +651,8 @@ OpenClaw puede iniciar turnos proactivamente sin que el usuario haya enviado nad
 
 Un push que llega mientras suena una respuesta tuya se entrega después del `turn_end` de esa respuesta, nunca encima (los pushes siguientes esperan en orden).
 
+Nunca hay dos push abiertos a la vez: si mientras uno está abierto llega otro de una conversación distinta (un recordatorio de ayer mientras habla uno de hoy), el segundo se descarta entero y no te llega; el abierto sigue intacto hasta su `turn_end`. Los push que lleguen después de ese `turn_end` se abren normalmente.
+
 Al revés, hablar corta el push: si el usuario hace barge-in, envía un `send` o un `cancel` mientras un push está abierto, el gateway para su audio, te envía su `turn_end` y, si el push es de tu misma sesión de agente, lo aborta en OpenClaw. Solo después arranca el turno del usuario, así que nunca hay dos turnos abiertos a la vez (#202). Lo que quedara de ese push no llega.
 
 Un push tiene el mismo tope que un turno normal: si OpenClaw lo abre y deja de mandar nada durante `TURN_TIMEOUT_S` (sin su fin), el gateway lo cierra con `{"type":"error","code":"TURN_ERROR","message":"turn_timeout","fatal":false,"turn_id":...}` y su `turn_end`, y lo aborta en OpenClaw si es de tu sesión de agente (#286). El siguiente push abre su propio `turn_start`.

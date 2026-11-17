@@ -843,6 +843,12 @@ class TurnController:
                     return
                 if self._user_task is not None and not self._user_task.done():
                     continue  # un turno que se estaba sustituyendo: el usuario gana
+                if self._push is not None and self._push.session_key != session_key:
+                    # C-r8-1: push de otra conversación con uno abierto: se descarta entero
+                    # (su texto y su fin irían al push abierto y lo cortarían).
+                    logger.info(f"[{self._client_id}] push de otra conversación: descartado")
+                    self._abort_run(run_id)
+                    return
                 if self._push is not None:
                     # #84: los `agent start` intermedios (tool use, varios pasos) no abren
                     # otro turno; tampoco el de un push que se está cortando.

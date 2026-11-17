@@ -143,6 +143,35 @@ async def test_an_open_push_of_a_retired_agent_is_cut_at_its_next_start(make_pus
     ]
     bridge.orchestrator.abort.assert_awaited_with(sk)
 
+async def test_push_of_another_conversation_while_one_is_open_is_dropped(make_push_bridge):
+    """C-r8-1: push A abierto y llega un push B de otra conversación (otro día, otro agente):
+    B se descarta entero y A llega completo con un solo turn_end; luego B se abre bien."""
+    bridge, _ = make_push_bridge(output_mode=("text",))
+    sk_b = "agent:main:hab_sito:ayer"
+
+    def ev(kind, arg, run):
+        bridge.enqueue_push(kind, arg, run)
+
+    ev("turn_start", SK, "ra")
+    ev("chat", {"sessionKey": SK, "runId": "ra", "deltaText": "uno "}, "ra")
+    ev("turn_start", sk_b, "rb")
+    ev("chat", {"sessionKey": sk_b, "runId": "rb", "deltaText": "intruso"}, "rb")
+    ev("turn_end", sk_b, "rb")
+    ev("chat", {"sessionKey": SK, "runId": "ra", "deltaText": "dos"}, "ra")
+    ev("turn_end", SK, "ra")
+    await bridge.push_idle()
+    msgs = await sent(bridge)
+    assert [(m["type"], m.get("text")) for m in msgs] == [
+        ("turn_start", None), ("token", "uno "), ("token", "dos"), ("turn_end", None)
+    ]
+    assert msgs[-1]["reason"] == "done"
+    ev("turn_start", sk_b, "rb2")
+    ev("chat", {"sessionKey": sk_b, "runId": "rb2", "deltaText": "hola"}, "rb2")
+    ev("turn_end", sk_b, "rb2")
+    await bridge.push_idle()
+    assert [m["type"] for m in (await sent(bridge))[4:]] == ["turn_start", "token", "turn_end"]
+
+
 async def test_revalidation_refreshes_allowed_agents_for_pushes(make_push_bridge, monkeypatch):
     """C-r7-1: la revalidación guarda el `allowed_agents` vigente; el push lo consulta sin leer
     la BD."""
