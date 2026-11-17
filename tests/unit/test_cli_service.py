@@ -461,6 +461,19 @@ def test_purge_removes_service_and_home(purge):
                                     "program": "pendiente"}
 
 
+def test_purge_final_message_needs_nothing_uv_just_uninstalled(purge, monkeypatch):
+    # En un terminal la CLI pinta con rich, que se importa al usarlo: tras `uv tool uninstall`
+    # ya no existe y el mensaje final no puede depender de él.
+    monkeypatch.setattr(output, "_isatty", lambda: True)
+    monkeypatch.setattr(service, "_uninstall_program", lambda: "desinstalado")
+    for mod in ("rich", "rich.console", "rich.markup", "rich.table"):
+        monkeypatch.setitem(sys.modules, mod, None)
+    r = run("--yes", "uninstall", "--purge")
+    assert r.exit_code == 0, r.output
+    assert "Borrado:" in r.output and "Programa desinstalado" in r.output
+    assert not purge.home.exists()
+
+
 def test_purge_without_tty_needs_yes(purge):
     r = run("uninstall", "--purge")
     assert r.exit_code == 2 and "--yes" in r.output
