@@ -585,3 +585,69 @@ def test_set_rejects_non_positive_or_infinite_deadlines(home, name, value):
     before = _env(home).read_bytes()
     assert run("config", "set", name, value).exit_code == 1
     assert _env(home).read_bytes() == before
+
+
+# --- ronda 8 -------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["a\x0cADMIN_TOKEN=x", "a\u2028b=c", "a\x00b"])
+def test_set_rejects_other_line_breaks_and_nul(home, value):
+    """F-r8-1, F-r8-3: splitlines también corta en \\x0c, \\u2028…; un segundo `set` dejaba una
+    línea suelta en config.env. Un NUL daba un traceback."""
+    before = _env(home).read_bytes()
+    for args, stdin in ((("TTS_WS_URL", value), None), (("OPENCLAW_TOKEN", "-"), value)):
+        r = run("config", "set", *args, input=stdin)
+        assert r.exit_code == 1 and "No se ha escrito nada" in r.output, r.output
+        assert r.exception is None or isinstance(r.exception, SystemExit)
+    assert _env(home).read_bytes() == before
+
+
+def test_onboard_apply_rejects_line_breaks(home):
+    from fogar_gateway.cli import api, config
+    from fogar_gateway.cli.output import Out
+
+    before = _env(home).read_bytes()
+    with pytest.raises(api.ApiError, match="No se ha escrito nada"):
+        config._apply(Out(False), "OPENCLAW_HOST", "h\x0bTURN_TIMEOUT_S=0")
+    assert _env(home).read_bytes() == before
+
+
+@pytest.mark.parametrize("shell_key", [False, True])
+def test_set_fatal_problem_warns_first_and_never_restarts(home, systemd, monkeypatch,
+                                                          shell_key):
+    """F-r8-2: STT_PROVIDER=elevenlabs sin clave en config.env no arranca (el servicio no
+    hereda la de esta shell): se avisa y no se reinicia, ni con --yes ni con --json."""
+    if shell_key:
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "de-la-shell")
+    else:
+        monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    r = run("--yes", "config", "set", "STT_PROVIDER", "elevenlabs")
+    assert r.exit_code == 0, r.output
+    assert "ELEVENLABS_API_KEY" in r.output and "no arrancaría" in r.output
+    assert ("restart", "fogar-gateway.service") not in systemd.calls
+    r = run("--json", "--yes", "config", "set", "STT_PROVIDER", "elevenlabs")
+    assert json.loads(r.stdout)["restarted"] is False
+    assert "ELEVENLABS_API_KEY" in r.stderr
+    assert ("restart", "fogar-gateway.service") not in systemd.calls
+
+
+def test_set_non_fatal_problem_restarts_and_warns_before(home, systemd, monkeypatch):
+    """F-r8-2: un ADMIN_TOKEN corto arranca: se reinicia y el aviso sale antes, también si el
+    reinicio falla."""
+    _env(home).write_text("ADMIN_TOKEN=corto\n")
+    r = run("--yes", "config", "set", "LOG_FORMAT", "text")
+    assert r.exit_code == 0, r.output
+    assert "ADMIN_TOKEN" in r.output and ("restart", "fogar-gateway.service") in systemd.calls
+    systemd.fail = True
+    r = run("--json", "--yes", "config", "set", "LOG_FORMAT", "json")
+    assert r.exit_code == 1 and r.stdout == ""
+    assert "ADMIN_TOKEN" in r.stderr and "guardado" in r.stderr
+
+
+def test_unset_accepts_retired_key(home):
+    """F-r8-4: el log pide quitar ORCHESTRATOR_RECONNECT_MAX_DURATION; `unset` lo hace."""
+    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nORCHESTRATOR_RECONNECT_MAX_DURATION=5\n")
+    r = run("config", "unset", "orchestrator_reconnect_max_duration")
+    assert r.exit_code == 0, r.output
+    assert _env(home).read_text() == f"ADMIN_TOKEN={SECRET}\n"
+    assert run("config", "set", "ORCHESTRATOR_RECONNECT_MAX_DURATION", "5").exit_code == 2
