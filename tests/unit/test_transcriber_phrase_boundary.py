@@ -10,11 +10,17 @@ import asyncio
 import json
 from unittest.mock import AsyncMock
 
+import pytest
 import websockets
+from websockets.exceptions import ConnectionClosedError
 
 from fogar_gateway.services.reconnection import ConnectionState
 from fogar_gateway.services.speech.ports import SttCallbacks, SttParams
-from fogar_gateway.services.transcriber_reconnecting import ReconnectingTranscriberClient
+from fogar_gateway.services.transcriber_client import TranscriberClient
+from fogar_gateway.services.transcriber_reconnecting import (
+    HELD_MAX,
+    ReconnectingTranscriberClient,
+)
 
 INFERENCE_S = 0.2
 
@@ -234,3 +240,90 @@ async def test_degraded_mid_phrase_raises_no_warnings():
     )
     w._callbacks.on_warning.assert_not_awaited()
     w._callbacks.on_incomplete.assert_not_awaited()
+
+
+class _SlowInner:
+    """Writes each frame to the wire at once, then yields like websockets' drain."""
+
+    def __init__(self, drain: float) -> None:
+        self.wire: list[bytes | str] = []
+        self.drain = drain
+        self._is_ready = True
+        self._end_sent = False
+
+    async def send_audio(self, frame: bytes) -> None:
+        self.wire.append(frame)
+        await asyncio.sleep(self.drain)
+
+    async def send_end(self) -> None:  # _end_sent late on purpose: the wrapper must not rely on it
+        self.wire.append("END")
+        await asyncio.sleep(self.drain)
+        self._end_sent = True
+
+
+def _slow(drain: float) -> tuple[ReconnectingTranscriberClient, _SlowInner]:
+    w = _wrap(1)
+    w._health.set_state(ConnectionState.CONNECTED)
+    inner = _SlowInner(drain)
+    w._client = inner  # type: ignore[assignment]
+    inner._end_sent = True  # our `end` went out; the reopen is under way
+    return w, inner
+
+
+async def test_overflow_during_the_replay_marks_the_phrase_lost():
+    """Review 1: a full buffer mid-replay drops an unsent frame, never the one in flight, and
+    the gap is flagged (final withheld) instead of passing silently."""
+    w, inner = _slow(0.05)
+    for i in range(HELD_MAX):
+        await w.send_audio(f"b{i}".encode())
+    inner._end_sent = False  # `ready`
+    replay = asyncio.create_task(w._replay_held())
+    await asyncio.sleep(0)
+    for i in range(5):
+        await w.send_audio(f"n{i}".encode())
+    inner.drain = 0
+    await replay
+    assert w._lost
+    sent = [int(f[1:]) for f in inner.wire if isinstance(f, bytes) and f.startswith(b"b")]
+    assert sent == sorted(sent) and sent[0] == 0  # in order, the first frame went out
+
+
+async def test_frames_after_a_replayed_end_wait_for_the_next_ready():
+    """Review: audio arriving while the replayed `end` drains belongs to the next phrase: it
+    is held, not written after the `end` the server no longer reads."""
+    w, inner = _slow(0.01)
+    for i in range(3):
+        await w.send_audio(f"b{i}".encode())
+    inner._end_sent = False
+    replay = asyncio.create_task(w._replay_held())
+    await asyncio.sleep(0)
+    await w.send_end()  # queued behind the frames
+    await asyncio.sleep(0.035)  # the replay is draining its `end`
+    for i in range(3):
+        await w.send_audio(f"c{i}".encode())
+    await replay
+    assert inner.wire == [b"b0", b"b1", b"b2", "END"]
+    assert list(w._held) == [b"c0", b"c1", b"c2"]
+
+
+class _Ws:
+    def __init__(self, client: TranscriberClient, fail: bool) -> None:
+        self.client, self.fail, self.end_sent_at_send = client, fail, None
+
+    async def send(self, _data) -> None:
+        self.end_sent_at_send = self.client._end_sent
+        if self.fail:
+            raise ConnectionClosedError(None, None)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+async def test_end_sent_is_raised_before_the_send(fail):
+    """Review 2: audio arriving while `end` drains must already see _end_sent; a failed send
+    lowers it again (the phrase is reported by the wrapper)."""
+    client = TranscriberClient(url="x:1", client_id="c1")
+    client._is_ready = True
+    client.ws = ws = _Ws(client, fail)  # type: ignore[assignment]
+    await client.send_end()
+    assert ws.end_sent_at_send is True
+    assert client._end_sent is (not fail)
+    assert client._is_ready is (not fail)

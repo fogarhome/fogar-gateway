@@ -67,6 +67,7 @@ class ReconnectingTranscriberClient:
         # None stands for an `end` that arrived while the held frames were being replayed.
         self._held: deque[bytes | None] = deque(maxlen=HELD_MAX)
         self._held_cut = False  # the oldest held frames were dropped
+        self._replaying = False  # frames and `end`s queue behind the replay, in order
 
     @property
     def last_transcript_at(self) -> float | None:
@@ -97,7 +98,7 @@ class ReconnectingTranscriberClient:
             await self._client.close()
 
     async def send_audio(self, audio_bytes: bytes) -> None:
-        if self._client._end_sent or self._held:  # the latter keeps order while replaying
+        if self._client._end_sent or self._replaying or self._held:
             self._hold(audio_bytes)
             return
         await self._send_now(audio_bytes)
@@ -109,13 +110,17 @@ class ReconnectingTranscriberClient:
                 self._held_cut = False
                 await self._phrase_lost()
             return
-        if self._held:  # `ready` came, replay under way: the `end` goes after its frames
+        if self._replaying or self._held:  # `ready` came: the `end` goes after the held frames
             self._hold(None)
             return
         await self._end_now()
 
     def _hold(self, item: bytes | None) -> None:
-        self._held_cut |= len(self._held) == HELD_MAX
+        if len(self._held) == HELD_MAX:  # the oldest held item is dropped
+            if self._replaying:  # it belongs to the phrase being replayed right now
+                self._phrase_open = self._lost = True
+            else:
+                self._held_cut = True
         self._held.append(item)
 
     async def _send_now(self, audio_bytes: bytes) -> None:
@@ -134,13 +139,13 @@ class ReconnectingTranscriberClient:
         if self._held_cut:
             self._phrase_open = self._lost = True
         self._held_cut = False
-        while self._held and not self._client._end_sent:  # a replayed `end` stops it
-            if self._held[0] is None:
-                self._held.popleft()
-                await self._end_now()
-            else:  # popped after sending: frames arriving meanwhile queue behind it
-                await self._send_now(self._held[0])
-                self._held.popleft()
+        self._replaying = True
+        try:
+            while self._held and not self._client._end_sent:  # a replayed `end` stops it
+                item = self._held.popleft()  # before sending: an overflow can't drop it then
+                await (self._end_now() if item is None else self._send_now(item))
+        finally:
+            self._replaying = False
 
     async def _phrase_lost(self) -> None:
         """The phrase in flight when the connection dropped is gone: tell the client to

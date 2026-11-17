@@ -187,11 +187,13 @@ class TranscriberClient:
         """Señaliza al transcriber que el audio terminó, disparando la transcripción final."""
         if not self._is_ready or not self.ws:
             return
+        # Antes del send: websockets escribe la trama y luego puede ceder en drain, y el audio
+        # que llegue en ese hueco ya es de la frase siguiente (lo retiene el wrapper).
+        self._end_sent = True
         try:
             await self.ws.send(json.dumps({"type": "end"}))
-            self._end_sent = True
         except ConnectionClosed:
-            self._is_ready = False
+            self._is_ready = self._end_sent = False
 
     ping = staticmethod(ping_ready)  # GET /ready (503 "busy" con la GPU saturada)
 
