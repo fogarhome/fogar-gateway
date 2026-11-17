@@ -12,7 +12,7 @@ from click.testing import CliRunner
 from fogar_gateway.cli.app import cli
 
 ROOT = Path(__file__).resolve().parents[2]
-SECRET = "s3cr3t-admin-token-0123456789"
+SECRET = "s3cr3t-admin-token-0123456789abcdef"
 
 
 @pytest.fixture()
@@ -227,6 +227,30 @@ def test_set_new_failing_check_aborts(home):
     r = run("config", "set", "ADMIN_TOKEN", "-", input="\n")
     assert r.exit_code == 1
     assert _env(home).read_bytes() == before
+
+
+@pytest.mark.parametrize("current", [SECRET, "corto"])
+def test_set_short_admin_token_is_refused(home, current):
+    """D-r5-1: < 32 caracteres → exit 1 sin escribir ni mostrar el valor, aunque el actual
+    ya sea corto (el filtro de «fallo nuevo» no lo frenaría)."""
+    _env(home).write_text(f"ADMIN_TOKEN={current}\n")
+    before = _env(home).read_bytes()
+    r = run("config", "set", "ADMIN_TOKEN", "-", input="y" * 31 + "\n")
+    assert r.exit_code == 1 and "32" in r.output
+    assert "y" * 31 not in r.output
+    assert _env(home).read_bytes() == before
+    r = run("config", "set", "ADMIN_TOKEN", "-", input="z" * 32 + "\n")
+    assert r.exit_code == 0, r.output
+    assert f"ADMIN_TOKEN={'z' * 32}" in _env(home).read_text()
+
+
+def test_validate_fails_on_short_admin_token(home):
+    _env(home).write_text("ADMIN_TOKEN=corto-pero-no-vacio\n")
+    r = run("--json", "config", "validate")
+    assert r.exit_code == 1
+    [check] = [c for c in json.loads(r.output) if c["check"] == "ADMIN_TOKEN"]
+    assert check["level"] == "fail" and "32" in check["detail"]
+    assert "corto-pero-no-vacio" not in r.output
 
 
 def test_set_keeps_comments_and_mode_600(home):

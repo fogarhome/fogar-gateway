@@ -15,7 +15,7 @@ from click.testing import CliRunner
 from fogar_gateway.cli import doctor
 from fogar_gateway.cli.app import cli
 
-SECRET = "s3cr3t-admin-token-0123456789"
+SECRET = "s3cr3t-admin-token-0123456789abcdef"
 ROOT = Path(__file__).resolve().parents[2]
 
 

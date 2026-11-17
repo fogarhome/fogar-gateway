@@ -51,6 +51,15 @@ def test_no_warning_when_tokens_are_set(caplog):
     assert caplog.records == []
 
 
+def test_short_admin_token_warns_without_the_value(caplog):
+    """D-r5-1: < 32 caracteres es adivinable; el aviso no lleva el valor. 32 ya vale."""
+    caplog.set_level(logging.WARNING)
+    short = "x" * 31
+    assert warn_insecure_tokens(_settings(ADMIN_TOKEN=short)) == ["ADMIN_TOKEN"]
+    assert caplog.records and all(short not in r.getMessage() for r in caplog.records)
+    assert insecure_tokens(_settings(ADMIN_TOKEN="x" * 32)) == []
+
+
 @pytest.mark.parametrize("value", ["", "changeme", "CHANGEME", " changeme ", "secret", "admin"])
 def test_admin_token_empty_or_placeholder_warns(value, caplog):
     caplog.set_level(logging.WARNING)
