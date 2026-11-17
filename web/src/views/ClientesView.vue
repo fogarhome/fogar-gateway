@@ -11,6 +11,7 @@ import FgEstado from '@/components/FgEstado.vue'
 import FgIcono from '@/components/FgIcono.vue'
 import FondoVivo from '@/components/FondoVivo.vue'
 import PanelEmparejar from '@/components/PanelEmparejar.vue'
+import { frenarRecarga, SALIR_CON_CLAVE, SALIR_EN_VUELO } from '@/lib/clave'
 import { CLIENT_TYPE, label } from '@/lib/labels'
 import { toast } from '@/lib/toasts'
 import { useClientsStore } from '@/stores/clients'
@@ -83,7 +84,12 @@ function claveCopiada() {
   nuevoTipo.value = ''
   if (id) void router.push(`/clientes/${encodeURIComponent(id)}`)
 }
-onBeforeRouteLeave(() => (creado.value ? window.confirm('La clave nueva no se vuelve a enseñar. ¿Salir sin copiarla?') : true))
+onBeforeRouteLeave(() => {
+  if (creando.value) return window.confirm(SALIR_EN_VUELO)
+  if (creado.value) return window.confirm(SALIR_CON_CLAVE)
+  return true
+})
+frenarRecarga(() => creando.value)
 function emparejado(clientId: string, nombre: string | null) {
   toast('ok', `${nombre ?? 'El aparato'} ya habla con Fogar`, 'Revisa sus ajustes si quieres cambiarlos.')
   panel.value = null

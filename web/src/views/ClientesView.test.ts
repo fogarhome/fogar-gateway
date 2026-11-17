@@ -77,4 +77,23 @@ describe('ClientesView: la clave nueva no se pierde', () => {
     expect(confirm).toHaveBeenCalled()
     expect(router.currentRoute.value.path).toBe('/clientes')
   })
+
+  it('salir o recargar con el POST de crear en curso pide confirmación', async () => {
+    createClient.mockReturnValue(new Promise(() => undefined))
+    const { el, router, boton } = await mount()
+    boton('Crear a mano').click()
+    await flush()
+    const nombre = el.querySelector('form input') as HTMLInputElement
+    nombre.value = 'Tele'
+    nombre.dispatchEvent(new Event('input'))
+    el.querySelector('form')!.dispatchEvent(new Event('submit'))
+    await flush()
+    const recarga = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(recarga)
+    expect(recarga.defaultPrevented).toBe(true)
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    await router.push('/otra')
+    expect(confirm).toHaveBeenCalled()
+    expect(router.currentRoute.value.path).toBe('/clientes')
+  })
 })

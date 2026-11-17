@@ -8,6 +8,7 @@ import ClaveNueva from '@/components/ClaveNueva.vue'
 import FgBoton from '@/components/FgBoton.vue'
 import FgCampo from '@/components/FgCampo.vue'
 import FgEstado from '@/components/FgEstado.vue'
+import { frenarRecarga, SALIR_CON_CLAVE, SALIR_EN_VUELO } from '@/lib/clave'
 import { diff, toForm, validate, type ClientForm } from '@/lib/clientForm'
 import { parseIso } from '@/lib/format'
 import { CLIENT_TYPE, label } from '@/lib/labels'
@@ -89,9 +90,11 @@ const claveNueva = ref<string | null>(null)
 const confirmar = ref<'rotar' | 'borrar' | null>(null)
 const nombreBorrar = ref('')
 const trabajando = ref(false)
+const rotando = ref(false) // aparte de trabajando: borrar sale de la página con trabajando a true
 
 async function rotar(): Promise<void> {
   trabajando.value = true
+  rotando.value = true
   try {
     const { client_key, ...resto } = await rotateClientKey(id.value)
     claveNueva.value = client_key
@@ -101,6 +104,7 @@ async function rotar(): Promise<void> {
     toast('bad', 'No he podido rotar la clave', 'La clave de antes sigue valiendo.')
   } finally {
     trabajando.value = false
+    rotando.value = false
     confirmar.value = null
   }
 }
@@ -134,10 +138,12 @@ async function borrar(): Promise<void> {
 }
 
 onBeforeRouteLeave(() => {
-  if (claveNueva.value) return window.confirm('La clave nueva no se vuelve a enseñar. ¿Salir sin copiarla?')
+  if (rotando.value) return window.confirm(SALIR_EN_VUELO)
+  if (claveNueva.value) return window.confirm(SALIR_CON_CLAVE)
   if (hayCambios.value) return window.confirm('Hay cambios sin guardar. ¿Salir sin guardarlos?')
   return true
 })
+frenarRecarga(() => rotando.value)
 </script>
 
 <template>

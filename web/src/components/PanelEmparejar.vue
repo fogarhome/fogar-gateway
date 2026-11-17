@@ -3,19 +3,24 @@ import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue'
 import { cancelPairing, getPairing, openPairing } from '@/api/admin'
 import { ApiError } from '@/api/http'
 import type { PairingOpened, PairingState } from '@/api/types'
+import { toast } from '@/lib/toasts'
+import { useClientsStore } from '@/stores/clients'
 import FgBoton from './FgBoton.vue'
 
 // Emparejar un aparato: abre un código de 6 cifras (10 min, un solo uso) y espera a que el aparato lo
 // canjee. El código solo vive aquí: no se guarda ni se registra. Al cerrar el panel, se anula.
 // La cuenta atrás va desde que llega el código, no contra `expires_at`: el reloj del navegador puede
-// ir desfasado. 600 s es CODE_TTL_S de services/pairing.py (el servidor no manda la duración).
+// ir desfasado. 600 s es CODE_TTL_S de services/pairing.py (el servidor no manda la duración); el
+// margen cubre la ida y vuelta del POST, para no enseñar como válido un código que el servidor ya caducó.
 const DURACION_MS = 600_000
+const MARGEN_MS = 5_000
 const emit = defineEmits<{ cerrar: []; emparejado: [clientId: string, nombre: string | null] }>()
 
 const abierto = shallowRef<PairingOpened | null>(null)
 const estado = ref<PairingState | 'abriendo' | 'error'>('abriendo')
 const error = ref('')
-const ahora = ref(Date.now())
+const clients = useClientsStore()
+const ahora = ref(performance.now())
 let recibido = 0
 let fuera = false // el panel ya se cerró o se desmontó
 let sondeo: ReturnType<typeof setInterval> | undefined
@@ -25,7 +30,18 @@ let reloj: ReturnType<typeof setInterval> | undefined
 function anular(): void {
   const p = abierto.value
   abierto.value = null
-  if (p && estado.value !== 'used') void cancelPairing(p.id).catch(() => undefined)
+  if (p && estado.value !== 'used') void cancelPairing(p.id).catch((e) => void siYaSeUso(p, e))
+}
+
+/** El DELETE da 404 si el código ya no estaba abierto: puede que un aparato acabe de canjearlo. */
+async function siYaSeUso(p: PairingOpened, e: unknown): Promise<void> {
+  if (!(e instanceof ApiError && e.kind === 'not-found')) return
+  const r = await getPairing(p.id).catch(() => null)
+  if (r?.state !== 'used' || !r.client_id) return
+  if (!fuera) return emit('emparejado', r.client_id, r.client_name)
+  // Panel ya cerrado: no queda quien escuche el evento.
+  toast('ok', `${r.client_name ?? 'El aparato'} ya habla con Fogar`, 'Revisa sus ajustes si quieres cambiarlos.')
+  void clients.refresh()
 }
 
 async function abrir(): Promise<void> {
@@ -38,7 +54,7 @@ async function abrir(): Promise<void> {
       return
     }
     abierto.value = p
-    recibido = Date.now()
+    recibido = performance.now()
     ahora.value = recibido
     estado.value = 'open'
   } catch (e) {
@@ -56,6 +72,7 @@ async function comprobar(): Promise<void> {
   if (!p || estado.value !== 'open') return
   try {
     const r = await getPairing(p.id)
+    if (abierto.value !== p) return // respuesta de un código anterior
     estado.value = r.state
     if (r.state === 'used' && r.client_id) emit('emparejado', r.client_id, r.client_name)
   } catch {
@@ -66,10 +83,10 @@ async function comprobar(): Promise<void> {
 const restante = computed(() => {
   const p = abierto.value
   if (!p) return 0
-  return Math.max(0, Math.round((recibido + DURACION_MS - ahora.value) / 1000))
+  return Math.max(0, Math.round((recibido + DURACION_MS - MARGEN_MS - ahora.value) / 1000))
 })
 const cuenta = computed(() => `${Math.floor(restante.value / 60)}:${String(restante.value % 60).padStart(2, '0')}`)
-const progreso = computed(() => `${Math.min(100, (restante.value / 600) * 100)}%`)
+const progreso = computed(() => `${Math.min(100, ((restante.value * 1000) / (DURACION_MS - MARGEN_MS)) * 100)}%`)
 const codigo = computed(() => abierto.value?.code ?? '')
 const codigoVisible = computed(() => `${codigo.value.slice(0, 3)} ${codigo.value.slice(3)}`)
 
@@ -83,7 +100,7 @@ onMounted(() => {
   void abrir()
   sondeo = setInterval(() => void comprobar(), 2000)
   reloj = setInterval(() => {
-    ahora.value = Date.now()
+    ahora.value = performance.now()
     if (estado.value === 'open' && restante.value === 0) estado.value = 'expired'
   }, 1000)
 })

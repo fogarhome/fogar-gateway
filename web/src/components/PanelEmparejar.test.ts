@@ -1,5 +1,7 @@
+import { createPinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, h, nextTick } from 'vue'
+import { ApiError } from '@/api/http'
 import type { PairingOpened } from '@/api/types'
 import PanelEmparejar from './PanelEmparejar.vue'
 
@@ -7,8 +9,12 @@ vi.mock('@/api/admin', () => ({
   openPairing: vi.fn(),
   getPairing: vi.fn(),
   cancelPairing: vi.fn(() => Promise.resolve()),
+  listClients: vi.fn(() => Promise.resolve([])),
 }))
+vi.mock('@/lib/toasts', () => ({ toast: vi.fn() }))
+const { toast } = vi.mocked(await import('@/lib/toasts'))
 const admin = await import('@/api/admin')
+const listClients = vi.mocked(admin.listClients)
 const openPairing = vi.mocked(admin.openPairing)
 const getPairing = vi.mocked(admin.getPairing)
 const cancelPairing = vi.mocked(admin.cancelPairing)
@@ -29,9 +35,9 @@ function pendiente<T>() {
   return { promise, resolve }
 }
 
-function mount() {
+function mount(onEmparejado = vi.fn()) {
   const el = document.createElement('div')
-  const app = createApp({ render: () => h(PanelEmparejar) })
+  const app = createApp({ render: () => h(PanelEmparejar, { onEmparejado }) }).use(createPinia())
   app.mount(el)
   const boton = (texto: string) =>
     [...el.querySelectorAll('button')].find((b) => b.textContent?.includes(texto)) as HTMLButtonElement
@@ -72,7 +78,7 @@ describe('PanelEmparejar: ningún código queda abierto sin verse', () => {
   })
 
   it('con el reloj del navegador adelantado, la cuenta atrás va desde que llega y «Cancelar» lo anula', async () => {
-    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] })
+    vi.useFakeTimers({ toFake: ['Date', 'performance', 'setInterval', 'clearInterval'] })
     const servidor = new Date('2026-11-17T10:00:00Z')
     vi.setSystemTime(new Date(servidor.getTime() + 15 * 60_000)) // 15 min adelantado
     openPairing.mockResolvedValue(codigo('c1', new Date(servidor.getTime() + 600_000)))
@@ -80,7 +86,7 @@ describe('PanelEmparejar: ningún código queda abierto sin verse', () => {
     await flush()
     vi.advanceTimersByTime(1000)
     await flush()
-    expect(el.textContent).toContain('caduca en 9:59')
+    expect(el.textContent).toContain('caduca en 9:54') // 10 min − 5 s de margen − 1 s
     boton('Cancelar').click()
     expect(cancelPairing).toHaveBeenCalledWith('c1')
   })
@@ -110,5 +116,51 @@ describe('PanelEmparejar: ningún código queda abierto sin verse', () => {
     await flush()
     app.unmount()
     expect(cancelPairing).not.toHaveBeenCalled()
+  })
+
+  it('un sondeo del código anterior que llega tarde no pisa el estado del nuevo', async () => {
+    const viejo = pendiente<PairingOpened>()
+    openPairing.mockResolvedValueOnce(codigo('c1')).mockResolvedValueOnce(codigo('c2'))
+    getPairing.mockReturnValue(viejo.promise) // los sondeos de c1 se quedan en vuelo
+    vi.useFakeTimers({ toFake: ['performance', 'setInterval', 'clearInterval'] })
+    const { el, boton } = mount()
+    await flush()
+    vi.advanceTimersByTime(596_000) // aquí caduca c1
+    await flush()
+    boton('Otro código').click()
+    await flush()
+    expect(el.textContent).toContain('caduca en')
+    viejo.resolve({ ...codigo('c1'), state: 'expired' })
+    await flush()
+    expect(el.textContent).toContain('caduca en') // sigue enseñando c2
+  })
+
+  it('si el DELETE da 404 porque ya se usó, avisa del emparejamiento aunque el panel esté cerrado', async () => {
+    openPairing.mockResolvedValue(codigo('c1'))
+    cancelPairing.mockRejectedValueOnce(new ApiError('not-found', 404, 'Pairing not found or not open'))
+    getPairing.mockResolvedValue({ ...codigo('c1'), state: 'used', client_id: 'x', client_name: 'Tele' })
+    const onEmparejado = vi.fn()
+    const { boton } = mount(onEmparejado)
+    await flush()
+    boton('Cancelar').click()
+    await flush()
+    expect(toast).toHaveBeenCalledWith('ok', 'Tele ya habla con Fogar', expect.any(String))
+    expect(listClients).toHaveBeenCalled()
+  })
+
+  it('si el DELETE de «Otro código» da 404 porque ya se usó, emite emparejado', async () => {
+    openPairing.mockResolvedValue(codigo('c1'))
+    getPairing.mockResolvedValueOnce({ ...codigo('c1'), state: 'expired' })
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    const onEmparejado = vi.fn()
+    const { boton } = mount(onEmparejado)
+    await flush()
+    vi.advanceTimersByTime(2000)
+    await flush()
+    cancelPairing.mockRejectedValueOnce(new ApiError('not-found', 404, 'x'))
+    getPairing.mockResolvedValue({ ...codigo('c1'), state: 'used', client_id: 'x', client_name: 'Tele' })
+    boton('Otro código').click()
+    await flush()
+    expect(onEmparejado).toHaveBeenCalledWith('x', 'Tele')
   })
 })
