@@ -200,4 +200,15 @@ describe('PanelEmparejar: ningún código queda abierto sin verse', () => {
     expect(boton('Anular los abiertos')).toBeUndefined()
     expect(boton('Probar otra vez')).toBeDefined()
   })
+
+  it('pagehide con el POST en vuelo anula el código cuando llega', async () => {
+    const p = pendiente<PairingOpened>()
+    openPairing.mockReturnValue(p.promise)
+    mount()
+    await flush()
+    window.dispatchEvent(new Event('pagehide'))
+    p.resolve(codigo('c8'))
+    await flush()
+    expect(cancelPairing).toHaveBeenCalledWith('c8')
+  })
 })

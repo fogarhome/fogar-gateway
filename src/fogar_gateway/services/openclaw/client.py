@@ -241,20 +241,25 @@ def _loads_frame(raw: str | bytes):
     # siempre (OpenClaw manda texto; el binario es raro).
     if not isinstance(raw, bytes) and "\\ud" not in raw and "\\uD" not in raw:
         return frame
-    payload = frame.get("payload") if isinstance(frame, dict) else None
-    if not isinstance(payload, dict):
-        return without_lone_surrogates(frame)
+    if not isinstance(frame, dict):
+        return without_lone_surrogates(frame)  # _handle_raw_frame lo rechaza igual
+    original = frame.get("payload")
+    con_payload = isinstance(original, dict)
+    payload: dict = original if isinstance(original, dict) else {}
     routing = _routing(frame, payload)
     text = {}
     if frame.get("event") == "chat":
         text = {k: payload.pop(k) for k in ("deltaText", "message") if k in payload}
+    claves = len(frame)
     frame = without_lone_surrogates(frame)
-    payload = frame.get("payload")
-    # B-r6-2: una clave que choca al limpiar ("payload\ud800") puede dejar un payload no dict.
-    if not isinstance(payload, dict):
+    limpio = frame.get("payload")
+    # B-r6-2: una clave de primer nivel que choca al limpiar ("payload\ud800", "id\ud800")
+    # pisa otra; un payload objeto que deja de serlo, igual.
+    if len(frame) != claves or (con_payload and not isinstance(limpio, dict)):
         raise ValueError("lone surrogate in a frame key")
-    # B-r5-1, B-r6-1: una clave limpiada sería la de otra sesión, turno o petición; la trama
-    # se descarta (_listen).
+    payload = limpio if isinstance(limpio, dict) and con_payload else {}
+    # B-r5-1, B-r6-1: una clave limpiada sería la de otra sesión, turno o petición (también en
+    # un `res` de error sin payload); la trama se descarta (_listen).
     if _routing(frame, payload) != routing:
         raise ValueError("lone surrogate in a routing key")
     payload.update(text)

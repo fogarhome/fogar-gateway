@@ -93,6 +93,7 @@ const trabajando = ref(false)
 const rotando = ref(false) // aparte de trabajando: borrar sale de la página con trabajando a true
 
 async function rotar(): Promise<void> {
+  const pedido = id.value
   trabajando.value = true
   rotando.value = true
   try {
@@ -104,10 +105,15 @@ async function rotar(): Promise<void> {
     if (e instanceof ApiError && e.kind !== 'network') {
       toast('bad', 'No he podido rotar la clave', 'La clave de antes sigue valiendo.')
     } else {
-      // G-r6-3: sin respuesta, el gateway pudo rotarla: la huella recargada lo dice. Solo el
-      // cliente, no cargar(): no tira los cambios sin guardar del formulario.
+      // G-r6-3: sin respuesta, el gateway pudo rotarla: la huella recargada lo dice. Solo la
+      // huella (no cargar() ni el cliente entero): no pisa el formulario ni los cambios sin guardar.
       toast('bad', 'No sé si se rotó la clave', 'Mira la huella: si ha cambiado, la clave de antes ya no vale.')
-      void getClient(id.value).then((c) => (cliente.value = c), () => undefined)
+      void getClient(pedido).then(
+        (c) => {
+          if (id.value === pedido && cliente.value) cliente.value = { ...cliente.value, key_fp: c.key_fp }
+        },
+        () => undefined,
+      )
     }
   } finally {
     trabajando.value = false

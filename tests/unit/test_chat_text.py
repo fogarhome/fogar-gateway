@@ -300,6 +300,8 @@ def test_loads_frame_drops_a_frame_whose_routing_key_would_change(key, event):
     [
         {"type": "res", "id": "q\ud800", "ok": True, "payload": {"status": "ok"}},
         {"type": "res", "id": "q", "ok": True, "payload": {"runIds": ["r\ud800"]}},
+        {"type": "res", "id": "abc\ud800", "ok": False},  # error sin payload
+        {"type": "res", "id": "abc\ud800", "ok": False, "payload": "x"},
     ],
 )
 def test_loads_frame_drops_a_frame_whose_id_or_run_ids_would_change(frame):
@@ -321,6 +323,16 @@ def test_loads_frame_rejects_a_payload_that_stops_being_an_object():
     raw = '{"type": "res", "id": "q", "payload": {"ok": 1}, "payload\\ud800": "x"}'
     with pytest.raises(ValueError):
         _loads_frame(raw)
+    # una clave de primer nivel que choca con otra, sin payload objeto
+    with pytest.raises(ValueError):
+        _loads_frame('{"type": "res", "id": "q", "ok": false, "ok\\ud800": true}')
+
+
+def test_loads_frame_cleans_a_res_without_payload_when_routing_is_intact():
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    raw = '{"type": "res", "id": "q", "ok": false, "error": {"message": "m\\ud800"}}'
+    assert _loads_frame(raw) == {"type": "res", "id": "q", "ok": False, "error": {"message": "m"}}
 
 
 def test_loads_frame_binary_chat_keeps_text_halves():

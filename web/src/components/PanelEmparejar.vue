@@ -37,6 +37,7 @@ function anular(): void {
 /** Recargar o cerrar la pestaña no desmonta el panel: el código se anula con un DELETE que
  * sobrevive a la página (G-r6-1). Si vuelve de la caché del navegador, ofrece otro código. */
 function alSalirDeLaPagina(): void {
+  if (estado.value === 'abriendo') fuera = true // POST en vuelo: abrir() anula el código si llega
   const p = abierto.value
   if (!p || estado.value === 'used') return
   abierto.value = null

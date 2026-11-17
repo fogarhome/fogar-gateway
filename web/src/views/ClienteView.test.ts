@@ -114,13 +114,15 @@ describe('ClienteView: acciones que no se repiten ni engañan (G-r6-2..4)', () =
   it('sin respuesta al rotar no dice que la clave de antes vale y recarga la huella', async () => {
     rotateClientKey.mockRejectedValue(new ApiError('network', 0, 'No llego al gateway'))
     const { el, boton } = await mount()
-    getClient.mockResolvedValue({ ...cliente, key_fp: 'ffff0000' })
+    // el gateway devuelve otro nombre: solo se toma la huella
+    getClient.mockResolvedValue({ ...cliente, name: 'Renombrado', key_fp: 'ffff0000' })
     boton('Rotar clave').click()
     await flush()
     boton('Rotar ahora').click()
     await flush()
     expect(toasts.map((t) => t.title)).toEqual(['No sé si se rotó la clave'])
     expect(el.textContent).toContain('ffff')
+    expect(el.querySelector('h1')!.textContent).toBe('Tele')
   })
 
   it('con error HTTP al rotar, la clave de antes sigue valiendo', async () => {
