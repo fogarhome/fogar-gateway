@@ -247,12 +247,17 @@ def _port() -> int:
 
 
 @click.command()
+@click.option("--purge", is_flag=True,
+              help="Borra también todos los datos (el directorio base y la BD) y el programa.")
 @click.pass_context
-def uninstall(ctx: click.Context) -> None:
-    """Quita el servicio; no toca los datos."""
+def uninstall(ctx: click.Context, purge: bool) -> None:
+    """Quita el servicio; no toca los datos (con --purge, lo borra todo)."""
     out = _out(ctx)
     unit = unit_path()
     home = paths.home()
+    if purge:
+        _purge(ctx, out, unit, home)
+        return
     if not unit.exists():
         if out.as_json:
             out.json({"unit": str(unit), "exe": None, "home": str(home), "state": "no instalado"})
@@ -261,13 +266,121 @@ def uninstall(ctx: click.Context) -> None:
         return
     require_systemd()
     confirm(ctx, f"¿Quitar el servicio {UNIT_NAME}?")
-    systemctl_or_fail("disable", "--now", UNIT_NAME)
-    unit.unlink()
-    systemctl_or_fail("daemon-reload")
+    _remove_unit(unit)
     if out.as_json:
         out.json({"unit": str(unit), "exe": None, "home": str(home), "state": "desinstalado"})
         return
     out.message(f"Servicio quitado. No se toca el directorio base ({home}): tus datos siguen ahí.")
+
+
+def _remove_unit(unit: Path) -> None:
+    systemctl_or_fail("disable", "--now", UNIT_NAME)
+    unit.unlink()
+    systemctl_or_fail("daemon-reload")
+
+
+def _purge(ctx: click.Context, out: Out, unit: Path, home: Path) -> None:
+    """Servicio, directorio base (BD incluida) y programa. Solo borra dentro de la base, resuelta
+    (sin `..` ni enlaces): una BD fuera de ella se niega. Nunca toca uv, linger, Tailscale ni
+    OpenClaw."""
+    from fogar_gateway.cli import output
+
+    if DOCKERENV.exists():
+        raise ApiError("En Docker los datos viven en el volumen: `docker compose down -v`.", 1)
+    home = home.resolve()
+    user_home = Path.home().resolve()
+    config = home / "config.env"
+    # La BD que usa el servicio: la de config.env (systemd no hereda esta shell), nunca la del entorno.
+    env = api.read_env_file(config) if config.is_file() else {}
+    # Marca de instalación: un config.env con ADMIN_TOKEN (init lo escribe) o la BD; un
+    # config.env cualquiera de otro proyecto no basta.
+    if home == Path(home.anchor) or home == user_home or home in user_home.parents or not (
+            "ADMIN_TOKEN" in env or (home / "data" / "gateway.db").is_file()):
+        raise ApiError(f"{home} no parece una instalación de fogar-gateway (sin ADMIN_TOKEN en "
+                       "config.env ni data/gateway.db): no se borra nada.", 1)
+    url = env.get("DATABASE_URL")
+    db = paths.sqlite_file(url) if url else None
+    if url and (db is None or not db.resolve().is_relative_to(home)):
+        raise ApiError(f"La BD ({db or url}) no está dentro de {home}: --purge solo borra dentro "
+                       "de la base. Bórrala a mano o quita DATABASE_URL de config.env.", 1)
+    lock = (db.resolve().parent if db else home / "data") / paths.LOCK_FILENAME
+    if (home / "data").resolve() != home / "data":
+        raise ApiError(f"{home}/data es un enlace a otro sitio: --purge no lo sigue. "
+                       "Bórralo a mano.", 1)
+    # Unidad y programa son de la instalación del servicio: solo se tocan si son de esta base
+    # (sin unidad, solo la base por defecto, la de install.sh).
+    ours = _unit_home(unit) == home if unit.exists() else (
+        home == user_home / ".fogar-gateway")
+    if not ctx.find_root().obj["yes"]:
+        if not output._stdin_isatty():
+            raise ApiError("Esto lo borra todo. Sin terminal para preguntar: repite con --yes.", 2)
+        typed = click.prompt(
+            f"Se borrarán {'el servicio, ' if ours and unit.exists() else ''}{home} (BD con "
+            "clientes y claves, config.env) y el programa, sin vuelta atrás. Escribe la ruta "
+            "para confirmar", default="", show_default=False, err=True)
+        if typed.strip() not in (str(home), str(paths.home())):
+            raise ApiError("La ruta no coincide: no se ha borrado nada.", 1)
+    removed = unit.exists() and ours
+    if removed:
+        require_systemd()
+        _remove_unit(unit)
+    # Con el servicio parado, un gateway con el lock es un `serve` a mano: no se le borra la BD.
+    if _lock_busy(lock):
+        quitado = "El servicio ya está quitado; " if removed else ""
+        raise ApiError(f"Hay un gateway en marcha ({lock}): páralo y repite. {quitado}Los "
+                       "datos siguen.", 1)
+    try:
+        shutil.rmtree(home)
+    except OSError as e:
+        raise ApiError(f"No se ha podido borrar todo {home} ({type(e).__name__}): lo que queda "
+                       "sigue ahí; revisa sus permisos y repite.", 1) from None
+    program = _uninstall_program() if ours else "pendiente"
+    if out.as_json:
+        out.json({"unit": str(unit), "exe": None, "home": str(home), "state": "purgado",
+                  "program": program})
+        return
+    if not ours:
+        out.message("El servicio y el programa son de otra base: no se han tocado.")
+    out.message(f"Borrado: {home}{' y el servicio' if removed else ''}.")
+    if program == "desinstalado":
+        out.message("Programa desinstalado (uv tool uninstall fogar-gateway).")
+    elif ours:
+        out.message("Quita el programa con: uv tool uninstall fogar-gateway")
+
+
+def _unit_home(unit: Path) -> Path | None:
+    """El FOGAR_GATEWAY_HOME de la unidad instalada (resuelto), o None si no se entiende."""
+    m = re.search(r'^Environment="?FOGAR_GATEWAY_HOME=([^"\n]*)"?$', unit.read_text(), re.M)
+    return Path(m.group(1)).resolve() if m else None
+
+
+def _lock_busy(lock: Path) -> bool:
+    import fcntl
+
+    if not lock.exists():
+        return False
+    with lock.open("a") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return False
+
+
+def _uninstall_program() -> str:
+    """`uv tool uninstall` si así se instaló; si no, el usuario lo quita a mano."""
+    import subprocess
+
+    uv = shutil.which("uv")
+    if uv is None:
+        return "pendiente"
+    listed = subprocess.run([uv, "tool", "list"], text=True, capture_output=True, check=False)
+    if not re.search(r"^fogar-gateway\s", listed.stdout, re.M):
+        return "pendiente"
+    done = subprocess.run([uv, "tool", "uninstall", "fogar-gateway"], text=True,
+                          capture_output=True, check=False)
+    return "desinstalado" if done.returncode == 0 else "pendiente"
 
 
 def require_unit() -> None:

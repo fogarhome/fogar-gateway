@@ -366,7 +366,15 @@ fogar-gw uninstall                # quita el servicio (pregunta); no toca los da
 uv tool uninstall fogar-gateway   # quita el programa
 ```
 
-Los datos (`config.env`, `data/gateway.db`) quedan en `<base>`; bórralos a mano si ya no los quieres.
+Los datos (`config.env`, `data/gateway.db`) quedan en `<base>`.
+
+Para borrarlo todo de una vez (por ejemplo, para empezar de cero con `install.sh`):
+
+```bash
+fogar-gw uninstall --purge        # servicio, <base> entero (con la BD) y el programa
+```
+
+Pide escribir la ruta de `<base>` para confirmar (`--yes` lo salta en scripts) y no tiene vuelta atrás: se pierden los clientes y sus claves, `config.env` con sus tokens y la identidad del gateway ante OpenClaw, así que habrá que emparejar los clientes otra vez. Solo borra dentro de `<base>`: se niega si no parece una instalación (sin `ADMIN_TOKEN` en `config.env` ni `data/gateway.db`), si la BD de `config.env` (`DATABASE_URL`) vive fuera o `data/` es un enlace a otro sitio, y con un gateway en marcha fuera del servicio. El servicio y el programa solo los quita si son de esa base (sin servicio instalado, solo con la base por defecto, `~/.fogar-gateway`). Si el programa no se instaló con `uv tool`, te dice cómo quitarlo. No toca uv, linger, Tailscale ni OpenClaw. En Docker: `docker compose down -v`.
 
 ### Pasar de Docker a nativo
 
