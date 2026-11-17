@@ -257,7 +257,9 @@ def _loads_frame(raw: str | bytes):
     # pisa otra; un payload objeto que deja de serlo, igual.
     if len(frame) != claves or (con_payload and not isinstance(limpio, dict)):
         raise ValueError("lone surrogate in a frame key")
-    payload = limpio if isinstance(limpio, dict) and con_payload else {}
+    # B-r7-1: sin `and con_payload`: un "payload\ud800" que limpio aparece como payload
+    # trae su sessionKey y el chequeo de enrutado de abajo lo descarta.
+    payload = limpio if isinstance(limpio, dict) else {}
     # B-r5-1, B-r6-1: una clave limpiada sería la de otra sesión, turno o petición (también en
     # un `res` de error sin payload); la trama se descarta (_listen).
     if _routing(frame, payload) != routing:

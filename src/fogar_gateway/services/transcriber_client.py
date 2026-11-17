@@ -8,6 +8,7 @@ import websockets
 from pydantic import ValidationError
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
+from websockets.protocol import State
 
 from fogar_gateway.core.config import settings
 from fogar_gateway.models.schemas import TranscriberConfig, TranscriberMessage
@@ -220,3 +221,7 @@ class TranscriberClient:
                 logger.warning(
                     f"[{self.client_id}] Transcriber close falló ({type(e).__name__})"
                 )
+            finally:
+                # A-r7-1: cancelado esperando a un peer que no lee, el socket no queda abierto.
+                if self.ws.state is not State.CLOSED:
+                    self.ws.transport.abort()

@@ -52,7 +52,7 @@ async def test_connect_closes_socket_when_auth_fails():
         recv_payloads=[json.dumps({"type": "error", "code": "bad_token", "message": "invalid"})]
     )
 
-    async def fake_connect(url):
+    async def fake_connect(url, **kwargs):
         return fake_ws
 
     tts = TTSClient(url="test:1", token="bad", client_id="c1")
@@ -69,7 +69,7 @@ async def test_connect_closes_socket_when_auth_fails():
 async def test_connect_closes_socket_and_reraises_cancelled_error():
     fake_ws = FakeTTSSocket()
 
-    async def fake_connect(url):
+    async def fake_connect(url, **kwargs):
         return fake_ws
 
     tts = TTSClient(url="test:1", token="token", client_id="c1")
@@ -88,7 +88,7 @@ async def test_connect_closes_socket_and_reraises_cancelled_error():
 async def test_connect_uses_configured_auth_timeout_and_closes_socket(monkeypatch):
     fake_ws = FakeTTSSocket()
 
-    async def fake_connect(url):
+    async def fake_connect(url, **kwargs):
         return fake_ws
 
     monkeypatch.setattr(settings, "TTS_AUTH_TIMEOUT_S", 0.01)
@@ -108,3 +108,18 @@ async def test_connect_uses_configured_auth_timeout_and_closes_socket(monkeypatc
     assert wait_for.await_args.kwargs["timeout"] == 0.01
     assert fake_ws.closed, "Socket must be closed when auth times out"
     assert tts.ws is None
+
+
+@pytest.mark.asyncio
+async def test_connect_uses_a_short_close_timeout():
+    """E-r7-1: un speaker que manda Close sin cerrar el TCP no congela el turno los 10 s
+    del close_timeout por defecto de websockets (como ElevenLabs: 1 s)."""
+    fake_ws = FakeTTSSocket(recv_payloads=[json.dumps({"type": "error", "code": "x"})])
+
+    async def fake_connect(url, **kwargs):
+        return fake_ws
+
+    tts = TTSClient(url="test:1", token="token", client_id="c1")
+    with patch("websockets.connect", side_effect=fake_connect) as connect, pytest.raises(RuntimeError):
+        await tts.connect()
+    assert connect.call_args.kwargs["close_timeout"] == 1

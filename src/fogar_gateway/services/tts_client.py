@@ -53,7 +53,8 @@ class TTSClient:
         ws_url = f"ws://{self.url}/ws"
         _authenticated = False
         try:
-            ws = await websockets.connect(ws_url)
+            # E-r7-1: un speaker que no cierra el TCP no congela el turno 10 s (como ElevenLabs).
+            ws = await websockets.connect(ws_url, close_timeout=1)
             self.ws = ws
             auth_msg: dict = {"type": "auth", "token": self.token}
             if voice is not None:

@@ -376,3 +376,13 @@ def test_text_without_surrogates_is_not_reencoded(monkeypatch):
     assert len(calls) == 2
     t.feed({"state": "final", "message": {"content": "otro"}})
     assert len(calls) == 2  # un snapshot nuevo sin surrogates
+
+
+def test_loads_frame_drops_a_payload_that_appears_when_cleaned():
+    """B-r7-1: una trama sin "payload" pero con "payload" + surrogate suelto: limpia, aparece un
+    payload con su sessionKey y se enrutaría a una sesión ajena. Se descarta (ValueError)."""
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    raw = '{"type": "event", "event": "agent", "payload\\ud800": {"sessionKey": "agent:x:y"}}'
+    with pytest.raises(ValueError):
+        _loads_frame(raw)
