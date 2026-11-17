@@ -2,13 +2,14 @@
 import json
 import logging
 
+import pytest
 from sqlmodel import Session
 
 from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.main import app
 from fogar_gateway.services.protocol import OrchestratorEvent
-from tests.integration.conftest import CLIENT_ID
+from tests.integration.conftest import CLIENT_ID, default_conversation_key
 
 
 def test_get_models_returns_list(client):
@@ -441,16 +442,40 @@ def test_missing_body_returns_422(client):
     assert r.status_code == 422, f"Esperado 422, recibido {r.status_code}: {r.text}"
 
 
-def test_chat_completions_no_user_message_returns_empty(client):
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"role": "system", "content": "Be helpful"}],
+        [{"role": "user", "content": ""}],
+        [{"role": "user", "content": " \n\t "}],
+    ],
+)
+def test_chat_completions_without_user_text_is_400_without_orchestrator(
+    client, mock_orchestrator, messages, stream
+):
+    """D-r6-3: sin texto (o solo espacios) no hay turno: 400 y OpenClaw ni se entera."""
+    called = []
+    mock_orchestrator.stream_response = lambda **kw: called.append(kw)
     r = client.post(
         "/v1/chat/completions",
-        json={
-            "model": "openclaw",
-            "messages": [{"role": "system", "content": "Be helpful"}],
-            "stream": False,
-        },
+        json={"model": "openclaw", "messages": messages, "stream": stream},
     )
-    assert r.status_code == 200
+    assert r.status_code == 400
+    assert r.json() == {"error": "empty_message"}
+    assert called == []
+
+
+def test_sse_responses_disable_proxy_buffering(client):
+    """D-r6-5: nginx no debe retener los fragmentos del stream."""
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={"model": "openclaw", "messages": [{"role": "user", "content": "Hi"}], "stream": True},
+    ) as r:
+        r.read()
+    assert r.headers["cache-control"] == "no-cache"
+    assert r.headers["x-accel-buffering"] == "no"
 
 
 def test_http_session_appears_in_registry(client):
@@ -508,10 +533,8 @@ def test_chat_completions_from_untrusted_origin_with_valid_key_passes(
 
 
 def test_chat_completions_with_valid_key_uses_real_client_session_key(
-    client_untrusted, ha_bearer_headers, mock_registry
+    client_untrusted, ha_bearer_headers, mock_registry, db_engine
 ):
-    from fogar_gateway.core.session_key import make_session_key
-
     captured = {}
 
     async def _stream(text, session_key=None):
@@ -531,7 +554,9 @@ def test_chat_completions_with_valid_key_uses_real_client_session_key(
         headers=ha_bearer_headers,
     )
 
-    expected = make_session_key("openclaw", CLIENT_ID)
+    # M19: la conversación por defecto de hoy del cliente para ese agente.
+    expected = default_conversation_key(db_engine, "openclaw")
+    assert expected.startswith("agent:openclaw:fogar-")
     assert captured.get("session_key") == expected
 
 
@@ -660,10 +685,8 @@ def _capture_session_key(mock_orchestrator):
 
 
 def test_model_alias_fogar_gateway_with_bearer_returns_200(
-    client_untrusted, ha_bearer_headers, mock_orchestrator
+    client_untrusted, ha_bearer_headers, mock_orchestrator, db_engine
 ):
-    from fogar_gateway.core.session_key import make_session_key
-
     captured = _capture_session_key(mock_orchestrator)
     r = client_untrusted.post(
         "/v1/chat/completions",
@@ -672,14 +695,12 @@ def test_model_alias_fogar_gateway_with_bearer_returns_200(
     )
     assert r.status_code == 200, r.text
     # Sin agente explícito -> cascada: default de OpenClaw ("main").
-    assert captured["session_key"] == make_session_key("main", CLIENT_ID)
+    assert captured["session_key"] == default_conversation_key(db_engine, "main")
 
 
 def test_model_alias_uses_client_default_agent_in_cascade(
     client_untrusted, ha_bearer_headers, mock_orchestrator, db_engine
 ):
-    from fogar_gateway.core.session_key import make_session_key
-
     with Session(db_engine) as s:
         rec = s.get(ClientRecord, CLIENT_ID)
         rec.default_agent = "a"
@@ -692,7 +713,7 @@ def test_model_alias_uses_client_default_agent_in_cascade(
         headers=ha_bearer_headers,
     )
     assert r.status_code == 200, r.text
-    assert captured["session_key"] == make_session_key("a", CLIENT_ID)
+    assert captured["session_key"] == default_conversation_key(db_engine, "a")
 
 
 def test_model_alias_respects_allowed_agents_of_cascade_default(
@@ -714,16 +735,14 @@ def test_model_alias_respects_allowed_agents_of_cascade_default(
 
 
 def test_real_agent_as_model_still_works_and_unknown_still_403(
-    client_untrusted, ha_bearer_headers, mock_orchestrator
+    client_untrusted, ha_bearer_headers, mock_orchestrator, db_engine
 ):
-    from fogar_gateway.core.session_key import make_session_key
-
     captured = _capture_session_key(mock_orchestrator)
     r = client_untrusted.post(
         "/v1/chat/completions", json={**BODY, "model": "a"}, headers=ha_bearer_headers
     )
     assert r.status_code == 200
-    assert captured["session_key"] == make_session_key("a", CLIENT_ID)
+    assert captured["session_key"] == default_conversation_key(db_engine, "a")
 
     r = client_untrusted.post(
         "/v1/chat/completions", json={**BODY, "model": "nope"}, headers=ha_bearer_headers
@@ -949,3 +968,21 @@ def test_foreign_runtimeerror_text_never_reaches_v1_stream(client, mock_orchestr
     assert MARK not in "\n".join(
         x.getMessage() for x in caplog.records if x.name.startswith("fogar_gateway")
     )
+
+
+@pytest.mark.parametrize("path", ["/v1/models", "/v1/chat/completions"])
+def test_corrupt_allowed_agents_in_db_returns_stable_500(
+    client_untrusted, ha_bearer_headers, db_engine, caplog, path
+):
+    """D-r8-1: `allowed_agents` ilegible (fila editada a mano): 500 `internal_error` estable,
+    con solo el tipo en el log, no un traceback sin manejar."""
+    with Session(db_engine) as s:
+        s.get(ClientRecord, CLIENT_ID).allowed_agents = '{"no": "lista"}'
+        s.commit()
+    if path == "/v1/models":
+        r = client_untrusted.get(path, headers=ha_bearer_headers)
+    else:
+        r = client_untrusted.post(path, json=BODY, headers=ha_bearer_headers)
+    assert r.status_code == 500
+    assert r.json() == {"detail": "internal_error"}
+    assert "ValueError" in caplog.text and "lista" not in caplog.text

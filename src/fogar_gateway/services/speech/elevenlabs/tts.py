@@ -279,6 +279,7 @@ class ElevenLabsTtsStream:
         self._reopened = True
         self._warn_close_once("cierre inesperado del upstream: se reabre una vez")
         await self._close_ws()
+        self._carry = b""  # E-r6-2: el byte suelto era de la síntesis cortada, no de la nueva
         return "reopen"
 
     def _warn_close_once(self, msg: str) -> None:

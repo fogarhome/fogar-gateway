@@ -1,4 +1,4 @@
-"""G-06 (#218): revocar un cliente corta sus sesiones vivas (1008 «revoked»), contra un
+"""G-06 (#218): revocar un cliente corta sus sesiones vivas (4200 «credential revoked»), contra un
 uvicorn real con la app completa (lifespan incluido) y un cliente `websockets` real."""
 
 import asyncio
@@ -16,6 +16,7 @@ from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.main import app
 from fogar_gateway.services.db_client import db_client
+from fogar_gateway.services.stats import gateway_stats
 from tests.integration.conftest import (
     ADMIN_TOKEN,
     CLIENT_ID,
@@ -65,7 +66,7 @@ async def _expect_revoked(ws):
     elapsed = time.monotonic() - started
     close = exc.value.rcvd
     assert close is not None
-    assert (close.code, close.reason) == (1008, "revoked")
+    assert (close.code, close.reason) == (4200, "credential revoked")
     assert elapsed < CLOSE_DEADLINE_S
     return elapsed
 
@@ -161,3 +162,28 @@ async def test_client_recreated_with_same_key_but_new_id_revokes_the_session(ser
         s.add(ClientRecord(id="otro-id", name="Nuevo", client_key=VALID_KEY, is_active=True))
         s.commit()
     await _expect_revoked(ws)
+
+
+@pytest.mark.parametrize("allowed", [["a"], []])
+async def test_narrowing_allowed_agents_closes_the_live_session_with_4020(server, allowed):
+    """C-r6-1: quitar el agente de la sesión de `allowed_agents` la corta (4020, no 4200: la
+    clave sigue valiendo); ampliarlo o mantenerlo (en otras mayúsculas) no la toca."""
+    ws = await _open(server)
+    async with _admin(server) as admin:
+        r = await admin.patch(f"/admin/clients/{CLIENT_ID}", json={"allowed_agents": ["MAIN", "a"]})
+        assert r.status_code == 200, r.text
+        await asyncio.sleep(INTERVAL_S * 3)
+        assert ws.close_code is None
+        r = await admin.patch(f"/admin/clients/{CLIENT_ID}", json={"allowed_agents": allowed})
+        assert r.status_code == 200, r.text
+    with pytest.raises(websockets.ConnectionClosed) as exc:
+        while True:
+            await asyncio.wait_for(ws.recv(), timeout=CLOSE_DEADLINE_S)
+    assert exc.value.rcvd is not None
+    assert (exc.value.rcvd.code, exc.value.rcvd.reason) == (4020, "agent not permitted")
+    await asyncio.sleep(0.2)  # deja terminar el teardown del lado del servidor
+    # Distinto de una clave revocada en /admin/sessions (evento) y en las estadísticas.
+    [record] = app.state.session_registry.get_all()
+    assert "agent_revoked" in [e.stage for e in record.events]
+    assert "session_revoked" not in [e.stage for e in record.events]
+    assert gateway_stats.snapshot()["sessions_closed"] == {"agent_revoked": 1}

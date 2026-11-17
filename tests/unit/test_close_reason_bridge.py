@@ -12,6 +12,7 @@ from fogar_gateway.core.session_key import make_session_key
 from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.openclaw.registry import TurnRegistry
 from fogar_gateway.services.pipeline_tracker import PipelineTracker
+from fogar_gateway.services.protocol import OrchestratorEvent
 from fogar_gateway.services.reconnection import ConnectionState
 from fogar_gateway.services.stats import gateway_stats
 from tests.fakes.bridge import DirectSender
@@ -34,7 +35,7 @@ def make_reason_bridge(make_bridge):
             config=config or ClientConfig(),
             input_mode=input_mode,
             tracker=tracker,
-            turn_registry=turn_registry,
+            turn_registry=turn_registry or TurnRegistry(),
             register=True,
         )
         return bridge
@@ -91,6 +92,23 @@ async def test_revoked_reason(make_reason_bridge, monkeypatch):
     await asyncio.wait_for(bridge._session_revalidation_loop(), timeout=1.0)
     assert _end_meta(bridge)["reason"] == "revoked"
     assert _closed() == {"revoked": 1}
+
+
+async def test_corrupt_allowed_agents_on_revalidation_closes_1011(make_reason_bridge, monkeypatch, caplog):
+    """A-r8-1: `allowed_agents` corrupto en la BD no es un fallo transitorio: la revalidación
+    cierra con 1011 (como el handshake, C-r7-2), con solo el tipo en el log."""
+    monkeypatch.setattr(settings, "SESSION_REVALIDATE_INTERVAL_S", 0.0)
+    monkeypatch.setattr(
+        "fogar_gateway.services.bridge.db_client.get_session",
+        AsyncMock(side_effect=ValueError("allowed_agents secreto")),
+    )
+    bridge = make_reason_bridge()
+    bridge.client_ws.close = AsyncMock()
+    await asyncio.wait_for(bridge._session_revalidation_loop(), timeout=1.0)
+    bridge.client_ws.close.assert_awaited_once_with(code=1011, reason="session setup failed")
+    assert _end_meta(bridge)["reason"] == "error"
+    assert _closed() == {"error": 1}
+    assert "ValueError" in caplog.text and "secreto" not in caplog.text
 
 
 async def test_client_disconnect_reason(make_reason_bridge):
@@ -156,9 +174,16 @@ async def test_session_closed_counted_once_when_tracker_close_fails(make_reason_
 
 async def test_turn_in_flight_flag(make_reason_bridge):
     bridge = make_reason_bridge()
-    gate = asyncio.Event()
-    bridge._active_turn = asyncio.create_task(gate.wait())
-    bridge._client_gone = True  # cancela el turno en vez de drenarlo
+    started = asyncio.Event()
+
+    async def forever(*a, **k):
+        started.set()
+        await asyncio.sleep(3600)
+        yield OrchestratorEvent(type="token", content="x")  # pragma: no cover
+
+    bridge.orchestrator.stream_response = forever
+    await bridge.turns.start_user_turn("x")
+    await asyncio.wait_for(started.wait(), 2)
     await bridge.close_all()
     assert _end_meta(bridge)["turn_in_flight"] is True
 
@@ -176,8 +201,12 @@ async def test_queue_peaks_in_session_end(make_reason_bridge):
     turns.deliver_by_session(sk, ("token", "b"))
     turns.unregister(sk, "req-1")
     assert q.qsize() == 2
-    bridge._push_pending_peak = 3
+    await bridge.turns._lock.acquire()  # a turn being replaced: the push worker waits
+    for kind in ("turn_start", "chat", "chat"):
+        bridge.enqueue_push(kind, {})
+    await asyncio.sleep(0.01)
     await bridge.close_all()
+    bridge.turns._lock.release()
     meta = _end_meta(bridge)
     assert meta["turn_queue_peak"] == 2
     assert meta["push_backlog_peak"] == 3
@@ -185,7 +214,7 @@ async def test_queue_peaks_in_session_end(make_reason_bridge):
     assert turns.depth(sk) == (0, 0)  # pop_peak consumido
 
 
-async def test_queue_peaks_default_to_zero_without_turn_registry(make_reason_bridge):
+async def test_queue_peaks_default_to_zero_without_a_turn(make_reason_bridge):
     bridge = make_reason_bridge()
     await bridge.close_all()
     assert _end_meta(bridge)["turn_queue_peak"] == 0

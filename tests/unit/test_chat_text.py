@@ -240,3 +240,149 @@ def test_growth_after_retraction_emits_only_new_tail():
     t.feed({"state": "delta", "deltaText": "Hola mundo"})
     assert t.feed({"state": "delta", "deltaText": "Hola", "replace": True}) == ""
     assert t.feed({"state": "delta", "deltaText": " mundo!"}) == "!"
+
+
+def test_emoji_split_between_two_snapshots_is_not_emitted_twice():
+    """G-r3-1 (revisión): «Hola \\ud83d» y luego «Hola 😀 amigo». Sin el surrogate suelto (ni
+    sustituto) el primero sigue siendo prefijo del segundo: nada se repite."""
+    import json
+
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    t = ChatTextTracker()
+    first = _loads_frame(json.dumps({"payload": _delta("", message="Hola \ud83d")}))
+    second = _loads_frame(json.dumps({"payload": _delta("", message="Hola \U0001f600 amigo")}))
+    out = t.feed(first["payload"]) + t.feed(second["payload"])
+    assert out == "Hola \U0001f600 amigo"
+
+
+def test_emoji_split_between_two_delta_texts_is_joined():
+    """B-r4-1: la mitad alta espera a su pareja; nada se reemite al llegar el final."""
+    t = ChatTextTracker()
+    out = [
+        t.feed(_delta("Hola ", message="Hola ")),
+        t.feed({"state": "delta", "deltaText": "amigo \ud83d"}),
+        t.feed({"state": "delta", "deltaText": "\ude00 qué tal"}),
+        t.feed({"state": "final", "message": {"content": "Hola amigo \U0001f600 qué tal"}}),
+    ]
+    assert out == ["Hola ", "amigo ", "\U0001f600 qué tal", ""]
+    assert "".join(out).encode()  # UTF-8 válido
+
+
+def test_loads_frame_keeps_chat_text_halves_but_cleans_the_rest():
+    import json
+
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    chat = {"sessionKey": "k", "state": "d\ud800", "deltaText": "a\ud83d", "message": {"content": "b\ude00"}}
+    frame = _loads_frame(json.dumps({"type": "event", "event": "chat", "payload": chat}))
+    assert frame["payload"] == {"sessionKey": "k", "state": "d", "deltaText": "a\ud83d", "message": {"content": "b\ude00"}}
+    other = _loads_frame(json.dumps({"type": "res", "payload": {"title": "t\ud800"}}))
+    assert other["payload"]["title"] == "t"
+
+
+@pytest.mark.parametrize("key", ["sessionKey", "runId"])
+@pytest.mark.parametrize("event", ["chat", "agent"])
+def test_loads_frame_drops_a_frame_whose_routing_key_would_change(key, event):
+    """B-r5-1: "k" + surrogate suelto, limpio, sería "k", la clave de otra sesión: la trama se descarta
+    (ValueError, que _listen registra solo por tipo) en vez de enrutarse."""
+    import json
+
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    payload = {"sessionKey": "k", "runId": "r", key: "k\ud800", "deltaText": "hola"}
+    with pytest.raises(ValueError):
+        _loads_frame(json.dumps({"type": "event", "event": event, "payload": payload}))
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"type": "res", "id": "q\ud800", "ok": True, "payload": {"status": "ok"}},
+        {"type": "res", "id": "q", "ok": True, "payload": {"runIds": ["r\ud800"]}},
+        {"type": "res", "id": "abc\ud800", "ok": False},  # error sin payload
+        {"type": "res", "id": "abc\ud800", "ok": False, "payload": "x"},
+    ],
+)
+def test_loads_frame_drops_a_frame_whose_id_or_run_ids_would_change(frame):
+    """B-r6-1: el `id` de la trama y `payload.runIds` también enrutan: si limpiarlos los
+    cambiaría, la trama se descarta como con sessionKey/runId."""
+    import json
+
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    with pytest.raises(ValueError):
+        _loads_frame(json.dumps(frame))
+
+
+def test_loads_frame_rejects_a_payload_that_stops_being_an_object():
+    """B-r6-2: "payload" + surrogate suelto, limpio, choca con "payload" y puede dejar un payload no dict:
+    ValueError (la vía que _recv_matching y _listen saltan), no AttributeError."""
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    raw = '{"type": "res", "id": "q", "payload": {"ok": 1}, "payload\\ud800": "x"}'
+    with pytest.raises(ValueError):
+        _loads_frame(raw)
+    # una clave de primer nivel que choca con otra, sin payload objeto
+    with pytest.raises(ValueError):
+        _loads_frame('{"type": "res", "id": "q", "ok": false, "ok\\ud800": true}')
+
+
+def test_loads_frame_cleans_a_res_without_payload_when_routing_is_intact():
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    raw = '{"type": "res", "id": "q", "ok": false, "error": {"message": "m\\ud800"}}'
+    assert _loads_frame(raw) == {"type": "res", "id": "q", "ok": False, "error": {"message": "m"}}
+
+
+def test_loads_frame_binary_chat_keeps_text_halves():
+    """B-r5-3: trama binaria (utf-16 con surrogates crudos): deltaText conserva la mitad para
+    ChatTextTracker, el resto se limpia y una sessionKey con surrogate descarta la trama."""
+    import json
+
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    def raw(payload):
+        frame = {"type": "event", "event": "chat", "payload": payload}
+        return json.dumps(frame, ensure_ascii=False).encode("utf-16", "surrogatepass")
+
+    frame = _loads_frame(raw({"sessionKey": "k", "state": "d\ud800", "deltaText": "a\ud83d"}))
+    assert frame["payload"] == {"sessionKey": "k", "state": "d", "deltaText": "a\ud83d"}
+    with pytest.raises(ValueError):
+        _loads_frame(raw({"sessionKey": "k\ud800", "deltaText": "a"}))
+
+
+def test_loads_frame_bytes_with_raw_surrogate_are_valid_utf8():
+    """C-r4-1: bytes UTF-8 de un surrogate crudo (sin el escape \\ud) también se sanean, sin
+    carácter de sustitución."""
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    frame = _loads_frame(b'{"type": "res", "payload": {"title": "t\xed\xa0\x80"}}')
+    assert frame["payload"]["title"] == "t"  # sin U+FFFD ni surrogate
+
+
+def test_text_without_surrogates_is_not_reencoded(monkeypatch):
+    """Revisión r4: sin surrogates no se re-codifica `current` en cada delta (O(n²))."""
+    from fogar_gateway.services.openclaw import chat_text
+
+    calls = []
+    monkeypatch.setattr(chat_text, "_paired", lambda s: calls.append(s) or s)
+    t = ChatTextTracker()
+    for word in ("Hola ", "amigo ", "qué tal"):
+        t.feed({"state": "delta", "deltaText": word})
+    assert calls == []
+    t.feed({"state": "delta", "deltaText": " \ud83d"})
+    t.feed({"state": "delta", "deltaText": "\ude00"})
+    assert len(calls) == 2
+    t.feed({"state": "final", "message": {"content": "otro"}})
+    assert len(calls) == 2  # un snapshot nuevo sin surrogates
+
+
+def test_loads_frame_drops_a_payload_that_appears_when_cleaned():
+    """B-r7-1: una trama sin "payload" pero con "payload" + surrogate suelto: limpia, aparece un
+    payload con su sessionKey y se enrutaría a una sesión ajena. Se descarta (ValueError)."""
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    raw = '{"type": "event", "event": "agent", "payload\\ud800": {"sessionKey": "agent:x:y"}}'
+    with pytest.raises(ValueError):
+        _loads_frame(raw)

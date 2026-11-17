@@ -1,5 +1,6 @@
 """Tests for send guards in _call_orchestrator closures."""
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -8,7 +9,7 @@ from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.openclaw.models import ToolCallEvent
 from fogar_gateway.services.outbound import ClientGone
 from fogar_gateway.services.protocol import OrchestratorEvent
-from tests.fakes.bridge import GoneSender, sent
+from tests.fakes.bridge import GoneSender, run_turn, sent
 
 
 @pytest.fixture
@@ -47,7 +48,7 @@ async def test_tool_call_forwarded_when_enabled(make_bridge):
     tc = ToolCallEvent(phase="start", name="exec", tool_call_id="call-1", args={"command": "ls"})
     b.orchestrator.stream_response = make_stream_with_tool_call(tc)
 
-    await b._call_orchestrator("test")
+    await run_turn(b, "test")
     await sent(b)
 
     tool_call_msgs = ws.of("tool_call")
@@ -68,7 +69,7 @@ async def test_tool_call_not_forwarded_when_disabled(make_bridge):
     tc = ToolCallEvent(phase="start", name="exec", tool_call_id="call-1", args={"command": "ls"})
     b.orchestrator.stream_response = make_stream_with_tool_call(tc)
 
-    await b._call_orchestrator("test")
+    await run_turn(b, "test")
     await sent(b)
 
     tool_call_msgs = ws.of("tool_call")
@@ -82,7 +83,7 @@ async def test_token_send_failure_does_not_propagate(make_bridge, error):
     bridge.orchestrator.stream_response = make_stream_with_token("hello")
 
     # Must not raise
-    await bridge._call_orchestrator("test")
+    await run_turn(bridge, "test")
 
 
 @_SEND_ERRORS
@@ -92,7 +93,7 @@ async def test_event_send_failure_does_not_propagate(make_bridge, error):
     bridge.orchestrator.stream_response = make_stream_with_event("status", "thinking")
 
     # Must not raise
-    await bridge._call_orchestrator("test")
+    await run_turn(bridge, "test")
 
 
 @_SEND_ERRORS
@@ -124,7 +125,7 @@ async def test_audio_send_failure_does_not_propagate(make_bridge, error):
 
     b.orchestrator.stream_response = stream_with_token
 
-    await b._call_orchestrator("test")  # must not raise
+    await run_turn(b, "test")  # must not raise
 
 
 async def test_turn_in_progress_error_event_sends_non_fatal_turn_error_frame(bridge):
@@ -138,7 +139,7 @@ async def test_turn_in_progress_error_event_sends_non_fatal_turn_error_frame(bri
 
     bridge.orchestrator.stream_response = make_stream_with_event("error", TURN_IN_PROGRESS_ERROR)
 
-    await bridge._call_orchestrator("test")  # must not raise — session stays open
+    await run_turn(bridge, "test")  # must not raise — session stays open
     await sent(bridge)
 
     error_msgs = bridge.client_ws.of("error")
@@ -174,13 +175,14 @@ async def test_tts_end_called_when_orchestrator_raises_non_runtime_error(make_br
     b, _ = make_bridge(input_mode="audio", output_mode=("audio", "text"), tts=tts_wrapper)
 
     async def _crashing_stream(*args, **kwargs):
+        await asyncio.sleep(0.01)  # E-2: el TTS conecta a la vez; aquí ya está conectado
         raise OSError("connection reset by peer")
         yield
 
     b.orchestrator.stream_response = _crashing_stream
 
     try:
-        await b._call_orchestrator("test")
+        await run_turn(b, "test")
     except Exception:
         pass  # _call_orchestrator puede propagar el OSError — nos interesa el efecto secundario
 

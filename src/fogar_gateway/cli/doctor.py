@@ -21,7 +21,7 @@ import click
 from fogar_gateway import paths
 from fogar_gateway.cli import api
 from fogar_gateway.cli import config as cfg
-from fogar_gateway.cli.output import ACCENT, ERROR, MUTED, TEXT, Out
+from fogar_gateway.cli.output import ERROR, MUTED, OK, WARN, Out
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations" / "versions"
 TCP_TIMEOUT_S = 2.0
@@ -184,6 +184,46 @@ def _services_online(client: api.Api, off: set[str], configured_off: set[str]) -
     return result
 
 
+ACCESS = "acceso a OpenClaw"
+
+
+def _access_from_file(settings: Any) -> Check:
+    """Con el gateway parado (o sin ese dato): la identidad guardada, sin cargar `cryptography`
+    ni enseñar la clave o el token."""
+    from fogar_gateway.cli.openclaw_access import scopes_text
+    from fogar_gateway.services.openclaw.device import DeviceFileError, DeviceStore
+
+    store = DeviceStore(paths.openclaw_device_file())
+    try:
+        summary = store.summary()
+    except DeviceFileError:
+        return _c("warn", ACCESS, f"{store.path} no es una identidad válida: el gateway conecta sin "
+                  "ella (solo vale con OpenClaw en esta máquina). Si no estaba emparejado, bórralo "
+                  "y el gateway creará otra.")
+    if not summary["exists"]:
+        return _c("info", ACCESS, "Sin identidad de dispositivo todavía: el gateway la crea al "
+                  "conectar con OpenClaw.")
+    device = (summary["device_id"] or "?")[:12]
+    gateway = f"{settings.OPENCLAW_HOST}:{settings.OPENCLAW_PORT}" if settings else None
+    if summary["token_gateway"] and summary["token_gateway"] == gateway:
+        return _c("info", ACCESS, f"Dispositivo {device}, emparejado con {gateway} (permisos: "
+                  f"{scopes_text(summary['token_scopes'])}).")
+    return _c("info", ACCESS, f"Dispositivo {device}, sin emparejar con {gateway or 'OpenClaw'} (con "
+              "OpenClaw en esta máquina no hace falta).")
+
+
+def _check_openclaw_access(state: Any, settings: Any) -> Check:
+    """Con el gateway en marcha y conectado (o esperando aprobación), lo que dice /admin/state;
+    si no, la identidad guardada."""
+    from fogar_gateway.cli.openclaw_access import describe
+
+    orch = state.get("services", {}).get("orchestrator") if isinstance(state, dict) else None
+    found = describe(orch) if isinstance(orch, dict) else None
+    if found is not None:
+        return _c(found[0], ACCESS, found[1])
+    return _access_from_file(settings)
+
+
 def run_checks(url: str, token: str | None) -> list[Check]:
     out: list[Check] = []
     settings, errors, _ = cfg.load()
@@ -206,7 +246,8 @@ def run_checks(url: str, token: str | None) -> list[Check]:
     held = None
     if settings:
         out.append(_check_db(db, settings.DATABASE_URL))
-        perms = [(paths.home(), 0o700), (paths.config_file(), 0o600)]
+        perms = [(paths.home(), 0o700), (paths.config_file(), 0o600),
+                 (paths.openclaw_device_file(), 0o600)]
         if db:
             perms += [(db.parent, 0o700), (db, 0o600)]
         out.append(_check_permissions(perms))
@@ -224,6 +265,7 @@ def run_checks(url: str, token: str | None) -> list[Check]:
         out.append(_c("warn", "gateway", f"{why}{hint}"))
         if settings:
             out.extend(_services_offline(settings))
+            out.append(_check_openclaw_access(None, settings))
         return out
     out.append(_c("ok", "gateway", f"Responde en {urlsplit(url).netloc}."))
     state = None
@@ -235,10 +277,11 @@ def run_checks(url: str, token: str | None) -> list[Check]:
         out.append(_c("fail", "token", e.message))
     configured_off = _voice_off(settings)
     out.extend(_services_online(client, _live_off(state, settings), configured_off))
+    out.append(_check_openclaw_access(state, settings))
     return out
 
 
-_MARKS = {"ok": ("✓", TEXT), "warn": ("!", ACCENT), "fail": ("✗", ERROR), "info": ("·", MUTED)}
+_MARKS = {"ok": ("✓", OK), "warn": ("!", WARN), "fail": ("✗", ERROR), "info": ("·", MUTED)}
 
 
 @click.command()

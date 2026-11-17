@@ -8,14 +8,16 @@ contratos internos con la interfaz HTTP de administración.
 """
 
 import json
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated, Literal
 
+from fastapi import Path, Query
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from fogar_gateway.core.logging import fingerprint_key
+from fogar_gateway.core.session_key import AGENT_ID_PATTERN
 from fogar_gateway.db.models import ClientRecord
-from fogar_gateway.models.schemas import OutputMode
+from fogar_gateway.models.schemas import CREDENTIAL_MAX_LEN, OutputMode
 
 # Etiqueta de cliente. Solo se valida la ENTRADA (create/update/CLI); la respuesta
 # sigue siendo `str` para no romper la lectura de filas antiguas con valores libres (#122).
@@ -27,8 +29,13 @@ ClientType = Literal["ha", "esp32", "web", "app", "screen"]
 _Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
 _Text = Annotated[str, StringConstraints(min_length=1, max_length=200)]
 # Solo para importar una clave existente (#293): "" no equivale a omitirla.
-_ImportedKey = Annotated[str, StringConstraints(min_length=32)]
-AgentName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+# Mismo tope que el handshake: una clave importada más larga no podría autenticarse nunca.
+_ImportedKey = Annotated[str, StringConstraints(min_length=32, max_length=CREDENTIAL_MAX_LEN)]
+# La regla de OpenClaw para un id de agente (core/session_key.py, AGENT_ID_PATTERN).
+# En minúsculas, como lo usa OpenClaw (auditoría 3.0, C-1).
+AgentName = Annotated[
+    str, StringConstraints(strip_whitespace=True, to_lower=True, pattern=AGENT_ID_PATTERN)
+]
 _VadThold = Annotated[float, Field(ge=0.0, le=1.0)]
 _Speed = Annotated[float, Field(gt=0.0, le=10.0)]
 _Seconds = Annotated[float, Field(gt=0.0, le=86_400.0)]
@@ -140,8 +147,10 @@ class ClientResponse(BaseModel):
             key_fp=fingerprint_key(r.client_key),
             is_active=r.is_active,
             client_type=r.client_type,
-            default_agent=r.default_agent,
-            allowed_agents=json.loads(r.allowed_agents) if r.allowed_agents else None,
+            # Una fila de la 2.x puede tener "Main": se devuelve como la usa el gateway (C-1).
+            default_agent=r.default_agent.lower() if r.default_agent else r.default_agent,
+            allowed_agents=[a.lower() for a in json.loads(r.allowed_agents)]
+            if r.allowed_agents else None,
             created_at=r.created_at,
             stt_language=r.stt_language,
             stt_vad_thold=r.stt_vad_thold,
@@ -188,3 +197,58 @@ class PairRequest(BaseModel):
     name: _Name | None = None
     client_type: ClientType | None = None
     output_mode: list[OutputMode] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Conversaciones (M19)
+# ---------------------------------------------------------------------------
+
+# Parámetros de las rutas (FastAPI valida Path/Query, no un Field suelto).
+ConversationIdPath = Annotated[str, Path(min_length=1, max_length=200)]
+ClientIdFilter = Annotated[str | None, Query(min_length=1, max_length=200)]
+# Mensajes de `GET /admin/conversations/{id}/messages` (el tope de `chat.history` es 1000).
+HistoryLimit = Annotated[int, Query(ge=1, le=1000)]
+
+
+class ConversationCreate(BaseModel):
+    """`POST /admin/conversations`: una conversación nueva del panel web. Sin `agent`, el de la
+    cascada (`default_agent` del panel, `DEFAULT_AGENT`, el de OpenClaw)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent: AgentName | None = None
+
+
+class ConversationResponse(BaseModel):
+    """Una conversación: sin texto (el título lo pone OpenClaw; null si no se sabe)."""
+
+    id: str
+    client_id: str
+    client_name: str
+    agent: str
+    kind: str
+    day: date | None
+    created_at: datetime
+    last_turn_at: datetime | None
+    turn_count: int
+    title: str | None = None
+
+
+class ConversationAgents(BaseModel):
+    """`GET /admin/conversations/agents`: con qué agentes puede empezar el panel una conversación
+    y cuál tocaría sin elegir (None si el de la cascada no le está permitido)."""
+
+    agents: list[str]
+    default: str | None
+
+
+class ConversationMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    text: str
+    timestamp: datetime | None
+
+
+class ConversationMessages(BaseModel):
+    conversation_id: str
+    messages: list[ConversationMessage]
+    has_more: bool

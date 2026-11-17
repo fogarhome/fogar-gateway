@@ -1,5 +1,58 @@
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
+
+from fogar_gateway.services.openclaw.device import clean_scopes
+
+ADMIN_SCOPE = "operator.admin"
+
+AuthMethod = Literal["shared_token", "device_token"]
+# unknown: no hay conexión ahora (aún no ha conectado, falló o se cayó); not_required: conectado
+# sin emparejar (camino local de gateway-client/backend con el token compartido); paired: con
+# token de dispositivo; pending: OpenClaw espera la aprobación; identity_required: OpenClaw pide
+# identidad de dispositivo y el gateway no pudo mandarla (`identity_error` dice por qué).
+PairingState = Literal["unknown", "not_required", "paired", "pending", "identity_required"]
+# Por qué no se mandó la identidad: el fichero no vale o no se puede crear, o el reto no trae nonce.
+IdentityError = Literal["identity_file_invalid", "challenge_without_nonce"]
+
+
+def approve_command(request_id: str | None) -> str:
+    """El comando que aprueba el gateway en la máquina de OpenClaw (sin id: `--latest` solo
+    enseña la última petición e imprime el comando exacto)."""
+    return f"openclaw devices approve {request_id or '--latest'}"
+
+
+# La causa de `identity_required`, en una frase: la usan la CLI (`cli/openclaw_access.py`) y el
+# panel (`/admin/state`, `identity_error_text`), para que digan lo mismo.
+IDENTITY_ERROR_TEXT: dict[str, str] = {
+    "identity_file_invalid": "el fichero de identidad del gateway no vale o no se puede crear",
+    "challenge_without_nonce": "este OpenClaw no manda nonce en el reto y no hay nada que firmar",
+}
+IDENTITY_ERROR_FALLBACK = "no hay identidad que mandar"
+
+
+def access_texts(access: dict[str, Any]) -> dict[str, str | None]:
+    """Lo que el panel enseña tal cual del acceso (`OrchestratorAccess.as_dict()`): el comando que
+    aprueba el gateway (solo con el emparejamiento pendiente) y la causa de `identity_required`."""
+    pairing = access.get("pairing")
+    rid = access.get("pairing_request_id")
+    cause = access.get("identity_error")
+    return {
+        "approve_command": (
+            approve_command(rid if isinstance(rid, str) else None) if pairing == "pending" else None
+        ),
+        "identity_error_text": (
+            IDENTITY_ERROR_TEXT.get(str(cause), IDENTITY_ERROR_FALLBACK)
+            if pairing == "identity_required"
+            else None
+        ),
+    }
+
+
+def hello_scopes(payload: dict) -> list[str] | None:
+    """`hello-ok.auth.scopes` saneados; None si no vienen (desconocidos, no «ninguno»)."""
+    auth = payload.get("auth")
+    scopes = auth.get("scopes") if isinstance(auth, dict) else None
+    return clean_scopes(scopes) if isinstance(scopes, list) else None
 
 
 @dataclass
@@ -9,15 +62,33 @@ class GatewayInfo:
     max_payload: int
     # Agent ids in the order agents.list returns them (/v1/models lists them as-is).
     agents: list[str] = field(default_factory=list)
+    # Permisos concedidos a esta conexión (`hello-ok.auth.scopes`), saneados; None si el
+    # servidor no los anuncia (desconocidos).
+    scopes: list[str] | None = None
+
+    @property
+    def admin(self) -> bool:
+        return ADMIN_SCOPE in (self.scopes or [])
 
     def has_agent(self, agent_id: str) -> bool:
         return agent_id in self.agents
 
-    def update_agents_from_list(self, payload: dict) -> None:
+    def update_agents_from_list(self, payload: object) -> bool:
         """Populate agents from an agents.list response (the only roster source since
-        OpenClaw server 2026.6.11, the minimum supported)."""
-        self.agents = [a["id"] for a in payload.get("agents", [])]
-        self.default_agent_id = payload.get("defaultId", self.default_agent_id)
+        OpenClaw server 2026.6.11, the minimum supported). False, without touching anything,
+        if the payload is not `{"agents": [...]}` with some usable entry; entries without a
+        string `id` are skipped (audit 3.0, B-1: a malformed answer must not break the connection)."""
+        if not isinstance(payload, dict) or not isinstance(payload.get("agents"), list):
+            return False
+        agents = payload["agents"]
+        ids = [a["id"].lower() for a in agents if isinstance(a, dict) and isinstance(a.get("id"), str)]
+        if agents and not ids:
+            return False  # nothing usable: an empty roster would refuse every named agent
+        self.agents = ids
+        default_id = payload.get("defaultId")
+        if isinstance(default_id, str) and default_id:
+            self.default_agent_id = default_id.lower()
+        return True
 
     @classmethod
     def from_hello_ok(cls, payload: dict) -> "GatewayInfo":
@@ -27,7 +98,47 @@ class GatewayInfo:
             default_agent_id=snapshot.get("sessionDefaults", {}).get("defaultAgentId") or "main",
             tick_interval_ms=policy.get("tickIntervalMs", 15000),
             max_payload=policy.get("maxPayload", 26214400),
+            scopes=hello_scopes(payload),
         )
+
+
+@dataclass
+class OrchestratorAccess:
+    """Con qué acceso está (o intenta estar) el gateway en OpenClaw *ahora*: lo enseñan
+    `/admin/state`, `fogar-gw status` y `doctor`. Lo actualiza OpenClawClient en el sitio (nunca
+    se reemplaza): al conectar, con PAIRING_REQUIRED, y vuelve a `unknown` (`reset()`) cuando un
+    connect falla o la conexión se cae, para no enseñar como actual un acceso que ya no hay. Sin
+    credenciales: el deviceId y el id de la petición de emparejamiento son públicos."""
+
+    scopes: list[str] | None = None  # None: sin conexión, o conectado sin permisos anunciados
+    auth_method: AuthMethod | None = None
+    pairing: PairingState = "unknown"
+    pairing_request_id: str | None = None
+    identity_error: IdentityError | None = None
+    device_id: str | None = None
+
+    @property
+    def admin(self) -> bool:
+        return ADMIN_SCOPE in (self.scopes or [])
+
+    def reset(self) -> None:
+        """Sin conexión: todo a desconocido salvo el deviceId (sigue siendo el de la instalación)."""
+        self.scopes = None
+        self.auth_method = None
+        self.pairing = "unknown"
+        self.pairing_request_id = None
+        self.identity_error = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "scopes": list(self.scopes) if self.scopes is not None else None,
+            "admin": self.admin,
+            "auth_method": self.auth_method,
+            "pairing": self.pairing,
+            "pairing_request_id": self.pairing_request_id,
+            "identity_error": self.identity_error,
+            "device_id": self.device_id,
+        }
 
 
 def _flatten_tool_result_content(content: list | None) -> str | None:

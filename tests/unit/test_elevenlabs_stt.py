@@ -644,3 +644,35 @@ async def test_close_does_not_swallow_callers_cancellation(env, monkeypatch):
         await closer
     assert life is not None and life.done()
     assert s._closed_evt.is_set()
+
+
+async def test_send_to_an_upstream_that_stops_reading_is_bounded(monkeypatch):
+    """E-r6-1: un upstream que deja de leer no cuelga `send_audio` (y con él el bucle de entrada
+    de la sesión): el envío vence, se aborta el transporte (el lector ve la caída y reconecta)
+    y el trozo sigue en el búfer para la conexión nueva."""
+    monkeypatch.setattr(stt_mod, "SEND_TIMEOUT_S", 0.1)
+
+    class Transport:
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
+    class HungWs:
+        transport = Transport()
+
+        async def send(self, _data):
+            await asyncio.Event().wait()  # drain que no acaba nunca
+
+    p = ElevenLabsSttProvider(make_settings("ws://127.0.0.1:1"))
+    s = open_session(p, Rec())
+    up = stt_mod._Upstream()
+    up.ws = HungWs()
+    up.ready.set()
+    s._conn = up
+    s._buf += b"\x01\x00" * 1600  # 0,1 s: un trozo
+    await asyncio.wait_for(s._pump(), 2)  # no lanza: ConnectionClosed lo trata el lector
+    assert up.ws.transport.aborted
+    assert len(s._buf) == 3200
+    s._conn = None
+    await s.close()

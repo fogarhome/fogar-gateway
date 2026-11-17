@@ -33,7 +33,7 @@ from fogar_gateway.api.admin_routes import _check_agent_consistency, create_clie
 from fogar_gateway.api.deps import get_admin_auth
 from fogar_gateway.core.config import settings
 from fogar_gateway.core.logging import fingerprint_key
-from fogar_gateway.core.network import resolve_client_ip
+from fogar_gateway.core.network import client_ip_for_log
 from fogar_gateway.db.database import get_db_session
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.models.admin_schemas import ClientCreate, PairingCreate, PairRequest
@@ -90,7 +90,7 @@ def pair(
     except InvalidCode as e:
         logger.warning(
             "Emparejamiento: código no válido desde %s%s",
-            resolve_client_ip(request),
+            client_ip_for_log(request),
             "; anulados los códigos abiertos tras varios fallos" if e.burned else "",
         )
         raise HTTPException(status_code=400, detail="invalid or expired code") from None

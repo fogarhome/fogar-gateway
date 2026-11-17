@@ -16,6 +16,8 @@ dependencies = [
     "click>=8.5.0",
     "rich>=15.0.0",
     "questionary>=2.1.1",
+    "cryptography>=46.0.0",
+    "segno>=1.6.6",
 ]
 
 [project.scripts]
@@ -24,7 +26,7 @@ fogar-gw = "fogar_gateway.cli.__main__:main"
 [project.optional-dependencies]
 dev = [
     "pytest>=9.1.1,<9.3.0",
-    "pytest-asyncio>=1.4.0,<1.5.0",
+    "pytest-asyncio>=1.4.0,<1.6.0",
     "respx>=0.23.1",
     "ruff>=0.15.21",
     "mypy>=1.20",

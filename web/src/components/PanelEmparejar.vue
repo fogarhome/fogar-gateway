@@ -1,32 +1,103 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue'
-import { cancelPairing, getPairing, openPairing } from '@/api/admin'
+import { cancelPairing, getPairing, listPairings, openPairing } from '@/api/admin'
 import { ApiError } from '@/api/http'
 import type { PairingOpened, PairingState } from '@/api/types'
+import { toast } from '@/lib/toasts'
+import { useClientsStore } from '@/stores/clients'
 import FgBoton from './FgBoton.vue'
 
 // Emparejar un aparato: abre un código de 6 cifras (10 min, un solo uso) y espera a que el aparato lo
 // canjee. El código solo vive aquí: no se guarda ni se registra. Al cerrar el panel, se anula.
+// La cuenta atrás va desde que llega el código, no contra `expires_at`: el reloj del navegador puede
+// ir desfasado. 600 s es CODE_TTL_S de services/pairing.py (el servidor no manda la duración); el
+// margen cubre la ida y vuelta del POST, para no enseñar como válido un código que el servidor ya caducó.
+const DURACION_MS = 600_000
+const MARGEN_MS = 5_000
 const emit = defineEmits<{ cerrar: []; emparejado: [clientId: string, nombre: string | null] }>()
 
 const abierto = shallowRef<PairingOpened | null>(null)
 const estado = ref<PairingState | 'abriendo' | 'error'>('abriendo')
 const error = ref('')
-const ahora = ref(Date.now())
+const lleno = ref(false) // 409: ya hay 5 códigos abiertos
+const clients = useClientsStore()
+const ahora = ref(performance.now())
+let recibido = 0
+let fuera = false // el panel ya se cerró o se desmontó
+let intento = 0 // cada abrir() y cada pagehide lo suben: un POST de antes anula el código que reciba
 let sondeo: ReturnType<typeof setInterval> | undefined
 let reloj: ReturnType<typeof setInterval> | undefined
 
-async function abrir(): Promise<void> {
+/** Anula el código recibido salvo que ya se haya usado: aunque aquí parezca caducado, puede seguir abierto. */
+function anular(): void {
+  const p = abierto.value
+  abierto.value = null
+  if (p && estado.value !== 'used') void cancelPairing(p.id).catch((e) => void siYaSeUso(p, e))
+}
+
+/** Recargar o cerrar la pestaña no desmonta el panel: el código se anula con un DELETE que
+ * sobrevive a la página (G-r6-1). Si vuelve de la caché del navegador, ofrece otro código.
+ * Con el POST de abrir en vuelo (G-r7-2): si la página vuelve de la caché, abrir() anula el código
+ * que llegue; si se recarga o se cierra, ya no corre JS y ese código queda abierto hasta 10 min
+ * (sin que nadie lo vea). Se anula con «Anular los abiertos» y MAX_FAILED lo protege. */
+function alSalirDeLaPagina(): void {
+  if (estado.value === 'abriendo') intento++
+  const p = abierto.value
+  if (!p || estado.value === 'used') return
+  abierto.value = null
+  estado.value = 'cancelled'
+  void cancelPairing(p.id, true).catch(() => undefined)
+}
+
+/** G-r7-3: al volver de la caché del navegador con el código a medio abrir, pide otro. */
+function alVolverALaPagina(e: PageTransitionEvent): void {
+  if (e.persisted && estado.value === 'abriendo' && !fuera) void abrir()
+}
+
+/** Con 5 códigos abiertos (p. ej. de pestañas cerradas a destiempo), los anula todos y abre uno. */
+async function anularAbiertos(): Promise<void> {
   estado.value = 'abriendo'
   try {
-    abierto.value = await openPairing()
+    const abiertos = await listPairings()
+    await Promise.all(abiertos.map((p) => cancelPairing(p.id).catch(() => undefined)))
+  } catch {
+    // abrir() dirá si sigue sin poder
+  }
+  await abrir()
+}
+
+/** El DELETE da 404 si el código ya no estaba abierto: puede que un aparato acabe de canjearlo. */
+async function siYaSeUso(p: PairingOpened, e: unknown): Promise<void> {
+  if (!(e instanceof ApiError && e.kind === 'not-found')) return
+  const r = await getPairing(p.id).catch(() => null)
+  if (r?.state !== 'used' || !r.client_id) return
+  if (!fuera) return emit('emparejado', r.client_id, r.client_name)
+  // Panel ya cerrado: no queda quien escuche el evento.
+  toast('ok', `${r.client_name ?? 'El aparato'} ya habla con Fogar`, 'Revisa sus ajustes si quieres cambiarlos.')
+  void clients.refresh()
+}
+
+async function abrir(): Promise<void> {
+  anular() // «Otro código» no deja el anterior abierto
+  estado.value = 'abriendo'
+  const mio = ++intento
+  try {
+    const p = await openPairing()
+    if (fuera || mio !== intento) {
+      void cancelPairing(p.id).catch(() => undefined)
+      return
+    }
+    abierto.value = p
+    recibido = performance.now()
+    ahora.value = recibido
     estado.value = 'open'
   } catch (e) {
+    if (fuera || mio !== intento) return
     estado.value = 'error'
-    error.value =
-      e instanceof ApiError && e.kind === 'conflict'
-        ? 'Ya hay 5 códigos abiertos. Espera a que caduquen o anúlalos.'
-        : 'No he podido abrir un código. Prueba otra vez.'
+    lleno.value = e instanceof ApiError && e.kind === 'conflict'
+    error.value = lleno.value
+      ? 'Ya hay 5 códigos abiertos. Espera a que caduquen o anúlalos.'
+      : 'No he podido abrir un código. Prueba otra vez.'
   }
 }
 
@@ -35,6 +106,7 @@ async function comprobar(): Promise<void> {
   if (!p || estado.value !== 'open') return
   try {
     const r = await getPairing(p.id)
+    if (abierto.value !== p) return // respuesta de un código anterior
     estado.value = r.state
     if (r.state === 'used' && r.client_id) emit('emparejado', r.client_id, r.client_name)
   } catch {
@@ -45,33 +117,36 @@ async function comprobar(): Promise<void> {
 const restante = computed(() => {
   const p = abierto.value
   if (!p) return 0
-  return Math.max(0, Math.round((Date.parse(p.expires_at) - ahora.value) / 1000))
+  return Math.max(0, Math.round((recibido + DURACION_MS - MARGEN_MS - ahora.value) / 1000))
 })
 const cuenta = computed(() => `${Math.floor(restante.value / 60)}:${String(restante.value % 60).padStart(2, '0')}`)
-const progreso = computed(() => `${Math.min(100, (restante.value / 600) * 100)}%`)
+const progreso = computed(() => `${Math.min(100, ((restante.value * 1000) / (DURACION_MS - MARGEN_MS)) * 100)}%`)
 const codigo = computed(() => abierto.value?.code ?? '')
 const codigoVisible = computed(() => `${codigo.value.slice(0, 3)} ${codigo.value.slice(3)}`)
 
 async function cerrar(): Promise<void> {
-  const p = abierto.value
-  if (p && estado.value === 'open') void cancelPairing(p.id).catch(() => undefined)
-  abierto.value = null
+  fuera = true
+  anular()
   emit('cerrar')
 }
 
 onMounted(() => {
+  window.addEventListener('pagehide', alSalirDeLaPagina)
+  window.addEventListener('pageshow', alVolverALaPagina)
   void abrir()
   sondeo = setInterval(() => void comprobar(), 2000)
   reloj = setInterval(() => {
-    ahora.value = Date.now()
+    ahora.value = performance.now()
     if (estado.value === 'open' && restante.value === 0) estado.value = 'expired'
   }, 1000)
 })
 onBeforeUnmount(() => {
+  window.removeEventListener('pagehide', alSalirDeLaPagina)
+  window.removeEventListener('pageshow', alVolverALaPagina)
   clearInterval(sondeo)
   clearInterval(reloj)
-  const p = abierto.value
-  if (p && estado.value === 'open') void cancelPairing(p.id).catch(() => undefined)
+  fuera = true
+  anular()
 })
 </script>
 
@@ -96,6 +171,7 @@ onBeforeUnmount(() => {
     </template>
     <template v-else-if="estado === 'error'">
       <p class="fg-suave">{{ error }}</p>
+      <FgBoton v-if="lleno" variante="principal" @click="anularAbiertos">Anular los abiertos</FgBoton>
       <FgBoton @click="abrir">Probar otra vez</FgBoton>
     </template>
     <p v-else class="fg-suave">Emparejado.</p>

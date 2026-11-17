@@ -17,6 +17,17 @@ def test_from_hello_ok_basic():
     assert info.max_payload == 26214400
     assert info.default_agent_id == "assistant"
     assert info.agents == []
+    assert info.scopes == ["operator.read", "operator.write"] and not info.admin
+
+
+def test_from_hello_ok_scopes_with_admin_and_junk():
+    payload = {**HELLO_OK_PAYLOAD, "auth": {"scopes": ["operator.admin", {"x": 1}, "bad scope"]}}
+    info = GatewayInfo.from_hello_ok(payload)
+    assert info.scopes == ["operator.admin"] and info.admin
+    assert GatewayInfo.from_hello_ok({**HELLO_OK_PAYLOAD, "auth": "nope"}).scopes is None
+    # Sin auth.scopes (servidores ≥ 2026.6.11 que no los anuncian): desconocidos, no ninguno.
+    no_scopes = GatewayInfo.from_hello_ok({**HELLO_OK_PAYLOAD, "auth": {"role": "operator"}})
+    assert no_scopes.scopes is None and not no_scopes.admin
 
 
 def test_from_hello_ok_minimal():
@@ -104,3 +115,10 @@ def test_tool_call_update_phase_returns_none():
 def test_tool_call_missing_required_fields_returns_none():
     assert ToolCallEvent.from_session_tool_payload({"phase": "start"}) is None
     assert ToolCallEvent.from_session_tool_payload({"phase": "start", "name": "exec"}) is None
+
+
+def test_agents_list_ids_are_lowercased_like_the_gateway():
+    # Revisión de C-1: el gateway lo compara todo en minúsculas.
+    info = GatewayInfo.from_hello_ok({})
+    info.update_agents_from_list({"defaultId": "Main", "agents": [{"id": "Main"}]})
+    assert info.agents == ["main"] and info.default_agent_id == "main"

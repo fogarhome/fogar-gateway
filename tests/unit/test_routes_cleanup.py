@@ -17,7 +17,8 @@ import pytest
 
 from fogar_gateway.api import routes
 from fogar_gateway.models.schemas import Client, ClientConfig
-from fogar_gateway.services.openclaw.registry import ClientRegistry
+from fogar_gateway.services.conversations import Conversation, ConversationIndex, conversation_day
+from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
 from fogar_gateway.services.session_registry import SessionRegistry
 
 CLIENT_KEY = "test-key"
@@ -72,8 +73,21 @@ def _make_app_state(orchestrator_ping_result=True):
         openclaw=orchestrator,
         speech=SimpleNamespace(tts=AsyncMock(), stt=AsyncMock()),
         client_registry=ClientRegistry(),
+        turn_registry=TurnRegistry(),
         session_registry=SessionRegistry(),
+        conversations=_FakeConversations(),
     ), orchestrator
+
+
+class _FakeConversations:
+    """Only what routes.py asks for: the client's default conversation of the day."""
+
+    def __init__(self):
+        self.index = ConversationIndex()
+
+    async def default_for(self, client_id, agent, day=None):
+        day = day or conversation_day()
+        return Conversation("conv-1", client_id, agent, f"agent:{agent}:fogar-conv-1", "default", day)
 
 
 @pytest.fixture(autouse=True)
@@ -122,7 +136,7 @@ async def test_connect_internal_services_failure_leaves_no_zombie_session(monkey
     assert len(sessions) == 1
     assert sessions[0].status == "error"
     assert sessions[0].ended_at is not None
-    assert ws.closed_with == (1011, "Problema estableciendo microservicios internos del hub.")
+    assert ws.closed_with == (1011, "session setup failed")
 
 
 async def test_session_end_reaches_client_before_socket_close():
@@ -184,6 +198,6 @@ async def test_session_construction_failure_closes_writer_and_session(
     sessions = app_state.session_registry.get_all()
     assert len(sessions) == (1 if registered else 0)
     assert all(s.status == "error" for s in sessions)
-    assert ws.closed_with == (1011, "Problema estableciendo microservicios internos del hub.")
+    assert ws.closed_with == (1011, "session setup failed")
     assert "RuntimeError" in caplog.text
     assert secret not in caplog.text

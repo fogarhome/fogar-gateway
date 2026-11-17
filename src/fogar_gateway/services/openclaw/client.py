@@ -2,27 +2,46 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
 from collections.abc import AsyncGenerator, Callable
+from dataclasses import dataclass, field
 
 import websockets
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
 from fogar_gateway.core.config import settings
+from fogar_gateway.core.logging import fingerprint_key, pin_websockets_logging
 from fogar_gateway.services.openclaw import frames
 from fogar_gateway.services.openclaw.chat_text import ChatTextTracker
+from fogar_gateway.services.openclaw.device import (
+    DeviceFileError,
+    DeviceIdentity,
+    DeviceStore,
+    StoredDeviceToken,
+    build_auth_payload_v3,
+)
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
-from fogar_gateway.services.openclaw.models import GatewayInfo, ToolCallEvent
+from fogar_gateway.services.openclaw.models import (
+    AuthMethod,
+    GatewayInfo,
+    IdentityError,
+    OrchestratorAccess,
+    ToolCallEvent,
+    approve_command,
+)
 from fogar_gateway.services.openclaw.registry import (
     TURN_IN_PROGRESS_ERROR,
     TURN_OVERFLOW_ERROR,
     TurnInProgress,
     TurnRegistry,
 )
-from fogar_gateway.services.protocol import OrchestratorEvent
+from fogar_gateway.services.protocol import ACCEPTED, OrchestratorEvent
 from fogar_gateway.services.reconnection import describe_error, traceback_no_message
 from fogar_gateway.services.teardown import Teardown
+from fogar_gateway.services.text import without_lone_surrogates
+from fogar_gateway.services.turn_progress import chat_status_phase
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +58,23 @@ ORCHESTRATOR_SEND_FAILED_ERROR = "orchestrator_send_failed"  # chat.send could n
 ORCHESTRATOR_UNAVAILABLE_ERROR = "orchestrator_unavailable"  # not connected / reconnecting
 ORCHESTRATOR_ERROR = "orchestrator_error"  # OpenClaw rejected the turn, or an internal failure
 ORCHESTRATOR_HANDSHAKE_FAILED_ERROR = "orchestrator_handshake_failed"  # connect() handshake
+# OpenClaw accepted the token but waits for the operator to approve this device (`last_error`).
+ORCHESTRATOR_PAIRING_REQUIRED_ERROR = "orchestrator_pairing_required"
+# OpenClaw asks for device identity but the gateway could not send it (identity file unusable,
+# or a challenge without nonce): approving on OpenClaw would not help.
+ORCHESTRATOR_DEVICE_IDENTITY_REQUIRED_ERROR = "orchestrator_device_identity_required"
 
 _TERMINAL = ("aborted", "final", "error")  # terminal `chat` states
+
+# Métodos que `request()` deja llamar (M19): solo lectura (`operator.read`). Ningún método de
+# admin (`sessions.reset`, `config.*`…) sale del gateway aunque la conexión tenga el permiso.
+READ_METHODS = frozenset({"sessions.list", "chat.history"})
+
+
+class OrchestratorRequestError(RuntimeError):
+    """Una petición de lectura (`request()`) no obtuvo respuesta. Su mensaje es siempre un
+    código estable: `orchestrator_unavailable` (sin conexión, envío fallido, sin respuesta a
+    tiempo) u `orchestrator_error` (OpenClaw la rechazó)."""
 
 
 class OrchestratorHandshakeError(RuntimeError):
@@ -61,6 +95,69 @@ class OrchestratorRejectedError(OrchestratorHandshakeError):
 class OrchestratorStartingError(OrchestratorHandshakeError):
     """OpenClaw was still starting (startup-sidecars) when the retry budget ran out: the same
     stable code, but not a rejected token (`fogar-gw onboard` tells them apart)."""
+
+
+class OrchestratorPairingRequired(OrchestratorRejectedError):
+    """OpenClaw answered `connect` with `NOT_PAIRED` / `details.code: PAIRING_REQUIRED` to a
+    connect that carried the device proof: the operator has to approve this device once with
+    `openclaw devices approve <request_id>`. OpenClaw checks the credential before pairing, so
+    the credential in `auth_method` was accepted (`fogar-gw onboard` claims the shared token
+    only when that is what was sent). Its own stable code, so `last_error` says it;
+    `request_id` is the pending request (sanitized, or None)."""
+
+    stable_code = ORCHESTRATOR_PAIRING_REQUIRED_ERROR
+
+    def __init__(self, request_id: str | None, auth_method: AuthMethod = "shared_token") -> None:
+        RuntimeError.__init__(self, ORCHESTRATOR_PAIRING_REQUIRED_ERROR)
+        self.request_id = request_id
+        self.auth_method = auth_method
+
+
+class OrchestratorDeviceIdentityRequired(OrchestratorRejectedError):
+    """OpenClaw asks for device identity (`PAIRING_REQUIRED` or `DEVICE_IDENTITY_REQUIRED`) but
+    this connect carried no device proof: `cause` says why (`identity_file_invalid`: the
+    identity file is unusable or cannot be created; `challenge_without_nonce`: nothing to
+    sign). Approving anything on OpenClaw would not help, so it is not a pairing request."""
+
+    stable_code = ORCHESTRATOR_DEVICE_IDENTITY_REQUIRED_ERROR
+
+    def __init__(self, cause: IdentityError) -> None:
+        RuntimeError.__init__(self, ORCHESTRATOR_DEVICE_IDENTITY_REQUIRED_ERROR)
+        self.cause = cause
+
+
+class _DeviceTokenRejected(Exception):
+    """Internal: OpenClaw refused the stored device token (already dropped); never escapes
+    _do_connect, which retries once with the shared token."""
+
+
+# `details.code` that mean the stored device token no longer works (revoked, rotated, device
+# removed → device_token_mismatch; approved scopes narrowed → scope_mismatch). Server 2026.10.5,
+# `resolveConnectAuthDecisionCore` + `connect-error-details`.
+_DEVICE_TOKEN_REJECTED = frozenset({"AUTH_DEVICE_TOKEN_MISMATCH", "AUTH_SCOPE_MISMATCH"})
+_PAIRING_REQUIRED = "PAIRING_REQUIRED"
+_IDENTITY_REQUIRED = frozenset({_PAIRING_REQUIRED, "DEVICE_IDENTITY_REQUIRED"})
+# OpenClaw's own PAIRING_CONNECT_REQUEST_ID_PATTERN: anything else is not echoed.
+_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+
+
+def _pairing_request_id(details: object) -> str | None:
+    rid = details.get("requestId") if isinstance(details, dict) else None
+    return rid if isinstance(rid, str) and _REQUEST_ID_RE.fullmatch(rid) else None
+
+
+@dataclass
+class _AuthPlan:
+    """What one `connect` sends: credential, scopes and (if the challenge has a nonce and the
+    identity is usable) the signed device block; `identity_error` says why there is none."""
+
+    method: AuthMethod
+    token: str = field(repr=False)
+    scopes: list[str] = field(default_factory=list)
+    identity: DeviceIdentity | None = None
+    stored: StoredDeviceToken | None = None
+    device: dict | None = None
+    identity_error: IdentityError | None = None
 
 
 # OpenClaw ≥2026.11 answers `connect` with a retryable UNAVAILABLE while its startup sidecars
@@ -134,6 +231,52 @@ def _safe_error_code(error: object) -> str:
     return "unspecified"
 
 
+def _loads_frame(raw: str | bytes):
+    """json.loads de una trama de OpenClaw sin surrogates sueltos (G-r3-1): romperían después
+    todo encode a UTF-8 (la salida al cliente, /admin, /v1). Solo re-codifica si la trama trae
+    un escape de surrogate o es binaria. El texto de un evento `chat` (`deltaText`, `message`) queda intacto:
+    un emoji puede llegar partido entre dos deltas y lo junta y limpia ChatTextTracker (B-r4-1)."""
+    frame = json.loads(raw)  # bytes: json.loads detecta la codificación y conserva los surrogates
+    # C-r4-1: una trama binaria puede traer un surrogate crudo sin el escape \ud: se limpia
+    # siempre (OpenClaw manda texto; el binario es raro).
+    if not isinstance(raw, bytes) and "\\ud" not in raw and "\\uD" not in raw:
+        return frame
+    if not isinstance(frame, dict):
+        return without_lone_surrogates(frame)  # _handle_raw_frame lo rechaza igual
+    original = frame.get("payload")
+    con_payload = isinstance(original, dict)
+    payload: dict = original if isinstance(original, dict) else {}
+    routing = _routing(frame, payload)
+    text = {}
+    if frame.get("event") == "chat":
+        text = {k: payload.pop(k) for k in ("deltaText", "message") if k in payload}
+    claves = len(frame)
+    frame = without_lone_surrogates(frame)
+    limpio = frame.get("payload")
+    # B-r6-2: una clave de primer nivel que choca al limpiar ("payload\ud800", "id\ud800")
+    # pisa otra; un payload objeto que deja de serlo, igual.
+    if len(frame) != claves or (con_payload and not isinstance(limpio, dict)):
+        raise ValueError("lone surrogate in a frame key")
+    # B-r7-1: sin `and con_payload`: un "payload\ud800" que limpio aparece como payload
+    # trae su sessionKey y el chequeo de enrutado de abajo lo descarta.
+    payload = limpio if isinstance(limpio, dict) else {}
+    # B-r5-1, B-r6-1: una clave limpiada sería la de otra sesión, turno o petición (también en
+    # un `res` de error sin payload); la trama se descarta (_listen).
+    if _routing(frame, payload) != routing:
+        raise ValueError("lone surrogate in a routing key")
+    payload.update(text)
+    return frame
+
+
+def _routing(frame: dict, payload: dict) -> list:
+    """Lo que enruta una trama: su `id` (respuesta a una petición) y las claves de sesión y
+    turno del payload (`runIds`: los turnos que cortó un `chat.abort`)."""
+    return [frame.get("id"), payload.get("runIds"), *(payload.get(k) for k in _ROUTING_KEYS)]
+
+
+_ROUTING_KEYS = ("sessionKey", "runId")
+
+
 def _log_safe(value: object) -> str:
     """Server-provided scalar rendered for a log line: short, single-line."""
     return str(value).replace("\n", " ").replace("\r", " ")[:40]
@@ -153,10 +296,25 @@ class OpenClawClient:
         token: str,
         turn_registry: TurnRegistry,
         dispatcher: FrameDispatcher,
+        device_store: DeviceStore | None = None,
+        access: OrchestratorAccess | None = None,
+        use_device_token: bool = True,
+        tls: bool = False,
     ) -> None:
+        # Key of the stored device token: the configured OpenClaw `host:port`.
+        self._gateway = f"{host}:{port}"
+        self._device_store = device_store if device_store is not None else DeviceStore()
+        # False (`fogar-gw onboard`): always the shared token, so it is what gets tested; the
+        # identity still signs, so pairing is detected (and a token issued is still stored).
+        self._use_device_token = use_device_token
+        # Updated in place (main.py shares it with /admin/state); never replaced.
+        self.access = access if access is not None else OrchestratorAccess()
+        self._pairing_logged: str | None = None  # last pending request logged at WARNING
+        self._identity_warned = False
         # An IPv6 literal (`::1`) goes in brackets inside the URI, unless it already has them.
         bare_ipv6 = ":" in host and not host.startswith("[")
-        self._uri = f"ws://[{host}]:{port}" if bare_ipv6 else f"ws://{host}:{port}"
+        scheme = "wss" if tls else "ws"
+        self._uri = f"{scheme}://[{host}]:{port}" if bare_ipv6 else f"{scheme}://{host}:{port}"
         self._token = token
         self._turn_registry = turn_registry
         self._dispatcher = dispatcher
@@ -171,9 +329,16 @@ class OpenClawClient:
         self.on_disconnect: Callable[[], None] | None = None
 
     async def connect(self) -> GatewayInfo:
+        pin_websockets_logging()  # `websockets` a DEBUG volcaría el `connect` con el token
         async with self._connect_lock:
             await self._cancel_and_close()
-            return await self._do_connect()
+            try:
+                return await self._do_connect()
+            except (OrchestratorPairingRequired, OrchestratorDeviceIdentityRequired):
+                raise  # access already says pending / identity_required
+            except BaseException:
+                self.access.reset()  # no connection now: no stale admin/paired/pending
+                raise
 
     async def _do_connect(self) -> GatewayInfo:
         """One handshake; while OpenClaw is still starting its sidecars, another on a new
@@ -182,9 +347,15 @@ class OpenClawClient:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _STARTUP_RETRY_BUDGET_S
         retries = 0
+        skip_device_token = False
         while True:
             try:
-                return await self._connect_once()
+                return await self._connect_once(skip_device_token)
+            except _DeviceTokenRejected:
+                if skip_device_token:  # cannot happen (no device token sent): never loop
+                    raise OrchestratorRejectedError() from None
+                skip_device_token = True  # once, on a new socket, with the shared token
+                continue
             except _StartupPending as e:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
@@ -202,7 +373,7 @@ class OpenClawClient:
                 retries += 1
                 await asyncio.sleep(wait_s)  # the failed attempt already closed its socket
 
-    async def _connect_once(self) -> GatewayInfo:
+    async def _connect_once(self, skip_device_token: bool = False) -> GatewayInfo:
         # Last roster known from a previous connect, kept as fallback if agents.list
         # fails on this one (#151). Captured before gateway_info is rebuilt below.
         previous_agents = list(self.gateway_info.agents) if self.gateway_info else []
@@ -215,19 +386,44 @@ class OpenClawClient:
             if frame.get("event") != "connect.challenge":
                 raise OrchestratorHandshakeError()
 
+            plan = await self._plan_auth(frame.get("payload"), skip_device_token)
             req_id = str(uuid.uuid4())
-            await self._ws.send(json.dumps(frames.connect_backend(req_id, self._token)))
+            connect = frames.connect_backend(
+                req_id,
+                plan.token,
+                scopes=plan.scopes,
+                device=plan.device,
+                device_token=plan.method == "device_token",
+            )
+            await self._ws.send(json.dumps(connect))
 
             raw = await asyncio.wait_for(self._ws.recv(), timeout=30.0)
             hello = self._parse_handshake_frame(raw)
             if not hello.get("ok"):
-                wait_s = _startup_retry_after_s(hello.get("error"))
+                error = hello.get("error")
+                wait_s = _startup_retry_after_s(error)
                 if wait_s is not None:
                     raise _StartupPending(wait_s)
+                rejected = hello.get("type") == "res" and hello.get("ok") is False
+                details = error.get("details") if isinstance(error, dict) else None
+                detail_code = _safe_error_code(details)
+                if rejected and plan.method == "device_token" and detail_code in _DEVICE_TOKEN_REJECTED:
+                    await self._forget_device_token(detail_code, plan.token)
+                    raise _DeviceTokenRejected()
+                if rejected and detail_code in _IDENTITY_REQUIRED and plan.device is None:
+                    cause = plan.identity_error or "challenge_without_nonce"
+                    self._mark_identity_required(cause, detail_code)
+                    raise OrchestratorDeviceIdentityRequired(cause)
+                if rejected and detail_code == _PAIRING_REQUIRED:
+                    request_id = _pairing_request_id(details)
+                    self._mark_pairing_pending(request_id, plan, details)
+                    raise OrchestratorPairingRequired(request_id, plan.method)
                 logger.warning(
-                    "OpenClaw rejected the handshake (code=%s)", _safe_error_code(hello.get("error"))
+                    "OpenClaw rejected the handshake (code=%s, detail=%s)",
+                    _safe_error_code(error),
+                    detail_code,
                 )
-                if hello.get("type") == "res" and hello.get("ok") is False:
+                if rejected:
                     raise OrchestratorRejectedError()  # a real `ok:false` answer to `connect`
                 raise OrchestratorHandshakeError()  # an event, or a `res` without ok:false
             hello_payload = hello.get("payload") or {}
@@ -235,18 +431,21 @@ class OpenClawClient:
                 raise OrchestratorHandshakeError()
             self.gateway_info = GatewayInfo.from_hello_ok(hello_payload)
             self._log_hello(hello_payload)
+            await self._accept_hello(hello_payload, plan)
             self._apply_frame_limit(self.gateway_info.max_payload, limit)
 
             agents_req_id = str(uuid.uuid4())
             await self._ws.send(json.dumps(frames.agents_list(agents_req_id)))
             agents_res = await self._recv_matching(agents_req_id, timeout=10.0)
-            if agents_res.get("ok"):
-                self.gateway_info.update_agents_from_list(agents_res.get("payload", {}))
-            else:
+            # A malformed payload counts as `ok:false` (B-1): keep the last roster.
+            if not (
+                agents_res.get("ok")
+                and self.gateway_info.update_agents_from_list(agents_res.get("payload"))
+            ):
                 # Only the short code, never OpenClaw's error text (#228).
                 logger.warning(
                     "agents.list failed at connect (code=%s)",
-                    _safe_error_code(agents_res.get("error")),
+                    _safe_error_code(agents_res.get("error")) if not agents_res.get("ok") else "malformed",
                 )
                 if previous_agents:
                     # Wiping the roster would make has_agent() reject every named
@@ -255,6 +454,11 @@ class OpenClawClient:
                     logger.warning(
                         f"keeping last known agent roster ({len(previous_agents)} agents)"
                     )
+
+            default_agent = settings.DEFAULT_AGENT
+            if default_agent and self.gateway_info.agents and default_agent not in self.gateway_info.agents:
+                # #245: un DEFAULT_AGENT mal puesto no impide arrancar; los turnos que lo usen fallarán.
+                logger.warning("DEFAULT_AGENT=%s is not in OpenClaw's agent roster", default_agent)
 
             sub_id = str(uuid.uuid4())
             await self._ws.send(json.dumps(frames.sessions_subscribe(sub_id)))
@@ -278,12 +482,187 @@ class OpenClawClient:
                     logger.debug("OpenClaw: cierre del socket tras connect fallido (%s)", describe_error(e))
                 self._ws = None
 
+    # ── Device identity and auth (docs/openclaw-protocol.md, «2026-11-13») ──
+
+    async def _plan_auth(self, challenge: object, skip_device_token: bool) -> _AuthPlan:
+        """Credential for this `connect`: the stored device token of this OpenClaw `host:port`
+        (with its stored scopes, like the reference client), else the shared token. With a
+        challenge nonce (every real OpenClaw), the device block signs the v3 payload; without
+        one (an old or fake server) the connect goes without device identity. One file read
+        per connect, off the event loop."""
+        payload = challenge if isinstance(challenge, dict) else {}
+        nonce = payload.get("nonce")
+        nonce = nonce.strip() if isinstance(nonce, str) else ""
+        identity: DeviceIdentity | None = None
+        stored: StoredDeviceToken | None = None
+        identity_error: IdentityError | None = None
+        if nonce:
+            loaded = await self._load_identity()
+            if loaded is None:
+                identity_error = "identity_file_invalid"
+            else:
+                identity, stored = loaded
+        else:
+            identity_error = "challenge_without_nonce"
+        if skip_device_token or not self._use_device_token:
+            stored = None
+        if stored is not None:
+            scopes = list(stored.scopes or frames.OPERATOR_SCOPES)
+            plan = _AuthPlan("device_token", stored.token, scopes, identity, stored)
+        else:
+            plan = _AuthPlan("shared_token", self._token, list(frames.OPERATOR_SCOPES), identity)
+        plan.identity_error = identity_error
+        if identity is None:
+            return plan
+        ts = payload.get("ts")
+        # Like the reference client: the challenge's `ts` (a safe integer), else the clock.
+        signed_at = int(time.time() * 1000)
+        if isinstance(ts, int) and not isinstance(ts, bool) and 0 <= ts < 2**53:
+            signed_at = ts
+        signature = identity.sign(
+            build_auth_payload_v3(
+                device_id=identity.device_id,
+                client_id=frames.CLIENT_ID,
+                client_mode=frames.CLIENT_MODE,
+                role=frames.ROLE,
+                scopes=plan.scopes,
+                signed_at_ms=signed_at,
+                token=plan.token,
+                nonce=nonce,
+                platform=frames.CLIENT_PLATFORM,
+            )
+        )
+        plan.device = {
+            "id": identity.device_id,
+            "publicKey": identity.public_key,
+            "signature": signature,
+            "signedAt": signed_at,
+            "nonce": nonce,
+        }
+        return plan
+
+    async def _load_identity(self) -> tuple[DeviceIdentity, StoredDeviceToken | None] | None:
+        """The install's identity (created on first use) and the device token stored for this
+        OpenClaw, in one read on a worker thread. If the file is unusable the connect goes
+        without device identity (enough on the same host) and says so once."""
+        try:
+            identity, stored = await asyncio.to_thread(self._device_store.load_for, self._gateway)
+        except (DeviceFileError, OSError) as e:
+            if not self._identity_warned:
+                self._identity_warned = True
+                logger.warning(
+                    "OpenClaw: sin identidad de dispositivo (%s en %s); solo vale con OpenClaw en "
+                    "esta misma máquina. Revísalo con `fogar-gw doctor`.",
+                    describe_error(e),
+                    self._device_store.path,
+                )
+            return None
+        self._identity_warned = False
+        self.access.device_id = identity.device_id
+        return identity, stored
+
+    async def _forget_device_token(self, detail_code: str, token: str) -> None:
+        logger.warning(
+            "OpenClaw rechazó el token de dispositivo (detail=%s): se borra y se reintenta con "
+            "el token compartido",
+            detail_code,
+        )
+        try:
+            await asyncio.to_thread(self._device_store.clear_token, self._gateway, token)
+        except (DeviceFileError, OSError) as e:
+            logger.warning(
+                "OpenClaw: no se pudo borrar el token de dispositivo (%s)", describe_error(e)
+            )
+
+    def _mark_pairing_pending(
+        self, request_id: str | None, plan: _AuthPlan, details: object
+    ) -> None:
+        """Once per pending request at WARNING (the approval command); every retry at DEBUG."""
+        self.access.reset()
+        self.access.pairing = "pending"
+        self.access.pairing_request_id = request_id
+        device = plan.identity.device_id[:12] if plan.identity else "?"
+        next_step = details.get("recommendedNextStep") if isinstance(details, dict) else None
+        if self._pairing_logged != (request_id or "?"):
+            self._pairing_logged = request_id or "?"
+            logger.warning(
+                "OpenClaw espera que apruebes este gateway como dispositivo (petición %s, "
+                "device=%s). En la máquina de OpenClaw: `%s`. El gateway reintenta solo.",
+                request_id or "?",
+                device,
+                approve_command(request_id),
+            )
+        logger.debug(
+            "OpenClaw: emparejamiento pendiente (next=%s)",
+            next_step if isinstance(next_step, str) and _REQUEST_ID_RE.fullmatch(next_step) else None,
+        )
+
+    def _mark_identity_required(self, cause: IdentityError, detail_code: str) -> None:
+        """OpenClaw wants a device proof this connect could not carry: the real cause, once per
+        cause at WARNING, never an approval command (there is nothing to approve)."""
+        self.access.reset()
+        self.access.pairing = "identity_required"
+        self.access.identity_error = cause
+        if self._pairing_logged != cause:
+            self._pairing_logged = cause
+            why = (
+                f"el fichero de identidad {self._device_store.path} no vale o no se puede crear"
+                if cause == "identity_file_invalid"
+                else "el reto de OpenClaw no trae nonce que firmar"
+            )
+            logger.warning(
+                "OpenClaw exige identidad de dispositivo (detail=%s) y el gateway no puede "
+                "mandarla: %s. Revísalo con `fogar-gw doctor`.",
+                detail_code,
+                why,
+            )
+
+    async def _accept_hello(self, payload: dict, plan: _AuthPlan) -> None:
+        """Persist `hello-ok.auth.deviceToken` (`DeviceStore.accept_token`: new or different →
+        saved; the same one keeps its stored scopes unless hello-ok announces broader ones)
+        and publish the access this connection got. A failed write is logged: the connection
+        still works."""
+        auth = payload.get("auth")
+        token = auth.get("deviceToken") if isinstance(auth, dict) else None
+        token = token.strip() if isinstance(token, str) else ""
+        scopes = self.gateway_info.scopes if self.gateway_info else None
+        paired = plan.method == "device_token"
+        if plan.identity is not None and token and len(token) <= 4096:
+            paired = True
+            try:
+                update = await asyncio.to_thread(
+                    self._device_store.accept_token, self._gateway, token, scopes
+                )
+                if update != "unchanged":
+                    logger.info(
+                        "OpenClaw: token de dispositivo %s (device=%s, fp=%s, scopes=%s)",
+                        "guardado" if update == "saved" else "con permisos ampliados",
+                        plan.identity.device_id[:12],
+                        fingerprint_key(token),
+                        ",".join(scopes) if scopes is not None else "desconocidos",
+                    )
+            except (DeviceFileError, OSError) as e:
+                logger.warning(
+                    "OpenClaw: no se pudo guardar el token de dispositivo (%s)", describe_error(e)
+                )
+        self._pairing_logged = None
+        self.access.reset()
+        self.access.scopes = list(scopes) if scopes is not None else None
+        self.access.auth_method = plan.method
+        self.access.pairing = "paired" if paired else "not_required"
+        logger.info(
+            "OpenClaw: acceso %s (auth=%s, pairing=%s)",
+            "permisos desconocidos" if scopes is None else ",".join(scopes) or "sin permisos",
+            plan.method,
+            self.access.pairing,
+        )
+
     @staticmethod
     def _parse_handshake_frame(raw: str | bytes) -> dict:
         """A handshake frame that is not a JSON object is a handshake failure with a
         stable reason, never a stray AttributeError/JSONDecodeError (#228)."""
         try:
-            frame = json.loads(raw)
+            frame = _loads_frame(raw)
         except ValueError:
             raise OrchestratorHandshakeError() from None
         if not isinstance(frame, dict):
@@ -327,12 +706,18 @@ class OpenClawClient:
             if remaining <= 0:
                 raise TimeoutError(f"No response for req_id={req_id} within {timeout}s")
             raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
-            frame = json.loads(raw)
+            try:
+                frame = _loads_frame(raw)
+            except ValueError:  # p. ej. un evento ajeno con clave sucia (B-r5-1): se ignora
+                continue
             if frame.get("id") == req_id:
                 return frame
 
     async def close(self) -> None:
-        await self._cancel_and_close()
+        try:
+            await self._cancel_and_close()
+        finally:
+            self.access.reset()
 
     async def _cancel_and_close(self) -> None:
         """Teardown used by close() and by connect() before it establishes a new
@@ -370,30 +755,73 @@ class OpenClawClient:
         finally:
             self._health_futures.pop(req_id, None)  # también si cancelan el ping
 
+    async def request(self, method: str, params: dict, timeout: float = 10.0) -> dict:
+        """Una petición de lectura (READ_METHODS) y su `payload`. Su respuesta se recoge por id,
+        como la de ping(), sin pasar por el dispatcher.
+
+        Raises:
+            ValueError: `method` no es de lectura (un error de programación).
+            OrchestratorRequestError: con un código estable; nunca el texto de OpenClaw.
+        """
+        if method not in READ_METHODS:
+            raise ValueError(f"not a read method: {method}")
+        if not self._ws:
+            raise OrchestratorRequestError(ORCHESTRATOR_UNAVAILABLE_ERROR)
+        req_id = str(uuid.uuid4())
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._health_futures[req_id] = fut
+        try:
+            await self._ws.send(json.dumps(frames.request(method, req_id, params)))
+            res = await asyncio.wait_for(fut, timeout=timeout)
+        except Exception as e:  # noqa: BLE001 — frontera: sin respuesta, un código estable
+            logger.warning("OpenClaw %s failed (%s)", method, type(e).__name__)
+            raise OrchestratorRequestError(ORCHESTRATOR_UNAVAILABLE_ERROR) from None
+        finally:
+            self._health_futures.pop(req_id, None)  # también si cancelan la petición
+        if not res.get("ok"):
+            logger.warning(
+                "OpenClaw rejected %s (code=%s)", method, _safe_error_code(res.get("error"))
+            )
+            raise OrchestratorRequestError(ORCHESTRATOR_ERROR)
+        payload = res.get("payload")
+        return payload if isinstance(payload, dict) else {}
+
     async def abort(self, session_key: str, timeout: float = 1.0) -> None:
         """Abort the run in flight on `session_key` and swallow its own `aborted`.
 
-        Frames are routed by session_key, not runId (G-14): holding the key until the
-        terminal `chat` arrives keeps it from closing the next turn empty. No-op if a
-        normal turn owns the key. Never raises an Exception.
+        A run already tombstoned (#285; the caller does it when it knows the run, e.g. a
+        cut push) has its frames dropped by the dispatcher, `aborted` included. Otherwise
+        holding the key until the terminal `chat` arrives keeps it from closing the next
+        turn empty. The answer's `runIds` are tombstoned afterwards. No-op if a normal turn
+        owns the key. Never raises an Exception.
         """
         if not self._ws:
             return
         req_id = str(uuid.uuid4())
         try:
-            queue = self._turn_registry.register(req_id, session_key)
+            # by_run=False: its answer is caught by id below, never acked through the
+            # dispatcher, so it takes every frame of the key.
+            queue = self._turn_registry.register(req_id, session_key, by_run=False)
         except TurnInProgress:
             return
         # The ok:true `res` never reaches the turn queue (the dispatcher only routes
         # ok:false): catch it by id, as ping() does.
         res: asyncio.Future = asyncio.get_running_loop().create_future()
         self._health_futures[req_id] = res
+        payload: object = None
         try:
             await self._ws.send(json.dumps(frames.chat_abort(req_id, session_key)))
             async with asyncio.timeout(timeout):
                 payload = (await res).get("payload")
                 if not (isinstance(payload, dict) and payload.get("aborted")):
                     return  # nothing was running: no `aborted` will follow
+                run_ids = payload.get("runIds")
+                if (
+                    isinstance(run_ids, list)
+                    and run_ids
+                    and all(self._turn_registry.is_run_aborted(r) for r in run_ids)
+                ):
+                    return  # their `aborted` is dropped by the dispatcher: nothing to wait for
                 # The `aborted` usually comes before the `res`: it is already queued.
                 while True:
                     kind, data = await queue.get()
@@ -405,6 +833,9 @@ class OpenClawClient:
         finally:
             self._health_futures.pop(req_id, None)
             self._turn_registry.unregister(session_key, req_id)
+            # After swallowing its `aborted` (a tombstone first would drop it): the runs it
+            # names are tombstoned for whatever of them is still in flight.
+            self._turn_registry.note_abort_result(payload)
 
     async def stream_response(
         self,
@@ -417,7 +848,7 @@ class OpenClawClient:
 
         req_id = str(uuid.uuid4())
         try:
-            queue = self._turn_registry.register(req_id, session_key)
+            queue = self._turn_registry.register(req_id, session_key, announce=True)
         except TurnInProgress:
             yield OrchestratorEvent(type="error", content=TURN_IN_PROGRESS_ERROR)
             return
@@ -450,6 +881,13 @@ class OpenClawClient:
                     yield OrchestratorEvent(type="error", content="turn_timeout")
                     break
                 if kind == "chat":
+                    # #254: a `state:"status"` carries no text, only a startup phase; it goes
+                    # out mapped to the gateway's vocabulary, never as OpenClaw's string.
+                    phase = chat_status_phase(data)
+                    if phase is not None:
+                        yield OrchestratorEvent(type="progress", phase=phase)
+                        continue
+                    # Only frames of this turn's own run get here (#285, TurnRegistry).
                     # #241: OpenClaw 2026.10.5 sends the full text only in `final`
                     # (no deltaText); emit just what the deltas did not cover.
                     delta = text_tracker.feed(data)
@@ -472,6 +910,8 @@ class OpenClawClient:
                         logger.warning("OpenClaw agent failed mid-turn (chat state=error)")
                         yield OrchestratorEvent(type="error", content=ORCHESTRATOR_ERROR)
                         break
+                elif kind == "accepted":
+                    yield OrchestratorEvent(type="status", content=ACCEPTED)
                 elif kind == "tool":
                     tool_call = ToolCallEvent.from_session_tool_payload(data)
                     if tool_call is not None:
@@ -498,6 +938,10 @@ class OpenClawClient:
                     yield OrchestratorEvent(type="error", content=str(data))
                     break
         finally:
+            if _sent and not _finished:
+                # #285: whatever of this run is still in flight never reaches the next turn
+                # nor comes back as a push (also if its ack has not arrived yet).
+                self._turn_registry.abandon(req_id)
             self._turn_registry.unregister(session_key, req_id)
             if _sent and not _finished and self._ws:
                 try:
@@ -537,6 +981,7 @@ class OpenClawClient:
             # response — without error_all() it would wait TURN_TIMEOUT_S and keep its
             # session_key occupied (G-04). Stable message: no raw exception text.
             self._turn_registry.error_all(ORCHESTRATOR_DISCONNECTED_ERROR)
+            self.access.reset()  # the connection is gone: its access no longer applies
         # A cancellation (clean close()/reconnect) propagates from the `finally` above and
         # never gets here: on_disconnect would wrongly start the reconnect loop (#103).
         if self.on_disconnect:
@@ -547,7 +992,7 @@ class OpenClawClient:
                 logger.debug("on_disconnect traceback (no message): %s", traceback_no_message(e))
 
     async def _handle_raw_frame(self, raw: str | bytes) -> None:
-        frame = json.loads(raw)
+        frame = _loads_frame(raw)
         if not isinstance(frame, dict):
             raise TypeError("frame is not an object")
         fid = frame.get("id", "")

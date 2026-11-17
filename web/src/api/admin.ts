@@ -3,6 +3,9 @@ import type {
   ClientInput,
   ClientResponse,
   ClientWithKey,
+  Conversation,
+  ConversationAgents,
+  ConversationMessages,
   PairingOpened,
   PairingSummary,
   PairingTemplate,
@@ -14,11 +17,11 @@ import type {
 
 // Una función por endpoint que usa la web.
 
-export const getOrchestratorStatus = () => api<ServiceDetail>('/admin/orchestrators/openclaw/status')
+export const getOrchestratorStatus = () => api<ServiceDetail>('/admin/orchestrator/status')
 /** Hace un sondeo real del transcriptor: solo al entrar en Estado y al comprobar servicios. */
 export const getTranscriberStatus = () => api<ServiceDetail>('/admin/transcriber/status')
 export const getTtsStatus = () => api<ServiceDetail>('/admin/tts/status')
-export const reconnectOrchestrator = () => api<{ accepted: boolean }>('/admin/orchestrators/openclaw/reconnect', { method: 'POST' })
+export const reconnectOrchestrator = () => api<{ accepted: boolean }>('/admin/orchestrator/reconnect', { method: 'POST' })
 /** Sondea los tres servicios de verdad (puede tardar): solo al pulsar «Comprobar servicios». */
 export const getReady = () => api<ReadyResponse>('/ready', { okStatuses: [503], timeoutMs: 20_000 })
 
@@ -41,4 +44,16 @@ export const getSession = (id: string) => api<SessionDetail>(`/admin/sessions/${
 export const openPairing = (template: PairingTemplate = {}) =>
   api<PairingOpened>('/admin/pairing', { method: 'POST', body: json(template) })
 export const getPairing = (id: string) => api<PairingSummary>(`/admin/pairing/${enc(id)}`)
-export const cancelPairing = (id: string) => api<void>(`/admin/pairing/${enc(id)}`, { method: 'DELETE' })
+export const listPairings = () => api<PairingSummary[]>('/admin/pairing')
+/** `keepalive`: el DELETE sigue en vuelo aunque la pestaña se cierre (`pagehide`). */
+export const cancelPairing = (id: string, keepalive?: boolean) =>
+  api<void>(`/admin/pairing/${enc(id)}`, { method: 'DELETE', ...(keepalive ? { keepalive } : {}) })
+
+export const listConversations = () => api<Conversation[]>('/admin/conversations')
+/** Lo dicho, de OpenClaw: 503 `orchestrator_unavailable` si no responde, 502 `orchestrator_error` si lo rechaza. */
+export const getConversationMessages = (id: string, limit = 200) =>
+  api<ConversationMessages>(`/admin/conversations/${enc(id)}/messages?limit=${limit}`, { timeoutMs: 20_000 })
+export const getConversationAgents = () => api<ConversationAgents>('/admin/conversations/agents')
+/** Conversación nueva del panel web; sin agente, el que toque por defecto. */
+export const createConversation = (agent: string | null) =>
+  api<Conversation>('/admin/conversations', { method: 'POST', body: json(agent ? { agent } : {}) })

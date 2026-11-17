@@ -1,5 +1,7 @@
 """Los proveedores de voz se construyen en el lifespan y se inyectan (spec 2026-10-20, fase 1)."""
 
+import logging
+
 import httpx
 import pytest
 
@@ -13,6 +15,25 @@ from fogar_gateway.services.speech.registry import SpeechProviders
 def test_app_state_has_stt_and_tts_providers(client):
     state = client.app.state.speech
     assert (state.stt.name, state.tts.name) == ("fogar", "fogar")
+
+
+@pytest.fixture
+def websockets_at_debug():
+    loggers = [logging.getLogger(n) for n in ("websockets", "websockets.client")]
+    levels = [lg.level for lg in loggers]
+    for lg in loggers:
+        lg.setLevel(logging.DEBUG)
+    yield
+    for lg, level in zip(loggers, levels, strict=True):
+        lg.setLevel(level)
+
+
+def test_lifespan_pins_websockets_logging_without_elevenlabs(websockets_at_debug, client):
+    """B-r4-2: `websockets` a DEBUG volcaría las tramas de OpenClaw (el connect lleva el token)
+    aunque la voz no sea ElevenLabs: el arranque lo fija en INFO siempre."""
+    assert client.app.state.speech.stt.name == "fogar"
+    for name in ("websockets", "websockets.client"):
+        assert logging.getLogger(name).level >= logging.INFO
 
 
 def test_ready_degraded_not_503_when_stt_and_tts_down(client, mock_services):

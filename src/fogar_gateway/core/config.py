@@ -1,15 +1,40 @@
-from typing import Literal
+import logging
+from typing import Annotated, Any, Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, StringConstraints, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from fogar_gateway import paths
 from fogar_gateway.access import parse_public_urls
+from fogar_gateway.core.session_key import AGENT_ID_PATTERN
+
+_logger = logging.getLogger(__name__)
+
+# Keys that older installs still carry in config.env: accepted and ignored (with one WARNING per
+# process, F-r7-3: the CLI builds Settings many times and may run this module more than once)
+# so an upgrade does not turn them into "Extra inputs are not permitted".
+RETIRED_KEYS = frozenset({"ORCHESTRATOR_RECONNECT_MAX_DURATION"})  # #272: single endless loop
 
 
 class Settings(BaseSettings):
     # Nunca el .env del directorio actual: <base>/config.env (o --home / FOGAR_GATEWAY_HOME).
-    model_config = SettingsConfigDict(env_file=paths.config_file())
+    # Ningún plazo admite inf ni nan (D-r7-1): un HANDSHAKE_TIMEOUT_S=inf no caduca nunca.
+    model_config = SettingsConfigDict(env_file=paths.config_file(), allow_inf_nan=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_retired_keys(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        retired = sorted(k for k in data if isinstance(k, str) and k.upper() in RETIRED_KEYS)
+        if retired and not getattr(_logger, "retired_warned", False):
+            _logger.retired_warned = True  # type: ignore[attr-defined]  # shared by every copy
+            _logger.warning(
+                "Config: %s is obsolete and ignored (remove it from config.env).", ", ".join(retired)
+            )
+        if retired:
+            data = {k: v for k, v in data.items() if k not in retired}
+        return data
 
     # Base de datos interna. Una ruta SQLite relativa cuelga del directorio base, también el
     # default: el engine, Alembic, el candado y `fogar-gw doctor` ven la misma ruta absoluta.
@@ -88,26 +113,39 @@ class Settings(BaseSettings):
     STT_GATE_RMS_DBFS: float = -45.0
     OPENCLAW_HOST: str = "127.0.0.1"
     OPENCLAW_PORT: int = 18789
+    # wss:// en vez de ws:// (OpenClaw de otra máquina tras TLS, p. ej. su `tailscale serve`).
+    OPENCLAW_TLS: bool = False
     OPENCLAW_TOKEN: str = ""
-    ORCHESTRATOR_RECONNECT_INITIAL_BACKOFF: float = 1.0
-    ORCHESTRATOR_RECONNECT_MAX_BACKOFF: float = 60.0
-    ORCHESTRATOR_RECONNECT_MAX_DURATION: float = 300.0
-    TRANSCRIBER_RECONNECT_INITIAL_BACKOFF: float = 1.0
-    TRANSCRIBER_RECONNECT_MAX_BACKOFF: float = 60.0
-    TRANSCRIBER_RECONNECT_MAX_DURATION: float = 300.0
-    TTS_RECONNECT_INITIAL_BACKOFF: float = 1.0
-    TTS_RECONNECT_MAX_BACKOFF: float = 60.0
-    TTS_AUTH_TIMEOUT_S: float = 10.0
-    TRANSCRIBER_READY_TIMEOUT_S: float = 10.0
+    # Agente por defecto de la instalación (#245): entra en la cascada de resolve_agent() entre
+    # el `default_agent` del cliente y el agente por defecto de OpenClaw. Vacío = el de OpenClaw.
+    # Misma regla que el `default_agent` de un cliente (admin_schemas.AgentName), la de un id de
+    # agente de OpenClaw (AGENT_ID_PATTERN); vacío = sin agente de instalación.
+    DEFAULT_AGENT: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, to_lower=True, pattern=f"^$|{AGENT_ID_PATTERN}"),
+    ] = ""
+
+    # Hora local del host (0-23) a la que empieza el día de las conversaciones por defecto (M19):
+    # una por cliente, agente y día. Un turno que empieza tras el corte pasa a la del día nuevo.
+    CONVERSATION_DAY_START_HOUR: int = Field(default=5, ge=0, le=23)
+    ORCHESTRATOR_RECONNECT_INITIAL_BACKOFF: float = Field(default=1.0, gt=0)
+    ORCHESTRATOR_RECONNECT_MAX_BACKOFF: float = Field(default=60.0, gt=0)
+    TRANSCRIBER_RECONNECT_INITIAL_BACKOFF: float = Field(default=1.0, gt=0)
+    TRANSCRIBER_RECONNECT_MAX_BACKOFF: float = Field(default=60.0, gt=0)
+    TRANSCRIBER_RECONNECT_MAX_DURATION: float = Field(default=300.0, gt=0)
+    TTS_RECONNECT_INITIAL_BACKOFF: float = Field(default=1.0, gt=0)
+    TTS_RECONNECT_MAX_BACKOFF: float = Field(default=60.0, gt=0)
+    TTS_AUTH_TIMEOUT_S: float = Field(default=10.0, gt=0)
+    TRANSCRIBER_READY_TIMEOUT_S: float = Field(default=10.0, gt=0)
 
     # Deadlines acotados (issue #115)
     # 5 s (antes 10, #216): un handshake es un único mensaje pequeño; el margen largo solo
     # sirve a quien conecta y se queda callado, reteniendo la conexión sin autenticar.
-    HANDSHAKE_TIMEOUT_S: float = 5.0
+    HANDSHAKE_TIMEOUT_S: float = Field(default=5.0, gt=0)
     # Tope (caracteres) del primer mensaje, comprobado antes de parsear/autenticar (#216).
     HANDSHAKE_MAX_BYTES: int = Field(default=4096, gt=0)
-    TURN_TIMEOUT_S: float = 120.0
-    IDLE_TIMEOUT_S: float = 300.0
+    TURN_TIMEOUT_S: float = Field(default=120.0, gt=0)
+    IDLE_TIMEOUT_S: float = Field(default=300.0, gt=0)
     # Tope de cada paso del cierre de una sesión (cancelar el turno, el push, las tareas,
     # cerrar el transcriber y el tracker) y del drenado de su cola de salida (#221).
     SESSION_TEARDOWN_S: float = Field(default=5.0, gt=0)
@@ -118,7 +156,7 @@ class Settings(BaseSettings):
 
     # Drenado del audio TTS de un push al cerrar su turno (issue #130 S3a): tope de tiempo
     # sin progreso del TTS (se reinicia con cada trozo), no duración total
-    PUSH_TTS_DRAIN_TIMEOUT_S: float = 30.0
+    PUSH_TTS_DRAIN_TIMEOUT_S: float = Field(default=30.0, gt=0)
 
     # Pacing del audio TTS (7e): el gateway envía a ritmo de reproducción, como mucho
     # AUDIO_LEAD_S por delante

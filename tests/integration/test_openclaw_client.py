@@ -281,6 +281,23 @@ async def test_connect_returns_gateway_info(fake_ws):
 
 
 @pytest.mark.asyncio
+async def test_connect_ignores_an_interleaved_event_with_a_dirty_routing_key():
+    """B-r5-1 (revisión): un evento ajeno con sessionKey sucia antes de la respuesta de
+    agents.list se ignora; no aborta el connect."""
+
+    class DirtyEventWS(SmartFakeWS):
+        async def send(self, data: str) -> None:
+            if json.loads(data).get("method") == "agents.list":
+                dirty = {"type": "event", "event": "chat", "payload": {"sessionKey": "k\ud800"}}
+                await self._to_client.put(json.dumps(dirty))
+            await super().send(data)
+
+    client = await connected_client(DirtyEventWS(hello_ok_payload=HELLO_OK_PAYLOAD_NO_SNAPSHOT_AGENTS))
+    assert client.gateway_info.has_agent("assistant")
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_connect_populates_agents_via_agents_list_when_snapshot_lacks_agents():
     """OpenClaw server 2026.6.11+ no longer embeds the agent roster in
     hello-ok's snapshot — it must be fetched via a separate agents.list call
@@ -315,6 +332,40 @@ async def test_reconnect_keeps_last_known_roster_when_agents_list_fails():
     assert info.has_agent("assistant")
     assert info.has_agent("ci-tester")
     assert client.gateway_info is info
+    await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad", [None, [], {"agents": None}, {"agents": "main"}, {"agents": ["main"]}]
+)
+async def test_reconnect_with_malformed_agents_list_connects_and_keeps_roster(bad):
+    """Auditoría 3.0, B-1: un agents.list `ok:true` mal formado (payload null, `agents` que no
+    es una lista de objetos) contaba como roster y rompía el connect para siempre
+    (AttributeError/TypeError en cada reintento). Ahora vale como `ok:false`: conecta y
+    conserva el roster anterior (#151)."""
+    fake_ws = SmartFakeWS(hello_ok_payload=HELLO_OK_PAYLOAD_NO_SNAPSHOT_AGENTS)
+    client = await connected_client(fake_ws)
+
+    fake_ws2 = SmartFakeWS(hello_ok_payload=HELLO_OK_PAYLOAD_NO_SNAPSHOT_AGENTS)
+    fake_ws2.agents_list_payload = bad
+    await fake_ws2.start()
+    with patch("websockets.connect", return_value=fake_ws2):
+        info = await client.connect()
+
+    assert info.agents == ["main", "assistant", "ci-tester"]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_agents_list_entries_without_a_string_id_are_skipped():
+    fake_ws = SmartFakeWS(
+        hello_ok_payload=HELLO_OK_PAYLOAD_NO_SNAPSHOT_AGENTS,
+        agents_list_payload={"defaultId": None, "agents": [{"id": "main"}, {"name": "x"}, {"id": 3}, "y"]},
+    )
+    client = await connected_client(fake_ws)
+    assert client.gateway_info.agents == ["main"]
+    assert client.gateway_info.default_agent_id == "main"
     await client.close()
 
 
@@ -450,6 +501,16 @@ def real_ws_client(port: int) -> OpenClawClient:
 def test_ipv6_host_is_bracketed_in_uri(host, uri):
     turns = TurnRegistry()
     client = OpenClawClient(host, 18789, "tok", turns, FrameDispatcher(turns, ClientRegistry()))
+    assert client._uri == uri
+
+
+@pytest.mark.parametrize(
+    ("host", "uri"),
+    [("green-house.example.ts.net", "wss://green-house.example.ts.net:443"), ("::1", "wss://[::1]:443")],
+)
+def test_tls_uses_wss(host, uri):
+    turns = TurnRegistry()
+    client = OpenClawClient(host, 443, "tok", turns, FrameDispatcher(turns, ClientRegistry()), tls=True)
     assert client._uri == uri
 
 
@@ -826,6 +887,9 @@ async def test_terminal_event_then_generator_close_does_not_send_spurious_chat_a
 
     async def drive_and_close():
         event = await stream.__anext__()
+        if event.type == "status":  # M19: the ack announces the turn as accepted first
+            assert event.content == "accepted"
+            event = await stream.__anext__()
         assert event.type == "error"
         await stream.aclose()
 
@@ -932,8 +996,7 @@ async def test_admin_trigger_reconnect_coalesces_with_real_background_reconnect(
         await fake_ws.close()  # simulate an unexpected drop → background reconnect starts
         await connect_attempted.wait()  # background reconnect is now mid-handshake
 
-        admin_job_id = roc.trigger_reconnect()
-        assert admin_job_id == roc._reconnect_job_id
+        roc.trigger_reconnect()
 
         release_connect.set()
         await asyncio.sleep(0.05)

@@ -25,6 +25,7 @@ ENV = (
     "DATABASE_URL=sqlite:////app/data/gateway.db\n"
     "GATEWAY_UID=1000\n"
     "  gateway_gid = 1000\n"
+    "TZ=Europe/Madrid\n"
     "HANDSHAKE_MAX_BYTES=4096\n"
 )
 
@@ -102,9 +103,10 @@ def test_same_client_ids(env):
 def test_drops_database_url_and_uid_gid(env):
     docker, native = env
     out = json.loads(run(docker).output)
-    assert out["config"]["dropped"] == ["DATABASE_URL", "GATEWAY_UID", "gateway_gid"]
+    assert out["config"]["dropped"] == ["DATABASE_URL", "GATEWAY_UID", "gateway_gid", "TZ"]
     text = (native / "config.env").read_text()
     assert "DATABASE_URL" not in text and "UID" not in text and "gid" not in text
+    assert "TZ" not in text  # la nativa usa la zona del host; Settings rechaza claves ajenas
     # el resto se conserva tal cual: export, comentario, comillas, línea vacía
     assert text.startswith("# Docker\nexport ADMIN_TOKEN='tok en'\n\nOPENCLAW_HOST=\"host:1\"\n")
 
@@ -336,4 +338,69 @@ def test_non_utf8_env_is_a_clean_error(env):
     r = run(docker)
     assert r.exit_code == 1 and isinstance(r.exception, SystemExit)
     assert "UTF-8" in r.output
+    assert not native.exists()
+
+
+# --- identidad ante OpenClaw (revisión M19) ---
+
+DEVICE = "openclaw-device.json"
+
+
+def _with_device(docker: Path) -> bytes:
+    from fogar_gateway.services.openclaw.device import DeviceStore
+
+    store = DeviceStore(docker / "data" / DEVICE)
+    store.load_or_create()
+    store.save_token("host:1", "devtok-docker", ["operator.read", "operator.admin"])
+    (docker / "data" / f".{DEVICE}.lock").unlink()  # un Docker real no tiene por qué tenerlo
+    (docker / "data" / DEVICE).chmod(0o644)  # aunque en origen sea más abierto
+    return (docker / "data" / DEVICE).read_bytes()
+
+
+def test_copies_the_openclaw_identity_600(env):
+    docker, native = env
+    original = _with_device(docker)
+    before = snapshot(docker)
+    r = run(docker)
+    assert r.exit_code == 0, r.output
+    copied = native / "data" / DEVICE
+    assert copied.read_bytes() == original and mode(copied) == 0o600
+    assert json.loads(r.output)["openclaw_device"] == str(copied)
+    assert snapshot(docker) == before  # origen intacto
+    assert not list(native.rglob("*.tmp"))
+    assert "devtok-docker" not in r.output
+
+
+def test_without_identity_nothing_is_copied(env):
+    docker, native = env
+    r = run(docker)
+    assert r.exit_code == 0
+    assert json.loads(r.output)["openclaw_device"] is None
+    assert not (native / "data" / DEVICE).exists()
+
+
+def test_refuses_existing_identity_in_target(env):
+    docker, native = env
+    _with_device(docker)
+    (native / "data").mkdir(parents=True)
+    (native / "data" / DEVICE).write_text("otra")
+    r = run(docker)
+    assert r.exit_code == 1 and DEVICE in r.output
+    assert (native / "data" / DEVICE).read_text() == "otra"
+    assert not (native / "config.env").exists()
+
+
+def test_failed_identity_copy_leaves_no_partial_files(env, monkeypatch):
+    docker, native = env
+    _with_device(docker)
+    real = os.replace
+
+    def replace(src, dst):
+        if str(dst).endswith(DEVICE):
+            raise OSError("fallo")
+        real(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    r = run(docker)
+    assert r.exit_code == 1 and "No se ha creado nada" in r.output
     assert not native.exists()

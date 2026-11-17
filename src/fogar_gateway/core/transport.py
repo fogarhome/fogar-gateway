@@ -14,6 +14,8 @@ from typing import Any
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from fogar_gateway.models.close_codes import Close, CloseFrame, send_close
+
 logger = logging.getLogger(__name__)
 
 # How long a courtesy close(1013) may take before the transport is aborted. If the
@@ -52,6 +54,16 @@ def abort_client_transport(websocket: Any) -> bool:
     return True
 
 
+async def close_or_abort(websocket: Any, frame: CloseFrame) -> None:
+    """Cierre `frame` con tope SLOW_CLOSE_GRACE_S; si no sale a tiempo (o falla), abort del
+    transporte, que es la salida garantizada. Nunca lanza `Exception`."""
+    try:
+        await asyncio.wait_for(send_close(websocket, frame), timeout=SLOW_CLOSE_GRACE_S)
+    except Exception as e:  # noqa: BLE001 — frontera: el abort de abajo es la salida
+        logger.debug("close_or_abort: close(%d) falló (%s).", frame.code, type(e).__name__)
+        abort_client_transport(websocket)
+
+
 async def drop_slow_client(
     websocket: Any, *, record: Callable[[], Awaitable[object]] | None = None
 ) -> None:
@@ -69,7 +81,7 @@ async def drop_slow_client(
                 logger.warning("drop_slow_client: record falló (%s).", type(e).__name__)
         try:
             await asyncio.wait_for(
-                websocket.close(code=1013, reason="client too slow"), timeout=SLOW_CLOSE_GRACE_S
+                send_close(websocket, Close.CLIENT_TOO_SLOW), timeout=SLOW_CLOSE_GRACE_S
             )
         except Exception as e:  # noqa: BLE001 — cortesía: el abort de abajo es la salida real
             # TimeoutError (close stuck behind the unread data), WebSocketDisconnect,

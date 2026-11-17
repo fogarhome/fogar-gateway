@@ -15,6 +15,7 @@ SNAPSHOT_KEYS = {
     "session_id",
     "client_id",
     "client_name",
+    "conversation",
     "input_mode",
     "output_mode",
     "started_at",
@@ -92,6 +93,9 @@ async def test_state_stream_emits_and_stops_when_request_reports_disconnect(clie
 
     resp = await admin_routes.get_state_stream(request)
     assert resp.media_type == "text/event-stream"
+    # D-r6-5: que un proxy (nginx) no retenga los eventos.
+    assert resp.headers["cache-control"] == "no-cache"
+    assert resp.headers["x-accel-buffering"] == "no"
     chunks = [c async for c in resp.body_iterator]
 
     assert len(chunks) == 2
@@ -160,3 +164,94 @@ def test_state_skips_bridge_whose_snapshot_fails(client, admin_headers):
         app.state.client_registry.unregister("bad", app.state.client_registry.get("bad"))
     assert r.status_code == 200
     assert r.json()["sessions"] == []
+
+
+# ── Acceso a OpenClaw (M19): permisos, admin, token en uso y emparejamiento ──
+
+ACCESS_KEYS = {"state", "last_error", "scopes", "admin", "auth_method", "pairing",
+               "pairing_request_id", "identity_error", "device_id",
+               "approve_command", "identity_error_text"}
+
+
+def test_state_orchestrator_access_before_connecting(client, admin_headers):
+    orch = client.get("/admin/state", headers=admin_headers).json()["services"]["orchestrator"]
+    assert set(orch) == ACCESS_KEYS
+    assert orch["scopes"] is None and orch["admin"] is False
+    assert orch["auth_method"] is None and orch["pairing"] == "unknown"
+    assert orch["approve_command"] is None and orch["identity_error_text"] is None
+
+
+def test_state_orchestrator_access_connected_with_admin(client, admin_headers):
+    access = client.app.state.openclaw_access
+    access.scopes = ["operator.read", "operator.write", "operator.admin"]
+    access.auth_method = "device_token"
+    access.pairing = "paired"
+    access.device_id = "ab" * 32
+    orch = client.get("/admin/state", headers=admin_headers).json()["services"]["orchestrator"]
+    assert orch["admin"] is True and orch["scopes"][-1] == "operator.admin"
+    assert orch["auth_method"] == "device_token" and orch["pairing"] == "paired"
+    assert orch["device_id"] == "ab" * 32 and orch["pairing_request_id"] is None
+
+
+def test_state_orchestrator_pairing_pending(client, admin_headers):
+    access = client.app.state.openclaw_access
+    access.pairing = "pending"
+    access.pairing_request_id = "req-7"
+    orch = client.get("/admin/state", headers=admin_headers).json()["services"]["orchestrator"]
+    assert orch["pairing"] == "pending" and orch["pairing_request_id"] == "req-7"
+    assert orch["admin"] is False
+    # La frase y el comando salen del gateway, el mismo texto que la CLI (una sola fuente).
+    assert orch["approve_command"] == "openclaw devices approve req-7"
+
+
+def test_state_orchestrator_identity_required_says_why(client, admin_headers):
+    access = client.app.state.openclaw_access
+    access.pairing = "identity_required"
+    access.identity_error = "challenge_without_nonce"
+    orch = client.get("/admin/state", headers=admin_headers).json()["services"]["orchestrator"]
+    assert orch["identity_error_text"] == (
+        "este OpenClaw no manda nonce en el reto y no hay nada que firmar"
+    )
+    assert orch["approve_command"] is None
+
+
+async def test_state_reflects_a_real_pairing_flow(tmp_path, monkeypatch):
+    """OpenClawClient real contra el fake remoto; /admin/state lee el mismo objeto de acceso."""
+    import fogar_gateway.api.admin_routes as admin_routes
+    from fogar_gateway.main import app
+    from fogar_gateway.services.openclaw.client import OpenClawClient, OrchestratorPairingRequired
+    from fogar_gateway.services.openclaw.device import DeviceStore
+    from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
+    from fogar_gateway.services.openclaw.models import OrchestratorAccess
+    from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+    from fogar_gateway.services.reconnection import ConnectionState, ServiceStatus
+    from tests.fakes.openclaw import FakeOpenClawServer
+
+    def status():
+        return ServiceStatus("x", ConnectionState.RECONNECTING, None, 1, "orchestrator_pairing_required")
+
+    access = OrchestratorAccess()
+    turns = TurnRegistry()
+    monkeypatch.setattr(app.state, "openclaw_access", access, raising=False)
+    monkeypatch.setattr(app.state, "openclaw", SimpleNamespace(status=status), raising=False)
+    voice = SimpleNamespace(name="off", status=status)
+    monkeypatch.setattr(app.state, "speech", SimpleNamespace(stt=voice, tts=voice), raising=False)
+    monkeypatch.setattr(app.state, "client_registry", ClientRegistry(), raising=False)
+    async with FakeOpenClawServer(token="t", remote=True) as server:
+        client = OpenClawClient("127.0.0.1", server.port, "t", turns,
+                                FrameDispatcher(turns, ClientRegistry()),
+                                device_store=DeviceStore(tmp_path / "d.json"), access=access)
+        with pytest.raises(OrchestratorPairingRequired):
+            await client.connect()
+        orch = admin_routes._build_state(app)["services"]["orchestrator"]
+        assert orch["pairing"] == "pending" and orch["pairing_request_id"] == "req-1"
+        assert orch["last_error"] == "orchestrator_pairing_required"
+        server.approve()
+        await client.connect()
+        orch = admin_routes._build_state(app)["services"]["orchestrator"]
+        assert orch["pairing"] == "paired" and orch["admin"] is True
+        assert "devtok" not in json.dumps(orch)
+        await client.close()  # sin conexión: el acceso vuelve a desconocido
+        orch = admin_routes._build_state(app)["services"]["orchestrator"]
+        assert orch["pairing"] == "unknown" and orch["admin"] is False
+        assert orch["device_id"] is not None

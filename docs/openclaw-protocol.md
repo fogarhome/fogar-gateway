@@ -105,12 +105,18 @@ Call `agents.list` right after `hello-ok` (`OpenClawClient.connect()` does this)
 Note the field is `id`, not `agentId` (the older `hello-ok.snapshot.agents[]` shape — now gone
 — used `agentId` + per-item `isDefault`; `agents.list`'s shape uses `id` + a top-level
 `defaultId` to compare against instead). `GatewayInfo.update_agents_from_list()`
-(`src/fogar_gateway/services/openclaw/models.py`) parses this.
+(`src/fogar_gateway/services/openclaw/models.py`) parses this. Since 2026-11-15 (audit 3.0, B-1)
+an `ok:true` answer outside this shape (payload not an object, `agents` not a list, or a list with
+no entry carrying a string `id`) is treated like `ok:false`: the connection goes on and keeps the
+last known roster (#151) instead of failing every reconnect; entries without a string `id` are
+skipped and a non-string `defaultId` is ignored. OpenClaw has always sent `id`; this only guards
+against a server outside the schema.
 
 **No per-agent `tools` field is included.** There is currently no known API method that
 returns an agent's *resolved* tool list. `config.get` with no params returns the entire raw
-`openclaw.json` (requires `operator.admin` scope, which fogar-gateway's token does not
-currently request), including `agents.list[].tools.allow`/`.deny` — but that's the config-level
+`openclaw.json` (`operator.read` in 2026.10.5, see "Method → scope" below; the gateway asks for
+read, write and admin since 2026-11-13, see "Device identity, pairing and `operator.admin`", but
+calls neither `config.get` nor any admin method), including `agents.list[].tools.allow`/`.deny` — but that's the config-level
 allow/deny, not the resolved set after profile expansion. The only reliable way found so far:
 ask the agent to do something and watch for `session.tool` events (below).
 
@@ -187,7 +193,9 @@ What changed versus 2026.6.11/2026.7.1:
   not a retraction the gateway can honor: tokens already sent to the client cannot be taken
   back. Official semantics below ("Official delta/replace/snapshot semantics", issue #243).
 - New `chat` events with `state:"status"` and a `phase` (`preparing_workspace`,
-  `preparing_context`, `starting_model`, ...). They carry no text and are ignored.
+  `preparing_context`, `starting_model`, ...). They carry no text. Since #254 the gateway
+  forwards them to the client mapped to its own vocabulary (see "Startup phases and tool
+  progress" below).
 
 ### Official delta/replace/snapshot semantics (issue #243)
 
@@ -242,6 +250,75 @@ Observation: with 2026.10.5 most of the text arrives at once in `final` (capture
 16-character delta, a 409-character final), so TTS starts only when generation ends. The 2 s
 narration interval does not explain it (it does not apply to `chat`, see above); fixing that
 latency is an OpenClaw streaming-configuration matter.
+
+---
+
+## Startup phases and tool progress (2026-11-14, server 2026.10.5, issue #254)
+
+Read in the npm package `openclaw@2026.10.5` (not a new live capture; the capture above already
+showed three of the phases). No server change; this records the full phase set and how the
+gateway uses it.
+
+- **The full set.** `chat` `state:"status"` is a closed schema (`ChatStatusEventSchema`):
+  `{runId, sessionKey, seq, state:"status", phase, retry?}`, where `phase` is one of
+  `ChatRunStartupPhaseSchema`, documented upstream as "coarse startup stages shown while a run
+  has not produced visible activity yet": `waiting_for_state`, `preparing_workspace`,
+  `naming_worktree`, `creating_worktree`, `running_setup`, `provisioning_environment`,
+  `preparing_context`, `memory_flushing`, `starting_model`. No text, ever.
+- **Where they come from.** The server projects its internal `agent` stream `run_status` onto
+  `chat` (`server-chat`), only for a run linked to a chat (`chatLink`), visible to the control
+  UI and not aborted, and with `dropIfSlow` (a slow consumer may miss some). The runner maps its
+  milestones to them (`resolveRunStartupPhase`): `runner_entered`/`workspace`/`runtime_plugins`
+  → `preparing_workspace`; `before_agent_reply`/`model_resolution`/`auth`/`context_engine`/
+  `attempt_dispatch`/`context_assembled` → `preparing_context`; `turn_accepted`/
+  `process_spawned`/`model_call_started` → `starting_model`; tool execution and assistant
+  output end the startup phases (no status for them).
+- **Retries.** A model retry (`run_status` `retrying`) arrives as `phase:"starting_model"` plus
+  `retry {attempt, maxAttempts, reason:"rate_limit"}` (only for `rate_limit`).
+- **Order.** Startup phases are meant to precede visible activity (the server's own in-flight
+  progress snapshot ignores a startup phase once a tool or item was recorded); a retry can
+  bring `starting_model` back. In the #300 failure they came before the `agent` `error`, with
+  no `agent` `start`: for a push, the phases can arrive before the push turn is open.
+
+How the gateway reacts (`src/fogar_gateway/services/turn_progress.py`): it sends the client a
+`turn_progress` message (docs/client-protocol.md §5) with its own vocabulary, never OpenClaw's
+string. Every startup phase except `starting_model` → `preparing`; `starting_model` (also a
+retry) → `thinking`; a phase not in the list above (a new startup stage) → `preparing`, with
+only a DEBUG line. `session.tool` `start` → `tool` with the tool `name` if it matches
+`[A-Za-z0-9_.:-]{1,128}` (otherwise no name); `result` → `thinking` (or the last tool still
+open, when several run at once). `args` and `result` never reach `turn_progress`. These frames
+go through the same `runId` filter as the rest of the turn ("How the gateway uses `runId`"), so
+nothing of an aborted run, and nothing after the turn's end, becomes progress. A startup phase
+that arrives while no push of its run is open (before its `agent` `lifecycle` `start`) is kept
+per `runId` (the last 8 runs, 30 s) and sent right after that push's `turn_start`. `update` tool
+frames and the `agent` `run_status`/`thinking` streams are still ignored.
+
+---
+
+## `agent` events of streams other than `lifecycle` (2026-11-14, server 2026.10.5)
+
+Read in the npm package `openclaw@2026.10.5` (`server-chat`, `builtin-openclaw`, the
+`AgentActivityItemSchema` in `sessions`); not a new live capture. **Gateway bug fixed.**
+
+- Every `agent` event carries `stream` (the payload spreads the internal agent event). OpenClaw
+  itself reads a run's lifecycle only from `stream:"lifecycle"`
+  (`lifecyclePhase = evt.stream === "lifecycle" && … data.phase`).
+- Other streams also carry `data.phase`: `item` (`start`/`update`/`end`, one item per tool
+  activity, `AgentActivityItemSchema`), `tool` (`start`/`update`/`result`), `run_status`
+  (the startup phases), `plan` (`update`), plus `assistant`/`thinking`/`usage`. Non-tool
+  streams of a control-UI-visible run are broadcast as `agent` events to every operator
+  connection (`sendOrBufferAgentTextEvent` → `sendLivePayload("agent", …)`), so the gateway
+  receives `item` `start`/`end` whenever the agent uses a tool. `tool`-stream `agent` events
+  go only to connections registered as tool recipients of the run, or (for a run hidden from
+  the control UI) to session-message subscribers; the gateway gets tools as `session.tool`.
+- Before this fix `FrameDispatcher._handle_agent_lifecycle` read `data.phase` whatever the
+  stream: an `item` `end` closed the open push (the rest of its text was then lost) and an
+  `item` (or `tool`) `start` with no push open could open one; an `end` also marked the run
+  ended for the active-run tracking.
+
+How the gateway reacts now: only `stream:"lifecycle"` opens (`start`) or ends (`end`/`error`) a
+push; an `agent` event of any other stream only records that its run is still active. A frame
+without `stream` (not sent by 2026.10.5) keeps the old reading, as lifecycle.
 
 ---
 
@@ -402,20 +479,39 @@ dedicated OpenClaw plugin becomes worth building.
 
 ---
 
-## Session key carries the per-client identity (fogar-gateway convention)
+## Session key carries the conversation (fogar-gateway convention)
 
-Every turn fogar-gateway sends over `chat.send` uses `sessionKey = "agent:{agent}:{client.id}"`,
-where `client.id` is the `ClientRecord` UUID of the authenticated caller (WS handshake or REST
-`/v1/*` with a Bearer key), not a shared global key. This is a fogar-gateway convention layered on
-OpenClaw's opaque `sessionKey` string, not something the OpenClaw server enforces or validates.
-Consequences observable on the wire:
+**Since M19 (2026-11-14):** every turn fogar-gateway sends over `chat.send` uses
+`sessionKey = "agent:{agent}:fogar-{conversation.id}"`, where the conversation is a row of the
+gateway's `conversations` table (its own index: client, agent, kind, day; no text). This is a
+fogar-gateway convention layered on OpenClaw's opaque `sessionKey` string, not something the
+OpenClaw server enforces or validates. Consequences observable on the wire:
 
-- Two clients talking to the same agent get independent OpenClaw sessions (separate history).
-- Events come back tagged with that same `sessionKey`; the gateway recovers the client with
-  `sk.rsplit(":", 1)[-1]` (safe for agent names or keys containing extra colons).
-- The REST trusted-origin legacy path (no Bearer) has no client row, so it uses the fixed id `ha`.
+- A client gets a new OpenClaw session per agent and day (its default conversation, the day
+  starting at `CONVERSATION_DAY_START_HOUR`), or the one it picks in the handshake. The gateway
+  never resets a session: OpenClaw's own `session.reset` (daily/idle, global to every channel)
+  would reset a conversation under the same key, so the gateway does the daily cut itself.
+- Push events come back tagged with that `sessionKey`; the gateway routes them through an
+  in-memory index `sessionKey → conversation → live session` (`ClientRegistry.route`). A key
+  missing from the index falls back to the pre-M19 rule (`sk.rsplit(":", 1)[-1]` = client id).
+- **Before M19** the key was `agent:{agent}:{client.id}` (one session per client and agent,
+  forever). The gateway imports those sessions once (`sessions.list`, see below) as `legacy`
+  conversations of their client and keeps their key, so pushes scheduled on them still arrive.
+- The REST trusted-origin legacy path (no Bearer) has no client row, so it keeps the fixed id
+  `ha` (`agent:{agent}:ha`) and is not a conversation.
 - Since server 2026.11.1, `chat.send` rejects session keys that do not identify an agent; ours
   always do (see "Connect deadline and `chat.send` session keys" below).
+- **The whole key is lower-cased by OpenClaw** (2026-11-15, server 2026.10.5, read in the
+  installed package; audit 3.0, C-1): `normalizeSessionKeyPreservingOpaquePeerIds` applies
+  `toLowerCase` to the entire key, so `resolveSessionStoreKey("agent:Main:fogar-AbC123")` is
+  `agent:main:fogar-abc123`. `chat.send` with a mixed-case key stores and runs the session under the
+  canonical key, **emits every `chat`/`agent` event with the canonical key**, and its ack carries
+  `sessionKeyAliases: ["<the key as sent>"]`. A gateway that matched events by the key it sent
+  would never see them (turn `turn_timeout`, pushes lost). The gateway therefore never sends a
+  mixed-case key: agent ids are lower-cased wherever they enter (`DEFAULT_AGENT`, admin
+  `default_agent`/`allowed_agents`, handshake `agent`, `/v1` `model`, and client rows saved by 2.x
+  when read), and `make_session_key`/`session_key_for` lower-case the key (client and conversation
+  ids are lower-case UUIDs, or `panel-web`/`ha`, anyway). `sessionKeyAliases` is not read.
 
 How the `agent` segment is resolved and validated lives in `src/fogar_gateway/core/agent_policy.py`
 (summarised for clients in `docs/client-protocol.md` §1, "Selección de agente").
@@ -441,6 +537,20 @@ Observed/decided while hardening the gateway's boundary with OpenClaw (audit G-0
   is the `chat` event with `state == "final"`.
 - **`hello-ok` carries `protocol` and `server.version`;** the gateway logs both once per
   connection (INFO) so version drift shows in the logs.
+- **Lone surrogates (2026-11-16, audit 3.0 r3, G-r3-1).** OpenClaw (Node) can send a string
+  with an unpaired surrogate escaped in JSON (`"\ud800"`: a half-stored emoji, a delta that
+  splits a pair, a user message saved that way). It is valid JSON but cannot be encoded as
+  UTF-8. The gateway drops each lone surrogate (no replacement character) when it parses a frame
+  that carries a `\ud`/`\uD` escape, so a snapshot that ends in half an emoji stays a prefix of
+  the next one; paired surrogates (normal emoji) are untouched. The text of a `chat` event
+  (`deltaText`, `message`) is the exception (audit 3.0 r4, B-r4-1): an emoji can arrive split
+  between two `deltaText`-only deltas, so it is kept as received and cleaned only when the reply
+  text is compared and emitted, after joining the halves; a high surrogate at the end waits for
+  its pair. A binary frame (OpenClaw sends text) is always cleaned the same way, since a raw
+  surrogate there carries no `\ud` escape (C-r4-1); its encoding is left to `json.loads`.
+  A frame whose routing would change by cleaning (the frame `id`, `payload.sessionKey`,
+  `runId` or `runIds`) or whose `payload` stops being an object (a key that collides once
+  cleaned, `"payload\ud800"`) is dropped instead (audit 3.0 r5/r6, B-r5-1, B-r6-1, B-r6-2).
 
 ---
 
@@ -466,7 +576,7 @@ a challenge/`hello`/`hello.payload` that is not a JSON object all raise
 retried by the reconnect loop like any failed connect (the one exception, the retryable
 `startup-sidecars` `UNAVAILABLE`, is first retried inside `connect()` itself — see "OpenClaw
 still starting" below). `ReconnectingOpenClawClient`'s
-`last_error` (exposed by `GET /admin/orchestrators/{name}/status`) holds that code, or just the
+`last_error` (exposed by `GET /admin/orchestrator/status`) holds that code, or just the
 exception type name (`OSError`, `TimeoutError`...) for anything else. The same `last_error`
 rule applies to every wrapper that goes through `reconnect_with_backoff`.
 
@@ -503,14 +613,55 @@ Full notes in the team's Obsidian vault (observations of 2026-10 on OpenClaw and
   it ends with a `chat` `final` carrying its `runId` while the original run keeps streaming
   and later sends its own `final` (OpenClaw appears to fold the message into the running run;
   not verified, no text recorded).
-- Events the gateway ignores today: `agent` streams `run_status`, `assistant`, `thinking`,
+- Events the gateway ignores today: `agent` streams `run_status`, `assistant`, `thinking`, `item`, `plan`,
   `usage`; `sessions.changed`, `session.message`.
 
 **Breaking for fogar-gateway as of v1.21.0:** `stream_response()` ends a turn on the first
 `chat` `final` of its `sessionKey` and its queue receives every `chat` event of that key,
 regardless of `runId`. With a push in flight, a user `send` therefore receives the push's
 deltas and is closed by whichever `final` comes first, and the rest of the other run is
-lost. Fix belongs to M9 (correlate by `runId`; issue #202).
+lost. Fix belongs to M9 (correlate by `runId`; issue #202). Since 7e a `send` aborts the
+open push before its `chat.send`; since M19 the gateway correlates by `runId` (next section).
+
+### How the gateway uses `runId` (2026-11-14, M19, issues #285/#286)
+
+No server change; this records how the gateway reacts. Frames are still routed by
+`sessionKey` (a normal turn owns its key in `TurnRegistry`), and `runId` filters on top:
+
+- **The ack names the run.** The `res ok` of `chat.send` (`payload {runId, status}`) is
+  recorded for its turn (`TurnRegistry.note_run`). From then on no frame (`chat` or
+  `session.tool`) of **another** run on the same key reaches the turn: not the late reply
+  of an aborted turn, not a push whose `agent start` was suppressed (#112). Frames with a
+  `runId` that arrive **before** the ack are held (bounded like the turn queue) and the ack
+  delivers those of its run, in order; an ack without `runId` delivers them all. Frames
+  without `runId` are delivered as they come. `chat.abort`'s own short registration takes
+  every frame of the key (its answer is caught by id, not through the dispatcher).
+- **Aborted runs are tombstoned** (`RUN_ABORT_TOMBSTONE_S`, 300 s; run ids are never reused)
+  on every abort path: a turn that ends without its terminal `chat` (barge-in, a replacing
+  `send`, `cancel`, the client gone, `turn_timeout`, `turn_overflow`) tombstones its run;
+  if its ack had not arrived yet, the late ack does it. The answer to `chat.abort`
+  (`{ok, aborted: true, runIds}`) tombstones the runs it names, and a push the gateway cuts
+  or times out has the `runId` of its `agent start` tombstoned too, before its `chat.abort`
+  (also on another agent's session key, where it is not aborted; a push whose `turn_start`
+  could not be sent, too). `FrameDispatcher` drops every `chat`, `agent` and `session.tool`
+  frame of a tombstoned run before routing it, so the late reply of an interrupted turn
+  neither closes the next turn nor comes back as a push (G-14); the push worker asks the
+  same tombstones for what was already queued. When every run a `chat.abort` answer names
+  is already tombstoned, the gateway does not wait for their `aborted` (the dispatcher
+  drops it).
+- **No other run is active on the key when the user's `chat.send` goes out.** Because of the
+  folding described above, the reply would otherwise come under the other run's `runId` and
+  the filter would drop it. `TurnRegistry` keeps the runs it sees active per session key
+  (from their first `agent`/`chat`/`session.tool` frame to a terminal `chat` or an `agent`
+  `end`/`error`; forgotten after `RUN_ABORT_TOMBSTONE_S` without frames, or when the
+  connection drops). Before a user turn, under the turn lock, any active run on our key is
+  tombstoned and `chat.abort`ed: a push not opened yet (still in the worker's queue, the
+  client has `push_enabled=False`, or its `turn_start` failed — that one is aborted right
+  away too).
+- **A push has the same budget as a normal turn:** `TURN_TIMEOUT_S` without any event of it
+  (idle-reset) closes it with `turn_timeout` and, on our own session key, `chat.abort` (G-15).
+- `agent` `phase: "error"` reaches the bridge as its own push event (`turn_error`), so the
+  push ends with reason `error` instead of `done` (internal; the wire is unchanged).
 
 ---
 
@@ -607,11 +758,256 @@ Read in the package source of 2026.11.1 and compared with 2026.10.5, not observe
 - **`chat.send` rejects ambiguous session keys** with `INVALID_REQUEST`: malformed keys, an
   `agentId` that conflicts with an agent-qualified key, and unqualified keys that do not identify
   an agent (`docs/gateway/protocol/rpc-session-control.md:14`, absent in 2026.10.5). The gateway is
-  not affected: every `sessionKey` it sends is agent-qualified (`agent:{agent}:{client.id}`, see
-  "Session key carries the per-client identity") and `frames.chat_send` never sends `agentId`.
+  not affected: every `sessionKey` it sends is agent-qualified (`agent:{agent}:fogar-{conversation}`, see
+  "Session key carries the conversation") and `frames.chat_send` never sends `agentId`.
+
+## Device identity, pairing and `operator.admin` (2026-11-13, server 2026.10.5)
+
+Read in the npm package `openclaw@2026.10.5` (`dist/message-handler-*.mjs` ~1135–1290 and ~3081,
+`dist/node-connect-reconcile-*.mjs`, `dist/device-auth-*.mjs`, `dist/ed25519-signature-*.mjs`,
+`dist/connect-error-details-*.mjs`, `dist/core-method-policy-*.mjs`, `docs/gateway/protocol/auth.md`)
+and in the reference client `@openclaw/gateway-client@2026.8.1`; the local admin path was also
+**probed live** against a 2026.10.5 instance on loopback. Remote pairing was **not** observed live
+(no non-loopback port available where it was probed): it is read from the source.
+
+**Who the gateway is.** `connect` declares `client.id: "gateway-client"`, `client.mode: "backend"`,
+`role: "operator"`. That id/mode is also the default of OpenClaw's own reference client for external
+apps (`@openclaw/gateway-client`, only in its code, not its docs), so it stays. Since this date the
+gateway asks for `scopes: ["operator.read", "operator.write", "operator.admin"]` (no feature calls
+an admin method yet) and signs every `connect` with a device identity.
+
+**Local trust path (same host).** With `gateway-client`/`backend` on a loopback connection
+authenticated by the shared token (`resolvePairingLocality` → `direct_local` or
+`shared_secret_loopback_local`, no browser `Origin`, no proxy headers),
+`shouldSkipLocalBackendSelfPairing` is true: OpenClaw trusts it directly, **creates no pairing
+record, issues no device token and keeps the requested scopes**. Live probe: asking for read +
+write + admin → `hello-ok.auth.scopes` has all three and `sessions.reset`/`sessions.compact` answer
+`ok`; without admin they answer `FORBIDDEN: missing scope: operator.admin`. Same-host LAN or
+tailnet addresses, and OpenClaw in Docker behind a published port (the connection arrives from the
+bridge address), count as **remote**.
+
+**Remote: device identity and pairing.** From a non-loopback address a device identity is
+required; without it the scopes are cleared (`missing scope` on every call) or the connect fails
+with `NOT_PAIRED` / `DEVICE_IDENTITY_REQUIRED`. With it, the **shared token is checked first** (a
+wrong one is `INVALID_REQUEST` / `AUTH_TOKEN_MISMATCH`, never a pairing request), then an unpaired
+device gets:
+
+```json
+{"type": "res", "ok": false,
+ "error": {"code": "NOT_PAIRED", "message": "pairing required: device is not approved yet",
+           "details": {"code": "PAIRING_REQUIRED", "reason": "not-paired", "requestId": "...",
+                       "remediationHint": "...", "deviceId": "<hex>", "requestedRole": "operator",
+                       "requestedScopes": ["..."]}}}
+```
+
+and a close 1008. For an operator backend there is no `recommendedNextStep` (it is
+`wait_then_retry` only for bootstrap/Control UI/node waits). The operator approves once on the
+OpenClaw host with `openclaw devices approve <requestId>` (without an id, or with `--latest`, it
+only previews the newest request and prints the exact command). The next `connect` answers
+`hello-ok` with `auth: {method, role, scopes, deviceToken, issuedAtMs}`; a device that is already
+paired gets its token even on the local path. `reason` can also be `role-upgrade`,
+`scope-upgrade` or `metadata-upgrade` (e.g. a different `client.platform` than when it was paired).
+
+**Device auth v3.** Identity: an Ed25519 key. `device.id` = SHA-256 hex of the raw 32-byte public
+key (`deriveDeviceIdFromPublicKey`); `device.publicKey` = the raw key in base64url without padding
+(PEM is also accepted); `device.signature` = Ed25519 over the UTF-8 payload, base64url without
+padding; `device.signedAt` = `connect.challenge.payload.ts` (must be within ±120 s of the server
+clock); `device.nonce` = the challenge nonce. The payload (`buildDeviceAuthPayloadV3`; `v2` without
+the last two fields is still accepted):
+
+```
+v3|{deviceId}|{client.id}|{client.mode}|{role}|{scopes joined by ","}|{signedAt}|{token}|{nonce}|{platform}|{deviceFamily}
+```
+
+`token` is `auth.token ?? auth.deviceToken ?? auth.bootstrapToken ?? ""`; `platform` and
+`deviceFamily` are trimmed and lower-cased (ASCII A–Z only), `""` when absent. A bad proof is
+`INVALID_REQUEST` with `details.code` `DEVICE_AUTH_DEVICE_ID_MISMATCH`, `…_SIGNATURE_EXPIRED`,
+`…_NONCE_REQUIRED`, `…_NONCE_MISMATCH`, `…_SIGNATURE_INVALID` or `…_PUBLIC_KEY_INVALID`.
+
+**Device token.** The reference client sends a stored device token in **both** `auth.token` and
+`auth.deviceToken`, requests the scopes stored with it, and in `acceptHello` stores
+`hello-ok.auth.deviceToken` with `hello-ok.auth.scopes ?? []` when it is new or different; an
+identical token always keeps its stored scopes (`stored.token === token ? stored.scopes : …`).
+A token that no longer works (revoked, rotated, device removed) is `AUTH_DEVICE_TOKEN_MISMATCH`;
+one that does not cover the requested scopes is `AUTH_SCOPE_MISMATCH`. `hello-ok.auth.scopes` is
+the live session's scopes (what was requested, within the grant); older servers (≥ 2026.6.11)
+may omit it.
+
+**How the gateway reacts** (`services/openclaw/device.py`, `client.py`): the identity lives in
+`<base>/data/openclaw-device.json` (0600; private key, public key, deviceId and, once paired, the
+device token with its scopes and the OpenClaw `host:port` it belongs to). Every write is atomic
+(temp 0600 + fsync + rename) and every read-modify-write runs under an exclusive `flock` on the
+sibling `.openclaw-device.json.lock`, because `fogar-gw onboard` can write it while the gateway
+runs; file I/O runs in `asyncio.to_thread`, with one read per connect (identity + token).
+`fogar-gw migrate --from-docker` copies it from `DIR/data/` when present (read-only source, 0600,
+never over an existing one). Every challenge with a nonce is signed. A stored token for the
+configured `OPENCLAW_HOST:OPENCLAW_PORT` is preferred over `OPENCLAW_TOKEN`; on
+`AUTH_DEVICE_TOKEN_MISMATCH`/`AUTH_SCOPE_MISMATCH` the gateway drops it (only if the file still
+holds that same token: a newer one another process saved meanwhile is kept; audit 3.0 r6, B-r6-3)
+and retries once, on a new socket, with the shared token. **`fogar-gw onboard` never uses the stored device token**
+(`OpenClawClient(use_device_token=False)`): it tests the token that was pasted, still signing so
+pairing is detected.
+
+**Transport and proxies** (observed 2026-11-14, server 2026.10.5): OpenClaw treats a connection
+as local only when it arrives over loopback **and carries no forwarded headers**
+(`isLocalDirectRequest`); an SSH tunnel is therefore local (no pairing), while any reverse proxy
+is not. A request with forwarded headers and no `gateway.trustedProxies` is refused with HTTP 403
+("Proxy client attribution is required"), so a plain nginx `location` in front of 18789 does not
+work. OpenClaw's own `gateway.tailscale.mode: serve` publishes it on the tailnet over HTTPS (443)
+through a separate internal listener, keeping `bind: loopback`; it is reached with
+`OPENCLAW_TLS=true` (`wss://<host>.<tailnet>.ts.net:443`) and needs device pairing like any
+remote connection.
+
+- **Same token, different scopes (deliberate deviation).** Like the reference client an identical
+  token never narrows its stored scopes, but when `hello-ok.auth.scopes` is a strict superset of
+  them (an approved scope upgrade can keep the token: `ensureDeviceToken` reuses it when it
+  already covers the request) the broader set is stored, so the next `connect` requests it.
+  Without `hello-ok.auth.scopes` the scopes are **unknown**: `None` in `GatewayInfo`/
+  `OrchestratorAccess`, `null` in the file (never an empty list), «desconocidos» in the CLI.
+- **`PAIRING_REQUIRED`** to a connect that carried the device proof raises
+  `OrchestratorPairingRequired` (stable code `orchestrator_pairing_required`, in `last_error`;
+  `auth_method` says which credential OpenClaw accepted), logs the request id and the approval
+  command once per request at WARNING, and the usual reconnect loop keeps retrying until the
+  approval. `PAIRING_REQUIRED` or `DEVICE_IDENTITY_REQUIRED` to a connect **without** device proof
+  (identity file unusable, or a challenge without nonce) raises
+  `OrchestratorDeviceIdentityRequired` (`orchestrator_device_identity_required`, `cause`
+  `identity_file_invalid`|`challenge_without_nonce`) and never suggests `devices approve`.
+- `/admin/state` (`services.orchestrator`), `fogar-gw status` and `fogar-gw doctor` show the
+  granted scopes, `admin`, `auth_method` (`shared_token`|`device_token`), `pairing`
+  (`unknown`|`not_required`|`paired`|`pending`|`identity_required`) with the request id or the
+  `identity_error`, and the deviceId (public: `openclaw devices list` shows it). This is the access
+  **now**: a failed connect, a dropped connection and `close()` reset it to `unknown` (keeping the
+  deviceId), and doctor then reads the identity file instead.
+
+**Method → scope** (`core-method-policy`, 2026.10.5):
+
+| Method | Scope |
+|---|---|
+| `chat.send`, `chat.abort` | `operator.write` |
+| `chat.history`, `sessions.list`, `sessions.subscribe`, `sessions.preview`, `sessions.describe`, `agents.list`, `config.get`, `config.schema` | `operator.read` |
+| `sessions.reset`, `sessions.compact`, `config.set`, `config.apply`, `config.patch`, `agents.create`, `agents.update`, `agents.delete` | `operator.admin` |
+| `sessions.patch`, `sessions.delete` | dynamic (depends on the change) |
+
+`operator.write` and `operator.admin` also satisfy `operator.read`.
+
+**Session reset policy** (config, not a method): `session.reset: {mode: "daily" | "idle",
+atHour: 0–23, idleMinutes}` (host local time; per type/channel in `resetByType`/`resetByChannel`);
+the default is `none` (no automatic reset, compaction bounds the context). It is global to every
+OpenClaw channel and resets the session under the **same key**.
+
+**The shared token.** `openclaw config get gateway.auth.token` always prints it redacted (also with
+`--json`) and does not resolve SecretRefs. The command that shows it is
+**`openclaw gateway auth-token --show`** (resolves `gateway.auth.token`, `OPENCLAW_GATEWAY_TOKEN`
+and SecretRefs; prints only in an interactive terminal on the OpenClaw host). `fogar-gw onboard`
+says so.
+
+## Reading sessions: `sessions.list` and `chat.history` (2026-11-14, server 2026.10.5)
+
+**Observed live** against a 2026.10.5 on loopback (`gateway run --dev --auth token --bind
+loopback`, connected as `gateway-client`/`backend` with `operator.read`), after creating two
+sessions with `chat.send` (no model credentials, so each run failed with `chat` `state:"error"`),
+and **read** in the package source (`SessionsListParamsSchema`, `ChatHistoryParamsSchema`,
+`deriveSessionTitle`, `docs/gateway/protocol/rpc-session-control.md`). Both are `operator.read`.
+The gateway uses them only through `OpenClawClient.request`, which refuses any method outside
+`READ_METHODS` (`sessions.list`, `chat.history`): no admin method is called in M19.
+
+**`sessions.list`** — params (closed schema): `limit` (≥1; default bounded, 100 observed as
+`limitApplied`), `offset`, `archived` (`false`/omitted = active only, `true`, `"all"`),
+`rowMode: "compact"` (drops detail-only fields), `includeDerivedTitles`, `includeLastMessage`,
+`agentId`, `search`, and many filters the gateway does not use. Answer:
+
+```json
+{"ts": 1794665075306, "count": 2, "totalCount": 2, "limitApplied": 100,
+ "hasMore": false, "nextOffset": null, "owners": [], "defaults": {...},
+ "sessions": [{"key": "agent:dev:fogar-probe-0001", "agentId": "dev", "kind": "direct",
+               "sessionId": "a460a678-…", "createdAt": 1794665068411, "updatedAt": 1794665071133,
+               "lastInteractionAt": 1794665068405, "lastActivityAt": 1794665071055,
+               "archived": false, "status": "failed", "lastRunId": "5c629a99-…",
+               "hasActiveRun": false, "activeRunIds": [], ...}]}
+```
+
+- Timestamps are epoch **ms**. Rows carry no title by default; with `includeDerivedTitles: true`
+  a row gets `derivedTitle` = `label` ?? external `displayName` ?? `displayName` ?? `subject` ??
+  a title derived from the first user message (empty for a short greeting: our probe sessions had
+  none). The gateway shows `derivedTitle` ?? `displayName` ?? `label` (the order OpenClaw's own UI
+  uses) and `null` when none; the title is user-derived text: it goes to `/admin` only, never to a
+  log. `includeLastMessage` adds `lastMessagePreview` (user text too; the gateway does not ask).
+- Archived sessions (OpenClaw archives old ones) are **not** listed unless `archived` is `true` or
+  `"all"`; the gateway always sends `"all"` and pages with `offset` while `hasMore`.
+- `search` matched a substring of the key (`"fogar-"` found only the M19-style key).
+
+**`chat.history`** — params (closed schema): `sessionKey` (required), `limit` (1–1000),
+`offset`, `cursor`, `maxBytes`, `maxChars`, … Answer, oldest first, the last `limit` messages:
+
+```json
+{"sessionKey": "agent:dev:3f2b…", "sessionId": "4de1a9e5-…", "hasMore": false,
+ "totalMessages": 2, "deltaCursor": "…", "pendingInputs": {...}, "defaults": {...},
+ "sessionInfo": {"key": "…", "agentId": "dev", "hasActiveRun": false, ...},
+ "messages": [
+   {"role": "user", "content": "hola 556666", "timestamp": 1794665071190,
+    "idempotencyKey": "c285c151-…:user", "__openclaw": {"id": "…", "seq": 1, ...}},
+   {"role": "custom", "customType": "run-failed-before-reply", "display": true,
+    "content": "Your request couldn't be completed: …", "timestamp": 1794665071823,
+    "__openclaw": {"runId": "c285c151-…", "seq": 2, ...}}]}
+```
+
+- `content` is a string for a user message; an assistant message carries parts
+  (`[{"type":"text","text":…}, …]`, the same shape as `chat` `message`). The history is
+  display-normalised by OpenClaw (directive tags, tool-call XML and silent `NO_REPLY` rows
+  stripped). Other roles appear (`custom` notices like the failed run above, tool rows): the
+  gateway keeps only `user`/`assistant` with text, as `{role, text, timestamp}`.
+- **A key with no session is not an error:** `ok:true` with `messages: []`, `totalMessages: 0` and
+  a `sessionInfo` for that key (`updatedAt: null`). An unknown conversation is the gateway's 404,
+  never OpenClaw's.
+- **Agent ids** (read in `dist/agent-id-*.mjs`, 2026.10.5): `VALID_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i`,
+  canonical form lower-case; anything else is normalised (invalid runs → `-`) or falls back to
+  `main`. The gateway validates `DEFAULT_AGENT` and a client's `default_agent`/`allowed_agents`
+  with the same pattern (`core/session_key.AGENT_ID_PATTERN`): a `:` or a space would also break
+  the `agent:{agent}:fogar-{id}` key.
+- Not checked live: an archived session's history (OpenClaw's docs say requesting history restores
+  it from cold storage) and the `deltaCursor` catch-up. The gateway does not use the cursor.
 
 ## Change log of this file
 
+- **2026-11-17**: lone surrogates: a frame whose `id` or `payload.runIds` would change by cleaning,
+  or whose `payload` would stop being an object, is dropped; a rejected device token is deleted
+  only if it is still the stored one (audit 3.0 r6, B-r6-1..3).
+- **2026-11-16**: lone surrogates: the halves of an emoji split between two `chat` deltas are
+  joined before cleaning; binary frames are always cleaned (audit 3.0 r4, B-r4-1, C-r4-1).
+- **2026-11-16**: "Frame size, malformed frames and connection end" gains lone surrogates
+  (audit 3.0 r3, G-r3-1): dropped on parse, without a replacement character.
+- **2026-11-15**: "Discovering Available Agents" no longer says the gateway does not request
+  `operator.admin` (it does since 2026-11-13; audit 3.0, B-3) and gives `config.get`'s scope from
+  the "Method → scope" table (`operator.read`).
+- **2026-11-15**: "Session key carries the conversation" gains "The whole key is lower-cased by
+  OpenClaw" (server 2026.10.5, audit 3.0, C-1): events come back with the lower-case key and the
+  `chat.send` ack lists the key as sent in `sessionKeyAliases`; the gateway lower-cases agent ids
+  and keys before sending.
+
+- **2026-11-13**: added "Device identity, pairing and `operator.admin`" (server 2026.10.5, read in
+  the package source; the local admin path probed live): the gateway asks for `operator.admin`,
+  signs every `connect` (device auth v3), stores and prefers the device token issued after a
+  remote pairing, falls back to the shared token when it is refused, and reports
+  `PAIRING_REQUIRED` with the approval command. The token hint is `openclaw gateway auth-token --show`.
+  Review the same day: onboard always tests the shared token, a missing device proof is its own
+  error (`orchestrator_device_identity_required`), the access resets on failure/drop/close,
+  unannounced scopes are unknown (`None`), broader scopes on the same token are stored, and the
+  identity file is locked (`flock`) and copied by `migrate`. Signature verified live against a
+  2026.10.5 on loopback (hello-ok read/write/admin, `shared_token`/`not_required`).
+
+- **2026-11-14**: added "Reading sessions: `sessions.list` and `chat.history`" (server 2026.10.5,
+  observed live on loopback and read in the package source); "Session key carries the
+  conversation" replaces "…per-client identity": the key is now `agent:{agent}:fogar-{conversation}`,
+  pre-M19 keys are imported as `legacy` conversations, push is routed by an in-memory index.
+- **2026-11-14**: added "`agent` events of streams other than `lifecycle`" (server 2026.10.5,
+  read in the package source): only `stream:"lifecycle"` opens or ends a push now; an `item`
+  `end` used to close the open push. Startup phases of a push that arrive before its
+  `agent start` are kept and sent when it opens.
+- **2026-11-14**: added "Startup phases and tool progress" (server 2026.10.5, read in the package
+  source, issue #254): the full `chat` `state:"status"` phase set, where it comes from, retries;
+  the gateway now forwards them and the tool names as `turn_progress`.
+- **2026-11-14**: added "How the gateway uses `runId`" (M19, issues #285/#286): `runId`
+  correlation of turns, tombstones for every aborted run, push turn budget. No server change.
 - **2026-11-06**: added "Connect deadline and `chat.send` session keys" (server 2026.11.1, read in
   the package source): the handshake deadline is now 30 s and `chat.send` rejects session keys
   that do not identify an agent; no gateway change needed.

@@ -51,7 +51,8 @@ def _file(path: Path, cache: str) -> FileResponse:
 
 @router.api_route("/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
 def web(path: str) -> FileResponse:
-    if path.split("/", 1)[0] in API_PREFIXES or not web_available():
+    # Un NUL haría fallar `resolve` con ValueError (500); no es una ruta válida (D-6).
+    if "\x00" in path or path.split("/", 1)[0] in API_PREFIXES or not web_available():
         raise HTTPException(status_code=404)
     root = WEB_DIR.resolve()
     target = (root / path).resolve()

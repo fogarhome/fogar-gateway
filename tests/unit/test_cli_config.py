@@ -12,7 +12,7 @@ from click.testing import CliRunner
 from fogar_gateway.cli.app import cli
 
 ROOT = Path(__file__).resolve().parents[2]
-SECRET = "s3cr3t-admin-token-0123456789"
+SECRET = "s3cr3t-admin-token-0123456789abcdef"
 
 
 @pytest.fixture()
@@ -164,12 +164,122 @@ def test_set_invalid_writes_nothing(home):
     assert [p.name for p in home.iterdir()] == ["config.env"]
 
 
+@pytest.mark.parametrize("field", ["TRUSTED_PROXIES", "TRUSTED_NETWORKS"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "127.0.0.1;::1", "localhost", "192.168.1.0/0", "192.168.1.5/24", "::1%eth0", "::/0",
+        "0.0.0.0/1", "128.0.0.0/1", "10.0.0.0/7", "::/1", "8000::/1", "::ffff:0:0/96", "::/80",
+    ],
+)
+def test_set_invalid_network_list_writes_nothing(home, field, value):
+    # F-r3-1: no son secretos, así que se dice qué entrada falla.
+    before = _env(home).read_bytes()
+    r = run("config", "set", field, f"127.0.0.1, {value}")
+    assert r.exit_code == 1
+    assert field in r.output and f"«{value}»" in r.output and "«127.0.0.1»" not in r.output
+    assert _env(home).read_bytes() == before
+
+
+def test_set_valid_network_list(home):
+    r = run("config", "set", "TRUSTED_NETWORKS", " 192.168.1.0/24 , fd12:3456::/48 ")
+    assert r.exit_code == 0, r.output
+
+
+def test_validate_marks_invalid_network_list(home):
+    # Una entrada mala en config.env no rompe la carga: validate (y doctor) la señalan.
+    (home / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nTRUSTED_PROXIES=127.0.0.1;::1\n")
+    r = run("config", "validate")
+    assert r.exit_code == 1
+    assert "TRUSTED_PROXIES" in r.output and "«127.0.0.1;::1»" in r.output
+    assert "fallo cerrado" in r.output
+
+
+def test_validate_fails_on_wide_networks(home):
+    (home / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nTRUSTED_NETWORKS=0.0.0.0/1,128.0.0.0/1\n")
+    r = run("--json", "config", "validate")
+    assert r.exit_code == 1
+    checks = [c for c in json.loads(r.output) if c["check"] == "TRUSTED_NETWORKS"]
+    assert [c["level"] for c in checks] == ["fail"]
+    assert "«0.0.0.0/1»" in checks[0]["detail"] and "«128.0.0.0/1»" in checks[0]["detail"]
+
+
+def test_host_bits_hint_only_for_host_bits(home):
+    r = run("config", "set", "TRUSTED_NETWORKS", "192.168.1.5/24,localhost")
+    assert r.exit_code == 1
+    assert "«192.168.1.5/24» (bits de host: 192.168.1.0/24)" in r.output
+    assert "«localhost» (no es una IP ni un CIDR)" in r.output
+
+
+def test_validate_only_warns_on_host_bits(home):
+    # El gateway acepta 192.168.1.5/24 (= 192.168.1.0/24): aviso, no fallo; `config set` sí lo rechaza.
+    (home / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nTRUSTED_NETWORKS=192.168.1.5/24\n")
+    r = run("--json", "config", "validate")
+    assert r.exit_code == 0, r.output
+    checks = [c for c in json.loads(r.output) if c["check"] == "TRUSTED_NETWORKS"]
+    assert [c["level"] for c in checks] == ["warn"] and "192.168.1.5/24" in checks[0]["detail"]
+    assert "válid" not in checks[0]["detail"]
+
+
 def test_set_new_failing_check_aborts(home):
     # Vaciar ADMIN_TOKEN crea un check `fail` nuevo (el sin definir no lo era).
     before = _env(home).read_bytes()
     r = run("config", "set", "ADMIN_TOKEN", "-", input="\n")
     assert r.exit_code == 1
     assert _env(home).read_bytes() == before
+
+
+@pytest.mark.parametrize("current", [SECRET, "corto"])
+def test_set_short_admin_token_is_refused(home, current):
+    """D-r5-1: < 32 caracteres → exit 1 sin escribir ni mostrar el valor, aunque el actual
+    ya sea corto (el filtro de «fallo nuevo» no lo frenaría)."""
+    _env(home).write_text(f"ADMIN_TOKEN={current}\n")
+    before = _env(home).read_bytes()
+    r = run("config", "set", "ADMIN_TOKEN", "-", input="y" * 31 + "\n")
+    assert r.exit_code == 1 and "32" in r.output
+    assert "y" * 31 not in r.output
+    assert _env(home).read_bytes() == before
+    r = run("config", "set", "ADMIN_TOKEN", "-", input="z" * 32 + "\n")
+    assert r.exit_code == 0, r.output
+    assert f"ADMIN_TOKEN={'z' * 32}" in _env(home).read_text()
+
+
+def test_set_admin_token_with_spaces_or_non_ascii_is_refused(home):
+    """D-r6-2: 32 caracteres que no son ASCII imprimible sin espacios no valen."""
+    before = _env(home).read_bytes()
+    for value in ("abc" + " " * 29, "ñ" * 32):
+        r = run("config", "set", "ADMIN_TOKEN", "-", input=value + "\n")
+        assert r.exit_code == 1 and "32" in r.output
+    assert _env(home).read_bytes() == before
+
+
+@pytest.mark.parametrize("current", [SECRET, "corto"])
+def test_unset_admin_token_is_always_refused(home, current):
+    """F-r6-3: aunque el actual ya sea corto (y por tanto no «empeore» ningún check)."""
+    _env(home).write_text(f"ADMIN_TOKEN={current}\n")
+    before = _env(home).read_bytes()
+    r = run("config", "unset", "ADMIN_TOKEN")
+    assert r.exit_code == 1
+    assert _env(home).read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "name", ["HANDSHAKE_TIMEOUT_S", "TURN_TIMEOUT_S", "IDLE_TIMEOUT_S", "PUSH_TTS_DRAIN_TIMEOUT_S"]
+)
+def test_set_zero_timeout_is_refused(home, name):
+    """A-r6-1: un 0 deja el gateway inservible; se rechaza al escribir."""
+    before = _env(home).read_bytes()
+    assert run("config", "set", name, "0").exit_code == 1
+    assert _env(home).read_bytes() == before
+
+
+def test_validate_fails_on_short_admin_token(home):
+    _env(home).write_text("ADMIN_TOKEN=corto-pero-no-vacio\n")
+    r = run("--json", "config", "validate")
+    assert r.exit_code == 1
+    [check] = [c for c in json.loads(r.output) if c["check"] == "ADMIN_TOKEN"]
+    assert check["level"] == "fail" and "32" in check["detail"]
+    assert "corto-pero-no-vacio" not in r.output
 
 
 def test_set_keeps_comments_and_mode_600(home):
@@ -307,7 +417,7 @@ def test_set_json_yes_is_valid_json(home, systemd):
     r = run("--json", "--yes", "config", "set", "LOG_FORMAT", "text")
     assert r.exit_code == 0, r.output
     assert json.loads(r.output) == {"name": "LOG_FORMAT", "value": "text", "changed": True,
-                                    "restarted": True}
+                                    "restarted": True, "problems": []}
     assert ("restart", "fogar-gateway.service") in systemd.calls
 
 
@@ -384,3 +494,160 @@ def test_set_secret_dash_with_tty_prompts_hidden(home, systemd, monkeypatch):
     assert seen["hide_input"] is True
     assert "OPENCLAW_TOKEN=tecleado-oculto" in _env(home).read_text()
     assert "tecleado-oculto" not in r.output  # click no hace eco con hide_input
+
+
+def test_set_fixes_an_invalid_value_already_in_config_env(home):
+    """#359: con un valor que ya no valida (aquí un timeout 0) `config set` y `unset` siguen
+    funcionando y lo corrigen, sin traceback ni el valor. En un proceso nuevo: en este,
+    `fogar_gateway.core.config` ya está importado y el fallo no se vería."""
+    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nTURN_TIMEOUT_S=0\nIDLE_TIMEOUT_S=0\n")
+
+    def cli_run(*args):
+        return subprocess.run([sys.executable, "-m", "fogar_gateway.cli", *args], cwd=ROOT,
+                              capture_output=True, text=True, env=os.environ)
+
+    r = cli_run("config", "set", "TURN_TIMEOUT_S", "120")
+    assert r.returncode == 0, r.stdout + r.stderr
+    r = cli_run("config", "set", "HANDSHAKE_TIMEOUT_S", "0")  # un error nuevo no: legible
+    assert r.returncode == 1 and "HANDSHAKE_TIMEOUT_S: greater_than" in r.stdout + r.stderr
+    r = cli_run("config", "unset", "IDLE_TIMEOUT_S")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "Traceback" not in r.stdout + r.stderr
+    assert _env(home).read_text() == f"ADMIN_TOKEN={SECRET}\nTURN_TIMEOUT_S=120\n"
+
+
+def test_set_only_rejects_its_own_field_and_warns_about_the_rest(home, monkeypatch):
+    """F-r7-1: `set`/`unset` solo rechazan que el propio ajuste quede inválido; corregir uno
+    siempre se puede, y lo que falla en otros ajustes solo se avisa (sin valores)."""
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    good = "a" * 32
+    _env(home).write_text("ADMIN_TOKEN=corto\nTURN_TIMEOUT_S=0\n")
+    r = run("config", "set", "TURN_TIMEOUT_S", "10")
+    assert r.exit_code == 0, r.output
+    assert "Aviso" in r.output and "ADMIN_TOKEN" in r.output and "corto" not in r.output
+
+    _env(home).write_text(f"ADMIN_TOKEN={good}\nTURN_TIMEOUT_S=0\n")
+    r = run("config", "set", "STT_PROVIDER", "elevenlabs")  # sin clave: otro ajuste, avisa
+    assert r.exit_code == 0, r.output
+    assert "TURN_TIMEOUT_S: greater_than" in r.output and "config validate" in r.output
+    r = run("config", "set", "TURN_TIMEOUT_S", "10")  # como `validate`: ahora sale la voz
+    assert r.exit_code == 0, r.output
+    assert "ELEVENLABS_API_KEY" in r.output and "TURN_TIMEOUT_S:" not in r.output
+
+    _env(home).write_text(f"ADMIN_TOKEN={good}\nTTS_VOICE_MAP=no-es-json\n")
+    before = _env(home).read_bytes()
+    r = run("config", "set", "TURN_TIMEOUT_S", "0")  # el propio ajuste queda inválido
+    assert r.exit_code == 1 and "TURN_TIMEOUT_S: greater_than" in r.output
+    r = run("config", "set", "TTS_VOICE_MAP", "-", input="{malo\n")
+    assert r.exit_code == 1 and "TTS_VOICE_MAP" in r.output
+    assert _env(home).read_bytes() == before
+    r = run("config", "unset", "TTS_VOICE_MAP")
+    assert r.exit_code == 0, r.output
+    assert "Aviso" not in r.output
+    assert _env(home).read_text() == f"ADMIN_TOKEN={good}\n"
+    r = run("--json", "config", "set", "TTS_VOICE_MAP", '{"a":"b"}')
+    assert r.exit_code == 0, r.output
+    assert json.loads(r.output)["problems"] == []
+
+
+def test_set_validates_its_field_ignoring_other_bad_environment(home, monkeypatch):
+    """F-r7-1 (revisión): un ajuste malo en el entorno (aquí un JSON que no se lee) no oculta
+    que el propio valor es inválido."""
+    monkeypatch.setenv("TTS_VOICE_MAP", "bad")
+    before = _env(home).read_bytes()
+    r = run("config", "set", "IDLE_TIMEOUT_S", "0")
+    assert r.exit_code == 1 and "IDLE_TIMEOUT_S: greater_than" in r.output
+    assert _env(home).read_bytes() == before
+    assert os.environ["TTS_VOICE_MAP"] == "bad"  # el entorno queda como estaba
+
+
+@pytest.mark.parametrize("extra", ["", "TURN_TIMEOUT_S=0\n"])
+def test_retired_key_warning_once_per_command(home, extra):
+    """F-r7-3: el WARNING de la clave obsoleta sale una vez, también con la configuración
+    inválida (la CLI ejecuta entonces el módulo otra vez). En un proceso nuevo."""
+    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nORCHESTRATOR_RECONNECT_MAX_DURATION=5\n{extra}")
+    r = subprocess.run([sys.executable, "-m", "fogar_gateway.cli", "config", "set",
+                        "TURN_TIMEOUT_S", "10"], cwd=ROOT, capture_output=True, text=True,
+                       env=os.environ)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (r.stdout + r.stderr).count("is obsolete and ignored") == 1
+
+
+@pytest.mark.parametrize("value", ["0", "inf", "nan"])
+@pytest.mark.parametrize(
+    "name",
+    ["ORCHESTRATOR_RECONNECT_INITIAL_BACKOFF", "TTS_RECONNECT_MAX_BACKOFF",
+     "TRANSCRIBER_RECONNECT_MAX_DURATION", "TTS_AUTH_TIMEOUT_S", "TRANSCRIBER_READY_TIMEOUT_S",
+     "HANDSHAKE_TIMEOUT_S"],
+)
+def test_set_rejects_non_positive_or_infinite_deadlines(home, name, value):
+    """D-r7-1: backoffs y plazos > 0 y finitos."""
+    before = _env(home).read_bytes()
+    assert run("config", "set", name, value).exit_code == 1
+    assert _env(home).read_bytes() == before
+
+
+# --- ronda 8 -------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["a\x0cADMIN_TOKEN=x", "a\u2028b=c", "a\x00b"])
+def test_set_rejects_other_line_breaks_and_nul(home, value):
+    """F-r8-1, F-r8-3: splitlines también corta en \\x0c, \\u2028…; un segundo `set` dejaba una
+    línea suelta en config.env. Un NUL daba un traceback."""
+    before = _env(home).read_bytes()
+    for args, stdin in ((("TTS_WS_URL", value), None), (("OPENCLAW_TOKEN", "-"), value)):
+        r = run("config", "set", *args, input=stdin)
+        assert r.exit_code == 1 and "No se ha escrito nada" in r.output, r.output
+        assert r.exception is None or isinstance(r.exception, SystemExit)
+    assert _env(home).read_bytes() == before
+
+
+def test_onboard_apply_rejects_line_breaks(home):
+    from fogar_gateway.cli import api, config
+    from fogar_gateway.cli.output import Out
+
+    before = _env(home).read_bytes()
+    with pytest.raises(api.ApiError, match="No se ha escrito nada"):
+        config._apply(Out(False), "OPENCLAW_HOST", "h\x0bTURN_TIMEOUT_S=0")
+    assert _env(home).read_bytes() == before
+
+
+@pytest.mark.parametrize("shell_key", [False, True])
+def test_set_fatal_problem_warns_first_and_never_restarts(home, systemd, monkeypatch,
+                                                          shell_key):
+    """F-r8-2: STT_PROVIDER=elevenlabs sin clave en config.env no arranca (el servicio no
+    hereda la de esta shell): se avisa y no se reinicia, ni con --yes ni con --json."""
+    if shell_key:
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "de-la-shell")
+    else:
+        monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    r = run("--yes", "config", "set", "STT_PROVIDER", "elevenlabs")
+    assert r.exit_code == 0, r.output
+    assert "ELEVENLABS_API_KEY" in r.output and "no arrancaría" in r.output
+    assert ("restart", "fogar-gateway.service") not in systemd.calls
+    r = run("--json", "--yes", "config", "set", "STT_PROVIDER", "elevenlabs")
+    assert json.loads(r.stdout)["restarted"] is False
+    assert "ELEVENLABS_API_KEY" in r.stderr
+    assert ("restart", "fogar-gateway.service") not in systemd.calls
+
+
+def test_set_non_fatal_problem_restarts_and_warns_before(home, systemd, monkeypatch):
+    """F-r8-2: un ADMIN_TOKEN corto arranca: se reinicia y el aviso sale antes, también si el
+    reinicio falla."""
+    _env(home).write_text("ADMIN_TOKEN=corto\n")
+    r = run("--yes", "config", "set", "LOG_FORMAT", "text")
+    assert r.exit_code == 0, r.output
+    assert "ADMIN_TOKEN" in r.output and ("restart", "fogar-gateway.service") in systemd.calls
+    systemd.fail = True
+    r = run("--json", "--yes", "config", "set", "LOG_FORMAT", "json")
+    assert r.exit_code == 1 and r.stdout == ""
+    assert "ADMIN_TOKEN" in r.stderr and "guardado" in r.stderr
+
+
+def test_unset_accepts_retired_key(home):
+    """F-r8-4: el log pide quitar ORCHESTRATOR_RECONNECT_MAX_DURATION; `unset` lo hace."""
+    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nORCHESTRATOR_RECONNECT_MAX_DURATION=5\n")
+    r = run("config", "unset", "orchestrator_reconnect_max_duration")
+    assert r.exit_code == 0, r.output
+    assert _env(home).read_text() == f"ADMIN_TOKEN={SECRET}\n"
+    assert run("config", "set", "ORCHESTRATOR_RECONNECT_MAX_DURATION", "5").exit_code == 2

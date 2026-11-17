@@ -12,7 +12,7 @@ const router = useRouter()
 const session = useSessionStore()
 
 const token = ref('')
-const recordar = ref(true)
+const recordar = ref(false)
 const error = ref<string | null>(null)
 const ocupado = ref(false)
 

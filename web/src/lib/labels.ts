@@ -38,7 +38,15 @@ export const PAIRING_STATE: Record<PairingState, string> = {
 
 /** Texto de un valor, o el valor tal cual si el gateway trae uno nuevo que la web aún no conoce. */
 export function label(texts: Record<string, string>, value: string): string {
-  return texts[value] ?? value
+  return ownText(texts, value) ?? value
+}
+
+/**
+ * El texto de `value` solo si es una clave propia de `texts`: un valor que llega del gateway como
+ * `constructor` o `toString` no debe dar con los miembros de `Object.prototype`.
+ */
+export function ownText(texts: Record<string, string>, value: string): string | undefined {
+  return Object.hasOwn(texts, value) ? texts[value] : undefined
 }
 
 /** Motivos de cierre de sesión (src/services/stats.py, CloseReason). */
@@ -48,6 +56,7 @@ export const CLOSE_REASON: Record<string, string> = {
   silence_timeout: 'Silencio al hablar',
   slow_client: 'Cliente lento',
   revoked: 'Acceso retirado',
+  agent_revoked: 'Agente retirado',
   shutdown: 'Apagado del gateway',
   error: 'Error',
   unknown: 'Desconocido',
@@ -73,6 +82,15 @@ export const TURN_ERROR: Record<string, string> = {
   turn_overflow: 'El gateway no pudo seguir el ritmo de la respuesta',
   turn_in_progress: 'Ya había un turno en marcha',
   internal_error: 'Error interno del gateway',
+}
+
+/** Errores de turno con los que la pregunta no llegó a OpenClaw: no vendrá al releer lo dicho. */
+export const NOT_IN_OPENCLAW: ReadonlySet<string> = new Set(['orchestrator_unavailable', 'orchestrator_send_failed'])
+
+/** En qué está un turno (`turn_progress`, docs/client-protocol.md §5); la herramienta va aparte. */
+export const TURN_PROGRESS: Record<string, string> = {
+  preparing: 'Preparando…',
+  thinking: 'Pensando…',
 }
 
 /** Modos de entrada y salida de una sesión. */
@@ -103,6 +121,7 @@ export const STAGE: Record<string, string> = {
   barge_in: 'Interrupción',
   client_slow: 'Cliente lento',
   session_revoked: 'Acceso retirado',
+  agent_revoked: 'Agente retirado',
   session_end: 'Fin de la sesión',
 }
 
@@ -111,5 +130,6 @@ export const SESSION_STATUS: Record<string, string> = {
   active: 'Abierta',
   completed: 'Cerrada',
   error: 'Con error',
-  revoked: 'Acceso retirado',
+  // G-r7-5: `revoked` cubre la clave retirada y el agente retirado (4020); la lista no trae el motivo
+  revoked: 'Clave o agente retirado',
 }

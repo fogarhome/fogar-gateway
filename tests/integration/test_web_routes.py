@@ -90,3 +90,8 @@ def test_without_build_root_is_404_and_api_works(client, tmp_path, monkeypatch):
 def test_web_dir_hangs_from_the_package_not_the_cwd():
     assert web_routes.WEB_DIR.parent.name == "fogar_gateway"
     assert web_routes.WEB_DIR.is_absolute()
+
+
+def test_nul_byte_in_path_is_404(client, web_dir):
+    """Auditoría 3.0, D-6: `resolve` con un NUL lanzaba ValueError (500)."""
+    assert client.get("/a%00b").status_code == 404

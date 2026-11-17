@@ -29,7 +29,7 @@ class TTSClient:
     Client for fogar-speaker TTS service (port 8005).
 
     One instance = one WebSocket session: auth → tokens → end → audio → done.
-    Create a fresh instance per _call_orchestrator invocation.
+    Create a fresh instance per turn (one `TurnTts` per turn, services/turns.py).
     """
 
     def __init__(self, url: str, token: str, client_id: str) -> None:
@@ -40,6 +40,8 @@ class TTSClient:
         self._out: asyncio.Queue[bytes | None] = asyncio.Queue()
         self._buffered = 0
         self._reader: asyncio.Task[None] | None = None
+        self._carry = b""  # byte suelto de un frame impar: PCM16 va por pares (E-r6-4)
+        self._dead = False  # el socket se cerró al enviar: no se manda ni se avisa más (E-r6-3)
 
     async def connect(
         self,
@@ -51,7 +53,8 @@ class TTSClient:
         ws_url = f"ws://{self.url}/ws"
         _authenticated = False
         try:
-            ws = await websockets.connect(ws_url)
+            # E-r7-1: un speaker que no cierra el TCP no congela el turno 10 s (como ElevenLabs).
+            ws = await websockets.connect(ws_url, close_timeout=1)
             self.ws = ws
             auth_msg: dict = {"type": "auth", "token": self.token}
             if voice is not None:
@@ -106,21 +109,21 @@ class TTSClient:
 
     async def send_text_chunk(self, text: str) -> None:
         """Send one LLM token. No-op if WS is unavailable."""
-        if not self.ws:
-            return
-        try:
-            await self.ws.send(json.dumps({"type": "token", "text": text}))
-        except ConnectionClosed:
-            logger.warning("[%s] send_text_chunk: ConnectionClosed", self.client_id)
+        await self._send({"type": "token", "text": text})
 
     async def end(self) -> None:
         """Signal no more tokens. No-op if WS is unavailable."""
-        if not self.ws:
+        await self._send({"type": "end"})
+
+    async def _send(self, msg: dict) -> None:
+        if not self.ws or self._dead:
             return
         try:
-            await self.ws.send(json.dumps({"type": "end"}))
+            await self.ws.send(json.dumps(msg))
         except ConnectionClosed:
-            logger.warning("[%s] end: ConnectionClosed", self.client_id)
+            # Sin relanzar: el audio que ya llegó sigue saliendo; un solo aviso por síntesis.
+            self._dead = True
+            logger.warning("[%s] TTS cerrado al enviar texto; la síntesis no sigue", self.client_id)
 
     async def get_audio_stream(self) -> AsyncGenerator[bytes, None]:
         """
@@ -145,6 +148,11 @@ class TTSClient:
         try:
             async for msg in ws:
                 if isinstance(msg, bytes):
+                    msg = self._carry + msg
+                    self._carry = msg[-1:] if len(msg) % 2 else b""
+                    msg = msg[: len(msg) - len(self._carry)]
+                    if not msg:
+                        continue
                     if self._buffered + len(msg) > MAX_BUFFER_BYTES:
                         logger.warning(
                             "[%s] TTS: el búfer de audio supera %d bytes; se corta la síntesis",

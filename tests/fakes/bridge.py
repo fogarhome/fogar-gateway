@@ -10,9 +10,11 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock
 
+from fogar_gateway.core.session_key import make_session_key
 from fogar_gateway.models.schemas import Client, ClientConfig, Handshake
 from fogar_gateway.services.bridge import FogarBridge
-from fogar_gateway.services.openclaw.registry import ClientRegistry
+from fogar_gateway.services.conversations import Conversation, SessionConversation
+from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
 from fogar_gateway.services.outbound import ClientGone, QueuedSender
 from fogar_gateway.services.protocol import OrchestratorEvent
 from tests.fakes.speech import speech_providers
@@ -75,7 +77,8 @@ def make_bridge(
         tracker=fake_tracker(),
         handshake=Handshake(client_key="k", input_mode=input_mode, output_mode=list(output_mode)),
         client_registry=ClientRegistry(),
-        default_agent="main",
+        turn_registry=TurnRegistry(),
+        conversation=fixed_conversation(client_id),
     )
     kwargs.update(overrides)
     if "sender" not in kwargs:  # not setdefault: it would start a writer task nobody closes
@@ -83,8 +86,24 @@ def make_bridge(
     bridge = FogarBridge(**kwargs)
     bridge.transcriber = transcriber
     if register:
-        kwargs["client_registry"].register(bridge.client_id, bridge)
+        kwargs["client_registry"].register(bridge.client_id, bridge, bridge.conversation.current)
     return bridge, ws
+
+
+CONVERSATION_ID = "conv-1"
+
+
+def fixed_conversation(client_id: str = "u", agent: str = "main", **kwargs) -> SessionConversation:
+    """A session conversation that never changes day, on the pre-M19 key `agent:{agent}:{client_id}`
+    (like an imported legacy conversation), so push tests keep their `agent:main:<client>` keys."""
+    conv = Conversation(
+        id=kwargs.pop("id", CONVERSATION_ID),
+        client_id=client_id,
+        agent=agent,
+        session_key=make_session_key(agent, client_id),
+        kind="legacy",
+    )
+    return SessionConversation(conv, explicit=True, **kwargs)
 
 
 async def sent(bridge) -> list:
@@ -94,6 +113,40 @@ async def sent(bridge) -> list:
     sent", not "the sender dropped it". With a broken sender, read `ws.sent`."""
     await bridge._sender.flush()
     return bridge.client_ws.sent
+
+
+async def start_turn(bridge, text: str = "x") -> asyncio.Task:
+    """Start a user turn as a `send` does (replacing the one in flight); return its task."""
+    await bridge.turns.start_user_turn(text)
+    task = bridge.turns.user_task
+    assert task is not None, "the turn did not start"
+    return task
+
+
+async def run_turn(bridge, text: str = "x", timeout: float = 5.0) -> None:
+    """Run one user turn to its end (its turn_end included)."""
+    task = await start_turn(bridge, text)
+    done, _ = await asyncio.wait({task}, timeout=timeout)
+    if not done:
+        task.cancel()
+        raise AssertionError(f"the turn did not end in {timeout}s")
+
+
+async def push(bridge, *events) -> None:
+    """Feed OpenClaw push events `(kind, arg)` through the bridge's push worker and wait
+    until it handled them all (what FrameDispatcher does with `enqueue_push`)."""
+    for kind, arg in events:
+        bridge.enqueue_push(kind, arg)
+    await bridge.push_idle()
+
+
+def push_reply(*deltas: str, sk: str = "sk", end: bool = True) -> list[tuple[str, object]]:
+    """The events of a push reply: agent start, one `chat` per delta and (if `end`) agent end."""
+    events: list[tuple[str, object]] = [("turn_start", sk)]
+    events += [("chat", {"sessionKey": sk, "deltaText": d}) for d in deltas]
+    if end:
+        events.append(("turn_end", sk))
+    return events
 
 
 def tokens(*tokens):
@@ -149,6 +202,9 @@ class GoneSender:
     def queue_stats(self) -> dict:
         return {"pending_msgs": 0, "pending_bytes": 0, "peak_msgs": 0, "peak_bytes": 0}
 
+    def restrict(self, allowed: frozenset[str]) -> None:
+        return None
+
 
 class DirectSender:
     """Passthrough: writes straight to the socket, no queue. For tests of the
@@ -171,3 +227,6 @@ class DirectSender:
 
     def queue_stats(self) -> dict:
         return {"pending_msgs": 0, "pending_bytes": 0, "peak_msgs": 0, "peak_bytes": 0}
+
+    def restrict(self, allowed: frozenset[str]) -> None:
+        return None

@@ -35,6 +35,37 @@ def test_unit_text_exact():
     assert "--create-db" not in text and "LOG_FORMAT" not in text
 
 
+def test_unit_quotes_and_escapes_odd_paths():
+    # Espacio, especificador %, variable $, comilla y barra: la unidad no debe partir ni expandir.
+    odd = 'a b%c$d"e\\f'
+    text = service.render_unit(Path(f"/x/{odd}/fogar-gw"), Path(f"/h/{odd}"))
+    # En ExecStart, systemd expande % y $ (se doblan); en Environment= solo % ($ es literal).
+    assert 'ExecStart="/x/a b%%c$$d\\"e\\\\f/fogar-gw" serve\n' in text
+    assert 'Environment="FOGAR_GATEWAY_HOME=/h/a b%%c$d\\"e\\\\f"\n' in text
+
+
+def test_pick_exe_makes_relative_exe_absolute_without_resolving(monkeypatch, tmp_path):
+    (tmp_path / "otro").mkdir()
+    monkeypatch.chdir(tmp_path / "otro")
+    # systemd rechaza una ruta con `..`: se normaliza sin resolver symlinks.
+    exe = service.pick_exe(Path("../.venv/bin/fogar-gw"))
+    assert exe == tmp_path / ".venv/bin/fogar-gw" and exe.is_absolute()
+
+
+def test_pick_exe_bare_name_is_looked_up_on_path(monkeypatch, tmp_path):
+    exe = tmp_path / "fogar-gw"
+    exe.write_text("")
+    monkeypatch.setattr(service.shutil, "which", lambda name: str(exe) if str(name) == "fogar-gw" else None)
+    monkeypatch.chdir(tmp_path.parent)
+    assert service.pick_exe(Path("fogar-gw")) == exe
+
+
+def test_pick_exe_bare_name_not_on_path_fails(monkeypatch):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    with pytest.raises(api.ApiError, match="No encuentro"):
+        service.pick_exe(Path("fogar-gw"))
+
+
 def test_stop_timeout_matches_compose_and_exceeds_graceful_shutdown():
     root = Path(__file__).resolve().parents[2]
     compose = (root / "docker-compose.yml").read_text()
@@ -145,6 +176,7 @@ def test_importing_service_does_not_load_subprocess():
 
 # --- install / uninstall / start / stop / restart (M14d, B2 y B3) ---
 
+import shutil  # noqa: E402
 import socket  # noqa: E402
 import subprocess  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
@@ -406,3 +438,152 @@ def test_inside_container_explains_docker(installed, monkeypatch):
     r = run("--yes", "restart")
     assert r.exit_code == 1 and service.NO_SERVICE_MSG in r.output
     assert installed.calls == []
+
+
+# --- uninstall --purge ---
+
+
+@pytest.fixture()
+def purge(svc, monkeypatch):
+    svc.unit.parent.mkdir(parents=True)
+    svc.unit.write_text(_unit_text(svc))
+    monkeypatch.setattr(service, "_uninstall_program", lambda: "pendiente")
+    return svc
+
+
+def test_purge_removes_service_and_home(purge):
+    r = run("--yes", "--json", "uninstall", "--purge")
+    assert r.exit_code == 0, r.output
+    assert not purge.unit.exists() and not purge.home.exists()
+    assert purge.calls == [("disable", "--now", "fogar-gateway.service"), ("daemon-reload",)]
+    assert json.loads(r.stdout) == {"unit": str(purge.unit), "exe": None,
+                                    "home": str(purge.home), "state": "purgado",
+                                    "program": "pendiente"}
+
+
+def test_purge_without_tty_needs_yes(purge):
+    r = run("uninstall", "--purge")
+    assert r.exit_code == 2 and "--yes" in r.output
+    assert purge.home.exists() and purge.unit.exists() and purge.calls == []
+
+
+def test_purge_asks_to_type_the_path(purge, monkeypatch):
+    monkeypatch.setattr(output, "_stdin_isatty", lambda: True)
+    r = run("uninstall", "--purge", input="otra\n")
+    assert r.exit_code == 1 and "no se ha borrado nada" in r.output
+    assert purge.home.exists() and purge.unit.exists()
+    r = run("uninstall", "--purge", input=f"{purge.home}\n")
+    assert r.exit_code == 0, r.output
+    assert not purge.home.exists() and not purge.unit.exists()
+    assert "uv tool uninstall fogar-gateway" in r.output
+
+
+def test_purge_refuses_a_dir_that_is_not_an_install(purge):
+    (purge.home / "config.env").unlink()
+    shutil.rmtree(purge.home / "data")
+    (purge.home / "mis-cosas.txt").write_text("no")
+    r = run("--yes", "uninstall", "--purge")
+    assert r.exit_code == 1 and "no parece una instalación" in r.output
+    assert (purge.home / "mis-cosas.txt").exists() and purge.unit.exists()
+
+
+def test_purge_refuses_while_a_gateway_holds_the_lock(purge):
+    import fcntl
+
+    lock = purge.home / "data" / "gateway.lock"
+    with lock.open("a") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        r = run("--yes", "uninstall", "--purge")
+    assert r.exit_code == 1 and "gateway en marcha" in r.output
+    assert (purge.home / "data" / "gateway.db").read_text() == "db"
+
+
+def test_purge_refuses_a_db_outside_home(purge):
+    elsewhere = purge.tmp / "fuera"
+    elsewhere.mkdir()
+    (elsewhere / "gw.db").write_text("db")
+    (purge.home / "config.env").write_text(f"DATABASE_URL=sqlite:///{elsewhere / 'gw.db'}\n")
+    r = run("--yes", "uninstall", "--purge")
+    assert r.exit_code == 1 and "no está dentro" in r.output
+    assert (elsewhere / "gw.db").exists() and purge.home.exists() and purge.unit.exists()
+
+
+def test_purge_ignores_database_url_of_the_shell(purge, monkeypatch):
+    other = purge.tmp / "otraapp"
+    other.mkdir()
+    (other / "app.db").write_text("ajena")
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{other / 'app.db'}")
+    r = run("--yes", "uninstall", "--purge")
+    assert r.exit_code == 0, r.output
+    assert not purge.home.exists() and (other / "app.db").read_text() == "ajena"
+
+
+def test_purge_resolves_dotdot_and_never_wipes_the_user_home(purge, monkeypatch):
+    user_home = purge.tmp / "usuario"
+    (user_home / "data").mkdir(parents=True)
+    (user_home / "config.env").write_text("x=1\n")
+    (user_home / "Documentos.txt").write_text("mío")
+    monkeypatch.setattr(Path, "home", lambda: user_home)
+    monkeypatch.setenv("FOGAR_GATEWAY_HOME", str(user_home / "x" / ".."))
+    r = run("--yes", "uninstall", "--purge")
+    assert r.exit_code == 1 and "no parece una instalación" in r.output
+    assert (user_home / "Documentos.txt").exists()
+
+
+def test_purge_does_not_follow_a_data_symlink(purge):
+    real = purge.tmp / "otro-disco"
+    shutil.move(purge.home / "data", real)
+    (purge.home / "data").symlink_to(real)
+    r = run("--yes", "uninstall", "--purge")
+    assert r.exit_code == 1 and "enlace" in r.output
+    assert (real / "gateway.db").read_text() == "db" and purge.unit.exists()
+
+
+def test_purge_of_another_base_leaves_the_installed_service(purge, monkeypatch):
+    other = purge.tmp / "prueba"
+    other.mkdir()
+    (other / "config.env").write_text("ADMIN_TOKEN=x\n")
+    called = []
+    monkeypatch.setattr(service, "_uninstall_program", lambda: called.append(1) or "desinstalado")
+    monkeypatch.setenv("FOGAR_GATEWAY_HOME", str(other))
+    r = run("--yes", "uninstall", "--purge")
+    assert r.exit_code == 0, r.output
+    assert not other.exists() and purge.home.exists()
+    assert purge.unit.exists() and purge.calls == [] and called == []
+    assert "otra base" in r.output
+
+
+def test_purge_without_unit_keeps_the_program_unless_default_base(purge, monkeypatch):
+    called = []
+    monkeypatch.setattr(service, "_uninstall_program", lambda: called.append(1) or "desinstalado")
+    purge.unit.unlink()
+    r = run("--yes", "--json", "uninstall", "--purge")  # base de prueba, no ~/.fogar-gateway
+    assert r.exit_code == 0, r.output
+    assert not purge.home.exists() and called == []
+    assert json.loads(r.stdout)["program"] == "pendiente"
+    default = purge.tmp / "usuario" / ".fogar-gateway"
+    (default / "data").mkdir(parents=True)
+    (default / "data" / "gateway.db").write_text("db")
+    monkeypatch.setattr(Path, "home", lambda: purge.tmp / "usuario")
+    monkeypatch.setenv("FOGAR_GATEWAY_HOME", str(default))
+    r = run("--yes", "uninstall", "--purge")
+    assert r.exit_code == 0, r.output
+    assert not default.exists() and called == [1]
+
+
+def test_purge_needs_admin_token_or_db_as_install_mark(purge):
+    (purge.home / "data" / "gateway.db").unlink()
+    (purge.home / "config.env").write_text("OTRA_COSA=1\n")
+    r = run("--yes", "uninstall", "--purge")
+    assert r.exit_code == 1 and "no parece una instalación" in r.output
+    assert purge.home.exists()
+
+
+def test_purge_accepts_relative_database_url_under_a_symlinked_base(purge, monkeypatch):
+    (purge.home / "config.env").write_text("ADMIN_TOKEN=x\nDATABASE_URL=sqlite:///data/gateway.db\n")
+    link = purge.tmp / "enlace"
+    link.symlink_to(purge.home)
+    monkeypatch.setenv("FOGAR_GATEWAY_HOME", str(link))
+    r = run("--yes", "uninstall", "--purge")
+    assert r.exit_code == 0, r.output
+    assert not purge.home.exists()

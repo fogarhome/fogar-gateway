@@ -124,6 +124,13 @@ def test_token_falls_back_to_admin_token_env(monkeypatch, tmp_path):
     assert api.resolve_token(None) == "env"
 
 
+def test_token_env_ignores_case_like_settings(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    monkeypatch.setenv("admin_token", "minusculas")
+    assert api.resolve_token(None) == "minusculas"
+
+
 def test_token_from_home_config_env(monkeypatch, tmp_path):
     monkeypatch.delenv("FOGAR_GATEWAY_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -133,6 +140,33 @@ def test_token_from_home_config_env(monkeypatch, tmp_path):
         '# comentario\nOTRA=1\nADMIN_TOKEN="desde-fichero"\n'
     )
     assert api.resolve_token(None) == "desde-fichero"
+
+
+@pytest.mark.parametrize("line", [
+    "ADMIN_TOKEN='a\\b\"c'",            # comillas simples: literal, con \ y "
+    'ADMIN_TOKEN="it\'s\\\\x"',          # comillas dobles: \\ es una barra
+    "ADMIN_TOKEN=abc # comentario",     # comentario en línea
+    "export ADMIN_TOKEN=exportado",
+    "admin_token=minusculas",           # Settings no distingue mayúsculas
+])
+def test_token_from_config_env_matches_what_the_gateway_reads(monkeypatch, tmp_path, line):
+    from fogar_gateway.core.config import Settings
+
+    monkeypatch.setenv("FOGAR_GATEWAY_HOME", str(tmp_path))
+    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    (tmp_path / "config.env").write_text(line + "\n")
+    expected = Settings(_env_file=tmp_path / "config.env").ADMIN_TOKEN
+    assert expected
+    assert api.resolve_token(None) == expected
+
+
+def test_token_key_without_value_is_missing(monkeypatch, tmp_path):
+    monkeypatch.setenv("FOGAR_GATEWAY_HOME", str(tmp_path))
+    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    (tmp_path / "config.env").write_text("ADMIN_TOKEN\n")
+    with pytest.raises(api.ApiError) as e:
+        api.resolve_token(None)
+    assert e.value.exit_code == 2
 
 
 def test_token_never_read_from_cwd_dotenv(monkeypatch, tmp_path):

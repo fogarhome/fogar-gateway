@@ -5,6 +5,7 @@ Ninguna función de aquí escribe el VALOR de un token: solo el nombre del setti
 
 import errno
 import logging
+import re
 from pathlib import Path
 from typing import IO
 
@@ -41,6 +42,14 @@ _PLACEHOLDER_TOKENS = frozenset(
     }
 )
 
+# Como la client_key: un ADMIN_TOKEN más corto es adivinable (/admin no limita intentos).
+ADMIN_TOKEN_MIN_LEN = 32
+
+
+def admin_token_too_short(token: str) -> bool:
+    """Menos de ADMIN_TOKEN_MIN_LEN caracteres ASCII imprimibles sin espacios (D-r6-2: 29
+    espacios, «ñ» o un ZWSP no suman entropía ni sobreviven a la cabecera HTTP)."""
+    return re.fullmatch(rf"[!-~]{{{ADMIN_TOKEN_MIN_LEN},}}", token) is None
 
 
 class SingleProcessLockError(RuntimeError):
@@ -75,21 +84,24 @@ def _is_placeholder(value: str) -> bool:
 
 
 def insecure_tokens(settings) -> list[str]:
-    """Nombres de los tokens vacíos o de ejemplo, sin escribir en el log (`fogar-gw doctor`)."""
+    """Nombres de los tokens vacíos, de ejemplo o (ADMIN_TOKEN) cortos, sin escribir en el log
+    (`fogar-gw doctor`)."""
     flagged: list[str] = []
-    if not settings.ADMIN_TOKEN or _is_placeholder(settings.ADMIN_TOKEN):
+    if admin_token_too_short(settings.ADMIN_TOKEN) or _is_placeholder(settings.ADMIN_TOKEN):
         flagged.append("ADMIN_TOKEN")
     if not settings.OPENCLAW_TOKEN or _is_placeholder(settings.OPENCLAW_TOKEN):
         flagged.append("OPENCLAW_TOKEN")
     # Vacío = «sin clave», legítimo (no es un placeholder): solo se marca un valor de ejemplo.
-    if _is_placeholder(settings.TTS_TOKEN):
+    # Y solo si el TTS de fogar está en uso: con elevenlabs u off el token no se usa (#248).
+    if settings.TTS_PROVIDER == "fogar" and _is_placeholder(settings.TTS_TOKEN):
         flagged.append("TTS_TOKEN")
     return flagged
 
 
 _INSECURE_TOKEN_WARNINGS = {
-    "ADMIN_TOKEN": "ADMIN_TOKEN está vacío o es un valor de ejemplo: /admin/* queda inutilizable "
-    "(vacío) o protegido por un secreto adivinable. Define uno propio.",
+    "ADMIN_TOKEN": f"ADMIN_TOKEN está vacío, es un valor de ejemplo o tiene menos de "
+    f"{ADMIN_TOKEN_MIN_LEN} caracteres ASCII sin espacios: /admin/* queda inutilizable (vacío) o protegido por un "
+    "secreto adivinable. Define uno propio y largo (`fogar-gw config set ADMIN_TOKEN`).",
     "OPENCLAW_TOKEN": "OPENCLAW_TOKEN está vacío o es un valor de ejemplo: la conexión con "
     "OpenClaw probablemente fallará o usa un secreto adivinable.",
     "TTS_TOKEN": "TTS_TOKEN es un valor de ejemplo: cámbialo y configura el mismo token en el "

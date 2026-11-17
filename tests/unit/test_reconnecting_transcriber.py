@@ -240,7 +240,10 @@ async def test_run_forwards_status_and_incomplete_callbacks_to_listen_loop():
 
     await w.run()
 
-    assert received == {"status": on_status, "incomplete": on_incomplete}
+    assert received["status"] is on_status
+    # Incomplete goes through the wrapper (one report per phrase, E-r3-1), which forwards it.
+    await received["incomplete"]("gpu_saturated")
+    on_incomplete.assert_awaited_once_with("gpu_saturated")
 
 
 @pytest.mark.asyncio

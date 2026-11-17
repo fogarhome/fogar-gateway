@@ -25,16 +25,22 @@ def serve(create_db: bool) -> None:
     os.umask(0o077)  # lo que cree (BD, candado, data/) solo para su dueño
     import uvicorn
     from pydantic import ValidationError
+    from pydantic_settings import SettingsError
 
     try:
         from fogar_gateway.core.config import settings  # construye Settings(): aquí falla
-    except ValidationError as e:
-        from fogar_gateway.cli.config import _errors
+    except (ValidationError, SettingsError, OSError, UnicodeDecodeError) as e:
+        from fogar_gateway.cli.config import _errors, _settings_error
 
         # Solo campo y tipo (nunca input_value: podría ser una clave); exit 3 = reintentar
         # no lo arregla (RestartPreventExitStatus de la unidad).
-        click.echo("Configuración no válida:\n" + "\n".join(f"  {m}" for m in _errors(e)),
-                   err=True)
+        if isinstance(e, ValidationError):
+            errors = _errors(e)
+        elif isinstance(e, SettingsError):  # JSON roto en un campo dict/list (TTS_VOICE_MAP)
+            errors = _settings_error(e)
+        else:  # config.env ilegible: sin permiso o no UTF-8
+            errors = [f"config.env: no se puede leer ({type(e).__name__})"]
+        click.echo("Configuración no válida:\n" + "\n".join(f"  {m}" for m in errors), err=True)
         raise SystemExit(3) from None
     from fogar_gateway.db import database
 

@@ -4,7 +4,7 @@ from typing import Any
 
 import click
 
-from fogar_gateway.cli import api
+from fogar_gateway.cli import api, openclaw_access
 from fogar_gateway.cli.output import Out
 
 
@@ -36,11 +36,14 @@ def status(ctx: click.Context) -> None:
     # .get con valores por defecto: un gateway de otra versión puede traer otra forma.
     gw, services = state.get("gateway", {}), state.get("services", {})
     uptime = gw.get("uptime_s")
+    orch = services.get("orchestrator", {})
+    access = openclaw_access.short(orch)
     out.pairs(
         [
             ("gateway", f"en marcha · v{gw.get('version', '?')}"),
             ("encendido", "?" if uptime is None else _uptime(uptime)),
-            ("orquestador", _service(services.get("orchestrator", {}))),
+            ("orquestador", _service(orch)),
+            *([("acceso OpenClaw", access)] if access else []),
             ("STT", _service(services.get("stt", {}))),
             ("TTS", _service(services.get("tts", {}))),
             ("sesiones", state.get("totals", {}).get("sessions_active", "?")),

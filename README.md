@@ -5,7 +5,7 @@ La puerta de entrada de Fogar en casa. Un solo servicio que reconoce cada aparat
 - **Aparatos**: Fogar TV, el cliente de voz (Mac y Android), la app de iPhone y Home Assistant. Un aparato nuevo **descubre el gateway y se empareja con un código de 6 cifras**, sin copiar claves.
 - **Asistente**: los turnos de voz y texto van a [OpenClaw](docs/openclaw-protocol.md), que elige el agente y sus herramientas. El gateway lleva el turno de principio a fin: streaming, interrupciones (barge-in) y avisos que llegan sin preguntar (push).
 - **Voz**: transcripción (STT) y síntesis (TTS) con los servicios propios de Fogar, con ElevenLabs o desactivadas. Sin voz, el texto sigue funcionando.
-- **Administración**: un panel web en `/` (estado en vivo, sesiones y clientes) y la CLI `fogar-gw` (diagnóstico, configuración, servicio, logs y emparejamiento).
+- **Administración**: un panel web en `/` (estado en vivo, conversaciones y chat con Fogar, sesiones y clientes) y la CLI `fogar-gw` (diagnóstico, configuración, servicio, logs y emparejamiento).
 - **Instalación**: un comando instala, verifica OpenClaw y la voz contra los servicios reales, lo deja como servicio de usuario y te dice cómo llegar al panel: desde casa, por Tailscale o por tu propio dominio.
 
 ```
@@ -17,7 +17,7 @@ La puerta de entrada de Fogar en casa. Un solo servicio que reconoce cada aparat
   Home Assistant     ──┘ emparejan└── /v1/*           API compatible OpenAI ┘──► TTS: propio · ElevenLabs · off
 
   Tú, desde casa, Tailscale o tu dominio:
-    navegador ──► /           panel web (estado, sesiones, clientes)
+    navegador ──► /           panel web (estado, conversaciones, sesiones, clientes)
     terminal  ──► fogar-gw    CLI sobre /admin/* (doctor, config, servicio, logs, pair)
 ```
 
@@ -35,7 +35,7 @@ Detalles en [Instalación](#instalación). Si integras un aparato nuevo, el prot
 
 ### Web
 
-`http://<host>:8004/` es el panel de Fogar: se entra con el token de administrador (`ADMIN_TOKEN`) y desde ahí se ve el estado en vivo y las sesiones, y se emparejan, crean, editan, rotan y borran clientes. Lo sirve el propio gateway desde su paquete, sin Node en la máquina; las rutas de la API de abajo tienen siempre prioridad. Si el paquete no lleva la web compilada (un clon sin build), `/` da 404, el gateway funciona igual y lo avisa una vez en el log. Para desarrollarla, [`web/README.md`](web/README.md).
+`http://<host>:8004/` es el panel de Fogar: se entra con el token de administrador (`ADMIN_TOKEN`) y desde ahí se ve el estado en vivo (también con qué acceso está el gateway en OpenClaw), las conversaciones de toda la casa y las sesiones, se habla con Fogar por texto en conversaciones propias del panel, y se emparejan, crean, editan, rotan y borran clientes. Lo sirve el propio gateway desde su paquete, sin Node en la máquina; las rutas de la API de abajo tienen siempre prioridad. Si el paquete no lleva la web compilada (un clon sin build), `/` da 404, el gateway funciona igual y lo avisa una vez en el log. Para desarrollarla, [`web/README.md`](web/README.md).
 
 ### WebSocket
 
@@ -79,8 +79,8 @@ Los dos son públicos: detrás de un proxy o un túnel también llegan desde int
 |----------|--------|-------------|
 | `/admin/sessions` | GET | Sesiones activas y recientes en memoria |
 | `/admin/sessions/{id}` | GET | Detalle con eventos y latencias por turno |
-| `/admin/orchestrators/{name}/status` | GET | Estado del orquestador (CONNECTED / RECONNECTING / DEGRADED) |
-| `/admin/orchestrators/{name}/reconnect` | POST | Fuerza reconexión — responde 202 |
+| `/admin/orchestrator/status` | GET | Estado del orquestador (CONNECTED / RECONNECTING) |
+| `/admin/orchestrator/reconnect` | POST | Reintenta ya (corta la espera del backoff) — responde 202 con `{"accepted": true}`; `{"accepted": false}` si ya está CONNECTED |
 | `/admin/transcriber/status` | GET | Estado del proveedor STT activo (`provider`; con fogar, reachability en vivo; con ElevenLabs, salud cacheada + `counters`) |
 | `/admin/tts/status` | GET | Estado del proveedor TTS activo (`provider`, breaker, último error; con ElevenLabs, `counters`) |
 | `/admin/speech` | GET | Proveedores de voz activos (`stt`, `tts`) y puerta de audio efectiva |
@@ -94,11 +94,17 @@ Los dos son públicos: detrás de un proxy o un túnel también llegan desde int
 | `/admin/pairing` | GET | Códigos abiertos (sin el código) |
 | `/admin/pairing/{id}` | GET | Estado de un código: `open`, `used` (con `client_id` y `client_name`), `expired` o `cancelled` |
 | `/admin/pairing/{id}` | DELETE | Anular un código abierto |
-| `/admin/state` | GET | Instantánea viva: versión, uptime, flujos `/admin/state/stream` abiertos (`gateway.dashboards`), estado de servicios, contadores y una fila por sesión |
+| `/admin/state` | GET | Instantánea viva: versión, uptime, flujos `/admin/state/stream` abiertos (`gateway.dashboards`), estado de servicios (el de OpenClaw, con su acceso: `scopes`, `admin`, `auth_method`, `pairing`, `pairing_request_id`, `identity_error`, `device_id` y, para el panel, `approve_command` con el emparejamiento pendiente e `identity_error_text` con `identity_required`; nunca secretos), contadores y una fila por sesión |
 | `/admin/state/stream` | GET | La misma instantánea por SSE cada segundo; cada stream termina solo a los 25 s, el cliente debe reconectar (`EventSource` lo hace solo) |
+| `/admin/conversations` | GET | Conversaciones de todos los clientes (filtro `?client_id=`), la última en hablarse primero: `id`, `client_id`, `client_name`, `agent`, `kind` (`default`, `created`, `legacy`), `day`, `created_at`, `last_turn_at`, `turn_count` y `title`, que se lee de OpenClaw (`sessions.list`, en caché 20 s, y un fallo, 5 s; `null` si no lo tiene o no responde; la lista nunca falla por eso). No salen las del día en las que nunca se habló (un cliente que conectó y calló) |
+| `/admin/conversations/{id}/messages` | GET | Lo dicho, de OpenClaw (`chat.history`), normalizado a `{role, text, timestamp}` (solo `user` y `assistant`); `?limit=` 1–1000 (200). `503 orchestrator_unavailable` con OpenClaw caído, `502 orchestrator_error` si lo rechaza |
+| `/admin/conversations` | POST | Conversación nueva del panel web (`{"agent"?}`; sin agente, el de la cascada). El agente se valida como en el handshake (`422 agent_not_permitted`/`agent_not_available`) |
+| `/admin/conversations/agents` | GET | Para el selector del panel: `{"agents", "default"}`, los agentes del roster de OpenClaw que el panel web puede usar (su `allowed_agents`; sin roster, esa lista o `[]`) y el que le tocaría sin elegir (`null` si ese no le está permitido). Es una lectura: no crea la ficha del panel. `409 panel_client_inactive` con el panel desactivado |
 | `/admin/access` | GET | Vías para llegar al gateway (`public`, `tailscale_https`, `tailscale`, `lan`), cada una con su estado (`ok`, `protegida`, `otro_gateway`, `inalcanzable`, `sin_verificar`) y la recomendada; `{"docker": bool, "routes": [...]}`, en caché 15 s |
 
 Los tres endpoints `*/status` comparten la forma `{"name", "state", "connected_at", "reconnect_attempts", "last_error"}`; los de transcriber y TTS añaden `provider` y, con ElevenLabs, `counters`.
+
+**Conversaciones (M19).** Cada sesión habla en una conversación, que es una sesión de OpenClaw (`agent:{agente}:fogar-{id}`). Quien no elige cae en la del día (una por cliente, agente y día; el día empieza a las `CONVERSATION_DAY_START_HOUR`, y una sesión abierta días pasa a la nueva en su primer turno tras el corte); un cliente puede elegir una de las suyas o crear una (`conversation` en el handshake). El gateway solo guarda el índice (tabla `conversations`, sin texto): lo dicho y el título viven en OpenClaw. Las sesiones de antes de M19 (`agent:{agente}:{client.id}`) se importan una vez como `legacy` al conectar con OpenClaw. El panel web entra en el WebSocket con `admin_token` como el cliente «Panel web» (id `panel-web`, una ficha normal que se crea sola la primera vez). Borrar un cliente borra sus conversaciones del gateway (`ON DELETE CASCADE`: el gateway activa `PRAGMA foreign_keys` en cada conexión), no de OpenClaw. Protocolo: [`docs/client-protocol.md` §14](docs/client-protocol.md#14-conversaciones).
 
 Los campos de un cliente (`POST`/`PATCH /admin/clients`) están en `src/fogar_gateway/models/admin_schemas.py` y sus defaults en `src/fogar_gateway/db/models.py`. Desde la terminal, `fogar-gw`. Los comandos de clientes y de estado necesitan el gateway en marcha y pasan por esta API (la CLI nunca escribe en la BD); `doctor` y `config` funcionan también con el gateway parado:
 
@@ -134,17 +140,19 @@ Opciones globales: van **antes** del subcomando (`fogar-gw --yes clients remove 
 
 - **Configuración que leen la CLI y el gateway:** variables del proceso → `<base>/config.env` → valores por defecto, con `<base>` = `--home`, `FOGAR_GATEWAY_HOME` o `~/.fogar-gateway`. Nunca el `.env` del directorio actual. Una `DATABASE_URL` relativa se resuelve contra `<base>`. Los secretos (`*_TOKEN`, `*_KEY`) salen siempre enmascarados, también en `--json`.
 - **`--set`:** `campo=valor` manda texto (el servidor convierte números y booleanos); `campo:=json` manda JSON (listas, `null`). Un campo desconocido sale con 2 y lista los editables.
-- **`config set`:** valida el valor antes de escribir y rechaza saltos de línea. Los secretos (`*_TOKEN`, `*_KEY`) nunca van como argumento, para que no queden en el historial: se piden por prompt oculto (`fogar-gw config set ADMIN_TOKEN`) o, en scripts, se leen de un fichero por stdin (`fogar-gw config set ADMIN_TOKEN - < fichero`); un `echo` dejaría el secreto en el historial. Si el servicio está activo, ofrece reiniciarlo (como `fogar-gw restart`: espera a `/healthz` y sale con 1 si no arranca, con el cambio ya guardado); si no, el cambio se aplica al reiniciar (`fogar-gw restart`). Avisa si la variable está también en el entorno, porque esa manda sobre `config.env`.
+- **`config set`:** valida el valor de ese ajuste antes de escribir y rechaza saltos de línea (también `\f`, `\v` y los separadores de línea Unicode) y caracteres nulos; si después la configuración tiene fallos (en ese u otro ajuste), los avisa sin deshacer el cambio, antes de ofrecer el reinicio (`problems` en `--json`, y el aviso en stderr). Los fallos se juzgan como los verá el servicio: solo `config.env`, sin las variables de tu shell (p. ej. una `ELEVENLABS_API_KEY` exportada no cuenta). Los secretos (`*_TOKEN`, `*_KEY`) nunca van como argumento, para que no queden en el historial: se piden por prompt oculto (`fogar-gw config set ADMIN_TOKEN`) o, en scripts, se leen de un fichero por stdin (`fogar-gw config set ADMIN_TOKEN - < fichero`); un `echo` dejaría el secreto en el historial. Si el servicio está activo, ofrece reiniciarlo (como `fogar-gw restart`: espera a `/healthz` y sale con 1 si no arranca, con el cambio ya guardado); si no, el cambio se aplica al reiniciar (`fogar-gw restart`). Con un fallo que impediría arrancar (un ajuste inválido, o la voz elegida sin su clave o su voz) no lo reinicia, ni con `--yes`: corrígelo y reinicia después. Un `ADMIN_TOKEN` corto o redes de confianza demasiado amplias se avisan pero no lo impiden. `config unset` también quita ajustes retirados que el log pide borrar (p. ej. `ORCHESTRATOR_RECONNECT_MAX_DURATION`). Avisa si la variable está también en el entorno, porque esa manda sobre `config.env`.
 - **`--import-key`** lee la clave de stdin, nunca de un argumento.
 - **En Docker:** `docker exec fogar_gateway fogar-gw …`. La imagen fija `FOGAR_GATEWAY_HOME=/app`, así que `doctor` encuentra la BD del volumen. Sin `-t` no hay terminal: no se abre el menú y `rotate-key`/`remove` necesitan `--yes` (o usa `docker exec -it`). Con `GATEWAY_HOST` en una IP de la LAN, pasa `--url http://<esa IP>:8004`.
 
 Auth: header `X-Admin-Token`. Sin header → 422. Token incorrecto → 401. `ADMIN_TOKEN` vacío → 503.
 
+**Límites de toda la API HTTP:** un cuerpo de más de 1 MiB recibe `413 {"detail": "request body too large"}` antes de cualquier validación o autenticación (cuenta los bytes recibidos, también sin `Content-Length`). Un `422` lista campo, tipo y mensaje de cada error, nunca el valor recibido. No hay `/docs`, `/redoc` ni `/openapi.json`: la referencia es esta página.
+
 ### OpenAI-compatible (`/v1/*`, para Home Assistant)
 
 **Autenticación** (`src/fogar_gateway/core/network.py`, `resolve_ha_caller` en `src/fogar_gateway/api/openai_routes.py`):
 
-- Origen **de confianza** (peer directo en las CIDR de `TRUSTED_NETWORKS`, peer loopback si `TRUST_LOOPBACK=true`, o un cliente avalado por un proxy de `TRUSTED_PROXIES` con `X-Real-IP` válido): no necesita credenciales. **Matiz (#216):** con `TRUSTED_PROXIES` por defecto (`127.0.0.1,::1`) un cliente directo en loopback *sin* `X-Real-IP` ya NO queda exento y debe enviar `Authorization: Bearer <client_key>`; sin proxy, vacía `TRUSTED_PROXIES=` para recuperar el comportamiento anterior (y con proxy, este debe sobrescribir `X-Real-IP`).
+- Origen **de confianza** (peer directo en las CIDR de `TRUSTED_NETWORKS`, peer loopback si `TRUST_LOOPBACK=true`, o un cliente avalado por un proxy de `TRUSTED_PROXIES` con un único `X-Real-IP` válido y, si hay `X-Forwarded-For`, igual a su único salto; en ningún caso con cabeceras de túnel o `Forwarded` ni saltos ajenos en `X-Forwarded-For`): no necesita credenciales. **Matiz (#216):** con `TRUSTED_PROXIES` por defecto (`127.0.0.1,::1`) un cliente directo en loopback *sin* `X-Real-IP` ya NO queda exento y debe enviar `Authorization: Bearer <client_key>`; sin proxy, vacía `TRUSTED_PROXIES=` para recuperar el comportamiento anterior (y con proxy, este debe sobrescribir `X-Real-IP`).
 
   | Escenario (config por defecto) | Antes | Ahora |
   |---|---|---|
@@ -153,18 +161,28 @@ Auth: header `X-Admin-Token`. Sin header → 422. Token incorrecto → 401. `ADM
   | Loopback + `X-Real-IP` en `TRUSTED_NETWORKS` / externo | 200 / 401 | 200 / 401 |
   | Peer LAN directo en `TRUSTED_NETWORKS` | 200 | 200 |
   | `TRUSTED_PROXIES=` vacío, loopback directo | 200 | 200 |
-- Cualquier otro origen debe enviar `Authorization: Bearer <client_key>`, validado contra la tabla `clients` (la misma que usa el handshake WebSocket). Sin él, o con una key inválida/inactiva → `401`.
+  | nginx documentado: `X-Real-IP` = único salto de `X-Forwarded-For` (o sin XFF) | 200 / 401 según la IP | igual |
+  | `X-Forwarded-For` con algún salto distinto de la IP resultante (`tailscale serve`/cloudflared reenviando el `X-Real-IP` del cliente, XFF inyectado por el cliente tras un nginx, túnel en otra máquina de `TRUSTED_NETWORKS`), sea cual sea esa IP | 200 si la IP era de confianza | **401** |
+  | `Tailscale-User-*`, `Cf-Connecting-Ip` o `Forwarded` (túnel o proxy en el mismo host o en otra máquina de `TRUSTED_NETWORKS`, también con `TRUSTED_PROXIES=` vacío), sea cual sea la IP | 200 | **401** |
+  | `X-Real-IP` repetido (proxy que lo añade en vez de sobrescribirlo) | 200 si el primero era de confianza | **401** |
+  | Petición de navegador (`Origin` o `Sec-Fetch-*`) desde un origen de confianza | 200 | **401** (Bearer) |
+- Cualquier otro origen debe enviar `Authorization: Bearer <client_key>`, validado contra la tabla `clients` (la misma que usa el handshake WebSocket). Sin él, o con una key inválida/inactiva → `401`. Si la configuración de ese cliente en la BD es ilegible (`allowed_agents` corrupto, solo editándola a mano) → `500` `{"detail":"internal_error"}`.
 - Si se envía un Bearer, siempre se valida, también desde un origen de confianza.
-- Detrás de un proxy (nginx), la IP real solo se toma de `X-Real-IP` si el peer está en `TRUSTED_PROXIES`. **Falla cerrado (#216):** un peer de `TRUSTED_PROXIES` sin `X-Real-IP` válido no es origen de confianza (se exige Bearer); el proxy debe *sobrescribir* `X-Real-IP` (`proxy_set_header X-Real-IP $remote_addr;`), nunca reenviar el del cliente. `X-Forwarded-For` nunca concede confianza (`fogar-gw serve` arranca uvicorn sin `proxy_headers`). Consecuencia: un cliente directo en loopback (p. ej. HA en el mismo host, sin proxy) ya no queda exento con la config por defecto; envía Bearer, o vacía `TRUSTED_PROXIES` si no hay proxy.
+- Detrás de un proxy (nginx), la IP real solo se toma de `X-Real-IP` si el peer está en `TRUSTED_PROXIES`. **Falla cerrado (#216):** un peer de `TRUSTED_PROXIES` sin `X-Real-IP` válido no es origen de confianza (se exige Bearer); el proxy debe *sobrescribir* `X-Real-IP` (`proxy_set_header X-Real-IP $remote_addr;`), nunca reenviar el del cliente. `X-Forwarded-For` nunca concede confianza por sí solo (`fogar-gw serve` arranca uvicorn sin `proxy_headers`). Ningún origen queda exento si `X-Forwarded-For` trae un salto distinto de su propia IP o si llega una cabecera de túnel o de proxy (`Tailscale-User-*`, `Cf-Connecting-Ip`, `Forwarded` de RFC 7239): vale para loopback y para `TRUSTED_NETWORKS`, aunque el túnel esté en otra máquina de la LAN o haya otro proxy detrás. Así un proxy que deja pasar el `X-Real-IP` del cliente y fija él `X-Forwarded-For` (`tailscale serve`, el de `fogar-gw access`, o cloudflared) no avala a nadie, un `X-Forwarded-For` que mande el propio cliente le cuesta la exención, y un único nginx con `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` sigue funcionando. Una cadena de proxies aunque sea solo de LAN (p. ej. Traefik → nginx, `X-Forwarded-For` con dos saltos) también da 401: deja un solo salto o usa Bearer. `X-Real-IP` debe llegar una sola vez, y un `X-Real-IP` de loopback solo cuenta si el peer TCP del proxy también es loopback: un proxy que llega por otra dirección (otra máquina, o uno en este mismo host que conecta por su IP de LAN o por el bridge de Docker, p. ej. 172.17.0.1) con `X-Real-IP: 127.0.0.1` no queda exento y debe usar Bearer. Consecuencia: un cliente directo en loopback (p. ej. HA en el mismo host, sin proxy) ya no queda exento con la config por defecto; envía Bearer, o vacía `TRUSTED_PROXIES` si no hay proxy.
+- **Reenvíos TCP en el host:** un reenvío que no añade cabeceras y escucha en una dirección alcanzable desde fuera (`socat`, nginx `stream`, `tailscale serve`/`funnel --tcp`, cloudflared `tcp://`, o un túnel SSH que entra a este equipo; ver abajo) entrega al gateway las conexiones remotas desde 127.0.0.1: llegan como loopback y, como 127.0.0.1 está en `TRUSTED_PROXIES` por defecto, pueden poner su propio `X-Real-IP`. Por eso **no basta `TRUST_LOOPBACK=false`** si `TRUSTED_NETWORKS` no está vacío: el remoto se presenta con un `X-Real-IP` de tu LAN. Con un reenvío así expuesto, pon `TRUST_LOOPBACK=false` y además quita loopback de `TRUSTED_PROXIES` (renuncias a un nginx en el mismo host) o deja `TRUSTED_NETWORKS` vacío (entonces todos necesitan Bearer).
+  Con SSH importa dónde escucha el puerto reenviado: `ssh -L 8004:127.0.0.1:8004 gateway` desde tu portátil escucha solo en el loopback del portátil (no expone nada); `-g` (para `-L`/`-D`) o `ssh -L 0.0.0.0:8004:…` (sin `-g`) lo abren a la red del portátil, y todo lo que entre llega al gateway como loopback. `ssh -R` hacia otro servidor queda en su loopback salvo que ese servidor tenga `GatewayPorts`.
+- `TRUSTED_NETWORKS` y `TRUSTED_PROXIES` son IPs o CIDRs separadas por comas (IPv4 o IPv6; se toleran espacios y entradas vacías). Al arrancar, el gateway rechaza solo lo que no puede ser una red: una entrada que no es IP ni CIDR (`127.0.0.1;::1`, `localhost`, `/33`), lleva identificador de zona (`%…`) o es `/0`. Eso no impide arrancar, pero en `TRUSTED_PROXIES` **desactiva toda exención** (fallo cerrado: ningún peer es proxy de confianza y todo `/v1` pide Bearer, también loopback y `TRUSTED_NETWORKS`); en `TRUSTED_NETWORKS` esa entrada se ignora. Rechazar `/0` no impide abrirlo todo con redes muy amplias (`0.0.0.0/1,128.0.0.0/1`, `::ffff:0:0/96`): el gateway las sigue usando, para no romper instalaciones al actualizar, y solo avisa. `fogar-gw config set` no escribe ninguna de estas ni una red más amplia que /8 (IPv4) o /16 (IPv6) o que abarque `::ffff:0:0/96` (las direcciones IPv4 vistas como IPv6), ni un CIDR con bits de host (`192.168.1.5/24`: escribe `192.168.1.0/24`). Cada problema sale como WARNING al arrancar, y `fogar-gw config validate` y `fogar-gw doctor` lo marcan: error para las entradas rechazadas y las redes demasiado amplias, aviso para los bits de host. Un `X-Real-IP` con identificador de zona IPv6 (`%…`) no es válido.
 - Host de escucha de `fogar-gw serve` (también en Docker): `GATEWAY_HOST` (default `0.0.0.0`); detrás de un proxy en el mismo host usa `GATEWAY_HOST=127.0.0.1`.
+- **DNS rebinding (auditoría 3.0):** una petición con `Origin` o cualquier `Sec-Fetch-*` viene de un navegador y nunca usa la exención de origen de confianza: necesita Bearer. Home Assistant (aiohttp) no manda esas cabeceras. No hay lista de `Host` permitidos: HA puede llegar por cualquier nombre o IP.
 - `TRUSTED_NETWORKS` vacío = fail-closed: solo loopback puede quedar exento (sujeto al matiz de `TRUSTED_PROXIES` de arriba).
 - `HANDSHAKE_MAX_BYTES` mide **caracteres**, no bytes (con caracteres multibyte el tope real puede ser hasta 4x mayor). El tope de 1 MiB por mensaje WebSocket lo pone `fogar-gw serve`: con `uvicorn` a mano rige el de uvicorn (16 MiB).
-- Con Bearer válido, `model` selecciona el agente y se aplican `default_agent`/`allowed_agents` del cliente (violación → `403`).
+- Con Bearer válido, `model` selecciona el agente (sin distinguir mayúsculas) y se aplican `default_agent`/`allowed_agents` del cliente (violación → `403`; un `model` que no es un id de agente válido, con `:` o espacios, es `403 agent_not_available` aunque OpenClaw no esté conectado). Sin `model`, la cascada: `default_agent` del cliente, `DEFAULT_AGENT`, el agente por defecto de OpenClaw y `main`.
+- Con Bearer, cada petición va a la **conversación por defecto del día** del cliente para ese agente (M19), como un cliente WebSocket que no elige conversación. El origen de confianza sin Bearer no tiene ficha de cliente: conserva su sesión `agent:{agente}:ha` y no sale en `/admin/conversations`.
 
 | Endpoint | Método | Descripción |
 |----------|--------|-------------|
 | `/v1/models` | GET | Devuelve el alias `fogar-gateway` y los agentes del roster de OpenClaw (filtrados por `allowed_agents`) para un llamante con Bearer; un origen confiable sin Bearer (el chat ignora `model` y usa el agente por defecto) y un gateway sin roster, solo el alias |
-| `/v1/chat/completions` | POST | Chat completion; soporta `stream: true/false` |
+| `/v1/chat/completions` | POST | Chat completion; soporta `stream: true/false`. Si el último mensaje `user` falta o solo tiene espacios → `400 empty_message`, sin llamar a OpenClaw. Si el cliente corta antes de la respuesta (con o sin stream), el turno se aborta en OpenClaw |
 
 ---
 
@@ -174,10 +192,10 @@ El cliente envía un handshake JSON como primer mensaje. Si es válido, el gatew
 
 **Cada turno de respuesta:**
 ```
-← {"type":"turn_start","turn_id":"t-1","turn_seq":1}
+← {"type":"turn_start","turn_id":"t-1","turn_seq":1,"conversation":"<id>","origin":"user"}
 ← {"type":"token","turn_id":"t-1","text":"Hola,"}
 ← [0xA1][0x00][0x01][PCM16 24kHz...]   ← audio binario con header
-← {"type":"turn_end","turn_id":"t-1"}
+← {"type":"turn_end","turn_id":"t-1","reason":"done"}
 ```
 
 Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la referencia completa incluyendo barge-in, transcripción, push turns y manejo de errores.
@@ -198,7 +216,7 @@ curl -fsSL https://github.com/fogarhome/fogar-gateway/releases/latest/download/i
 
 Qué hace `install.sh`:
 
-1. Comprueba Linux, la arquitectura y `systemctl --user`. Si falta `git` (`sudo apt-get install -y git`) o linger (`sudo loginctl enable-linger $(id -un)`; sin él, el servicio se para al cerrar tu sesión), enseña el comando y pregunta «¿lo ejecuto yo? [s/N]»: nada con `sudo` sin una `s`. Sin terminal, o con otra respuesta, sale y te dice qué ejecutar.
+1. Comprueba Linux, la arquitectura y `systemctl --user`. Si falta `git` (`sudo apt-get install -y git`) o linger (`sudo loginctl enable-linger $(id -un)`; sin él, el servicio se para al cerrar tu sesión), enseña el comando y pregunta «¿lo ejecuto yo? [s/N]» (en inglés, «shall I run it? [y/N]»; acepta `s`, `si`, `sí`, `y` o `yes`, sin distinguir mayúsculas): nada con `sudo` sin un sí. Los mensajes salen en español si `LC_ALL`, `LC_MESSAGES` o `LANG` (el primero definido) empieza por `es`, y en inglés en cualquier otro caso. Sin terminal, o con otra respuesta, sale y te dice qué ejecutar. El asistente (`fogar-gw onboard`) y la CLI siguen solo en español.
 2. Instala [uv](https://docs.astral.sh/uv/) si falta, y `fogar-gw` con `uv tool install` en la versión de la release, con su `constraints.txt` (las mismas versiones que la imagen Docker). `uv tool update-shell` deja `~/.local/bin` en el PATH de las terminales nuevas; si la tuya aún no lo tiene, el instalador acaba diciéndolo (abre otra terminal o usa `~/.local/bin/fogar-gw`).
 3. La primera vez lanza el asistente, `fogar-gw onboard` (abajo). Sin terminal (p. ej. `ssh host 'curl … | sh'`) se para ahí: «Instalado. Configúralo con `fogar-gw onboard` o, si vienes de Docker, `fogar-gw migrate --from-docker DIR` y `fogar-gw install`.»
 
@@ -208,25 +226,28 @@ Qué hace `install.sh`:
 
 #### El asistente: `fogar-gw onboard`
 
-`fogar-gw onboard` pregunta lo mínimo y **verifica cada proveedor contra el servicio real antes de guardarlo** en `config.env`:
+`fogar-gw onboard` pregunta lo mínimo y **verifica cada proveedor contra el servicio real antes de guardarlo** en `config.env`.
+
+En una terminal con color empieza con la línea viva de Fogar escribiendo su nombre (con `FOGAR_REDUCED_MOTION=1`, quieta; en una terminal de menos de 60 columnas, no sale). Cada paso se abre con «● Paso» y lo resuelto queda en «■ …». Los colores dicen siempre lo mismo: naranja es lo que pasa ahora, azul lo resuelto, amarillo ◆ un aviso y rosa ▲ un error; el resto va sin color. Con `NO_COLOR`, `--json` o `--answers`, la salida es texto plano.
 
 1. Si falta `config.env` o la BD, prepara `<base>` como `fogar-gw init` (no toca lo que ya exista).
-2. OpenClaw: lo busca en este equipo (si no, pregunta host y puerto) y pide su token (`openclaw config get gateway.auth.token`). Solo en loopback: para un OpenClaw de otra máquina, un túnel SSH (`ssh -L 18789:127.0.0.1:18789 …`). Sin OpenClaw verificado no sigue.
+2. OpenClaw: lo busca en este equipo (si no, pregunta host y puerto) y pide su token: ejecuta `openclaw gateway auth-token --show` en una terminal de la máquina de OpenClaw (`openclaw config get gateway.auth.token` lo enseña siempre redactado). Verifica siempre el token pegado (aunque el gateway ya tenga un token de dispositivo) y dice con qué acceso queda («Conectado a OpenClaw … con permisos de administración»). Solo en loopback: para un OpenClaw de otra máquina, un túnel SSH (`ssh -L 18789:127.0.0.1:18789 …`) o, a mano, `fogar-gw config set OPENCLAW_HOST` y aprobar el gateway en OpenClaw (ver [Conexión con OpenClaw](#conexión-con-openclaw)). Sin OpenClaw verificado no sigue.
 3. STT y TTS: servicio propio (`host:puerto` y, si la usa, su clave), ElevenLabs (una sola clave para los dos) o «ahora no» (`off`: sin STT no hay transcripción y sin TTS las respuestas llegan solo en texto).
-4. «¿Cómo vas a entrar a Fogar?»: desde casa (red local) siempre; además, si los marcas:
+4. «¿Desde dónde vas a entrar a Fogar?»: una sola elección entre «Desde casa», «Casa y Tailscale», «Casa y mi dominio» y «Casa, Tailscale y mi dominio». El paso acaba diciendo qué ha quedado listo:
    - **Con Tailscale:** si `tailscale serve` ya lleva al gateway, te da su `https://…` y no toca nada. Si no, pregunta antes de activarlo en 443 (o en 8443 si 443 ya sirve otra cosa; si los dos están ocupados, no lo toca). Si Tailscale pide permiso, te enseña `sudo tailscale set --operator=$USER` y lo ejecuta solo si eliges «Ejecutarlo ahora» (y reintenta una vez); si la tailnet no tiene HTTPS, te da el enlace para activarlo. Sin Tailscale te da los comandos oficiales para instalarlo (`curl -fsSL https://tailscale.com/install.sh | sh` y `sudo tailscale up`) y vuelve a mirar cuando quieras, o sigues sin él: nunca lo instala por ti.
    - **Con mi propio dominio:** una URL `https://` (sin ruta, parámetros ni usuario) que tu proxy haga llegar a `http://localhost:8004`; se añade a `PUBLIC_URLS` sin quitar las que ya hay.
 
    Lo mismo, en cualquier momento: `fogar-gw access setup`.
 5. Instala el servicio, o lo reinicia si ya estaba instalado (con terminal pregunta antes, porque corta las sesiones abiertas), y pasa `fogar-gw doctor`.
 6. Termina en el dashboard:
-   - las vías para llegar al dashboard desde otro aparato: la recomendada («Tu dashboard») y las demás, cada una con su estado (verificada, sin comprobar…). Por la LAN es `http://<IP de la LAN>:8004/` (o la de `GATEWAY_HOST` si escucha en una dirección concreta; si solo escucha en loopback y no hay otra vía, te dice cómo entrar con un túnel SSH). Para verlas o cambiarlas después: `fogar-gw access` y `fogar-gw access setup`;
-   - el token de administración que se pega en él (solo en una terminal), dónde está (`<base>/config.env`, `ADMIN_TOKEN`) y cómo verlo otra vez: `fogar-gw token`;
+   - las vías para llegar al dashboard desde otro aparato: la recomendada («Tu dashboard») y las demás, cada una con su estado (verificada, sin comprobar…). Por la LAN es `http://<IP de la LAN>:8004/` (o la de `GATEWAY_HOST` si escucha en una dirección concreta; si solo escucha en loopback y no hay otra vía, te dice cómo entrar con un túnel SSH: `ssh -L 8004:127.0.0.1:8004 …` desde tu equipo, que solo escucha en su loopback; si el puerto reenviado escucha en otra dirección (`-g`, `ssh -L 0.0.0.0:…`), todo lo que entra por él es loopback para `/v1`, ver [OpenAI-compatible](#openai-compatible-v1-para-home-assistant)). Para verlas o cambiarlas después: `fogar-gw access` y `fogar-gw access setup`;
+   - en una terminal con color, un QR de la vía recomendada para abrirla con el móvil;
+   - el token de administración que se pega en él. En una terminal con color no se imprime: se copia al portapapeles (OSC 52, también por ssh; el Terminal de macOS no lo admite, iTerm2 lo pide en sus ajustes y Ghostty, Kitty y WezTerm lo hacen solos). Sin color se imprime en la terminal, y nunca con `--answers`. Siempre dice dónde está (`<base>/config.env`, `ADMIN_TOKEN`) y cómo verlo otra vez: `fogar-gw token`;
    - el recordatorio de no compartirlo: quien lo tenga controla el gateway.
 
    Después te espera hasta que abres el dashboard y pegas el token («Conectado»); Enter sigue sin esperar. El primer cliente se empareja desde Clientes, en el dashboard. También da la dirección `ws://<host>:8004/ws/stream` para quien configure un cliente a mano.
 
-**El token del dashboard:** `fogar-gw token` lo escribe solo en una terminal; en una tubería, un fichero o con `--json` se niega, para que no acabe en un log. No lo pegues en chats ni en capturas. Sin la CLI, está en `config.env` (`ADMIN_TOKEN`), legible solo por tu usuario.
+**El token del dashboard:** es la llave del panel y de `/admin`, que no limitan los intentos: necesita al menos 32 caracteres ASCII imprimibles, sin espacios (`fogar-gw init` genera uno aleatorio de 43; `config set ADMIN_TOKEN` rechaza uno más corto y `doctor` lo marca). `fogar-gw token` lo escribe solo en una terminal; en una tubería, un fichero o con `--json` se niega, para que no acabe en un log. No lo pegues en chats ni en capturas. Sin la CLI, está en `config.env` (`ADMIN_TOKEN`), legible solo por tu usuario.
 
 Si lo cortas a medias, `config.env` queda como estaba más lo ya verificado, y volver a ejecutarlo retoma. También sirve para cambiar de proveedores más adelante (en el menú de `fogar-gw`, «Configurar proveedores»): cada paso que `config.env` ya tiene ofrece primero «Dejar como está», que ni verifica ni escribe nada. Necesita una terminal; para scripts, `fogar-gw onboard --answers respuestas.json` no pregunta nada y un fallo de verificación sale con 1 y su motivo. El fichero lleva secretos: tiene que ser tuyo y con permisos 600. Créalo ya privado, para que no haya un momento en que otros puedan leerlo: `(umask 077; cat > respuestas.json)` y pega el JSON (termina con Ctrl+D), o `install -m 600 /dev/null respuestas.json` antes de editarlo. Escribirlo y después hacer `chmod` deja esa ventana abierta.
 
@@ -293,7 +314,16 @@ fogar-gw logs -n 20         # últimas líneas del journal (-f para seguir)
 ```
 
 - **`OPENCLAW_TOKEN`** es el token del gateway de OpenClaw (el de su configuración). El gateway no lo exige: `install` y `serve` arrancan igual y solo registran un WARNING («OPENCLAW_TOKEN está vacío…»), y `config validate` y `doctor` lo marcan como aviso. Pero sin un token válido OpenClaw rechazará la conexión: `/ready` da 503 y las sesiones se cierran, porque el orquestador es la única dependencia fatal. Los secretos se piden por prompt oculto, ver `config set` en [Admin](#admin-requiere-x-admin-token). `OPENCLAW_HOST` y `OPENCLAW_PORT` se cambian con `fogar-gw config set <AJUSTE> <valor>` (solo los secretos se piden por prompt; sin valor, un ajuste normal sale con 2).
+- **Conexión con OpenClaw:** ver [abajo](#conexión-con-openclaw).
 - **Linger y sesión:** `systemctl --user` necesita una sesión con bus de usuario: SSH normal sí; con `su` o `sudo -iu`, no (define antes `XDG_RUNTIME_DIR=/run/user/$(id -u)`).
+
+#### Conexión con OpenClaw
+
+El gateway se conecta a OpenClaw como `gateway-client`/`backend` pidiendo `operator.read`, `operator.write` y `operator.admin` (ninguna función usa todavía el admin), y firma cada conexión con su **identidad de dispositivo**: una clave Ed25519 propia de la instalación, en `<base>/data/openclaw-device.json` (permisos 600; es una credencial, como `config.env`).
+
+- **OpenClaw en esta máquina:** basta el token compartido (`OPENCLAW_TOKEN`); OpenClaw se fía de la conexión local y concede los permisos pedidos, sin emparejar.
+- **OpenClaw en otra máquina** (Tailscale, LAN, o en Docker con el puerto publicado): la primera vez OpenClaw pide aprobar el gateway como dispositivo. El gateway lo dice en el log, en `fogar-gw status`/`doctor` y en `/admin/state`, con el comando exacto: `openclaw devices approve <id>`, en la máquina de OpenClaw. Tras aprobarlo, el gateway recibe un **token de dispositivo**, lo guarda en ese fichero y conecta con él (aunque cambie el token compartido); si OpenClaw lo revoca, vuelve al token compartido y, si hace falta, a pedir aprobación.
+- **Por Tailscale (lo recomendado para otra máquina):** si OpenClaw se publica en la tailnet con su `tailscale serve` (`gateway.tailscale.mode: serve`), sigue escuchando solo en loopback y se llega con TLS: `OPENCLAW_HOST=<máquina>.<tailnet>.ts.net`, `OPENCLAW_PORT=443` y `OPENCLAW_TLS=true`. No abras el puerto 18789 a la red ni lo pongas detrás de otro proxy inverso: con cabeceras de proxy y sin `gateway.trustedProxies`, OpenClaw responde 403.
 
 > **El gateway nunca crea una BD por su cuenta.** Si no la encuentra en `<base>/data/gateway.db`
 > (o en la `DATABASE_URL` configurada), se para y explica qué hacer: así no arranca vacío, sin
@@ -305,7 +335,7 @@ fogar-gw logs -n 20         # últimas líneas del journal (-f para seguir)
 
 Solo en Linux con systemd. `fogar-gw install` crea `~/.config/systemd/user/fogar-gateway.service` y lo arranca. Exige una config válida, la BD ya creada (`fogar-gw init` o `fogar-gw migrate`; `install` nunca la crea) y el puerto 8004 libre (para el contenedor antes). Si el servicio ya es el nuestro y está activo, reinstala, y si la unidad cambia, lo reinicia. `uninstall` y sobrescribir una unidad distinta con `install` piden confirmación (para scripts, `fogar-gw --yes …`).
 
-- **Ejecutable:** usa el `fogar-gw` del PATH. Rechaza uno dentro de un clon o de una instalación editable, porque la unidad se rompería al moverlo: instala con `uv tool install` o pasa `--exe RUTA`.
+- **Ejecutable:** usa el `fogar-gw` del PATH. Rechaza uno dentro de un clon o de una instalación editable, porque la unidad se rompería al moverlo: instala con `uv tool install` o pasa `--exe RUTA` (una ruta relativa se guarda absoluta, sin resolver el enlace).
 - **Linger:** sin `loginctl enable-linger $USER` el servicio se para al cerrar tu sesión; `install` avisa si falta.
 - **Registros:** `fogar-gw logs` lee el journal. `--level` y `--session` filtran por nivel mínimo y por sesión o cliente, tanto con `LOG_FORMAT=json` como con texto.
 
@@ -316,6 +346,8 @@ Las migraciones de la BD se aplican solas al arrancar y no hay vuelta atrás aut
 ```bash
 curl -fsSL https://github.com/fogarhome/fogar-gateway/releases/latest/download/install.sh | sh
 ```
+
+**Al actualizar a 3.0:** una entrada inválida en `TRUSTED_PROXIES` (también un `/0`, que antes se aceptaba) ya no se ignora: el gateway falla cerrado y Home Assistant sin Bearer recibe 401 en `/v1`. La CLI 2.x aún no lo comprueba: antes de actualizar, revisa `TRUSTED_PROXIES` y `TRUSTED_NETWORKS` a mano en `<base>/config.env` (solo IPs o CIDRs separados por comas, sin `/0` ni `%`). Después, `fogar-gw doctor` (en una actualización nativa, el instalador lo pasa al terminar sobre la base del servicio) o `fogar-gw config validate` te dicen si queda alguna entrada mal. `ADMIN_TOKEN` necesita al menos 32 caracteres: uno más corto sigue funcionando (el gateway arranca y avisa en el log), pero `fogar-gw doctor` y `config validate` lo marcan como fallo y `config set ADMIN_TOKEN` ya no acepta uno así; cámbialo con `fogar-gw config set ADMIN_TOKEN`: `init` genera uno de 43, pero si ya tienes `config.env` no lo toca (y `config unset ADMIN_TOKEN` no se acepta). Cuentan solo caracteres ASCII imprimibles sin espacios. Los plazos y backoffs (`HANDSHAKE_TIMEOUT_S`, `TURN_TIMEOUT_S`, `IDLE_TIMEOUT_S`, `PUSH_TTS_DRAIN_TIMEOUT_S`, `TTS_AUTH_TIMEOUT_S`, `TRANSCRIBER_READY_TIMEOUT_S`, `TRANSCRIBER_RECONNECT_MAX_DURATION` y los `*_RECONNECT_*_BACKOFF`) deben ser mayores que 0, y ningún número decimal admite `inf` ni `nan`: con uno así el gateway ya no arranca (antes arrancaba inservible). Si el servicio no arranca tras actualizar, el instalador lo dice, pasa igualmente `fogar-gw doctor` y termina con error. `config validate` lo marca y se corrige con `fogar-gw config set <AJUSTE> <valor>` o `fogar-gw config unset <AJUSTE>` (vuelve al valor por defecto), que funcionan aunque la configuración no valide: solo rechazan un valor que deje inválido el propio ajuste (y `config unset ADMIN_TOKEN`). Si tras el cambio queda algún fallo, en ese u otro ajuste, lo avisan sin deshacer nada; `config validate` y `doctor` dicen si la configuración es válida. Además, un `X-Real-IP` de loopback ya solo cuenta si el peer del proxy también es loopback: un proxy en este host que llega por la IP de LAN o por el bridge de Docker (p. ej. 172.17.0.1) con `X-Real-IP: 127.0.0.1` ya no queda exento y debe usar Bearer.
 
 A mano: instala la nueva versión sobre la anterior y reinicia (pregunta; en scripts, `fogar-gw --yes restart`).
 
@@ -334,11 +366,19 @@ fogar-gw uninstall                # quita el servicio (pregunta); no toca los da
 uv tool uninstall fogar-gateway   # quita el programa
 ```
 
-Los datos (`config.env`, `data/gateway.db`) quedan en `<base>`; bórralos a mano si ya no los quieres.
+Los datos (`config.env`, `data/gateway.db`) quedan en `<base>`.
+
+Para borrarlo todo de una vez (por ejemplo, para empezar de cero con `install.sh`):
+
+```bash
+fogar-gw uninstall --purge        # servicio, <base> entero (con la BD) y el programa
+```
+
+Pide escribir la ruta de `<base>` para confirmar (`--yes` lo salta en scripts) y no tiene vuelta atrás: se pierden los clientes y sus claves, `config.env` con sus tokens y la identidad del gateway ante OpenClaw, así que habrá que emparejar los clientes otra vez. Solo borra dentro de `<base>`: se niega si no parece una instalación (sin `ADMIN_TOKEN` en `config.env` ni `data/gateway.db`), si la BD de `config.env` (`DATABASE_URL`) vive fuera o `data/` es un enlace a otro sitio, y con un gateway en marcha fuera del servicio. El servicio y el programa solo los quita si son de esa base (sin servicio instalado, solo con la base por defecto, `~/.fogar-gateway`). Si el programa no se instaló con `uv tool`, te dice cómo quitarlo. No toca uv, linger, Tailscale ni OpenClaw. En Docker: `docker compose down -v`.
 
 ### Pasar de Docker a nativo
 
-`fogar-gw migrate --from-docker <carpeta de compose>` copia `.env` y `data/gateway.db` de una instalación Docker a `<base>`. Solo vale para una instalación Docker de la v2.0.0 o posterior: las versiones 1.x no se migran, se instala desde cero. Procedimiento, con la ventana de parada y la vuelta atrás:
+`fogar-gw migrate --from-docker <carpeta de compose>` copia `.env` y `data/gateway.db` de una instalación Docker a `<base>` (y `data/openclaw-device.json`, la identidad ante OpenClaw, si existe: así sigue emparejado). Solo vale para una instalación Docker de la v2.0.0 o posterior: las versiones 1.x no se migran, se instala desde cero. Procedimiento, con la ventana de parada y la vuelta atrás:
 
 1. **Misma versión a los dos lados.** Despliega la versión vN en Docker e instala la vN nativa **sin arrancarla**, con el instalador y `--no-onboard`:
    ```bash
@@ -363,7 +403,7 @@ Qué hace `migrate` (`src/fogar_gateway/cli/migrate.py`):
 - Copia la BD con la API de backup de sqlite3, comprueba `integrity_check` y que los clientes coinciden; **nunca escribe el origen** (lo abre en solo lectura). Si algo falla, no queda nada a medias, salvo un corte brusco (SIGKILL, corte de luz) entre la copia de la BD y la de `config.env`: entonces borra a mano lo creado en `<base>` y repite.
 - Exige la misma revisión de Alembic a los dos lados; si no, se niega y dice qué desplegar.
 - Se niega si el contenedor sigue en marcha mientras el gateway de Docker tenga el candado sobre `data/gateway.lock` (por defecto sí; no con `SINGLE_PROCESS_LOCK=false`), si `<base>` ya tiene `config.env` o BD (o restos `-journal`/`-wal`/`-shm`), o si el `DATABASE_URL` del `.env` no apunta a `/app/data/gateway.db`.
-- Del `.env` quita `DATABASE_URL`, `GATEWAY_UID` y `GATEWAY_GID`, y añade `LOG_FORMAT=json` si falta (la imagen lo fijaba). Una clave del `.env` que no sea un ajuste del gateway hace que se niegue ("La configuración migrada no es válida"): quítala antes y repite.
+- Del `.env` quita `DATABASE_URL`, `GATEWAY_UID`, `GATEWAY_GID` y `TZ` (la nativa usa la zona del host), y añade `LOG_FORMAT=json` si falta (la imagen lo fijaba). Una clave del `.env` que no sea un ajuste del gateway hace que se niegue ("La configuración migrada no es válida"): quítala antes y repite.
 - Crea `<base>` y `data/` con permisos 700 y `config.env` y la BD con 600. No migra los datos más allá de `data/gateway.db`: si montabas más cosas en el volumen, cópialas a mano.
 
 ### Desarrollo en la misma máquina que producción
@@ -390,6 +430,9 @@ docker compose up
 > define `GATEWAY_UID`/`GATEWAY_GID` en `.env` con el dueño de `./data`
 > (`echo "GATEWAY_UID=$(id -u)" >> .env && echo "GATEWAY_GID=$(id -g)" >> .env`).
 > Si `./data` viene de un despliegue anterior como root: `sudo chown -R "$(id -u):$(id -g)" data`.
+> El contenedor no ve la zona horaria del host: la fija `TZ` (por defecto `Europe/Madrid`; otra con
+> `TZ=America/Bogota` en el `.env`). De ella depende el corte del día de las conversaciones
+> (`CONVERSATION_DAY_START_HOUR`, hora local); sin `TZ` sería UTC.
 > Detalles en `docker-compose.yml`. Para pasar a nativo, ver [Pasar de Docker a nativo](#pasar-de-docker-a-nativo).
 
 ---
@@ -409,13 +452,15 @@ Variables de entorno o, si no, de `<base>/config.env` (instalación nativa). En 
 | `TTS_TOKEN` | — | Token de auth para fogar-speaker; vacío si el TTS no exige clave |
 | `OPENCLAW_HOST` | `127.0.0.1` | Host de OpenClaw |
 | `OPENCLAW_PORT` | `18789` | Puerto de OpenClaw |
+| `OPENCLAW_TLS` | `false` | `true` = conecta por `wss://` (OpenClaw de otra máquina tras TLS, p. ej. Tailscale) |
 | `OPENCLAW_TOKEN` | — | Token de OpenClaw. Sin él el gateway arranca con un aviso, pero OpenClaw rechaza la conexión (`/ready` 503) |
-| `ADMIN_TOKEN` | — | Token para endpoints `/admin/*`; vacío deshabilita el admin API |
+| `ADMIN_TOKEN` | — | Token para endpoints `/admin/*` y para el panel web en el WebSocket (`admin_token`); vacío deshabilita los dos. Al menos 32 caracteres (uno más corto arranca con un aviso, pero `doctor` lo marca como fallo) |
+| `DEFAULT_AGENT` | — | Agente por defecto de la instalación (#245): en la cascada, después del `default_agent` del cliente y antes del de OpenClaw; también el de una conversación nueva. Vacío = el de OpenClaw. Si no está en OpenClaw, avisa al conectar. Es un id de agente de OpenClaw (letras, cifras, `_` y `-`, hasta 64, empezando por letra o cifra), la misma regla que `default_agent` y `allowed_agents` de un cliente. Sin distinguir mayúsculas: se usa en minúsculas, como en OpenClaw (`Main` es `main`); `/admin/clients` guarda y devuelve también en minúsculas `default_agent` y `allowed_agents` |
+| `CONVERSATION_DAY_START_HOUR` | `5` | Hora local (0–23) a la que empieza el día de las conversaciones por defecto. En Docker la hora local es la de `TZ` (ver [Docker](#docker-alternativa)) |
 | `ORCHESTRATOR_RECONNECT_INITIAL_BACKOFF` | `1.0` | Backoff inicial en reconexión del orquestador (s) |
-| `ORCHESTRATOR_RECONNECT_MAX_BACKOFF` | `60.0` | Backoff máximo en reconexión del orquestador (s); también el periodo del reintento lento en DEGRADED |
-| `ORCHESTRATOR_RECONNECT_MAX_DURATION` | `300.0` | Tiempo hasta DEGRADED del orquestador (s); en DEGRADED sigue reintentando un intento cada `MAX_BACKOFF` s |
+| `ORCHESTRATOR_RECONNECT_MAX_BACKOFF` | `60.0` | Backoff máximo en reconexión del orquestador (s) (el gateway reintenta sin parar, sin tope de duración) |
 | `SINGLE_PROCESS_LOCK` | `true` | `flock` sobre `gateway.lock` junto a la BD: un segundo proceso (p. ej. `--workers 2`) no arranca. Multi-worker no está soportado |
-| `SESSION_REVALIDATE_INTERVAL_S` | `10.0` | Cada sesión WS se revalida contra la BD; cliente borrado/desactivado/clave rotada → cierre 1008 `revoked` |
+| `SESSION_REVALIDATE_INTERVAL_S` | `10.0` | Cada sesión WS se revalida contra la BD; cliente borrado/desactivado/clave rotada → cierre 4200 (`credential revoked`); agente de la sesión quitado de su `allowed_agents` → cierre 4020 (`agent not permitted`, la clave sigue valiendo). Ver [códigos de cierre](docs/client-protocol.md#códigos-de-cierre) |
 | `TRANSCRIBER_RECONNECT_INITIAL_BACKOFF` | `1.0` | Backoff inicial en reconexión del transcriptor (s) |
 | `TRANSCRIBER_RECONNECT_MAX_BACKOFF` | `60.0` | Backoff máximo en reconexión del transcriptor (s) |
 | `TRANSCRIBER_RECONNECT_MAX_DURATION` | `300.0` | Tiempo hasta DEGRADED del transcriptor (s) |
@@ -528,7 +573,8 @@ src/fogar_gateway/
 ├── api/
 │   ├── routes.py            WebSocket /ws/stream — handshake, ready, ciclo de vida del bridge
 │   ├── pairing_routes.py    /.well-known/fogar-gateway, POST /pair y /admin/pairing
-│   ├── admin_routes.py      /admin/* — clientes, sesiones, servicios, voz, vías de acceso y estado en vivo (SSE)
+│   ├── admin_routes.py      /admin/* — clientes (y el «Panel web»), sesiones, servicios, voz, vías de acceso y estado en vivo (SSE)
+│   ├── conversation_routes.py /admin/conversations — lista, mensajes (chat.history) y alta del panel
 │   ├── openai_routes.py     /v1/models, /v1/chat/completions
 │   ├── web_routes.py        el panel en / (caché, CSP y vuelta a index.html)
 │   ├── health_routes.py     /healthz, /ready
@@ -539,15 +585,17 @@ src/fogar_gateway/
 │   ├── network.py           resolve_client_ip() / origen de confianza de /v1
 │   ├── startup_checks.py    lock de proceso único y comprobaciones de arranque
 │   ├── logging.py           formatos de log y fingerprint_key()
-│   └── session_key.py       make_session_key() — formato canónico de session key
+│   └── session_key.py       make_session_key() — la clave de antes de M19 (`agent:{agente}:{client.id}`)
 ├── db/
-│   ├── models.py            ClientRecord (SQLModel) — identidad y config por cliente
+│   ├── models.py            ClientRecord (identidad y config por cliente), ConversationRecord (índice de conversaciones)
 │   └── database.py          get_engine() / run_migrations() / get_db_session()
 ├── cli/                     fogar-gw — init, serve, menú, onboard (el asistente; verify.py comprueba cada
 │                            proveedor contra el servicio real), access, token, pair, clients, doctor, config,
 │                            status, version, servicio systemd (install/start/stop/restart), logs y migrate
 └── services/
     ├── bridge.py            FogarBridge — coordinador de sesión WS
+    ├── turns.py             TurnController — los turnos de una sesión (user y push), su TTS y su fin
+    ├── conversations.py     conversaciones: reglas del día, tabla, índice, importación legacy
     ├── pairing.py           PairingStore — códigos de emparejamiento en memoria
     ├── db_client.py         DbClient — lee ClientRecord de SQLite local (sin caché)
     ├── outbound.py          QueuedSender — salida serializada hacia cada cliente
@@ -563,11 +611,12 @@ src/fogar_gateway/
     ├── session_registry.py  SessionRegistry — observabilidad de sesiones
     ├── speech/              Proveedores STT/TTS: ports.py, factory.py, fogar.py, elevenlabs/, off.py (voz desactivada)
     └── openclaw/
-        ├── client.py        OpenClawClient — WebSocket v4, multiplexado
+        ├── client.py        OpenClawClient — WebSocket v4, multiplexado; auth y emparejamiento
+        ├── device.py        identidad de dispositivo (Ed25519, firma v3) y token de dispositivo
         ├── reconnecting.py  ReconnectingOpenClawClient — backoff + DEGRADED
         ├── dispatcher.py    FrameDispatcher — enruta frames a turn/client registry
-        ├── registry.py      TurnRegistry + ClientRegistry (+ broadcast_status a todas las sesiones)
-        └── models.py        GatewayInfo
+        ├── registry.py      TurnRegistry + ClientRegistry (sesiones vivas por conversación, reparto del push, broadcast_status)
+        └── models.py        GatewayInfo, OrchestratorAccess (permisos y emparejamiento)
 ```
 
 En la raíz del repo, `install.sh` es el instalador nativo (se publica como asset de cada release; el job `installer-smoke` del CI lo prueba).

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, shallowRef } from 'vue'
-import { useRouter } from 'vue-router'
+import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { createClient } from '@/api/admin'
 import { ApiError } from '@/api/http'
 import type { ClientType, ClientWithKey } from '@/api/types'
@@ -11,6 +11,7 @@ import FgEstado from '@/components/FgEstado.vue'
 import FgIcono from '@/components/FgIcono.vue'
 import FondoVivo from '@/components/FondoVivo.vue'
 import PanelEmparejar from '@/components/PanelEmparejar.vue'
+import { frenarRecarga, releer, SALIR_CON_CLAVE, SALIR_EN_VUELO } from '@/lib/clave'
 import { CLIENT_TYPE, label } from '@/lib/labels'
 import { toast } from '@/lib/toasts'
 import { useClientsStore } from '@/stores/clients'
@@ -57,9 +58,11 @@ const nuevoTipo = ref<ClientType | ''>('')
 const nuevoError = ref<string | null>(null)
 const creando = ref(false)
 const creado = shallowRef<ClientWithKey | null>(null)
+const comprobando = ref(false) // releyendo la lista tras un fallo de red: crear otra vez podría duplicarlo
 
 async function crear(): Promise<void> {
   const nombre = nuevoNombre.value.trim()
+  if (comprobando.value) return
   if (!nombre) {
     nuevoError.value = 'Ponle un nombre.'
     return
@@ -70,10 +73,35 @@ async function crear(): Promise<void> {
     creado.value = await createClient({ name: nombre, client_type: nuevoTipo.value || null })
     void clients.refresh()
   } catch (e) {
-    nuevoError.value = e instanceof ApiError && e.kind === 'invalid' ? 'Ese nombre no vale: entre 1 y 200 caracteres.' : 'No he podido crearlo. Prueba otra vez.'
+    if (e instanceof ApiError && e.kind !== 'network') {
+      nuevoError.value = e.kind === 'invalid' ? 'Ese nombre no vale: entre 1 y 200 caracteres.' : 'No he podido crearlo. Prueba otra vez.'
+    } else {
+      // G-r6-3: sin respuesta, el gateway pudo crearlo: reintentar daría un duplicado.
+      nuevoError.value = 'No sé si se creó: estoy mirando la lista; no pruebes otra vez todavía.'
+      void comprobarLista(nombre)
+    }
   } finally {
     creando.value = false
   }
+}
+/** G-r7-1: relee la lista (con reintentos) antes de pedir que se mire; su clave nunca se vio. */
+async function comprobarLista(nombre: string): Promise<void> {
+  comprobando.value = true
+  // G-r8-1: una lectura que se adelanta a la escritura no lo trae: se relee hasta verlo (o 3 veces).
+  const leida = await releer(
+    async () => {
+      await clients.refresh()
+      if (clients.error) throw new Error(clients.error)
+    },
+    () => clients.items.some((c) => c.name === nombre),
+  )
+  comprobando.value = false
+  if (creando.value || creado.value) return // ya hay otro intento en marcha
+  const rotala = `Si «${nombre}» sale en la lista, su clave no se ha visto: entra en él y rota la clave.`
+  nuevoError.value =
+    leida === null
+      ? `No sé si se creó y no he podido comprobarlo: recarga la página antes de probar otra vez. ${rotala}`
+      : `No sé si se creó. ${rotala} Si no sale, prueba otra vez.`
 }
 function claveCopiada() {
   const id = creado.value?.id
@@ -83,6 +111,12 @@ function claveCopiada() {
   nuevoTipo.value = ''
   if (id) void router.push(`/clientes/${encodeURIComponent(id)}`)
 }
+onBeforeRouteLeave(() => {
+  if (creando.value) return window.confirm(SALIR_EN_VUELO)
+  if (creado.value) return window.confirm(SALIR_CON_CLAVE)
+  return true
+})
+frenarRecarga(() => creando.value)
 function emparejado(clientId: string, nombre: string | null) {
   toast('ok', `${nombre ?? 'El aparato'} ya habla con Fogar`, 'Revisa sus ajustes si quieres cambiarlos.')
   panel.value = null
@@ -98,8 +132,8 @@ function emparejado(clientId: string, nombre: string | null) {
         <h1 class="fg-h1">{{ titulo }}</h1>
         <p class="fg-sub">Cada uno entra con su propia clave. Para añadir otro, empareja con un código; no hace falta copiar claves.</p>
       </div>
-      <FgBoton :disabled="!!creado" @click="panel = 'crear'">Crear a mano</FgBoton>
-      <FgBoton variante="principal" icono="mas" :disabled="!!creado" @click="panel = 'emparejar'">Emparejar un aparato</FgBoton>
+      <FgBoton :disabled="!!creado || creando" @click="panel = 'crear'">Crear a mano</FgBoton>
+      <FgBoton variante="principal" icono="mas" :disabled="!!creado || creando" @click="panel = 'emparejar'">Emparejar un aparato</FgBoton>
     </header>
 
     <div class="cuerpo">
@@ -170,8 +204,8 @@ function emparejado(clientId: string, nombre: string | null) {
             </select>
           </div>
           <div class="acciones">
-            <FgBoton type="submit" variante="principal" :ocupado="creando">Crear y ver la clave</FgBoton>
-            <FgBoton @click="panel = null">Cancelar</FgBoton>
+            <FgBoton type="submit" variante="principal" :ocupado="creando" :disabled="comprobando">Crear y ver la clave</FgBoton>
+            <FgBoton :disabled="creando" @click="panel = null">Cancelar</FgBoton>
           </div>
         </form>
       </aside>

@@ -1,6 +1,8 @@
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, StringConstraints, model_validator
+
+from fogar_gateway.core.session_key import AGENT_ID_PATTERN
 
 # Modos de salida conocidos. Compartido por el handshake WS y la API admin (#122).
 OutputMode = Literal["audio", "text", "status"]
@@ -34,8 +36,9 @@ class ClientConfig(BaseModel):
     max_silence_turns: int = 3
     push_enabled: bool = True
     tool_calls_enabled: bool = False
-    default_agent: str | None = None
-    allowed_agents: list[str] | None = None
+    # En minúsculas, como OpenClaw: una fila anterior a la 3.0 puede guardar "Main" (C-1).
+    default_agent: Annotated[str, StringConstraints(to_lower=True)] | None = None
+    allowed_agents: list[Annotated[str, StringConstraints(to_lower=True)]] | None = None
 
     model_config = ConfigDict(extra="allow")
 
@@ -45,18 +48,42 @@ class ClientConfig(BaseModel):
 # =====================================================================
 
 
+CREDENTIAL_MAX_LEN = 1024
+
+
 class Handshake(BaseModel):
     """
-    Configuración inicial que el ESP32 o la Web envían al Gateway al conectar
-    por WebSocket. Define qué patas internas del ecosistema se deben encender.
+    Configuración inicial que el cliente envía al Gateway al conectar por WebSocket. Define
+    qué patas internas del ecosistema se deben encender.
+
+    Credencial: `client_key` o, para el panel web, `admin_token` (M19); una de las dos.
     """
 
-    client_key: str
+    # Con tope (como `conversation`): un valor enorme o un surrogate suelto ("\ud800") falla la
+    # validación (cierre 4000) en vez de reventar al codificarlo (auditoría 3.0, D-5).
+    client_key: Annotated[str, StringConstraints(max_length=CREDENTIAL_MAX_LEN)] | None = None
+    admin_token: Annotated[str, StringConstraints(max_length=CREDENTIAL_MAX_LEN)] | None = None
     input_mode: Literal["audio", "text"]
     output_mode: list[OutputMode]
-    agent: str | None = None  # OpenClaw agent name; None → gateway default
+    # Id de agente de OpenClaw, en minúsculas; None, "" o solo espacios → la cascada de
+    # resolve_agent. Un id que OpenClaw no admite (`:`, espacios…) es 4000 (auditoría 3.0, C-2).
+    agent: (
+        Annotated[
+            str,
+            StringConstraints(strip_whitespace=True, to_lower=True, pattern=f"^$|{AGENT_ID_PATTERN}"),
+        ]
+        | None
+    ) = None
+    # Id de una conversación del cliente o "new"; None → la conversación por defecto (M19).
+    conversation: Annotated[str, StringConstraints(min_length=1, max_length=64)] | None = None
 
     model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="after")
+    def _one_credential(self) -> "Handshake":
+        if (self.client_key is None) == (self.admin_token is None):
+            raise ValueError("client_key or admin_token, exactly one")
+        return self
 
 
 # =====================================================================

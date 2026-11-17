@@ -8,11 +8,30 @@ from datetime import UTC, datetime
 from enum import Enum
 
 import httpx
+from websockets.exceptions import ConnectionClosedError
 
 logger = logging.getLogger(__name__)
 
 # Tests swap this name; patching asyncio.sleep would change it process-wide.
 _sleep = asyncio.sleep
+
+# E-r2-1: a connection that lived less than this is a flap; from the second flap in a row
+# the reconnect waits (the first one reconnects at once, E-r3-1).
+STABLE_CONNECTION_S = 10.0
+
+
+async def send_or_abort(ws, data: str | bytes, timeout: float, label: str) -> None:
+    """`ws.send` with a deadline (E-r6-1). A peer that stops reading (hung process, host gone
+    with TCP open) blocks `send` in drain with no limit of its own, and with it whoever awaits
+    it (the session's input loop). On timeout the transport is aborted, so the reader sees the
+    drop and reconnects, and this raises ConnectionClosed like any other closed socket."""
+    try:
+        async with asyncio.timeout(timeout):
+            await ws.send(data)
+    except TimeoutError:
+        logger.warning("%s: el envío no avanzó en %.1f s; se aborta la conexión", label, timeout)
+        ws.transport.abort()  # not close(): it would wait close_timeout on a peer that doesn't read
+        raise ConnectionClosedError(None, None) from None
 
 
 class ConnectionState(Enum):
@@ -116,6 +135,11 @@ class ServiceHealth:
         self.reconnect_attempts = 0
         self.last_error: str | None = None
         self.on_state_change: Callable[[ConnectionState], None] | None = None
+        # E-r2-1: monotonic time of the last connect, the next wait before reconnecting after
+        # a connection that died young (0: none pending) and when the last such wait ended.
+        self.connected_mono: float | None = None
+        self.flap_backoff = 0.0
+        self.flap_at: float | None = None
 
     def set_state(self, state: ConnectionState) -> None:
         if state == self.state:
@@ -135,6 +159,11 @@ class ServiceHealth:
     def mark_connected(self) -> None:
         # Fields first, hook last: a callback calling status() sees the final state.
         self.connected_at = datetime.now(UTC)
+        self.connected_mono = time.monotonic()
+        # A connect long after the last flap (a reopen outside reconnect_with_backoff) starts
+        # clean; the connect that follows a flap wait keeps the doubled backoff.
+        if self.flap_at is not None and self.connected_mono - self.flap_at >= STABLE_CONNECTION_S:
+            self.flap_backoff = 0.0
         self.reconnect_attempts = 0
         self.last_error = None
         self.set_state(ConnectionState.CONNECTED)
@@ -153,21 +182,60 @@ class ServiceHealth:
         )
 
 
+async def _wait_or_wake(wake: asyncio.Event, delay: float) -> bool:
+    """Waits `delay` s (through the patchable `_sleep`) or until `wake` is set. True if woken."""
+    sleeper = asyncio.ensure_future(_sleep(delay))
+    waker = asyncio.ensure_future(wake.wait())
+    try:
+        done, _ = await asyncio.wait({sleeper, waker}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        sleeper.cancel()
+        waker.cancel()
+    return waker in done
+
+
 async def reconnect_with_backoff(
     attempt: Callable[[], Awaitable[None]],
     health: ServiceHealth,
     *,
     initial_backoff: float,
     max_backoff: float,
-    max_duration: float,
+    max_duration: float | None,
     label: str,
+    wake: asyncio.Event | None = None,
 ) -> bool:
-    """Retries `attempt()` with exponential backoff until it succeeds or
-    `max_duration` elapses. True on success (health -> CONNECTED); False once
-    exhausted (health -> DEGRADED). Cancellation propagates."""
+    """Retries `attempt()` with exponential backoff until it succeeds or `max_duration`
+    elapses (`None`: never gives up, #272). True on success (health -> CONNECTED); False once
+    exhausted (health -> DEGRADED). With `wake`, setting the event cuts the current wait short
+    and resets the backoff to `initial_backoff` (the event is cleared before each attempt).
+    If the last connection lived less than `STABLE_CONNECTION_S` (a server that accepts and
+    closes soon), it first waits `health.flap_backoff`: nothing on the first such flap, then
+    `initial_backoff` doubled on each further one up to `max_backoff`, reset by a connection
+    that lasts (`wake` cuts it short, back to `initial_backoff`) (E-r2-1, E-r3-1); that wait counts towards `max_duration`.
+    Cancellation propagates."""
     start = time.monotonic()
+    if health.connected_mono is not None:
+        if start - health.connected_mono < STABLE_CONNECTION_S:
+            # The first early drop reconnects at once (a lone cut must not lose the phrase in
+            # flight, E-r3-1); only a second one in a row starts waiting.
+            delay = health.flap_backoff
+            health.flap_backoff = min(max(delay * 2, initial_backoff), max_backoff)
+            logger.warning("[%s] connection dropped soon after connecting%s.", label,
+                           f" — waiting {delay:.1f}s" if delay else "")
+            if delay:
+                if wake is None:
+                    await _sleep(delay)
+                elif await _wait_or_wake(wake, delay):
+                    # A manual reconnect skips this wait, but not the next one: a server that
+                    # keeps closing at once still gets a wait on the following drop.
+                    health.flap_backoff = initial_backoff
+            health.flap_at = time.monotonic()
+        else:
+            health.flap_backoff = 0.0
     backoff = initial_backoff
     while True:
+        if wake is not None:
+            wake.clear()
         try:
             await attempt()
             health.mark_connected()
@@ -187,13 +255,18 @@ async def reconnect_with_backoff(
                 "[%s] reconnect traceback (no message): %s", label, traceback_no_message(e)
             )
 
-        if time.monotonic() - start >= max_duration:
+        if max_duration is not None and time.monotonic() - start >= max_duration:
             health.set_state(ConnectionState.DEGRADED)
             logger.warning("[%s] reconnect exhausted — DEGRADED.", label)
             return False
 
-        await _sleep(backoff)
-        backoff = min(backoff * 2, max_backoff)
+        if wake is None:
+            await _sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+        elif await _wait_or_wake(wake, backoff):
+            backoff = initial_backoff
+        else:
+            backoff = min(backoff * 2, max_backoff)
 
 
 class LazyBackoffGate:

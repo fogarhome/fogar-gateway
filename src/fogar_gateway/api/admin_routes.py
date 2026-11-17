@@ -16,11 +16,12 @@ Clientes:
 Observabilidad:
   GET    /admin/sessions             — sesiones en memoria
   GET    /admin/sessions/{id}        — detalle de sesión
-  GET    /admin/orchestrators/{name}/status
-  POST   /admin/orchestrators/{name}/reconnect  (202)
+  GET    /admin/orchestrator/status
+  POST   /admin/orchestrator/reconnect  (202)
   GET    /admin/transcriber/status
   GET    /admin/tts/status
-  GET    /admin/state                — instantánea viva (gateway con `dashboards`, servicios, totales, sesiones)
+  GET    /admin/state                — instantánea viva (gateway con `dashboards`, servicios con el acceso
+                                        a OpenClaw: permisos, token y emparejamiento; totales, sesiones)
   GET    /admin/state/stream         — la misma instantánea por SSE cada STATE_STREAM_INTERVAL_S
   GET    /admin/access               — vías para llegar al gateway, verificadas (caché 15 s)
 """
@@ -40,7 +41,7 @@ from sqlmodel import Session, select
 
 from fogar_gateway._version import __version__
 from fogar_gateway.api.deps import get_admin_auth
-from fogar_gateway.db.database import get_db_session
+from fogar_gateway.db.database import get_db_session, get_engine
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.models.admin_schemas import (
     ClientCreate,
@@ -48,6 +49,9 @@ from fogar_gateway.models.admin_schemas import (
     ClientUpdate,
     ClientWithKey,
 )
+from fogar_gateway.models.schemas import Client, ClientConfig
+from fogar_gateway.services.db_client import db_client
+from fogar_gateway.services.openclaw.models import OrchestratorAccess, access_texts
 from fogar_gateway.services.reconnection import ServiceStatus
 from fogar_gateway.services.stats import gateway_stats
 
@@ -85,7 +89,7 @@ def _check_agent_consistency(default_agent: str | None, allowed_agents: list[str
     """
     if default_agent is None or allowed_agents is None:
         return
-    if default_agent not in allowed_agents:
+    if default_agent.lower() not in [a.lower() for a in allowed_agents]:  # filas de la 2.x (C-1)
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="default_agent must be one of allowed_agents",
@@ -111,11 +115,16 @@ def list_clients(session: Session = Depends(get_db_session)) -> list[ClientRespo
     return [ClientResponse.from_record(r) for r in records]
 
 
-def create_client_record(session: Session, body: ClientCreate) -> ClientRecord:
-    """Crea el cliente: la única vía, la usan `POST /admin/clients` y el emparejamiento (#317)."""
+def create_client_record(
+    session: Session, body: ClientCreate, *, client_id: str | None = None
+) -> ClientRecord:
+    """Crea el cliente: la única vía, la usan `POST /admin/clients`, el emparejamiento (#317) y
+    el cliente «Panel web» (M19, el único con `client_id` fijo)."""
     _check_agent_consistency(body.default_agent, body.allowed_agents)
     data = _lists_to_json(body.model_dump())
     data["client_key"] = data["client_key"] or secrets.token_urlsafe(32)
+    if client_id is not None:
+        data["id"] = client_id
     record = ClientRecord(**data)
     session.add(record)
     try:
@@ -130,6 +139,57 @@ def create_client_record(session: Session, body: ClientCreate) -> ClientRecord:
         ) from None
     session.refresh(record)
     return record
+
+
+# El panel web entra con el ADMIN_TOKEN (handshake `admin_token`, M19) como este cliente: una
+# ficha normal (se ve, se edita y se desactiva como las demás), creada la primera vez que hace
+# falta. Su client_key no se enseña nunca (no se usa: el panel no la conoce).
+PANEL_CLIENT_ID = "panel-web"
+PANEL_CLIENT_NAME = "Panel web"
+
+
+def ensure_panel_client(session: Session) -> ClientRecord:
+    """La ficha del cliente «Panel web»; la crea por la vía única si no existe."""
+    record = session.get(ClientRecord, PANEL_CLIENT_ID)
+    if record is not None:
+        return record
+    body = ClientCreate(name=PANEL_CLIENT_NAME, client_type="web", output_mode=["text"])
+    try:
+        return create_client_record(session, body, client_id=PANEL_CLIENT_ID)
+    except HTTPException:
+        # Otra petición la creó a la vez (409 de create_client_record): es esa.
+        record = session.get(ClientRecord, PANEL_CLIENT_ID)
+        if record is None:
+            raise
+        return record
+
+
+def _panel_key() -> str:
+    with Session(get_engine()) as session:
+        return ensure_panel_client(session).client_key
+
+
+async def panel_session() -> tuple[Client, ClientConfig]:
+    """`(Client, ClientConfig)` del panel web, como `db_client.get_session`: lanza
+    `ClientInactive` si el administrador lo desactivó."""
+    key = await asyncio.to_thread(_panel_key)
+    return await db_client.get_session(key)
+
+
+def _existing_panel_key() -> str | None:
+    with Session(get_engine()) as session:
+        record = session.get(ClientRecord, PANEL_CLIENT_ID)
+        return record.client_key if record is not None else None
+
+
+async def existing_panel_config() -> ClientConfig | None:
+    """La configuración del panel web sin crear su ficha (para lecturas): None si aún no existe,
+    `ClientInactive` si el administrador lo desactivó."""
+    key = await asyncio.to_thread(_existing_panel_key)
+    if key is None:
+        return None
+    _, config = await db_client.get_session(key)
+    return config
 
 
 @router.post("/clients", response_model=ClientWithKey, status_code=status.HTTP_201_CREATED)
@@ -173,13 +233,20 @@ def update_client(
     return ClientResponse.from_record(rec)
 
 
+def _delete_client_record(client_id: str) -> None:
+    with Session(get_engine()) as session:
+        session.delete(_get_or_404(session, client_id))
+        session.commit()
+
+
 @router.delete("/clients/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_client(
-    client_id: str,
-    session: Session = Depends(get_db_session),
-) -> None:
-    session.delete(_get_or_404(session, client_id))
-    session.commit()
+async def delete_client(client_id: str, request: Request) -> None:
+    await asyncio.to_thread(_delete_client_record, client_id)
+    # Sus conversaciones se van con él por ON DELETE CASCADE (M19; lo dicho sigue en OpenClaw).
+    # El índice, hecho ya el commit y en el hilo del loop, como cualquier otro cambio suyo.
+    conversations = getattr(request.app.state, "conversations", None)
+    if conversations is not None:
+        conversations.index.forget_client(client_id)
 
 
 @router.post("/clients/{client_id}/rotate-key", response_model=ClientWithKey)
@@ -304,12 +371,9 @@ async def get_session(session_id: str, request: Request) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@router.get("/orchestrators/{name}/status")
-async def get_orchestrator_status(name: str, request: Request) -> dict:
-    openclaw = request.app.state.openclaw
-    if name != openclaw.get_name():
-        raise HTTPException(status_code=404, detail=f"Orchestrator '{name}' not registered")
-    s = openclaw.status()
+@router.get("/orchestrator/status")
+async def get_orchestrator_status(request: Request) -> dict:
+    s = request.app.state.openclaw.status()
     return {
         "name": s.name,
         "state": s.state.value,
@@ -319,13 +383,13 @@ async def get_orchestrator_status(name: str, request: Request) -> dict:
     }
 
 
-@router.post("/orchestrators/{name}/reconnect", status_code=202)
-async def post_orchestrator_reconnect(name: str, request: Request) -> dict:
-    openclaw = request.app.state.openclaw
-    if name != openclaw.get_name():
-        raise HTTPException(status_code=404, detail=f"Orchestrator '{name}' not registered")
-    job_id = openclaw.trigger_reconnect()
-    return {"accepted": True, "job_id": job_id}
+@router.post("/orchestrator/reconnect", status_code=202)
+async def post_orchestrator_reconnect(request: Request) -> dict:
+    """Retry now: cuts the reconnect loop's wait short (#272). Does not block on the handshake.
+
+    `{"accepted": false}` when nothing was done: OpenClaw is already CONNECTED (reconnecting
+    would tear down a healthy socket and fail in-flight turns) or the gateway is shutting down."""
+    return {"accepted": request.app.state.openclaw.trigger_reconnect()}
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +464,7 @@ def _service_state(s: ServiceStatus) -> dict[str, Any]:
 
 def _build_state(app: FastAPI) -> dict[str, Any]:
     speech = app.state.speech
+    access = getattr(app.state, "openclaw_access", OrchestratorAccess()).as_dict()
     sessions = []
     for bridge in app.state.client_registry.bridges():
         try:
@@ -421,7 +486,12 @@ def _build_state(app: FastAPI) -> dict[str, Any]:
             "dashboards": _open_streams,
         },
         "services": {
-            "orchestrator": _service_state(app.state.openclaw.status()),
+            "orchestrator": {
+                **_service_state(app.state.openclaw.status()),
+                # Permisos concedidos, admin, token en uso y emparejamiento (M19); sin secretos.
+                **access,
+                **access_texts(access),
+            },
             "stt": {"provider": speech.stt.name, **_service_state(speech.stt.status())},
             "tts": {"provider": speech.tts.name, **_service_state(speech.tts.status())},
         },
@@ -448,7 +518,12 @@ async def get_state_stream(request: Request) -> StreamingResponse:
         finally:
             _open_streams -= 1
 
-    return StreamingResponse(state_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        state_stream(),
+        media_type="text/event-stream",
+        # D-r6-5: que un proxy (nginx) no retenga los eventos.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 _ACCESS_TTL_S = 15.0

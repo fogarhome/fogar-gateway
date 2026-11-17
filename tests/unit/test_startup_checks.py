@@ -51,6 +51,21 @@ def test_no_warning_when_tokens_are_set(caplog):
     assert caplog.records == []
 
 
+def test_short_admin_token_warns_without_the_value(caplog):
+    """D-r5-1: < 32 caracteres es adivinable; el aviso no lleva el valor. 32 ya vale."""
+    caplog.set_level(logging.WARNING)
+    short = "x" * 31
+    assert warn_insecure_tokens(_settings(ADMIN_TOKEN=short)) == ["ADMIN_TOKEN"]
+    assert caplog.records and all(short not in r.getMessage() for r in caplog.records)
+    assert insecure_tokens(_settings(ADMIN_TOKEN="x" * 32)) == []
+
+
+@pytest.mark.parametrize("value", ["abc" + " " * 29, "ñ" * 32, "\u200b" * 32, "x" * 31 + " "])
+def test_admin_token_needs_32_printable_ascii_without_spaces(value):
+    """D-r6-2: espacios, no ASCII o invisibles no cuentan para el mínimo de 32."""
+    assert insecure_tokens(_settings(ADMIN_TOKEN=value)) == ["ADMIN_TOKEN"]
+
+
 @pytest.mark.parametrize("value", ["", "changeme", "CHANGEME", " changeme ", "secret", "admin"])
 def test_admin_token_empty_or_placeholder_warns(value, caplog):
     caplog.set_level(logging.WARNING)
@@ -82,6 +97,18 @@ def test_empty_tts_token_not_flagged(monkeypatch):
 def test_placeholder_tts_token_flagged(value, caplog):
     caplog.set_level(logging.WARNING)
     assert warn_insecure_tokens(_settings(TTS_TOKEN=value)) == ["TTS_TOKEN"]
+
+
+@pytest.mark.parametrize(
+    ("provider", "flagged"), [("fogar", ["TTS_TOKEN"]), ("elevenlabs", []), ("off", [])]
+)
+def test_placeholder_tts_token_only_flagged_for_the_fogar_provider(provider, flagged, caplog):
+    """#248: con elevenlabs u off el TTS_TOKEN no se usa, así que no se avisa de él."""
+    caplog.set_level(logging.WARNING)
+    s = _settings(TTS_TOKEN="changeme", TTS_PROVIDER=provider)
+    assert insecure_tokens(s) == flagged
+    assert warn_insecure_tokens(s) == flagged
+    assert ("TTS_TOKEN" in caplog.text) == bool(flagged)
 
 
 def test_warnings_never_contain_the_token_value(caplog):

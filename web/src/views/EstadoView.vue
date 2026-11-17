@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import { getOrchestratorStatus, getReady, getTranscriberStatus, getTtsStatus, reconnectOrchestrator } from '@/api/admin'
 import type { ServiceDetail } from '@/api/types'
+import AccesoOpenClaw from '@/components/AccesoOpenClaw.vue'
 import FgBoton from '@/components/FgBoton.vue'
 import FgEstado from '@/components/FgEstado.vue'
 import LienzoServicios from '@/components/LienzoServicios.vue'
@@ -84,8 +85,9 @@ async function reconectar(): Promise<void> {
   if (reconectando.value) return
   reconectando.value = true
   try {
-    await reconnectOrchestrator()
-    toast('ok', 'Reconectando OpenClaw', 'Su estado cambia aquí en cuanto vuelva.')
+    const { accepted } = await reconnectOrchestrator()
+    if (accepted) toast('ok', 'Reconectando OpenClaw', 'Su estado cambia aquí en cuanto vuelva.')
+    else toast('ok', 'OpenClaw ya está conectado', 'No hacía falta reconectar.')
   } catch {
     toast('bad', 'No se pudo pedir la reconexión', 'Prueba otra vez en unos segundos.')
   } finally {
@@ -205,6 +207,11 @@ const totales = computed(() => {
           </table>
         </div>
         <p v-else class="fg-meta">Nadie conectado. Aquí aparecen la tele, los altavoces y el resto de aparatos mientras tengan una sesión abierta.</p>
+      </section>
+
+      <section v-if="live.state" aria-labelledby="h-acceso" class="bloque estrecho">
+        <h2 id="h-acceso" class="fg-h2">Acceso a OpenClaw</h2>
+        <AccesoOpenClaw :access="live.state.services.orchestrator" />
       </section>
 
       <section v-if="peor" aria-labelledby="h-peor" class="bloque estrecho">

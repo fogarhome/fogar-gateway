@@ -21,10 +21,10 @@ SK_A = "agent:main:client-a"
 SK_B = "agent:main:client-b"
 
 
-def make_client(port):
+def make_client(port, token="tok"):
     turns = TurnRegistry()
     dispatcher = FrameDispatcher(turns, ClientRegistry())
-    client = OpenClawClient("127.0.0.1", port, "tok", turns, dispatcher)
+    client = OpenClawClient("127.0.0.1", port, token, turns, dispatcher)
     return client, turns
 
 
@@ -284,14 +284,18 @@ async def test_fail_ends_turn_with_stable_orchestrator_error(server):
 
 async def test_agent_error_after_ack_ends_turn_with_stable_error(server, caplog):
     # #300: el chat state:error termina el turno ya, sin esperar a turn_timeout.
+    # B-r4-2: `websockets` a DEBUG volcaría las tramas (el connect con el token): connect lo fija.
     caplog.set_level(logging.DEBUG)
-    client, turns = make_client(server.port)
+    for name in ("websockets", "websockets.client"):
+        caplog.set_level(logging.DEBUG, logger=name)
+    client, turns = make_client(server.port, token="SECRET-OC-TOKEN")
     await client.connect()
     try:
         events = await asyncio.wait_for(run_turn(client, SK_A, "agent_error"), 3)
         assert errors(events) == ["orchestrator_error"] and tokens(events) == ""
         assert turns.get_queue_by_session(SK_A) is None
         assert "No API key" not in caplog.text
+        assert "SECRET-OC-TOKEN" not in caplog.text
     finally:
         await client.close()
 
@@ -313,7 +317,7 @@ async def test_push_reaches_registered_bridge_in_order(server):
         def __init__(self):
             self.calls = []
 
-        def enqueue_push(self, kind, payload):
+        def enqueue_push(self, kind, payload, run_id=None):
             self.calls.append((kind, payload))
 
     client, _ = make_client(server.port)
@@ -351,6 +355,12 @@ def _ev(sk, **kw):
     return json.dumps({"type": "event", "event": "chat", "payload": {"sessionKey": sk, **kw}})
 
 
+def _binary(sk, **kw):
+    """Trama binaria con los surrogates crudos en UTF-8 (sin escapes)."""
+    frame = {"type": "event", "event": "chat", "payload": {"sessionKey": sk, **kw}}
+    return json.dumps(frame, ensure_ascii=False).encode("utf-8", "surrogatepass")
+
+
 def _delta(sk, text, seq, replace=False):
     kw = {"state": "delta", "seq": seq, "deltaText": text, "message": _msg(text)}
     if replace:
@@ -376,6 +386,15 @@ class Scripted2026_10_5(FakeOpenClawServer):
             await ws.send(_delta(sk, "1, 2, 3,", 6))
             await ws.send(_delta(sk, "", 9, replace=True))
             await ws.send(_final(sk, "1, 2, 3, 4, 5"))
+        elif scenario == "split_emoji":  # B-r4-1: solo el 1.er delta trae `message`
+            await ws.send(_delta(sk, "Hola ", 1))
+            await ws.send(_ev(sk, state="delta", seq=2, deltaText="amigo \ud83d"))
+            await ws.send(_ev(sk, state="delta", seq=3, deltaText="\ude00 qué tal"))
+            await ws.send(_final(sk, "Hola amigo \U0001f600 qué tal"))
+        elif scenario == "split_emoji_binary":  # revisión r4: snapshots en tramas binarias
+            for text in ("Hola amigo \ud83d", "Hola amigo \U0001f600 qué tal"):
+                await ws.send(_binary(sk, state="delta", seq=1, message=_msg(text)))
+            await ws.send(_binary(sk, state="final", seq=2, message=_msg("Hola amigo \U0001f600 qué tal")))
         elif scenario == "multi_message":
             await ws.send(_delta(sk, "Voy a buscar. ", 1))
             await ws.send(_final(sk, f"Resultado: {TEXT}"))
@@ -407,6 +426,18 @@ async def test_captured_sequence_delivers_full_text_then_done(scripted_server):
     assert errors(events) == []
 
 
+async def test_emoji_split_between_deltas_is_delivered_once(scripted_server):
+    events = await _turn(scripted_server, "split_emoji")
+    assert "".join(_toks(events)) == "Hola amigo \U0001f600 qué tal"
+    assert errors(events) == []
+
+
+async def test_emoji_split_in_binary_snapshots_is_delivered_once(scripted_server):
+    events = await _turn(scripted_server, "split_emoji_binary")
+    assert "".join(_toks(events)) == "Hola amigo \U0001f600 qué tal"
+    assert errors(events) == []
+
+
 async def test_diverging_final_emits_full_final_and_warns_without_content(scripted_server, caplog):
     caplog.set_level(logging.DEBUG)
     events = await _turn(scripted_server, "multi_message")
@@ -417,7 +448,7 @@ async def test_diverging_final_emits_full_final_and_warns_without_content(script
     assert "Voy a buscar" not in caplog.text
 
 
-# ── 7e: chat.abort se queda con su propio `aborted` (G-14, sin filtro por runId) ──
+# ── 7e: chat.abort se queda con su propio `aborted` (G-14) ──
 
 
 async def test_abort_absorbs_its_aborted_frame(server):
@@ -425,7 +456,7 @@ async def test_abort_absorbs_its_aborted_frame(server):
         def __init__(self):
             self.calls = []
 
-        def enqueue_push(self, kind, payload):
+        def enqueue_push(self, kind, payload, run_id=None):
             self.calls.append((kind, payload))
 
     client, turns = make_client(server.port)
@@ -444,5 +475,52 @@ async def test_abort_absorbs_its_aborted_frame(server):
         assert not [p for k, p in bridge.calls if k == "chat" and p.get("state") == "aborted"]
         events = await asyncio.wait_for(run_turn(client, SK_A, "hola"), 5)
         assert tokens(events) == "reply-hola" and not errors(events)
+        # #285: the answer named the aborted run; its late frames are dropped from now on
+        assert turns.is_run_aborted("run-1")
+    finally:
+        await client.close()
+
+
+# ── #285: correlación por runId ──
+
+
+async def test_aborted_turn_frames_never_reach_the_next_turn(server):
+    """A turn cancelled mid-run (barge-in) is aborted; the reply of its run that was
+    already on its way is dropped instead of closing the next turn (G-14)."""
+    client, turns = make_client(server.port)
+    await client.connect()
+    try:
+        first = asyncio.create_task(run_turn(client, SK_A, "wait"))
+        await server.wait_held(1)
+        await asyncio.sleep(0.05)  # the ack (with run-1) arrived
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        second = asyncio.create_task(run_turn(client, SK_A, "wait again"))
+        await server.wait_held(2)
+        await server.finish_next()  # the reply of the aborted run arrives late
+        await server.finish_next()
+        events = await asyncio.wait_for(second, 5)
+        assert tokens(events) == "reply-wait again" and not errors(events)
+        assert turns.is_run_aborted("run-1") and not turns.is_run_aborted("run-2")
+    finally:
+        await client.close()
+
+
+async def test_terminal_chat_of_another_run_does_not_end_the_turn(server):
+    """#285: once the turn knows its run (from the ack), a `final` of another run on the
+    same session key does not close it; its own `final` does."""
+    client, turns = make_client(server.port)
+    await client.connect()
+    try:
+        task = asyncio.create_task(run_turn(client, SK_A, "wait"))
+        await server.wait_held(1)
+        await asyncio.sleep(0.05)
+        other = {"sessionKey": SK_A, "runId": "run-other", "state": "final", "deltaText": "x"}
+        await client._dispatcher.dispatch({"type": "event", "event": "chat", "payload": other})
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        await server.finish_next()
+        events = await asyncio.wait_for(task, 5)
+        assert tokens(events) == "reply-wait" and not errors(events)
     finally:
         await client.close()

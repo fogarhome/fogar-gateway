@@ -13,6 +13,8 @@ from typing import Protocol
 from starlette.websockets import WebSocketDisconnect
 
 from fogar_gateway.core.config import settings
+from fogar_gateway.services.reconnection import describe_error
+from fogar_gateway.services.text import without_lone_surrogates
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,12 @@ def _is_routine_disconnect(e: Exception) -> bool:
     return isinstance(e, WebSocketDisconnect) or (
         isinstance(e, RuntimeError) and "once a close message has been sent" in str(e)
     )
+
+
+def log_send_failed(client_id: str, what: str, e: BaseException) -> None:
+    """A send to a client failed — almost always one that already left: DEBUG, with the
+    exception type only, never its text (#221)."""
+    logger.debug(f"[{client_id}] envío de {what} al cliente falló: {describe_error(e)}")
 
 
 class ClientGone(ConnectionError):
@@ -46,6 +54,8 @@ class OutboundSender(Protocol):
 
     def queue_stats(self) -> dict: ...
 
+    def restrict(self, allowed: frozenset[str]) -> None: ...
+
 
 class QueuedSender:
     """FIFO sender: one unbounded queue and one writer task per session.
@@ -64,9 +74,17 @@ class QueuedSender:
     timeout bounds memory only for clients below the threshold.
     """
 
-    def __init__(self, ws, on_slow: Callable[[], Awaitable[None]] | None = None):
+    def __init__(
+        self,
+        ws,
+        on_slow: Callable[[], Awaitable[None]] | None = None,
+        on_error: Callable[[], Awaitable[None]] | None = None,
+    ):
         self._ws = ws
         self._on_slow = on_slow
+        # G-r3-1: un mensaje que no se puede serializar (bug del gateway) con el socket sano;
+        # quien crea el sender cierra la sesión (1011) para que no quede viva sin salida.
+        self._on_error = on_error
         self._queue: asyncio.Queue = asyncio.Queue()
         self._failure: Exception | None = None
         self._closing = False
@@ -76,6 +94,8 @@ class QueuedSender:
         self._pending_bytes = 0
         self._peak_msgs = 0
         self._peak_bytes = 0
+        # restrict(): solo estos tipos de mensaje JSON siguen saliendo (None = todos).
+        self._allowed: frozenset[str] | None = None
         # Not part of FogarBridge.tasks on purpose: close_all() must not cancel it
         # before the final messages (session_end, turn_end) are drained.
         self._writer = asyncio.create_task(self._run(), name="outbound_writer")
@@ -86,13 +106,27 @@ class QueuedSender:
 
     async def send_json(self, payload: dict) -> None:
         self._check_open()
+        if not self._passes("json", payload):
+            return
         self._queue.put_nowait(("json", payload))
         self._count_in(0)
 
     async def send_bytes(self, data: bytes) -> None:
         self._check_open()
+        if not self._passes("bytes", data):
+            return
         self._queue.put_nowait(("bytes", data))
         self._count_in(len(data))
+
+    def restrict(self, allowed: frozenset[str]) -> None:
+        """Desde ya solo salen mensajes JSON de estos tipos: ni audio ni ningún otro, tampoco
+        lo que ya estaba en la cola (una sesión revocada o desplazada, G-18)."""
+        self._allowed = allowed
+
+    def _passes(self, kind: str, item) -> bool:
+        if self._allowed is None:
+            return True
+        return kind == "json" and isinstance(item, dict) and item.get("type") in self._allowed
 
     def _count_in(self, nbytes: int) -> None:
         self._pending_msgs += 1
@@ -146,11 +180,19 @@ class QueuedSender:
                     item.set_result(None)
                 continue
             self._count_out(kind, item)
+            if not self._passes(kind, item):
+                continue  # encolado antes de restrict(): ya no sale
             timeout = asyncio.timeout(settings.CLIENT_SEND_TIMEOUT_S)
             try:
                 async with timeout:
                     if kind == "json":
-                        await self._ws.send_json(item)
+                        try:
+                            await self._ws.send_json(item)
+                        except UnicodeEncodeError:
+                            # G-r3-1: un surrogate suelto (texto del STT, de OpenClaw…). El encode
+                            # falla antes de escribir nada: sale el mismo mensaje sin ellos.
+                            logger.warning("Outbound: surrogate suelto en un mensaje — se quita.")
+                            await self._ws.send_json(without_lone_surrogates(item))
                     else:
                         await self._ws.send_bytes(item)
             except Exception as e:  # noqa: BLE001 — frontera: el writer registra y para
@@ -160,11 +202,21 @@ class QueuedSender:
                     await self._fail_slow()
                     return
                 self._failure = e
+                # ValueError/TypeError: el mensaje no se puede serializar (un bug del gateway) y
+                # el socket sigue abierto. Saltarlo rompería el par turn_start/turn_end: se
+                # cierra la sesión (1011) en vez de dejarla sin salida.
+                unencodable = isinstance(e, (ValueError, TypeError))
                 # One line, never the payload (it may hold user text).
                 level = logging.INFO if _is_routine_disconnect(e) else logging.WARNING
-                logger.log(level, "Outbound: fallo de socket (%s) — descartando lo pendiente.",
+                logger.log(level, "Outbound: %s (%s) — descartando lo pendiente.",
+                           "mensaje no serializable" if unencodable else "fallo de socket",
                            type(e).__name__)
                 self._discard_pending()
+                if unencodable and self._on_error is not None:
+                    try:
+                        await self._on_error()
+                    except Exception as err:  # noqa: BLE001 — frontera: callback externo
+                        logger.warning("Outbound: on_error falló (%s).", type(err).__name__)
                 return
 
     async def _fail_slow(self) -> None:

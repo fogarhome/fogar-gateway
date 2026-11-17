@@ -3,10 +3,14 @@
 Owns the cascade that picks the effective agent for a request, plus the
 two policy checks (allowlist, global roster). Pure helper — no DB, no
 FastAPI, no WebSocket. Translation of AgentPolicyError into wire formats
-(close 1008 reason / 403 JSON body) happens at the call sites.
+(close 4020/4021 / 403 JSON body) happens at the call sites.
 """
 
-from typing import TYPE_CHECKING, Optional
+import re
+from typing import TYPE_CHECKING, Literal, Optional
+
+from fogar_gateway.core.config import settings
+from fogar_gateway.core.session_key import AGENT_ID_PATTERN
 
 if TYPE_CHECKING:
     from fogar_gateway.models.schemas import ClientConfig
@@ -25,9 +29,12 @@ def agent_from_model(model: str | None) -> str | None:
     solo espacios o el alias `MODEL_ALIAS`; en otro caso, el nombre tal cual (un agente).
     """
     name = (model or "").strip()
-    if not name or name == MODEL_ALIAS:
+    if not name or name.lower() == MODEL_ALIAS:
         return None
     return name
+
+
+AgentPolicyKind = Literal["not_permitted", "not_available"]
 
 
 class AgentPolicyError(Exception):
@@ -40,7 +47,7 @@ class AgentPolicyError(Exception):
         agent_name: the offending agent, or None if no name is meaningful.
     """
 
-    def __init__(self, kind: str, agent_name: str | None, message: str):
+    def __init__(self, kind: AgentPolicyKind, agent_name: str | None, message: str):
         super().__init__(message)
         self.kind = kind
         self.agent_name = agent_name
@@ -56,8 +63,9 @@ def resolve_agent(
     Cascade (first non-empty-after-stripping wins):
       1. requested (handshake.agent or body.model)
       2. client_config.default_agent (if client_config is not None and set)
-      3. gateway_info.default_agent_id (if gateway_info is not None)
-      4. "main" (last-resort fallback; preserves legacy REST trusted-origin)
+      3. settings.DEFAULT_AGENT, the installation default (#245), if set
+      4. gateway_info.default_agent_id (if gateway_info is not None)
+      5. "main" (last-resort fallback; preserves legacy REST trusted-origin)
 
     Policy checks, fail-fast in order:
       a. If client_config is not None and client_config.allowed_agents is
@@ -68,7 +76,7 @@ def resolve_agent(
          AND gateway_info is not None: the effective agent must be in
          gateway_info.agents. Otherwise AgentPolicyError("not_available", ...).
          The roster check is skipped when the agent came from the cascade
-         (client default / gateway default / "main" fallback) — these are
+         (client default / DEFAULT_AGENT / gateway default / "main") — these are
          trusted server-side configuration, not user input.
 
     Raises:
@@ -77,17 +85,24 @@ def resolve_agent(
     # Normalize once, here, so every caller (WS handshake.agent, REST body.model)
     # gets identical whitespace-only-is-absent handling instead of duplicating
     # (and potentially diverging on) `.strip() or None` at each call site.
-    requested = (requested or "").strip() or None
+    # Ids en minúsculas, como los usa OpenClaw (auditoría 3.0, C-1). Un id que OpenClaw no
+    # admite no está disponible, haya roster o no (C-2: `model` de /v1, OpenClaw caído).
+    requested = (requested or "").strip().lower() or None
+    if requested is not None and not re.fullmatch(AGENT_ID_PATTERN, requested):
+        raise AgentPolicyError("not_available", None, "Agent not available.")
 
     # 1. Cascade — pick the effective agent.
     if requested:
         effective = requested
     elif client_config is not None and client_config.default_agent:
         effective = client_config.default_agent
+    elif settings.DEFAULT_AGENT:
+        effective = settings.DEFAULT_AGENT
     elif gateway_info is not None and gateway_info.default_agent_id:
         effective = gateway_info.default_agent_id
     else:
         effective = "main"
+    effective = effective.lower()
 
     # 2a. Allowlist check (only when an explicit list is configured).
     if (

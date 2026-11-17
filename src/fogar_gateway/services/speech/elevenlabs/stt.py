@@ -31,6 +31,7 @@ from fogar_gateway.services.reconnection import (
     describe_error,
     health_attr,
     reconnect_with_backoff,
+    send_or_abort,
     traceback_no_message,
 )
 from fogar_gateway.services.speech.audio import EnergyGate, f32le_to_s16le
@@ -71,6 +72,7 @@ PROBE_CONNECT_TIMEOUT_S = 4.0  # TCP + handshake WS: vencer aquí es un fallo, n
 MAX_FRAME_BYTES = 4 * 1024 * 1024
 VAD_SILENCE_S = 1.0  # silencio con el que el VAD del proveedor confirma la frase
 IDLE_CLOSE_S = 5.0  # sin audio reenviado este tiempo: se cierra la conexión upstream
+SEND_TIMEOUT_S = 5.0  # un envío que no avanza en este plazo aborta la conexión (E-r6-1)
 DRAIN_S = 1.5  # espera máxima del `committed_transcript` al cerrar
 CONNECT_BUFFER_S = 2.0  # audio guardado mientras se abre la conexión (se tira lo más viejo)
 MAX_SESSIONS = 15  # conexiones upstream abiertas a la vez por proceso
@@ -520,7 +522,8 @@ class ElevenLabsSttSession:
             "commit": commit,
             "sample_rate": SAMPLE_RATE,
         }
-        await up.ws.send(json.dumps(msg))
+        # Sin plazo, un upstream que no lee colgaría el bucle de entrada de la sesión (E-r6-1).
+        await send_or_abort(up.ws, json.dumps(msg), SEND_TIMEOUT_S, "ElevenLabs STT")
         self._p._counters["audio_seconds_sent"] += len(pcm) / BYTES_PER_S
 
     # --- cierre ---

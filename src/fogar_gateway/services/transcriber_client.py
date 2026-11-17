@@ -8,12 +8,22 @@ import websockets
 from pydantic import ValidationError
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
+from websockets.protocol import State
 
 from fogar_gateway.core.config import settings
 from fogar_gateway.models.schemas import TranscriberConfig, TranscriberMessage
-from fogar_gateway.services.reconnection import describe_error, ping_ready, safe_code
+from fogar_gateway.services.reconnection import (
+    describe_error,
+    ping_ready,
+    safe_code,
+    send_or_abort,
+)
 
 logger = logging.getLogger(__name__)
+
+# A transcriber that stops reading for this long is hung: the socket is aborted and reconnected
+# (E-r6-1). A healthy one takes a 20 ms frame at once; this only bounds the session's input loop.
+SEND_TIMEOUT_S = 5.0
 
 
 class TranscriberHandshakeError(RuntimeError):
@@ -39,13 +49,19 @@ class TranscriberClient:
         self._is_ready = False
         self._session_id: str | None = None  # recibido en el mensaje "ready"
         self._dropped_unexpectedly: bool = False
+        # fogar-transcriber cierra con 1000 tras la final de cada `end`: es fin de frase, no caída.
+        self._end_sent = False
+        self.closed_after_end = False
+        self._closing = False  # solo close(): send_audio también baja _is_ready al ver el socket cerrado
         self._last_transcription_at: float | None = None
 
     async def connect(self, language: str = "es", token: str = "", vad_thold: float = 0.0):
         """Abre el socket y manda el Handshake inicial de config."""
         ok = False
+        self.closed_after_end = False  # _end_sent baja con el `ready`: hasta entonces se retiene el audio
         try:
-            self.ws = await websockets.connect(f"ws://{self.url}/api/stt")
+            # E-r8-1: close_timeout=1 (no los 10 s por defecto) en el cierre tras un connect fallido.
+            self.ws = await websockets.connect(f"ws://{self.url}/api/stt", close_timeout=1)
 
             config = TranscriberConfig(language=language, token=token, vad_thold=vad_thold)
             logger.info(
@@ -62,7 +78,7 @@ class TranscriberClient:
             msg = TranscriberMessage(**data)
 
             if msg.type == "ready":
-                self._is_ready = True
+                self._is_ready, self._end_sent = True, False
                 self._session_id = msg.session_id
                 logger.info(
                     f"[{self.client_id}] Transcriber listo. session_id={self._session_id!r}"
@@ -94,7 +110,7 @@ class TranscriberClient:
             return
 
         try:
-            await self.ws.send(audio_bytes)
+            await send_or_abort(self.ws, audio_bytes, SEND_TIMEOUT_S, f"[{self.client_id}] transcriber")
         except ConnectionClosed:
             self._is_ready = False
             logger.warning(f"[{self.client_id}] Intento de enviar audio a Transcriber cerrado.")
@@ -166,34 +182,48 @@ class TranscriberClient:
 
                 elif t_msg.type == "error":
                     logger.error(f"[{self.client_id}] Transcriber error [{safe_code(t_msg.code)}]")
-        except ConnectionClosed as e:
-            clean_close = e.rcvd is not None and e.rcvd.code == 1000
-            if self._is_ready and not clean_close:
-                self._dropped_unexpectedly = True
-            self._is_ready = False
-            logger.info(
-                f"[{self.client_id}] Loop de escucha del Transcriber finalizado (code={e.rcvd.code if e.rcvd else 'none'})."
-            )
+        except ConnectionClosed:
+            pass  # 1000/1001 (ConnectionClosedOK) ni llegan aquí: el `async for` termina sin más
+        # Si el socket se cerró sin un close() nuestro, el transcriber se ha ido, con el
+        # código que sea (fogar manda 1001 al reiniciar): reconectar.
+        if not self._closing:
+            self._dropped_unexpectedly = True
+            self.closed_after_end = self._end_sent and getattr(self.ws, "close_code", None) == 1000
+        self._is_ready = False
+        logger.info(
+            f"[{self.client_id}] Loop de escucha del Transcriber finalizado (code={getattr(self.ws, 'close_code', None)})."
+        )
 
     async def send_end(self):
         """Señaliza al transcriber que el audio terminó, disparando la transcripción final."""
         if not self._is_ready or not self.ws:
             return
+        # Antes del send: websockets escribe la trama y luego puede ceder en drain, y el audio
+        # que llegue en ese hueco ya es de la frase siguiente (lo retiene el wrapper).
+        self._end_sent = True
         try:
-            await self.ws.send(json.dumps({"type": "end"}))
+            await send_or_abort(
+                self.ws, json.dumps({"type": "end"}), SEND_TIMEOUT_S, f"[{self.client_id}] transcriber"
+            )
         except ConnectionClosed:
-            self._is_ready = False
+            self._is_ready = self._end_sent = False
 
     ping = staticmethod(ping_ready)  # GET /ready (503 "busy" con la GPU saturada)
 
     async def close(self):
+        self._closing = True
         self._is_ready = False
-        if self.ws:
+        ws = self.ws  # E-r8-2: un connect cancelado lo pone a None mientras se espera
+        if ws:
             # `websockets.asyncio` has no `.closed` (G-01, #214): close() is idempotent,
             # so no state check is needed. A failure is logged (type only), never swallowed.
             try:
-                await self.ws.close()
+                await ws.close()
             except Exception as e:  # noqa: BLE001 — limpieza: el fallo se registra
                 logger.warning(
                     f"[{self.client_id}] Transcriber close falló ({type(e).__name__})"
                 )
+            finally:
+                # A-r7-1: cancelado esperando a un peer que no lee, el socket no queda abierto.
+                if ws.state is not State.CLOSED:
+                    ws.transport.abort()

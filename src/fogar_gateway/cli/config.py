@@ -8,11 +8,13 @@ Orden, como el gateway: variables del proceso → `<base>/config.env` → valore
 secretos salen siempre enmascarados, también en --json.
 """
 
+import contextlib
 import difflib
 import json
 import os
 import re
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -29,14 +31,34 @@ ENVIRON = "entorno"
 
 
 def _settings_class() -> Any:
-    """`Settings`, importado solo al usarse (`--help` no carga pydantic).
+    return _config_module().Settings
 
-    `fogar_gateway.core.config` construye un `Settings()` global al importarse: una variable de
-    entorno inválida lo rompe y sale como error de validación, igual que al arrancar el gateway.
+
+def _config_module() -> Any:
+    """`fogar_gateway.core.config`, importado solo al usarse (`--help` no carga pydantic).
+
+    `fogar_gateway.core.config` construye un `Settings()` global al importarse: un valor inválido
+    (entorno o config.env) lo rompe. Entonces se ejecuta el módulo aparte, sin registrarlo, y se
+    toman la clase y RETIRED_KEYS, definidas antes de esa línea: la CLI sigue pudiendo validar
+    y corregir el valor (`config set`/`unset`, #359) sin traceback.
     """
-    from fogar_gateway.core.config import Settings
+    import importlib
+    import importlib.util
 
-    return Settings
+    from pydantic import ValidationError
+    from pydantic_settings import SettingsError
+
+    try:
+        return importlib.import_module("fogar_gateway.core.config")
+    except (ValidationError, SettingsError):
+        spec = importlib.util.find_spec("fogar_gateway.core.config")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+        except (ValidationError, SettingsError):
+            pass  # el error lo da load() con campo + tipo
+        return module
 
 
 def _errors(exc: Any) -> list[str]:
@@ -52,7 +74,6 @@ def _settings_error(exc: Exception) -> list[str]:
 
 def load(path: Path | None = None) -> tuple[Any, list[str], dict[str, str]]:
     """(settings o None, errores de validación, origen de cada ajuste) de `path` (o config.env)."""
-    from dotenv import dotenv_values
     from pydantic import ValidationError
     from pydantic_settings import SettingsError
 
@@ -60,10 +81,9 @@ def load(path: Path | None = None) -> tuple[Any, list[str], dict[str, str]]:
     from_file: dict[str, Any] = {}
     if path.is_file():
         try:
-            api.read_env_file(path)  # mensaje legible si no hay permiso
+            from_file = api.read_env_file(path)  # mensaje legible si no hay permiso
         except api.ApiError as e:
             return None, [e.message], {}
-        from_file = {k.upper(): v for k, v in dotenv_values(path).items()}
     try:
         settings_cls = _settings_class()
         settings = settings_cls(_env_file=path if path.is_file() else None)
@@ -110,6 +130,7 @@ def _mask_url_password(url: str) -> str:
 def validation_checks(settings: Any) -> list[dict[str, str]]:
     """Comprobaciones de la configuración, compartidas por `config validate` y `doctor`."""
     from fogar_gateway.core.startup_checks import (
+        ADMIN_TOKEN_MIN_LEN,
         SpeechConfigError,
         check_speech_settings,
         deprecated_settings,
@@ -120,8 +141,11 @@ def validation_checks(settings: Any) -> list[dict[str, str]]:
     checks: list[dict[str, str]] = []
     for name in insecure_tokens(settings):
         empty = not getattr(settings, name)
-        if name == "ADMIN_TOKEN" and empty:
-            checks.append(_check("fail", name, f"Vacío: /admin no funciona. Defínelo en {where}."))
+        if name == "ADMIN_TOKEN":
+            checks.append(_check("fail", name, f"Vacío: /admin no funciona. Defínelo en {where}."
+                                 if empty else f"Valor de ejemplo o de menos de "
+                                 f"{ADMIN_TOKEN_MIN_LEN} caracteres ASCII sin espacios: adivinable. Cámbialo con "
+                                 "`fogar-gw config set ADMIN_TOKEN`."))
         elif name == "TTS_TOKEN":
             checks.append(_check("warn", name, "Es un valor de ejemplo."))
         else:
@@ -132,9 +156,46 @@ def validation_checks(settings: Any) -> list[dict[str, str]]:
         )
     except SpeechConfigError as e:
         checks.append(_check("fail", e.setting, "Inválido o ausente para el proveedor elegido."))
+    for name, effect in _NETWORK_FIELDS.items():
+        csv = getattr(settings, name)
+        if bad := _bad_network_entries(csv, strict=False):  # lo que el gateway rechaza
+            checks.append(_check("fail", name, f"Entradas no válidas: {bad}. {effect}"))
+        if wide := _bad_network_entries(csv, only_wide=True):  # el gateway las usa
+            checks.append(_check("fail", name, f"Redes demasiado amplias: {wide}. El gateway las "
+                                 "usa: acótalas a tu proxy o a tu LAN."))
+        if hosts := _host_bit_entries(csv):
+            checks.append(_check("warn", name, f"{hosts}. El gateway usa la red indicada; "
+                                 "escríbela así."))
     for name in deprecated_settings(settings):
         checks.append(_check("warn", name, "Obsoleto e ignorado; bórralo de la configuración."))
     return checks
+
+
+# Listas de IP/CIDR: sus entradas no son secretas y se muestran (F-r3-1).
+_NETWORK_FIELDS = {
+    "TRUSTED_PROXIES": "Mientras tanto ningún origen queda exento de Bearer en /v1 (fallo cerrado).",
+    "TRUSTED_NETWORKS": "El gateway las ignora.",
+}
+
+
+def _bad_network_entries(csv: str, *, strict: bool = True, only_wide: bool = False) -> str:
+    from fogar_gateway.core.network import entry_problem, invalid_entries, wide_entries
+
+    entries = wide_entries(csv) if only_wide else invalid_entries(csv, strict=strict)
+    return "; ".join(f"«{raw}» ({entry_problem(raw, strict=strict)})" for raw in entries)
+
+
+def _host_bit_entries(csv: str) -> str:
+    import ipaddress
+
+    from fogar_gateway.core.network import host_bits
+
+    entries = (raw.strip() for raw in csv.split(","))
+    return "; ".join(
+        f"«{raw}» (bits de host: {ipaddress.ip_network(raw, strict=False)})"
+        for raw in entries
+        if host_bits(raw)
+    )
 
 
 def _check(level: str, name: str, detail: str) -> dict[str, str]:
@@ -252,23 +313,67 @@ def _edit(text: str, key: str, value: str | None) -> str:
     return "".join(out)
 
 
-def _fails(path: Path, key: str) -> tuple[set[str], list[str]]:
-    # Sin la variable de NAME en el entorno: el servicio de systemd no hereda esta shell, así
-    # que lo que vale es lo que dice el fichero.
-    names = [n for n in os.environ if n.upper() == key]
-    saved = {n: os.environ.pop(n) for n in names}
+@contextlib.contextmanager
+def _without_settings_env() -> Iterator[None]:
+    """Sin las variables del entorno que son ajustes (se restauran al salir): solo config.env y
+    los valores por defecto, lo que lee el servicio (systemd no hereda esta shell)."""
+    fields = set(_settings_class().model_fields)
+    saved = {n: os.environ.pop(n) for n in [n for n in os.environ if n.upper() in fields]}
     try:
-        settings, errors, _ = load(path)
+        yield
     finally:
         os.environ.update(saved)
+
+
+def _own_errors(key: str, value: str) -> list[str]:
+    """Errores de validación de KEY=value solo (campo + tipo, nunca el valor), frente a los
+    valores por defecto: sin ningún otro ajuste del entorno, cuyo error (p. ej. un JSON malo)
+    ocultaría el de KEY. Se valida como variable de entorno, que decodifica el JSON igual que
+    config.env: `set` solo frena lo que deja inválido el propio KEY."""
+    from pydantic import ValidationError
+    from pydantic_settings import SettingsError
+
+    settings_cls = _settings_class()
+    with _without_settings_env():
+        try:
+            os.environ[key] = value
+            settings_cls(_env_file=None)
+        except ValidationError as e:
+            return _errors(e)
+        except SettingsError as e:
+            return _settings_error(e)
+        finally:
+            os.environ.pop(key, None)
+    return []
+
+
+def _problems() -> tuple[list[str], bool]:
+    """Lo que `config validate` marca como fallo en config.env, como «campo: motivo», visto
+    como el servicio (sin los ajustes del entorno), y si le impide arrancar: un error de
+    validación o la voz; un ADMIN_TOKEN corto o redes amplias arrancan (F-r8-2)."""
+    from fogar_gateway.core.startup_checks import SpeechConfigError, check_speech_settings
+
+    with _without_settings_env():
+        settings, errors, _ = load()
     if errors:
-        return set(), errors
-    return {c["check"] for c in validation_checks(settings) if c["level"] == "fail"}, []
+        return errors, True
+    problems = [f"{c['check']}: {c['detail']}" for c in validation_checks(settings)
+                if c["level"] == "fail"]
+    try:
+        check_speech_settings(
+            settings, stt_provider=settings.STT_PROVIDER, tts_provider=settings.TTS_PROVIDER
+        )
+    except SpeechConfigError:
+        return problems, True
+    return problems, False
 
 
-def _resolve_name(name: str) -> str:
-    fields = _settings_class().model_fields
+def _resolve_name(name: str, *, retired: bool = False) -> str:
+    module = _config_module()
+    fields = module.Settings.model_fields
     key = name.upper()
+    if retired and key in module.RETIRED_KEYS:  # `unset` las quita, como pide el log (F-r8-4)
+        return key
     if key not in fields:
         close = difflib.get_close_matches(key, list(fields), n=1)
         hint = f" ¿Querías decir {close[0]}?" if close else ""
@@ -277,12 +382,39 @@ def _resolve_name(name: str) -> str:
 
 
 def _apply(out: Out, key: str, value: str | None) -> bool:
-    """Valida el candidato en un temporal 600 y lo mueve sobre config.env. False = sin cambios."""
+    """Valida KEY y escribe config.env por un temporal 600. False = sin cambios."""
     from dotenv import dotenv_values
 
     path = paths.config_file()
     if not path.is_file():
         raise api.ApiError(f"No hay {path}. Prepara la instalación con `fogar-gw init`.", 1)
+    # Una sola línea de config.env: splitlines también corta en \x0b, \x0c, \x85, \u2028... y un
+    # NUL no se puede pasar a os.environ (F-r8-1, F-r8-3). También para `onboard`.
+    if value is not None and (value.splitlines() not in ([], [value]) or "\0" in value):
+        raise api.ApiError(f"El valor de {key} no puede tener saltos de línea ni caracteres "
+                           "nulos. No se ha escrito nada.", 1)
+    if key == "ADMIN_TOKEN":
+        from fogar_gateway.core.startup_checks import ADMIN_TOKEN_MIN_LEN, admin_token_too_short
+
+        # Aunque el actual ya sea corto (D-r5-1, F-r6-3).
+        if value is None:
+            raise api.ApiError("ADMIN_TOKEN no se puede quitar: sin él /admin queda inutilizable. "
+                               "Cámbialo con `fogar-gw config set ADMIN_TOKEN`. No se ha "
+                               "escrito nada.", 1)
+        if admin_token_too_short(value):
+            raise api.ApiError(f"ADMIN_TOKEN necesita al menos {ADMIN_TOKEN_MIN_LEN} caracteres "
+                               "ASCII imprimibles, sin espacios. "
+                               "Genera uno con `python3 -c \"import "
+                               "secrets; print(secrets.token_urlsafe(32))\"`. No se ha escrito "
+                               "nada.", 1)
+    if key in _NETWORK_FIELDS and value is not None:
+        if bad := "; ".join(filter(None, (_bad_network_entries(value), _host_bit_entries(value)))):
+            raise api.ApiError(f"{key}: entradas no válidas: {bad}. Usa IPs o CIDRs separadas "
+                               "por comas. No se ha escrito nada.", 1)
+    # Solo el propio KEY: corregir un ajuste siempre se puede aunque otros fallen; lo demás lo
+    # avisa _report y lo juzgan `config validate` y `doctor` (#359, F-r7-1).
+    if value is not None and (errors := _own_errors(key, value)):
+        raise api.ApiError(f"Valor no válido: {'; '.join(errors)}. No se ha escrito nada.", 1)
     old = path.read_text()
     new = _edit(old, key, value)
     if new == old:
@@ -295,14 +427,6 @@ def _apply(out: Out, key: str, value: str | None) -> bool:
         if value is not None and dotenv_values(tmp).get(key) != value:
             raise api.ApiError(f"El valor de {key} no se puede guardar en config.env tal cual "
                                "(p. ej. contiene `${...}` o saltos de línea).", 1)
-        before, _ = _fails(path, key)
-        after, errors = _fails(tmp, key)
-        if errors:
-            raise api.ApiError("Con ese cambio la configuración no sería válida: "
-                               + "; ".join(errors) + ". No se ha escrito nada.", 1)
-        if after - before:
-            raise api.ApiError("Con ese cambio fallaría: " + ", ".join(sorted(after - before))
-                               + ". No se ha escrito nada.", 1)
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
@@ -346,20 +470,30 @@ def _restart(ctx: click.Context) -> None:
 def _report(ctx: click.Context, out: Out, key: str, value: str | None, changed: bool) -> None:
     # Siempre el valor guardado (nunca el del entorno), enmascarado si es un secreto.
     saved = None if value is None else shown(key, value)
-    restarted = changed and _offer_restart(ctx, out)
+    problems, fatal = _problems()
+    if not out.as_json:
+        if not changed:
+            out.message(f"{key}: sin cambios.")
+        elif saved is None:
+            out.message(f"{key} quitado de config.env (vuelve al valor por defecto).")
+        else:
+            out.message(f"{key}={saved}")
+        if key in {k.upper() for k in os.environ}:
+            out.message(f"Aviso: {key} está en el entorno y en esta shell manda sobre config.env.")
+    # Antes del reinicio, también con --json (a stderr): si falla, el aviso ya ha salido.
+    if problems:
+        out.error("Aviso: la configuración tiene fallos (no se ha deshecho nada): "
+                  + "; ".join(problems) + ". Revisa `fogar-gw config validate`.")
+    # Con un fallo que impide arrancar no se reinicia, ni con --yes: el servicio caería (F-r8-2).
+    restarted = changed and not fatal and _offer_restart(ctx, out)
     if out.as_json:
-        out.json({"name": key, "value": saved, "changed": changed, "restarted": restarted})
-        return
-    if not changed:
-        out.message(f"{key}: sin cambios.")
-    elif saved is None:
-        out.message(f"{key} quitado de config.env (vuelve al valor por defecto).")
-    else:
-        out.message(f"{key}={saved}")
-    if key in {k.upper() for k in os.environ}:
-        out.message(f"Aviso: {key} está en el entorno y en esta shell manda sobre config.env.")
-    if restarted:
+        out.json({"name": key, "value": saved, "changed": changed, "restarted": restarted,
+                  "problems": problems})
+    elif restarted:
         out.message("Servicio reiniciado.")
+    elif changed and fatal:
+        out.error("No se reinicia: con estos fallos el servicio no arrancaría. Corrígelos y "
+                  "después: fogar-gw restart")
     elif changed:
         out.message("Para aplicarlo: fogar-gw restart")
 
@@ -403,6 +537,6 @@ def set_(ctx: click.Context, name: str, value: str | None) -> None:
 def unset(ctx: click.Context, name: str) -> None:
     """Quita un ajuste de config.env (vuelve a su valor por defecto)."""
     out = _out(ctx)
-    key = _resolve_name(name)
+    key = _resolve_name(name, retired=True)
     changed = _apply(out, key, None)
     _report(ctx, out, key, None, changed)

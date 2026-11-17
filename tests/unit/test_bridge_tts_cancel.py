@@ -3,6 +3,8 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+from tests.fakes.bridge import blocking
+
 
 async def test_cancel_right_after_tts_connect_closes_the_stream(make_bridge):
     stream = MagicMock()
@@ -12,6 +14,8 @@ async def test_cancel_right_after_tts_connect_closes_the_stream(make_bridge):
     tts.resolve_voice = MagicMock(return_value="v")
     tts.connect = AsyncMock(return_value=stream)
     bridge, _ws = make_bridge(output_mode=("audio", "text"), tts=tts)
+    # E-2: el TTS conecta a la vez que el orquestador contesta; este no termina el turno antes.
+    bridge.orchestrator.stream_response = blocking()
     in_record = asyncio.Event()
 
     async def blocking_record(name, **kw):
@@ -20,7 +24,8 @@ async def test_cancel_right_after_tts_connect_closes_the_stream(make_bridge):
             await asyncio.sleep(3600)
 
     bridge.tracker.record = blocking_record
-    task = asyncio.create_task(bridge._run_turn("hola", "t-1", 1))
+    await bridge.turns.start_user_turn("hola")
+    task = bridge.turns.user_task
     await asyncio.wait_for(in_record.wait(), 2)
     task.cancel()
     await asyncio.wait({task}, timeout=2)

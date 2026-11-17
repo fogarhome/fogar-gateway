@@ -4,9 +4,15 @@ Cada test dice qué hace el orquestador (responde, se queda esperando, falla, se
 inicia un turno) y comprueba solo lo que recibe el cliente por su WebSocket.
 """
 
+import asyncio
+
+import httpx
+
+from tests.integration.conftest import VALID_KEY
 from tests.integration.harness.conftest import (
     assert_turns_paired,
     audio,
+    interrupted,
     of_type,
     turn_ended,
 )
@@ -60,6 +66,29 @@ async def test_voice_turn_transcribes_and_speaks_the_reply(harness):
     assert_turns_paired(msgs)
 
 
+async def test_two_phrases_in_a_row_each_get_their_final(harness):
+    """A-r5-1: el transcriber cierra 1000 tras cada final (como el real); el gateway reabre y
+    la segunda frase recibe su propia final, no `phrase_interrupted`."""
+    harness.transcriber.on_end = [("enciende la luz", True)]
+    client = await harness.connect(input_mode="audio", output_mode=("text",))
+    for n in (1, 2):
+        await _until(lambda n=n: len(harness.transcriber.configs) == n)  # su conexión ya tiene `ready`
+        for _ in range(4):
+            await client.send_audio(AUDIO_FRAME)
+            await asyncio.sleep(0.05)
+        await client.send({"type": "end"})
+        await client.collect(lambda m, n=n: len(of_type(m, "transcription")) == n)
+
+    assert [t["text"] for t in of_type(client.messages, "transcription")] == ["enciende la luz"] * 2
+    assert of_type(client.messages, "status") == []  # ningún phrase_interrupted
+
+
+async def _until(cond, timeout: float = 5.0) -> None:
+    async with asyncio.timeout(timeout):
+        while not cond():
+            await asyncio.sleep(0.01)
+
+
 async def test_speaking_over_a_running_turn_interrupts_it(harness):
     harness.transcriber.on_audio = [("espera un momento", False)]
     client = await harness.connect(input_mode="audio", output_mode=("text",))
@@ -68,15 +97,13 @@ async def test_speaking_over_a_running_turn_interrupts_it(harness):
     await client.send({"type": "send", "text": "hold"})  # el orquestador se queda esperando
     await client.collect(lambda m: bool(of_type(m, "turn_start")))
     await client.send_audio(AUDIO_FRAME)
-    msgs = await client.collect(lambda m: bool(of_type(m, "interrupted")))
+    msgs = await client.collect(lambda m: bool(interrupted(m)))
 
     (start,) = of_type(msgs, "turn_start")
     assert of_type(msgs, "transcription_partial")[0]["text"] == "espera un momento"
-    types = [m.get("type") for m in msgs if isinstance(m, dict)]
     (end,) = of_type(msgs, "turn_end")
-    (interrupted,) = of_type(msgs, "interrupted")
-    assert end["turn_id"] == interrupted["turn_id"] == start["turn_id"]
-    assert types.index("turn_end") < types.index("interrupted")
+    assert end == {"type": "turn_end", "turn_id": start["turn_id"], "reason": "interrupted"}
+    assert of_type(msgs, "interrupted") == []  # M19: sustituido por turn_end.reason
     assert_turns_paired(msgs)
 
 
@@ -157,3 +184,26 @@ async def test_failing_push_still_ends_its_turn(harness):
 
     assert len(of_type(msgs, "turn_end")) == 1
     assert_turns_paired(msgs)
+
+
+async def test_v1_without_stream_aborts_the_turn_when_the_client_leaves(harness):
+    """D-r6-1: HA corta (timeout) un /v1 sin stream: el turno se aborta en OpenClaw y la
+    siguiente petición no choca con un `turn_in_progress` hasta TURN_TIMEOUT_S."""
+    body = {"model": "fogar-gateway", "messages": [{"role": "user", "content": "wait"}]}
+    async with httpx.AsyncClient(
+        base_url=f"http://127.0.0.1:{harness.port}",
+        headers={"authorization": f"Bearer {VALID_KEY}"},
+        timeout=10,
+    ) as http:
+        request = asyncio.create_task(http.post("/v1/chat/completions", json=body))
+        await harness.openclaw.wait_held(1)
+        request.cancel()  # el cliente se va: httpx cierra la conexión
+        await asyncio.wait({request})
+        [(_, sk)] = harness.openclaw.calls
+        async with asyncio.timeout(5):
+            while ("chat.abort", sk) not in harness.openclaw.calls:
+                await asyncio.sleep(0.02)
+        body["messages"][0]["content"] = "hola"
+        res = await http.post("/v1/chat/completions", json=body)
+    assert res.status_code == 200, res.text
+    assert res.json()["choices"][0]["message"]["content"] == "reply-hola"

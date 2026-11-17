@@ -11,7 +11,7 @@ import websockets
 from fogar_gateway.core.config import settings
 from fogar_gateway.services.protocol import OrchestratorEvent
 from fogar_gateway.services.tts_client import TTSClient
-from tests.fakes.bridge import sent, tokens
+from tests.fakes.bridge import sent, start_turn, tokens
 
 
 @pytest.fixture
@@ -26,7 +26,7 @@ def make_tts_bridge(make_bridge):
 
 async def _run_bounded(bridge, timeout):
     """Run the turn; FAIL (not hang) if it doesn't finish in `timeout` (no fix)."""
-    task = asyncio.create_task(bridge._call_orchestrator("x"))
+    task = await start_turn(bridge, "x")
     done, _ = await asyncio.wait({task}, timeout=timeout)
     if not done:
         task.cancel()
@@ -59,7 +59,7 @@ async def test_alive_tts_that_never_sends_done_ends_turn_by_cap(make_tts_bridge,
         with caplog.at_level(logging.WARNING):
             await _run_bounded(bridge, 3.0)
 
-        assert (await sent(bridge))[-1] == {"type": "turn_end", "turn_id": "t-1"}
+        assert (await sent(bridge))[-1] == {"type": "turn_end", "turn_id": "t-1", "reason": "done"}
         await asyncio.wait_for(server_closed.wait(), timeout=2.0)
     assert any("TTS" in r.getMessage() for r in caplog.records)
 
@@ -84,7 +84,7 @@ async def test_hung_send_text_chunk_and_end_do_not_wedge_turn(make_tts_bridge, m
 
     await _run_bounded(bridge, 3.0)
 
-    assert (await sent(bridge))[-1] == {"type": "turn_end", "turn_id": "t-1"}
+    assert (await sent(bridge))[-1] == {"type": "turn_end", "turn_id": "t-1", "reason": "done"}
     # text tokens still reached the client despite the dead TTS
     assert [m["text"] for m in ws.of("token")] == ["a", "b"]
 
@@ -110,7 +110,7 @@ async def test_healthy_slow_tts_is_not_truncated_by_idle_cap(make_tts_bridge, mo
     await sent(bridge)
     chunks = [m for m in ws.sent if isinstance(m, bytes)]
     assert len(chunks) == total
-    assert ws.sent[-1] == {"type": "turn_end", "turn_id": "t-1"}
+    assert ws.sent[-1] == {"type": "turn_end", "turn_id": "t-1", "reason": "done"}
 
 
 async def _cancel_turn_during(make_tts_bridge, monkeypatch, *, tokens_block):
@@ -133,7 +133,7 @@ async def _cancel_turn_during(make_tts_bridge, monkeypatch, *, tokens_block):
 
     bridge.orchestrator.stream_response = stream
     before = asyncio.all_tasks()
-    task = asyncio.create_task(bridge._call_orchestrator("x"))
+    task = await start_turn(bridge, "x")
     if tokens_block:
         await asyncio.wait_for(entered.wait(), 2.0)
     else:

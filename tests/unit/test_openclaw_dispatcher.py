@@ -8,7 +8,12 @@ from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
 from fogar_gateway.services.reconnection import ConnectionState, ServiceStatus
-from tests.fakes.bridge import sent
+from tests.fakes.bridge import push, sent
+from tests.fakes.openclaw import SendOnlyOpenClawWS
+
+
+def push_open(bridge) -> bool:
+    return bridge.turns.snapshot(0.0)["turn"]["kind"] == "push"
 
 
 def make_dispatcher():
@@ -30,8 +35,8 @@ def _connected_status() -> ServiceStatus:
 
 @pytest.fixture
 def make_real_bridge(make_bridge):
-    """A real FogarBridge (not AsyncMock) so dispatcher tests can exercise
-    _push_allowed() gating (issue #109)."""
+    """A real FogarBridge (not AsyncMock) so dispatcher tests can exercise the push
+    gating (issue #109)."""
 
     def _make(push_enabled=True, tool_calls_enabled=False):
         config = ClientConfig(push_enabled=push_enabled, tool_calls_enabled=tool_calls_enabled)
@@ -87,6 +92,7 @@ async def test_res_unknown_req_id_is_ignored():
 async def test_chat_event_routes_to_session_queue():
     dispatcher, turn_reg, _ = make_dispatcher()
     q = turn_reg.register("req-1", "agent:main:client-a")
+    await dispatcher.dispatch(_ack("req-1", "r1"))
     payload = {
         "sessionKey": "agent:main:client-a",
         "runId": "r1",
@@ -114,7 +120,7 @@ async def test_chat_event_no_active_turn_routes_to_client_registry():
     }
     frame = {"type": "event", "event": "chat", "payload": payload}
     await dispatcher.dispatch(frame)
-    bridge.enqueue_push.assert_called_once_with("chat", payload)
+    bridge.enqueue_push.assert_called_once_with("chat", payload, run_id="r1")
 
 
 @pytest.mark.asyncio
@@ -137,7 +143,7 @@ async def test_agent_lifecycle_start_calls_on_push_turn_start():
     }
     frame = {"type": "event", "event": "agent", "payload": payload}
     await dispatcher.dispatch(frame)
-    bridge.enqueue_push.assert_called_once_with("turn_start", "agent:main:client-a")
+    bridge.enqueue_push.assert_called_once_with("turn_start", "agent:main:client-a", run_id="r1")
 
 
 @pytest.mark.asyncio
@@ -153,7 +159,7 @@ async def test_agent_lifecycle_end_calls_on_push_turn_end():
     }
     frame = {"type": "event", "event": "agent", "payload": payload}
     await dispatcher.dispatch(frame)
-    bridge.enqueue_push.assert_called_once_with("turn_end", "agent:main:client-a")
+    bridge.enqueue_push.assert_called_once_with("turn_end", "agent:main:client-a", run_id="r1")
 
 
 @pytest.mark.asyncio
@@ -195,7 +201,7 @@ async def test_agent_lifecycle_end_always_forwarded_regardless_of_normal_turn():
     }
     frame = {"type": "event", "event": "agent", "payload": payload}
     await dispatcher.dispatch(frame)
-    bridge.enqueue_push.assert_called_once_with("turn_end", "agent:main:client-a")
+    bridge.enqueue_push.assert_called_once_with("turn_end", "agent:main:client-a", run_id="r1")
 
 
 @pytest.mark.asyncio
@@ -210,6 +216,7 @@ async def test_health_and_tick_ignored():
 async def test_session_tool_start_routes_to_turn_queue():
     dispatcher, turn_reg, _ = make_dispatcher()
     q = turn_reg.register("req-1", "agent:main:client-a")
+    await dispatcher.dispatch(_ack("req-1", "r1"))
     payload = {
         "sessionKey": "agent:main:client-a",
         "runId": "r1",
@@ -273,7 +280,7 @@ async def test_session_tool_no_active_turn_routes_to_client_registry():
     }
     frame = {"type": "event", "event": "session.tool", "payload": payload}
     await dispatcher.dispatch(frame)
-    bridge.enqueue_push.assert_called_once_with("tool", payload["data"])
+    bridge.enqueue_push.assert_called_once_with("tool", payload["data"], run_id=None)
 
 
 @pytest.mark.asyncio
@@ -376,7 +383,7 @@ async def test_dispatcher_full_push_lifecycle_disabled_client_receives_nothing(m
     await bridge.push_idle()
 
     assert await sent(bridge) == []
-    assert bridge._push_turn_open is False
+    assert not push_open(bridge)
     await bridge.close_all()
 
 
@@ -453,7 +460,7 @@ async def test_dispatcher_agent_lifecycle_suppressed_full_sequence_with_active_t
     assert q.empty()
 
     await bridge.push_idle()
-    assert bridge._push_turn_open is False
+    assert not push_open(bridge)
     assert await sent(bridge) == []
     await bridge.close_all()
 
@@ -478,8 +485,9 @@ async def test_agent_lifecycle_end_closes_push_turn_opened_before_normal_turn(ma
         }
     )
     await bridge.push_idle()
-    assert bridge._push_turn_open is True
-    push_turn_id = bridge._push_turn_id
+    assert push_open(bridge)
+    (push_turn_start,) = [m for m in await sent(bridge) if m["type"] == "turn_start"]
+    push_turn_id = push_turn_start["turn_id"]
 
     # A normal turn now registers for the same session_key while the push
     # turn is still open (e.g. the user replies mid-push).
@@ -495,26 +503,36 @@ async def test_agent_lifecycle_end_closes_push_turn_opened_before_normal_turn(ma
     )
 
     await bridge.push_idle()
-    assert bridge._push_turn_open is False
-    assert {"type": "turn_end", "turn_id": push_turn_id} in await sent(bridge)
+    assert not push_open(bridge)
+    assert {"type": "turn_end", "turn_id": push_turn_id, "reason": "done"} in await sent(bridge)
     await bridge.close_all()
 
 
 @pytest.mark.asyncio
-async def test_dispatch_agent_end_does_not_wait_for_slow_tts_drain(make_real_bridge, monkeypatch):
+async def test_dispatch_agent_end_does_not_wait_for_slow_tts_drain(make_bridge, monkeypatch):
     """#130 S3a — el motivo de todo el cambio: un push cuyo audio TTS tarda en
     drenar no debe retener a dispatch() (y por tanto a _listen y al resto de
     sesiones multiplexadas)."""
     # Pinned so the proof does not depend on the default drain timeout.
     monkeypatch.setattr(settings, "PUSH_TTS_DRAIN_TIMEOUT_S", 30)
     dispatcher, _, client_reg = make_dispatcher()
-    bridge, _ = make_real_bridge(push_enabled=True)
+    audio_cancelled = asyncio.Event()
+
+    async def stuck_audio():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            audio_cancelled.set()
+            raise
+        yield b""  # pragma: no cover
+
+    stream = AsyncMock()
+    stream.get_audio_stream = stuck_audio
+    tts = AsyncMock()
+    tts.connect = AsyncMock(return_value=stream)
+    bridge, _ = make_bridge(client_id="hab_sito", output_mode=("audio", "text"), tts=tts)
     client_reg.register("hab_sito", bridge)
-    stuck = asyncio.create_task(asyncio.sleep(3600))
-    bridge._push_tts = AsyncMock()
-    bridge._push_audio_task = stuck
-    bridge._push_turn_open = True
-    bridge._push_turn_id = "t-1"
+    await push(bridge, ("turn_start", "agent:main:hab_sito"))
 
     await asyncio.wait_for(
         dispatcher.dispatch(
@@ -528,12 +546,12 @@ async def test_dispatch_agent_end_does_not_wait_for_slow_tts_drain(make_real_bri
     )
     # What is proven: dispatch() returned within the 0.5s wait_for although the
     # drain it enqueued would take PUSH_TTS_DRAIN_TIMEOUT_S (30s) — dispatch did
-    # not wait for the handler. (_push_pending == 1 only shows the event is queued.)
-    assert bridge._push_pending == 1
+    # not wait for the handler. (pending == 1 only shows the event is queued.)
+    assert bridge.turns.snapshot(0.0)["push_backlog"]["pending"] == 1
 
     # Cleanup: close_all() must not hang on the stuck audio task.
     await asyncio.wait_for(bridge.close_all(), timeout=2.0)
-    assert stuck.cancelled()
+    assert audio_cancelled.is_set()
 
 
 @pytest.mark.asyncio
@@ -555,7 +573,7 @@ async def test_dispatch_keeps_the_112_decision_synchronous_in_listen(make_real_b
     turn_reg.register("req-1", "agent:main:hab_sito")  # registered after the frame
     await bridge.push_idle()
 
-    assert bridge._push_turn_open is True
+    assert push_open(bridge)
     await bridge.close_all()
 
 
@@ -605,3 +623,311 @@ async def test_known_events_are_not_reported_as_unknown(caplog):
         await dispatcher.dispatch({"type": "res", "id": "x", "payload": {}})
 
     assert [r for r in caplog.records if r.levelno >= logging.INFO] == []
+
+
+# --- #285: frames of a run the gateway aborted are dropped by runId ----------
+
+SK = "agent:main:client-a"
+
+
+def _ack(req_id, run_id):
+    return {"type": "res", "id": req_id, "ok": True, "payload": {"runId": run_id, "status": "started"}}
+
+
+def _chat(run_id, state="delta", text="late"):
+    payload = {"sessionKey": SK, "runId": run_id, "state": state, "deltaText": text}
+    return {"type": "event", "event": "chat", "payload": payload}
+
+
+def _agent(run_id, phase):
+    payload = {"sessionKey": SK, "runId": run_id, "data": {"phase": phase}}
+    return {"type": "event", "event": "agent", "payload": payload}
+
+
+def _tool(run_id):
+    data = {"phase": "start", "name": "exec", "toolCallId": "c1", "args": {}}
+    return {"type": "event", "event": "session.tool", "payload": {"sessionKey": SK, "runId": run_id, "data": data}}
+
+
+async def test_frames_of_an_abandoned_turn_never_reach_the_next_turn_nor_a_push():
+    dispatcher, turn_reg, client_reg = make_dispatcher()
+    bridge = MagicMock()
+    client_reg.register("client-a", bridge)
+    turn_reg.register("req-1", SK)
+    await dispatcher.dispatch(_ack("req-1", "run-1"))
+    turn_reg.abandon("req-1")  # barge-in: the turn is aborted
+    turn_reg.unregister(SK, "req-1")
+    q = turn_reg.register("req-2", SK)  # the next turn
+    await dispatcher.dispatch(_ack("req-2", "run-2"))
+
+    for frame in (_agent("run-1", "start"), _chat("run-1"), _tool("run-1"), _chat("run-1", "final"),
+                  _agent("run-1", "end")):  # fmt: skip
+        await dispatcher.dispatch(frame)
+    assert q.empty()
+    turn_reg.unregister(SK, "req-2")
+    for frame in (_agent("run-1", "start"), _chat("run-1"), _agent("run-1", "end")):
+        await dispatcher.dispatch(frame)
+    bridge.enqueue_push.assert_not_called()
+
+    await dispatcher.dispatch(_agent("run-3", "start"))  # another run still gets through
+    bridge.enqueue_push.assert_called_once_with("turn_start", SK, run_id="run-3")
+
+
+async def test_a_turn_aborted_before_its_ack_gets_its_run_tombstoned_by_the_late_ack():
+    dispatcher, turn_reg, client_reg = make_dispatcher()
+    bridge = MagicMock()
+    client_reg.register("client-a", bridge)
+    turn_reg.register("req-1", SK)
+    turn_reg.abandon("req-1")
+    turn_reg.unregister(SK, "req-1")
+    await dispatcher.dispatch(_ack("req-1", "run-1"))  # the ack arrives after the abort
+    await dispatcher.dispatch(_chat("run-1"))
+    bridge.enqueue_push.assert_not_called()
+
+
+async def test_chat_abort_answer_tombstones_the_runs_it_aborted():
+    dispatcher, turn_reg, client_reg = make_dispatcher()
+    bridge = MagicMock()
+    client_reg.register("client-a", bridge)
+    res = {"type": "res", "id": "abort-1", "ok": True, "payload": {"ok": True, "aborted": True, "runIds": ["run-9"]}}
+    await dispatcher.dispatch(res)
+    await dispatcher.dispatch(_agent("run-9", "start"))
+    bridge.enqueue_push.assert_not_called()
+    assert turn_reg.is_run_aborted("run-9")
+    assert not turn_reg.is_run_aborted("run-8")
+    assert not turn_reg.is_run_aborted(None)
+
+
+async def test_run_tombstone_expires(monkeypatch):
+    import fogar_gateway.services.openclaw.registry as registry
+
+    turn_reg = TurnRegistry()
+    now = [1000.0]
+    monkeypatch.setattr(registry.time, "monotonic", lambda: now[0])
+    turn_reg.abort_run("run-1")
+    now[0] += registry.RUN_ABORT_TOMBSTONE_S - 1
+    assert turn_reg.is_run_aborted("run-1")
+    now[0] += 2
+    assert not turn_reg.is_run_aborted("run-1")
+
+
+async def test_agent_error_phase_is_forwarded_as_turn_error():
+    """#300: a failed push run ends with `error`; the bridge closes it with reason error."""
+    dispatcher, _, client_reg = make_dispatcher()
+    bridge = MagicMock()
+    client_reg.register("client-a", bridge)
+    await dispatcher.dispatch(_agent("run-1", "error"))
+    bridge.enqueue_push.assert_called_once_with("turn_error", SK, run_id="run-1")
+
+
+def _drain(q):
+    out = []
+    while not q.empty():
+        out.append(q.get_nowait())
+    return out
+
+
+async def test_frames_of_another_run_never_reach_the_turn():
+    """#285 (review 1): once the ack named the turn's run, every frame of another run on
+    the same key is dropped — deltas and tool events too, not only its terminal."""
+    dispatcher, turn_reg, _ = make_dispatcher()
+    q = turn_reg.register("req-1", SK)
+    await dispatcher.dispatch(_ack("req-1", "run-1"))
+    for frame in (_chat("run-push"), _tool("run-push"), _chat("run-push", "final"), _chat("run-1", text="mio")):
+        await dispatcher.dispatch(frame)
+    assert [(k, d.get("deltaText")) for k, d in _drain(q)] == [("chat", "mio")]
+
+
+async def test_frames_before_the_ack_are_held_until_it_names_the_run():
+    """#285 (review 2): frames with a run id that arrive before the turn's ack are held;
+    the ack delivers those of its run, in order, and drops the rest."""
+    dispatcher, turn_reg, _ = make_dispatcher()
+    q = turn_reg.register("req-1", SK)
+    for frame in (_chat("run-old", text="viejo"), _chat("run-1", text="a"), _chat("run-old", "final"),
+                  _chat("run-1", text="b")):  # fmt: skip
+        await dispatcher.dispatch(frame)
+    assert q.empty()
+    await dispatcher.dispatch(_ack("req-1", "run-1"))
+    assert [d["deltaText"] for _, d in _drain(q)] == ["a", "b"]
+
+
+async def test_an_ack_without_run_id_delivers_what_was_held():
+    """A server whose ack names no run (older than 2026.10.5) loses nothing."""
+    dispatcher, turn_reg, _ = make_dispatcher()
+    q = turn_reg.register("req-1", SK)
+    await dispatcher.dispatch(_chat("run-x", text="a"))
+    await dispatcher.dispatch({"type": "res", "id": "req-1", "ok": True, "payload": {"status": "started"}})
+    await dispatcher.dispatch(_chat("run-x", text="b"))
+    assert [d["deltaText"] for _, d in _drain(q)] == ["a", "b"]
+
+
+async def test_held_frames_are_bounded_like_the_queue():
+    turn_reg = TurnRegistry(max_queue_size=2)
+    dispatcher = FrameDispatcher(turn_reg, ClientRegistry())
+    q = turn_reg.register("req-1", SK)
+    for i in range(3):
+        await dispatcher.dispatch(_chat("run-1", text=str(i)))
+    assert _drain(q) == [("overflow", None)]
+    await dispatcher.dispatch(_ack("req-1", "run-1"))
+    assert q.empty()
+
+
+async def test_abort_registration_takes_every_frame_of_the_key():
+    """chat.abort's own registration is never acked through the dispatcher: it filters
+    nothing by run (it waits for the `aborted` of a run it does not know)."""
+    dispatcher, turn_reg, _ = make_dispatcher()
+    q = turn_reg.register("abort-1", SK, by_run=False)
+    await dispatcher.dispatch(_chat("run-push", "aborted"))
+    assert [d["state"] for _, d in _drain(q)] == ["aborted"]
+
+
+async def test_late_terminal_of_an_aborted_turn_before_both_acks_does_not_close_the_next():
+    """#285 (review 2), the exact ordering: turn A is aborted before its ack; turn B is
+    sent; A's late reply (delta + final) arrives before B's ack, then B's ack, then A's
+    late ack, then B's own reply. B gets only its own text and ends on its own final."""
+    from fogar_gateway.services.openclaw.client import OpenClawClient
+
+    turns = TurnRegistry()
+    dispatcher = FrameDispatcher(turns, ClientRegistry())
+    client = OpenClawClient("127.0.0.1", 1, "tok", turns, dispatcher)
+    client._ws = ws = SendOnlyOpenClawWS()  # no connect: the test is the server
+
+    async def collect(text):
+        return [e async for e in client.stream_response(text, session_key=SK)]
+
+    first = asyncio.create_task(collect("uno"))
+    while len(ws.ids("chat.send")) < 1:
+        await asyncio.sleep(0)
+    first.cancel()  # barge-in before A's ack
+    await asyncio.gather(first, return_exceptions=True)
+    second = asyncio.create_task(collect("dos"))
+    while len(ws.ids("chat.send")) < 2:
+        await asyncio.sleep(0)
+    req_a, req_b = ws.ids("chat.send")
+
+    await dispatcher.dispatch(_chat("run-a", text="viejo"))
+    await dispatcher.dispatch(_chat("run-a", "final"))
+    await dispatcher.dispatch(_ack(req_b, "run-b"))
+    await dispatcher.dispatch(_ack(req_a, "run-a"))
+    await dispatcher.dispatch(_chat("run-a", text="aun mas viejo"))
+    await dispatcher.dispatch(_chat("run-b", text="nuevo"))
+    await dispatcher.dispatch(_chat("run-b", "final", text=""))
+    events = await asyncio.wait_for(second, 2)
+
+    assert "".join(e.content for e in events if e.type == "token") == "nuevo"
+    assert (events[-1].type, events[-1].content) == ("status", "done")
+    assert turns.is_run_aborted("run-a")
+
+
+async def test_frames_without_run_id_wait_behind_held_ones():
+    """Review 6: once a frame is held before the ack, the ones without run id queue behind
+    it, so the turn sees them in arrival order; the held ones count in the depth."""
+    dispatcher, turn_reg, _ = make_dispatcher()
+    q = turn_reg.register("req-1", SK)
+    plain = {"sessionKey": SK, "state": "delta", "deltaText": "b"}
+    await dispatcher.dispatch(_chat("run-1", text="a"))
+    await dispatcher.dispatch({"type": "event", "event": "chat", "payload": plain})
+    assert q.empty() and turn_reg.depth(SK) == (2, 2)
+    await dispatcher.dispatch(_ack("req-1", "run-1"))
+    assert [d["deltaText"] for _, d in _drain(q)] == ["a", "b"]
+
+
+async def test_held_frames_overflow_once(caplog):
+    """Review 7: after the overflow the turn takes nothing more (one warning, one item)."""
+    turn_reg = TurnRegistry(max_queue_size=2)
+    dispatcher = FrameDispatcher(turn_reg, ClientRegistry())
+    q = turn_reg.register("req-1", SK)
+    for i in range(6):
+        await dispatcher.dispatch(_chat("run-1", text=str(i)))
+    assert _drain(q) == [("overflow", None)]
+    assert caplog.text.count("turn queue overflow") == 1
+
+
+async def test_a_rejected_send_is_delivered_even_with_frames_held():
+    dispatcher, turn_reg, _ = make_dispatcher()
+    q = turn_reg.register("req-1", SK)
+    await dispatcher.dispatch(_chat("run-other", text="x"))
+    await dispatcher.dispatch({"type": "res", "id": "req-1", "ok": False, "error": {"code": "X"}})
+    assert [k for k, _ in _drain(q)] == ["done"]
+
+
+async def test_active_runs_follow_their_frames():
+    """Review 3: a run is active on its key from its first frame to its terminal one; a
+    tombstone or a lost connection forgets it."""
+    dispatcher, turn_reg, _ = make_dispatcher()
+    await dispatcher.dispatch(_agent("run-1", "start"))
+    await dispatcher.dispatch(_chat("run-2"))
+    assert sorted(turn_reg.active_runs(SK)) == ["run-1", "run-2"]
+    assert turn_reg.active_runs("agent:otro:client-a") == []
+    await dispatcher.dispatch(_chat("run-2", "final"))
+    assert turn_reg.active_runs(SK) == ["run-1"]
+    await dispatcher.dispatch(_agent("run-1", "end"))
+    assert turn_reg.active_runs(SK) == []
+    await dispatcher.dispatch(_agent("run-3", "start"))
+    turn_reg.abort_run("run-3")
+    assert turn_reg.active_runs(SK) == []
+    await dispatcher.dispatch(_tool("run-4"))
+    turn_reg.error_all("orchestrator_disconnected")
+    assert turn_reg.active_runs(SK) == []
+
+
+# ── `agent` de streams que no son `lifecycle` (2026.10.5; revisión de #254) ──
+
+
+def _agent_stream(stream, phase, run_id="r1", sk=SK):
+    payload = {"sessionKey": sk, "runId": run_id, "stream": stream, "data": {"phase": phase}}
+    return {"type": "event", "event": "agent", "payload": payload}
+
+
+@pytest.mark.parametrize(
+    ("stream", "phase"),
+    [
+        ("item", "start"),
+        ("item", "update"),
+        ("item", "end"),
+        ("tool", "start"),
+        ("tool", "result"),
+        ("assistant", "end"),
+        ("run_status", "preparing_workspace"),
+        ("thinking", "error"),
+    ],
+)
+async def test_only_the_lifecycle_stream_opens_or_ends_a_push(stream, phase):
+    """OpenClaw's `item` events carry `data.phase` start/update/end (one per tool activity)
+    and are broadcast as `agent` too: an `item` `end` used to close a push and a `tool`
+    `start` to open one."""
+    dispatcher, turn_reg, client_reg = make_dispatcher()
+    bridge = MagicMock()
+    client_reg.register("client-a", bridge)
+    await dispatcher.dispatch(_agent_stream(stream, phase))
+    bridge.enqueue_push.assert_not_called()
+    assert turn_reg.active_runs(SK) == ["r1"]  # the run is still alive
+
+
+@pytest.mark.parametrize(
+    ("phase", "kind"), [("start", "turn_start"), ("end", "turn_end"), ("error", "turn_error")]
+)
+async def test_the_lifecycle_stream_still_opens_and_ends_a_push(phase, kind):
+    dispatcher, _, client_reg = make_dispatcher()
+    bridge = MagicMock()
+    client_reg.register("client-a", bridge)
+    await dispatcher.dispatch(_agent_stream("lifecycle", phase))
+    bridge.enqueue_push.assert_called_once_with(kind, SK, run_id="r1")
+
+
+async def test_an_item_end_does_not_close_the_open_push(make_real_bridge):
+    dispatcher, _, client_reg = make_dispatcher()
+    bridge, _ = make_real_bridge()
+    client_reg.register("hab_sito", bridge)
+    sk = "agent:main:hab_sito"
+    await dispatcher.dispatch(_agent_stream("lifecycle", "start", sk=sk))
+    await bridge.push_idle()
+    assert push_open(bridge)
+    await dispatcher.dispatch(_agent_stream("item", "end", sk=sk))
+    await dispatcher.dispatch(_agent_stream("tool", "start", sk=sk))
+    await bridge.push_idle()
+    assert push_open(bridge)
+    await dispatcher.dispatch(_agent_stream("lifecycle", "end", sk=sk))
+    await bridge.push_idle()
+    assert not push_open(bridge)
+    assert [m["type"] for m in await sent(bridge)] == ["turn_start", "turn_end"]

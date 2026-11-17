@@ -1,6 +1,7 @@
 """Tests para WebSocket handshake (/ws/stream)."""
 
 import asyncio
+import json
 import logging
 import queue
 import re
@@ -13,6 +14,7 @@ import pytest
 import uvicorn
 import websockets
 from fastapi import FastAPI
+from starlette.websockets import WebSocketDisconnect
 
 from fogar_gateway.api.routes import router as stream_router
 from fogar_gateway.core.config import settings
@@ -20,6 +22,7 @@ from fogar_gateway.core.logging import fingerprint_key
 from fogar_gateway.core.request_id import RequestIdMiddleware
 from fogar_gateway.main import app
 from fogar_gateway.services.outbound import ClientGone, QueuedSender
+from fogar_gateway.services.stats import gateway_stats
 from tests.integration.conftest import CLIENT_ID, VALID_KEY
 
 
@@ -30,14 +33,50 @@ def _assert_request_id(message: str) -> None:
 
 
 def test_malformed_json_closes_ws(client):
-    """JSON malformado como primer mensaje → WS se cierra (código 1008)."""
-    with pytest.raises(Exception), client.websocket_connect("/ws/stream") as ws:
+    """JSON malformado como primer mensaje → WS se cierra (4000)."""
+    with pytest.raises(WebSocketDisconnect) as exc, client.websocket_connect("/ws/stream") as ws:
         ws.send_text("not-json{{")
         ws.receive_text()  # debe lanzar excepción al recibir close frame
+    assert (exc.value.code, exc.value.reason) == (4000, "invalid handshake")
+
+
+@pytest.mark.parametrize("payload", ["[]", '"x"', "1", "null"])
+def test_valid_json_that_is_not_an_object_closes_4000(client, payload):
+    """D-r4-1: JSON válido que no es objeto → 4000 y cuenta como invalid, no TypeError/1006."""
+    with pytest.raises(WebSocketDisconnect) as exc, client.websocket_connect("/ws/stream") as ws:
+        ws.send_text(payload)
+        ws.receive_text()
+    assert (exc.value.code, exc.value.reason) == (4000, "invalid handshake")
+    assert gateway_stats.snapshot()["handshake_rejected"] == {"invalid": 1}
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_huge_int_or_deep_nesting_closes_4000(client, monkeypatch, caplog, deep):
+    """D-r5-2: con HANDSHAKE_MAX_BYTES alto, un entero > 4300 cifras (ValueError) o un
+    anidamiento que agote la pila (RecursionError; el json de este Python no llega, se simula)
+    → 4000 e invalid, no 1006; el log da solo el tipo."""
+    import types
+
+    from fogar_gateway.api import routes
+
+    monkeypatch.setattr(settings, "HANDSHAKE_MAX_BYTES", 1_000_000)
+    payload = '{"n": ' + "9" * 5000 + "}"
+    if deep:
+        def loads(_raw):
+            raise RecursionError("maximum recursion depth exceeded")
+        fake = types.SimpleNamespace(loads=loads, JSONDecodeError=json.JSONDecodeError)
+        monkeypatch.setattr(routes, "json", fake)
+    with pytest.raises(WebSocketDisconnect) as exc, client.websocket_connect("/ws/stream") as ws:
+        ws.send_text(payload)
+        ws.receive_text()
+    assert (exc.value.code, exc.value.reason) == (4000, "invalid handshake")
+    assert gateway_stats.snapshot()["handshake_rejected"] == {"invalid": 1}
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "4300" not in logged and "digits" not in logged
 
 
 def test_handshake_timeout_closes_ws(client, monkeypatch):
-    """Cliente conecta pero nunca manda el JSON de handshake → cierre 1008
+    """Cliente conecta pero nunca manda el JSON de handshake → cierre 4900
     tras HANDSHAKE_TIMEOUT_S (issue #115).
 
     Bounded via a daemon worker thread + queue.get(timeout=...), not
@@ -65,7 +104,7 @@ def test_handshake_timeout_closes_ws(client, monkeypatch):
 
         threading.Thread(target=_receive, daemon=True).start()
         try:
-            kind, _exc = result.get(timeout=5.0)
+            kind, exc = result.get(timeout=5.0)
         except queue.Empty:
             pytest.fail(
                 "ws.receive_text() did not return within 5s — HANDSHAKE_TIMEOUT_S "
@@ -77,6 +116,8 @@ def test_handshake_timeout_closes_ws(client, monkeypatch):
                 "expected ws.receive_text() to raise once the server closes the "
                 "connection on handshake timeout, but it returned normally"
             )
+    assert isinstance(exc, WebSocketDisconnect)
+    assert (exc.code, exc.reason) == (4900, "handshake timeout")
 
 
 def test_invalid_client_key_log_is_safe_and_correlatable(client, caplog, monkeypatch):
@@ -278,6 +319,46 @@ def test_handshake_validation_error_log_has_no_key_material(client, caplog):
     assert "input_mode" in caplog.text
 
 
+@pytest.mark.parametrize(
+    "credentials",
+    [{}, {"client_key": VALID_KEY, "admin_token": "test-admin-token"}],
+    ids=["none", "both"],
+)
+def test_handshake_needs_exactly_one_credential(client, caplog, credentials):
+    """M19: `client_key` o `admin_token`, una de las dos; el log no lleva ninguna."""
+    with caplog.at_level(logging.ERROR), pytest.raises(Exception):
+        with client.websocket_connect("/ws/stream") as ws:
+            ws.send_json({**credentials, "input_mode": "text", "output_mode": ["text"]})
+            ws.receive_text()
+    assert "value_error" in caplog.text
+    assert "test-admin-token" not in caplog.text
+    assert VALID_KEY not in caplog.text
+
+
+@pytest.mark.parametrize("conversation", ["", "x" * 65])
+def test_handshake_conversation_is_validated(client, conversation):
+    with pytest.raises(Exception), client.websocket_connect("/ws/stream") as ws:
+        ws.send_json(
+            {"client_key": VALID_KEY, "input_mode": "text", "output_mode": ["text"],
+             "conversation": conversation}
+        )
+        ws.receive_text()
+
+
+@pytest.mark.parametrize("field", ["client_key", "admin_token"])
+@pytest.mark.parametrize("value", ["\ud800", "k" * 1025], ids=["surrogate", "huge"])
+def test_handshake_credential_is_validated(client, caplog, field, value):
+    """Auditoría 3.0, D-5: un surrogate suelto o un valor enorme es un handshake inválido
+    (4000), no un UnicodeEncodeError con traceback."""
+    raw = json.dumps({field: value, "input_mode": "text", "output_mode": ["text"]})
+    with caplog.at_level(logging.ERROR), pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect("/ws/stream") as ws:
+            ws.send_text(raw)
+            ws.receive_text()
+    assert exc.value.code == 4000
+    assert "Traceback" not in caplog.text and "UnicodeEncodeError" not in caplog.text
+
+
 # ── Primer frame binario (#232) y ClientGone en el health check (#205) ────────
 
 def _start_server():
@@ -306,7 +387,7 @@ def real_port():
     thread.join(timeout=10)
 
 
-async def test_binary_first_frame_closes_1008_with_stable_reason(real_port, caplog):
+async def test_binary_first_frame_closes_4001(real_port, caplog):
     """#232: antes, `receive_text()` lanzaba KeyError('text') sin capturar."""
     caplog.set_level(logging.ERROR)
     async with websockets.connect(f"ws://127.0.0.1:{real_port}/ws/stream") as ws:
@@ -315,7 +396,7 @@ async def test_binary_first_frame_closes_1008_with_stable_reason(real_port, capl
             await asyncio.wait_for(ws.recv(), timeout=5)
     close = exc.value.rcvd
     assert close is not None
-    assert (close.code, close.reason) == (1008, "Handshake invalido. Se esperaba texto.")
+    assert (close.code, close.reason) == (4001, "handshake must be a text frame")
     assert not [r for r in caplog.records if r.exc_info], "no debe haber traceback sin capturar"
 
 
@@ -324,7 +405,7 @@ def test_binary_first_frame_does_not_raise_under_testclient(client):
         ws.send_bytes(b"\x00\x01")
         with pytest.raises(Exception) as exc:
             ws.receive_text()
-    assert getattr(exc.value, "code", None) == 1008
+    assert getattr(exc.value, "code", None) == 4001
 
 
 def test_client_gone_during_health_check_is_a_clean_disconnect(
