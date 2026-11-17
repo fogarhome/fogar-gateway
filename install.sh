@@ -45,6 +45,19 @@ fail() {
   exit 1
 }
 
+# FOGAR_GATEWAY_HOME del Environment= que escribe `fogar-gw install`: sin comillas o entre
+# comillas de systemd (\\, \" y %%). Vacío si la unidad no la trae.
+unit_home() {
+  sed -n 's/^Environment="\{0,1\}FOGAR_GATEWAY_HOME=//p' "$1" |
+    sed -e 's/"$//' -e 's/\\\(.\)/\1/g' -e 's/%%/%/g' | head -n 1
+}
+
+# `fogar-gw doctor` sobre la base del servicio, no la de esta shell (F-r5-1).
+unit_doctor() {
+  unit_base=$(unit_home "$1")
+  if [ -n "$unit_base" ]; then fogar-gw --home "$unit_base" doctor; else fogar-gw doctor; fi
+}
+
 # El probe va en un subshell: con dash, una redirección fallida en `:` saldría del script.
 has_tty() { (: </dev/tty) 2>/dev/null; }
 
@@ -156,7 +169,7 @@ main() {
   unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/fogar-gateway.service"
   if [ -e "$unit" ]; then
     fogar-gw --yes restart
-    fogar-gw doctor || say "$(t "El diagnóstico marca algún fallo (arriba); la actualización está hecha." "The diagnosis reports a problem (above); the update is done.")"
+    unit_doctor "$unit" || say "$(t "El diagnóstico marca algún fallo (arriba); la actualización está hecha." "The diagnosis reports a problem (above); the update is done.")"
     [ -z "$path_note" ] || say "$path_note"
     return
   fi

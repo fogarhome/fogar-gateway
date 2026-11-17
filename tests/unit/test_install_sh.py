@@ -131,3 +131,23 @@ def test_no_answer_aborts_without_running_the_command(env, answer, msg, tmp_path
 def test_t_picks_the_text_of_the_language():
     assert _sh("lang=es; t uno one", LANG="C").stdout == "uno"
     assert _sh("lang=en; t uno one", LANG="C").stdout == "one"
+
+
+@pytest.mark.parametrize("home", ["/srv/fogar", "/srv/mi casa/50% \"fogar\" \\x"])
+def test_doctor_after_update_uses_the_base_of_the_unit(home, tmp_path):
+    """F-r5-1: tras actualizar, `doctor` mira la base del servicio (Environment= de la unidad,
+    tal como la escribe `fogar-gw install`), no la de la shell del instalador."""
+    from fogar_gateway.cli.service import render_unit
+
+    unit = tmp_path / "fogar-gateway.service"
+    unit.write_text(render_unit(Path("/opt/fogar-gw"), Path(home)), encoding="utf-8")
+    stub = tmp_path / "bin" / "fogar-gw"  # dash no admite `-` en el nombre de una función
+    stub.parent.mkdir()
+    stub.write_text('#!/bin/sh\nprintf "%s|" "$@"\n', encoding="utf-8")
+    stub.chmod(0o755)
+    path = f"{stub.parent}:/usr/bin:/bin"
+    r = _sh('unit_doctor "$UNIT"', UNIT=str(unit), PATH=path)
+    assert (r.returncode, r.stderr) == (0, "")
+    assert r.stdout == f"--home|{home}|doctor|"
+    unit.write_text("[Service]\nExecStart=/opt/fogar-gw serve\n", encoding="utf-8")
+    assert _sh('unit_doctor "$UNIT"', UNIT=str(unit), PATH=path).stdout == "doctor|"
