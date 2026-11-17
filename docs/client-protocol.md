@@ -134,7 +134,7 @@ El código es el contrato; el `reason` es un texto en inglés para logs y person
 
 | Situación | Código WS | `reason` |
 |-----------|-----------|----------|
-| JSON inválido (también un número de más de 4300 cifras, que antes cerraba con 1006), que no es un objeto, o campos incorrectos (también un `agent` que no es un id de agente válido); `client_key` y `admin_token` a la vez, o ninguna de las dos | 4000 | `invalid handshake` |
+| JSON inválido (también un número de más de 4300 cifras, que antes cerraba con 1006; solo con `HANDSHAKE_MAX_BYTES` por encima de ~4300: con el valor por defecto cierra antes con 4002), que no es un objeto, o campos incorrectos (también un `agent` que no es un id de agente válido); `client_key` y `admin_token` a la vez, o ninguna de las dos | 4000 | `invalid handshake` |
 | El primer mensaje es binario, no texto | 4001 | `handshake must be a text frame` |
 | El handshake supera `HANDSHAKE_MAX_BYTES` (4096 caracteres) | 4002 | `handshake too large` |
 | No se recibe el handshake JSON en los primeros `HANDSHAKE_TIMEOUT_S` (5s por defecto) | 4900 | `handshake timeout` |

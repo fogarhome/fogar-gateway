@@ -281,6 +281,23 @@ async def test_connect_returns_gateway_info(fake_ws):
 
 
 @pytest.mark.asyncio
+async def test_connect_ignores_an_interleaved_event_with_a_dirty_routing_key():
+    """B-r5-1 (revisión): un evento ajeno con sessionKey sucia antes de la respuesta de
+    agents.list se ignora; no aborta el connect."""
+
+    class DirtyEventWS(SmartFakeWS):
+        async def send(self, data: str) -> None:
+            if json.loads(data).get("method") == "agents.list":
+                dirty = {"type": "event", "event": "chat", "payload": {"sessionKey": "k\ud800"}}
+                await self._to_client.put(json.dumps(dirty))
+            await super().send(data)
+
+    client = await connected_client(DirtyEventWS(hello_ok_payload=HELLO_OK_PAYLOAD_NO_SNAPSHOT_AGENTS))
+    assert client.gateway_info.has_agent("assistant")
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_connect_populates_agents_via_agents_list_when_snapshot_lacks_agents():
     """OpenClaw server 2026.6.11+ no longer embeds the agent roster in
     hello-ok's snapshot — it must be fetched via a separate agents.list call

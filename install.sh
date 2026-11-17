@@ -47,6 +47,7 @@ fail() {
 
 # FOGAR_GATEWAY_HOME del Environment= que escribe `fogar-gw install`: sin comillas o entre
 # comillas de systemd (\\, \" y %%). Vacío si la unidad no la trae.
+# shortcut: una ruta con salto de línea (\n en la unidad) no se reconstruye; si hiciera falta, leerla con systemctl show.
 unit_home() {
   sed -n 's/^Environment="\{0,1\}FOGAR_GATEWAY_HOME=//p' "$1" |
     sed -e 's/"$//' -e 's/\\\(.\)/\1/g' -e 's/%%/%/g' | head -n 1
