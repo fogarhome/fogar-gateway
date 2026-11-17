@@ -150,6 +150,25 @@ describe('ClienteView: acciones que no se repiten ni engañan (G-r6-2..4)', () =
     expect(el.textContent).toContain('huella sin comprobar')
   })
 
+  it('mientras relee la huella no deja rotar otra vez; si no cambia, lo dice (G-r7-1)', async () => {
+    rotateClientKey.mockRejectedValue(new ApiError('network', 0, 'No llego al gateway'))
+    const { el, boton } = await mount()
+    vi.useFakeTimers()
+    boton('Rotar clave').click()
+    await flush()
+    boton('Rotar ahora').click()
+    await flush()
+    expect(boton('Rotar clave').disabled).toBe(true)
+    await vi.advanceTimersByTimeAsync(3000)
+    vi.useRealTimers()
+    await flush()
+    expect(getClient).toHaveBeenCalledTimes(4) // la carga y 3 lecturas con la misma huella
+    expect(toasts[0]!.title).toBe('La huella no ha cambiado')
+    expect(toasts[0]!.body).toMatch(/Parece que no se rotó/)
+    expect(el.textContent).toContain('huella abcd 1234')
+    expect(boton('Rotar clave').disabled).toBe(false)
+  })
+
   it('si no puede releer la huella, no enseña la vieja y pide recargar (G-r7-1)', async () => {
     rotateClientKey.mockRejectedValue(new ApiError('network', 0, 'No llego al gateway'))
     const { el, boton } = await mount()

@@ -26,12 +26,16 @@ const cliente = shallowRef<ClientResponse | null>(null)
 const form = ref<ClientForm | null>(null)
 const cargaError = ref<string | null>(null)
 const huellaDudosa = ref(false) // G-r7-1: rotar sin respuesta y sin poder releer la huella
+const comprobando = ref(false) // releyendo la huella: rotar otra vez ahora mezclaría las respuestas
+let vuelta = 0 // cada comprobación, rotación o carga lo sube: una comprobación vieja ya no toca nada
 async function cargar(): Promise<void> {
   try {
     cliente.value = await getClient(id.value)
     form.value = toForm(cliente.value)
     cargaError.value = null
     huellaDudosa.value = false
+    comprobando.value = false
+    vuelta++
   } catch (e) {
     cargaError.value = e instanceof ApiError && e.kind === 'not-found' ? 'Ese cliente ya no existe.' : 'No llego al gateway.'
   }
@@ -96,11 +100,14 @@ const trabajando = ref(false)
 const rotando = ref(false) // aparte de trabajando: borrar sale de la página con trabajando a true
 
 async function rotar(): Promise<void> {
+  if (comprobando.value) return
   const pedido = id.value
   trabajando.value = true
   rotando.value = true
   try {
     const { client_key, ...resto } = await rotateClientKey(id.value)
+    vuelta++
+    huellaDudosa.value = false
     claveNueva.value = client_key
     cliente.value = resto // sin la clave: solo vive en claveNueva mientras se enseña
     void clients.refresh()
@@ -122,9 +129,12 @@ async function rotar(): Promise<void> {
  * el cliente entero): no pisa el formulario ni los cambios sin guardar. */
 async function comprobarHuella(pedido: string): Promise<void> {
   const antes = cliente.value?.key_fp
+  const mia = ++vuelta
   huellaDudosa.value = true
+  comprobando.value = true
   const c = await releer(() => getClient(pedido), (r) => r.key_fp !== antes)
-  if (id.value !== pedido || !cliente.value) return
+  if (mia !== vuelta || id.value !== pedido || !cliente.value) return
+  comprobando.value = false
   if (!c) {
     toast('bad', 'No he podido comprobarlo', 'Recarga la página para ver la huella: si ha cambiado, la clave de antes ya no vale.')
     return
@@ -259,7 +269,7 @@ frenarRecarga(() => rotando.value)
               <FgBoton variante="principal" :ocupado="trabajando" @click="rotar">Rotar ahora</FgBoton>
               <FgBoton @click="confirmar = null">Cancelar</FgBoton>
             </div>
-            <FgBoton v-else @click="confirmar = 'rotar'">Rotar clave…</FgBoton>
+            <FgBoton v-else :disabled="comprobando" @click="confirmar = 'rotar'">Rotar clave…</FgBoton>
           </div>
           <div class="accion">
             <div>

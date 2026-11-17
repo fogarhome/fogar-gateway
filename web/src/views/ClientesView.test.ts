@@ -127,6 +127,27 @@ describe('ClientesView: crear sin respuesta (G-r6-3)', () => {
     expect(el.textContent).toContain('su clave no se ha visto: entra en él y rota la clave')
   })
 
+  it('mientras relee la lista no deja crear otra vez (G-r7-1)', async () => {
+    createClient.mockRejectedValue(new ApiError('network', 0, 'No llego al gateway'))
+    const { el, boton } = await mount()
+    vi.useFakeTimers()
+    boton('Crear a mano').click()
+    await flush()
+    const nombre = el.querySelector('form input') as HTMLInputElement
+    nombre.value = 'Tele'
+    nombre.dispatchEvent(new Event('input'))
+    el.querySelector('form')!.dispatchEvent(new Event('submit'))
+    await flush()
+    expect(boton('Crear y ver la clave').disabled).toBe(true)
+    el.querySelector('form')!.dispatchEvent(new Event('submit'))
+    await flush()
+    expect(createClient).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1000)
+    vi.useRealTimers()
+    await flush()
+    expect(boton('Crear y ver la clave').disabled).toBe(false)
+  })
+
   it('si no puede releer la lista, pide recargar antes de reintentar (G-r7-1)', async () => {
     createClient.mockRejectedValue(new ApiError('network', 0, 'No llego al gateway'))
     const { el, boton } = await mount()

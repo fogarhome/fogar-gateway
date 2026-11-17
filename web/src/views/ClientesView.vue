@@ -58,9 +58,11 @@ const nuevoTipo = ref<ClientType | ''>('')
 const nuevoError = ref<string | null>(null)
 const creando = ref(false)
 const creado = shallowRef<ClientWithKey | null>(null)
+const comprobando = ref(false) // releyendo la lista tras un fallo de red: crear otra vez podría duplicarlo
 
 async function crear(): Promise<void> {
   const nombre = nuevoNombre.value.trim()
+  if (comprobando.value) return
   if (!nombre) {
     nuevoError.value = 'Ponle un nombre.'
     return
@@ -84,10 +86,12 @@ async function crear(): Promise<void> {
 }
 /** G-r7-1: relee la lista (con reintentos) antes de pedir que se mire; su clave nunca se vio. */
 async function comprobarLista(nombre: string): Promise<void> {
+  comprobando.value = true
   const leida = await releer(async () => {
     await clients.refresh()
     if (clients.error) throw new Error(clients.error)
   })
+  comprobando.value = false
   if (creando.value || creado.value) return // ya hay otro intento en marcha
   const rotala = `Si «${nombre}» sale en la lista, su clave no se ha visto: entra en él y rota la clave.`
   nuevoError.value =
@@ -196,7 +200,7 @@ function emparejado(clientId: string, nombre: string | null) {
             </select>
           </div>
           <div class="acciones">
-            <FgBoton type="submit" variante="principal" :ocupado="creando">Crear y ver la clave</FgBoton>
+            <FgBoton type="submit" variante="principal" :ocupado="creando" :disabled="comprobando">Crear y ver la clave</FgBoton>
             <FgBoton :disabled="creando" @click="panel = null">Cancelar</FgBoton>
           </div>
         </form>
