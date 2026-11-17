@@ -71,7 +71,13 @@ async function crear(): Promise<void> {
     creado.value = await createClient({ name: nombre, client_type: nuevoTipo.value || null })
     void clients.refresh()
   } catch (e) {
-    nuevoError.value = e instanceof ApiError && e.kind === 'invalid' ? 'Ese nombre no vale: entre 1 y 200 caracteres.' : 'No he podido crearlo. Prueba otra vez.'
+    if (e instanceof ApiError && e.kind !== 'network') {
+      nuevoError.value = e.kind === 'invalid' ? 'Ese nombre no vale: entre 1 y 200 caracteres.' : 'No he podido crearlo. Prueba otra vez.'
+    } else {
+      // G-r6-3: sin respuesta, el gateway pudo crearlo: reintentar daría un duplicado.
+      nuevoError.value = 'No sé si se creó: mira la lista antes de probar otra vez.'
+      void clients.refresh()
+    }
   } finally {
     creando.value = false
   }

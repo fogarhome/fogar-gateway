@@ -10,7 +10,9 @@ withDefaults(
     icono?: IconoNombre
     /** Sin texto visible: el botón necesita `aria-label`. */
     soloIcono?: boolean
+    /** Ocupado también desactiva: un doble clic no repite la acción (G-r6-2). */
     ocupado?: boolean
+    disabled?: boolean
     type?: 'button' | 'submit'
   }>(),
   { variante: 'discreto', tam: 'md', type: 'button', icono: undefined },
@@ -18,7 +20,7 @@ withDefaults(
 </script>
 
 <template>
-  <button :type="type" class="boton" :class="[variante, tam, { 'solo-icono': soloIcono }]" :aria-busy="ocupado || undefined">
+  <button :type="type" class="boton" :class="[variante, tam, { 'solo-icono': soloIcono }]" :disabled="ocupado || disabled" :aria-busy="ocupado || undefined">
     <span v-if="ocupado" class="giro" aria-hidden="true" />
     <FgIcono v-else-if="icono" :nombre="icono" :tam="tam === 'sm' ? 16 : 18" />
     <slot />

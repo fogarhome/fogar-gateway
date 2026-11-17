@@ -9,6 +9,7 @@ vi.mock('@/api/admin', () => ({
   openPairing: vi.fn(),
   getPairing: vi.fn(),
   cancelPairing: vi.fn(() => Promise.resolve()),
+  listPairings: vi.fn(() => Promise.resolve([])),
   listClients: vi.fn(() => Promise.resolve([])),
 }))
 vi.mock('@/lib/toasts', () => ({ toast: vi.fn() }))
@@ -18,6 +19,7 @@ const listClients = vi.mocked(admin.listClients)
 const openPairing = vi.mocked(admin.openPairing)
 const getPairing = vi.mocked(admin.getPairing)
 const cancelPairing = vi.mocked(admin.cancelPairing)
+const listPairings = vi.mocked(admin.listPairings)
 
 const codigo = (id: string, expira = new Date(Date.now() + 600_000)): PairingOpened => ({
   id,
@@ -162,5 +164,40 @@ describe('PanelEmparejar: ningún código queda abierto sin verse', () => {
     boton('Otro código').click()
     await flush()
     expect(onEmparejado).toHaveBeenCalledWith('x', 'Tele')
+  })
+
+  it('recargar o cerrar la pestaña anula el código con un DELETE keepalive (G-r6-1)', async () => {
+    openPairing.mockResolvedValue(codigo('c9'))
+    const { el, app } = mount()
+    await flush()
+    window.dispatchEvent(new Event('pagehide'))
+    await flush()
+    expect(cancelPairing).toHaveBeenCalledWith('c9', true)
+    expect(el.textContent).toContain('Otro código') // si vuelve de la caché del navegador
+    app.unmount()
+    // paneles de otros tests siguen montados: solo cuenta el de este
+    expect(cancelPairing.mock.calls.filter(([id]) => id === 'c9')).toHaveLength(1)
+  })
+
+  it('con 5 códigos abiertos (409), «Anular los abiertos» los anula y abre otro (G-r6-1)', async () => {
+    openPairing.mockRejectedValueOnce(new ApiError('conflict', 409, 'x')).mockResolvedValueOnce(codigo('c3'))
+    listPairings.mockResolvedValue([codigo('c1'), codigo('c2')])
+    const { el, boton } = mount()
+    await flush()
+    expect(el.textContent).toContain('Ya hay 5 códigos abiertos')
+    boton('Anular los abiertos').click()
+    await flush()
+    expect(cancelPairing).toHaveBeenCalledWith('c1')
+    expect(cancelPairing).toHaveBeenCalledWith('c2')
+    expect(openPairing).toHaveBeenCalledTimes(2)
+    expect(el.textContent).toContain('caduca en')
+  })
+
+  it('sin 409, no ofrece anular los abiertos', async () => {
+    openPairing.mockRejectedValueOnce(new ApiError('server', 500, 'x'))
+    const { boton } = mount()
+    await flush()
+    expect(boton('Anular los abiertos')).toBeUndefined()
+    expect(boton('Probar otra vez')).toBeDefined()
   })
 })

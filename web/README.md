@@ -27,7 +27,7 @@ Todo sale de `fogar-brand`, copiado y sin editar a mano:
 - `src/lib/lineaViva.js`: el motor de `linea-viva/index.html`, envuelto para tener varias instancias.
 - `public/favicon.svg` (`web/favicon.svg`) y los iconos de estado (`iconos/estados/`).
 
-Reglas que no se negocian: nada se carga de fuera (CSP `default-src 'self'`), nunca `v-html` ni `style="…"` estático en las plantillas (la CSP no deja estilos en línea), la clave de un cliente y el código de emparejamiento solo existen en la pantalla que los enseña.
+Reglas que no se negocian: nada se carga de fuera (CSP `default-src 'self'`), nunca `v-html` ni `style="…"` estático en las plantillas (la CSP no deja estilos en línea), la clave de un cliente y el código de emparejamiento solo existen en la pantalla que los enseña. Un código abierto se anula al cerrar el panel, recargar o cerrar la pestaña (`pagehide`, DELETE con `keepalive`); con 5 abiertos, el panel ofrece «Anular los abiertos». `FgBoton` con `ocupado` queda desactivado: un doble clic no crea dos clientes ni rota dos veces.
 
 ## Chat (M19)
 

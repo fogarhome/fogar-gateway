@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue'
-import { cancelPairing, getPairing, openPairing } from '@/api/admin'
+import { cancelPairing, getPairing, listPairings, openPairing } from '@/api/admin'
 import { ApiError } from '@/api/http'
 import type { PairingOpened, PairingState } from '@/api/types'
 import { toast } from '@/lib/toasts'
@@ -19,6 +19,7 @@ const emit = defineEmits<{ cerrar: []; emparejado: [clientId: string, nombre: st
 const abierto = shallowRef<PairingOpened | null>(null)
 const estado = ref<PairingState | 'abriendo' | 'error'>('abriendo')
 const error = ref('')
+const lleno = ref(false) // 409: ya hay 5 códigos abiertos
 const clients = useClientsStore()
 const ahora = ref(performance.now())
 let recibido = 0
@@ -31,6 +32,28 @@ function anular(): void {
   const p = abierto.value
   abierto.value = null
   if (p && estado.value !== 'used') void cancelPairing(p.id).catch((e) => void siYaSeUso(p, e))
+}
+
+/** Recargar o cerrar la pestaña no desmonta el panel: el código se anula con un DELETE que
+ * sobrevive a la página (G-r6-1). Si vuelve de la caché del navegador, ofrece otro código. */
+function alSalirDeLaPagina(): void {
+  const p = abierto.value
+  if (!p || estado.value === 'used') return
+  abierto.value = null
+  estado.value = 'cancelled'
+  void cancelPairing(p.id, true).catch(() => undefined)
+}
+
+/** Con 5 códigos abiertos (p. ej. de pestañas cerradas a destiempo), los anula todos y abre uno. */
+async function anularAbiertos(): Promise<void> {
+  estado.value = 'abriendo'
+  try {
+    const abiertos = await listPairings()
+    await Promise.all(abiertos.map((p) => cancelPairing(p.id).catch(() => undefined)))
+  } catch {
+    // abrir() dirá si sigue sin poder
+  }
+  await abrir()
 }
 
 /** El DELETE da 404 si el código ya no estaba abierto: puede que un aparato acabe de canjearlo. */
@@ -60,10 +83,10 @@ async function abrir(): Promise<void> {
   } catch (e) {
     if (fuera) return
     estado.value = 'error'
-    error.value =
-      e instanceof ApiError && e.kind === 'conflict'
-        ? 'Ya hay 5 códigos abiertos. Espera a que caduquen o anúlalos.'
-        : 'No he podido abrir un código. Prueba otra vez.'
+    lleno.value = e instanceof ApiError && e.kind === 'conflict'
+    error.value = lleno.value
+      ? 'Ya hay 5 códigos abiertos. Espera a que caduquen o anúlalos.'
+      : 'No he podido abrir un código. Prueba otra vez.'
   }
 }
 
@@ -97,6 +120,7 @@ async function cerrar(): Promise<void> {
 }
 
 onMounted(() => {
+  window.addEventListener('pagehide', alSalirDeLaPagina)
   void abrir()
   sondeo = setInterval(() => void comprobar(), 2000)
   reloj = setInterval(() => {
@@ -105,6 +129,7 @@ onMounted(() => {
   }, 1000)
 })
 onBeforeUnmount(() => {
+  window.removeEventListener('pagehide', alSalirDeLaPagina)
   clearInterval(sondeo)
   clearInterval(reloj)
   fuera = true
@@ -133,6 +158,7 @@ onBeforeUnmount(() => {
     </template>
     <template v-else-if="estado === 'error'">
       <p class="fg-suave">{{ error }}</p>
+      <FgBoton v-if="lleno" variante="principal" @click="anularAbiertos">Anular los abiertos</FgBoton>
       <FgBoton @click="abrir">Probar otra vez</FgBoton>
     </template>
     <p v-else class="fg-suave">Emparejado.</p>

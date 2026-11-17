@@ -2,7 +2,9 @@ import { createPinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, nextTick } from 'vue'
 import { createMemoryHistory, createRouter, RouterView } from 'vue-router'
+import { ApiError } from '@/api/http'
 import type { ClientResponse, ClientWithKey } from '@/api/types'
+import { clearToasts, toasts } from '@/lib/toasts'
 import ClienteView from './ClienteView.vue'
 
 vi.mock('@/api/admin', () => ({
@@ -15,6 +17,7 @@ vi.mock('@/api/admin', () => ({
 const admin = await import('@/api/admin')
 const getClient = vi.mocked(admin.getClient)
 const rotateClientKey = vi.mocked(admin.rotateClientKey)
+const deleteClient = vi.mocked(admin.deleteClient)
 
 const cliente: ClientResponse = {
   id: 'c1',
@@ -47,6 +50,7 @@ async function mount() {
     routes: [
       { path: '/clientes/:id', component: ClienteView },
       { path: '/otra', component: defineComponent({ render: () => null }) },
+      { path: '/clientes', component: defineComponent({ render: () => null }) },
     ],
   })
   await router.push('/clientes/c1')
@@ -60,6 +64,7 @@ async function mount() {
 
 beforeEach(() => {
   vi.restoreAllMocks()
+  clearToasts()
   getClient.mockResolvedValue(cliente)
 })
 
@@ -90,5 +95,63 @@ describe('ClienteView: rotar la clave', () => {
     await flush()
     expect((el.querySelector('input[readonly]') as HTMLInputElement).value).toBe(r.client_key)
     expect(el.textContent).toContain('ffff')
+  })
+})
+
+describe('ClienteView: acciones que no se repiten ni engañan (G-r6-2..4)', () => {
+  it('un doble clic en «Rotar ahora» rota una sola vez', async () => {
+    rotateClientKey.mockReturnValue(new Promise(() => undefined))
+    const { boton } = await mount()
+    boton('Rotar clave').click()
+    await flush()
+    boton('Rotar ahora').click()
+    await flush()
+    boton('Rotar ahora').click()
+    await flush()
+    expect(rotateClientKey).toHaveBeenCalledTimes(1)
+  })
+
+  it('sin respuesta al rotar no dice que la clave de antes vale y recarga la huella', async () => {
+    rotateClientKey.mockRejectedValue(new ApiError('network', 0, 'No llego al gateway'))
+    const { el, boton } = await mount()
+    getClient.mockResolvedValue({ ...cliente, key_fp: 'ffff0000' })
+    boton('Rotar clave').click()
+    await flush()
+    boton('Rotar ahora').click()
+    await flush()
+    expect(toasts.map((t) => t.title)).toEqual(['No sé si se rotó la clave'])
+    expect(el.textContent).toContain('ffff')
+  })
+
+  it('con error HTTP al rotar, la clave de antes sigue valiendo', async () => {
+    rotateClientKey.mockRejectedValue(new ApiError('server', 500, 'x'))
+    const { boton } = await mount()
+    boton('Rotar clave').click()
+    await flush()
+    boton('Rotar ahora').click()
+    await flush()
+    expect(toasts.map((t) => t.body)).toEqual(['La clave de antes sigue valiendo.'])
+  })
+
+  it('borrar con cambios sin guardar sale sin preguntar', async () => {
+    deleteClient.mockResolvedValue(undefined)
+    const { el, router, boton } = await mount()
+    const nombre = el.querySelector('form input') as HTMLInputElement
+    nombre.value = 'Otro nombre'
+    nombre.dispatchEvent(new Event('input'))
+    await flush()
+    boton('Borrar…').click()
+    await flush()
+    const confirmar = el.querySelector('form.confirmar input') as HTMLInputElement
+    confirmar.value = 'Tele'
+    confirmar.dispatchEvent(new Event('input'))
+    await flush()
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    el.querySelector('form.confirmar')!.dispatchEvent(new Event('submit'))
+    await flush()
+    await new Promise((r) => setTimeout(r, 0)) // la navegación resuelve fuera de los ticks de Vue
+    expect(deleteClient).toHaveBeenCalled()
+    expect(confirm).not.toHaveBeenCalled()
+    expect(router.currentRoute.value.path).toBe('/clientes')
   })
 })

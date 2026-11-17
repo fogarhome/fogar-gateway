@@ -2,6 +2,7 @@ import { createPinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, nextTick } from 'vue'
 import { createMemoryHistory, createRouter, RouterView } from 'vue-router'
+import { ApiError } from '@/api/http'
 import type { ClientWithKey } from '@/api/types'
 import ClientesView from './ClientesView.vue'
 
@@ -9,7 +10,9 @@ vi.mock('@/api/admin', () => ({
   createClient: vi.fn(),
   listClients: vi.fn(() => Promise.resolve([])),
 }))
-const createClient = vi.mocked((await import('@/api/admin')).createClient)
+const admin = await import('@/api/admin')
+const createClient = vi.mocked(admin.createClient)
+const listClients = vi.mocked(admin.listClients)
 
 const nuevo: ClientWithKey = {
   id: 'c1',
@@ -95,5 +98,22 @@ describe('ClientesView: la clave nueva no se pierde', () => {
     await router.push('/otra')
     expect(confirm).toHaveBeenCalled()
     expect(router.currentRoute.value.path).toBe('/clientes')
+  })
+})
+
+describe('ClientesView: crear sin respuesta (G-r6-3)', () => {
+  it('con error de red no invita a reintentar a ciegas y recarga la lista', async () => {
+    createClient.mockRejectedValue(new ApiError('network', 0, 'No llego al gateway'))
+    const { el, boton } = await mount()
+    boton('Crear a mano').click()
+    await flush()
+    const nombre = el.querySelector('form input') as HTMLInputElement
+    nombre.value = 'Tele'
+    nombre.dispatchEvent(new Event('input'))
+    listClients.mockClear()
+    el.querySelector('form')!.dispatchEvent(new Event('submit'))
+    await flush()
+    expect(el.textContent).toContain('No sé si se creó')
+    expect(listClients).toHaveBeenCalled()
   })
 })

@@ -44,7 +44,10 @@ export const getSession = (id: string) => api<SessionDetail>(`/admin/sessions/${
 export const openPairing = (template: PairingTemplate = {}) =>
   api<PairingOpened>('/admin/pairing', { method: 'POST', body: json(template) })
 export const getPairing = (id: string) => api<PairingSummary>(`/admin/pairing/${enc(id)}`)
-export const cancelPairing = (id: string) => api<void>(`/admin/pairing/${enc(id)}`, { method: 'DELETE' })
+export const listPairings = () => api<PairingSummary[]>('/admin/pairing')
+/** `keepalive`: el DELETE sigue en vuelo aunque la pestaña se cierre (`pagehide`). */
+export const cancelPairing = (id: string, keepalive?: boolean) =>
+  api<void>(`/admin/pairing/${enc(id)}`, { method: 'DELETE', ...(keepalive ? { keepalive } : {}) })
 
 export const listConversations = () => api<Conversation[]>('/admin/conversations')
 /** Lo dicho, de OpenClaw: 503 `orchestrator_unavailable` si no responde, 502 `orchestrator_error` si lo rechaza. */

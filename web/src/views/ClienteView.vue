@@ -100,8 +100,15 @@ async function rotar(): Promise<void> {
     claveNueva.value = client_key
     cliente.value = resto // sin la clave: solo vive en claveNueva mientras se enseña
     void clients.refresh()
-  } catch {
-    toast('bad', 'No he podido rotar la clave', 'La clave de antes sigue valiendo.')
+  } catch (e) {
+    if (e instanceof ApiError && e.kind !== 'network') {
+      toast('bad', 'No he podido rotar la clave', 'La clave de antes sigue valiendo.')
+    } else {
+      // G-r6-3: sin respuesta, el gateway pudo rotarla: la huella recargada lo dice. Solo el
+      // cliente, no cargar(): no tira los cambios sin guardar del formulario.
+      toast('bad', 'No sé si se rotó la clave', 'Mira la huella: si ha cambiado, la clave de antes ya no vale.')
+      void getClient(id.value).then((c) => (cliente.value = c), () => undefined)
+    }
   } finally {
     trabajando.value = false
     rotando.value = false
@@ -130,6 +137,7 @@ async function borrar(): Promise<void> {
     await deleteClient(id.value)
     toast('ok', `«${c.name}» borrado`)
     void clients.refresh()
+    form.value = toForm(c) // G-r6-4: ya borrado, los cambios sin guardar no frenan la salida
     await router.replace('/clientes')
   } catch {
     toast('bad', 'No he podido borrarlo', 'Prueba otra vez.')
