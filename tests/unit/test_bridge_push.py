@@ -116,6 +116,38 @@ async def test_push_disabled_client_receives_nothing(make_push_bridge):
     provider.connect.assert_not_awaited()
 
 
+
+async def test_push_of_a_retired_agent_is_dropped_and_aborted(make_push_bridge):
+    """C-r7-1: sesión en main y allowed_agents=["main"]: el push de otro agente (conversación
+    de otro día, clave legacy) no llega al cliente y se aborta en OpenClaw."""
+    bridge, _ = make_push_bridge(output_mode=("text",), config=ClientConfig(allowed_agents=["Main"]))
+    await push(bridge, *push_reply("hola", sk="agent:x:hab_sito"))
+    assert await sent(bridge) == []
+    bridge.orchestrator.abort.assert_awaited_with("agent:x:hab_sito")
+    await push(bridge, *push_reply("hola", sk=SK))  # el suyo sí
+    assert [m["type"] for m in await sent(bridge)] == ["turn_start", "token", "turn_end"]
+
+
+async def test_revalidation_refreshes_allowed_agents_for_pushes(make_push_bridge, monkeypatch):
+    """C-r7-1: la revalidación guarda el `allowed_agents` vigente; el push lo consulta sin leer
+    la BD."""
+    from fogar_gateway.core.config import settings
+    from fogar_gateway.services import bridge as bridge_module
+
+    bridge, _ = make_push_bridge(output_mode=("text",))
+    fresh = ClientConfig(allowed_agents=["main"])
+    monkeypatch.setattr(settings, "SESSION_REVALIDATE_INTERVAL_S", 0.01)
+    monkeypatch.setattr(
+        bridge_module.db_client, "get_session", AsyncMock(return_value=(bridge.client, fresh))
+    )
+    task = asyncio.create_task(bridge._session_revalidation_loop())
+    await wait_until(lambda: bridge.turns.allowed_agents == ["main"])
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    await push(bridge, *push_reply("hola", sk="agent:x:hab_sito"))
+    assert await sent(bridge) == []
+    bridge.orchestrator.abort.assert_awaited_with("agent:x:hab_sito")
+
 _TOOL = {"phase": "start", "name": "exec", "toolCallId": "call-1", "args": {"command": "ls"}}
 
 

@@ -499,7 +499,7 @@ class FogarBridge:
                     await self._revoke_session()
                     return
                 agent = self.conversation.current.agent.lower()
-                allowed = config.allowed_agents
+                allowed = self.turns.allowed_agents = config.allowed_agents
                 if allowed is not None and agent not in {a.lower() for a in allowed}:
                     # C-r6-1: como en el handshake, 4020 y no 4200: la clave sigue valiendo.
                     logger.warning(f"[{self.client_id}] El agente ya no está permitido; se cierra.")

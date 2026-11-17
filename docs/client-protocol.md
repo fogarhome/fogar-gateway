@@ -127,6 +127,7 @@ El agente efectivo de la sesión no es simplemente "el que pediste o el global":
 1. Si omites `agent` en el handshake, el que acabes usando puede venir de una configuración por-cliente que un admin te haya asignado (no siempre el default global) — comprueba siempre `ready.agent`, no asumas cuál será.
 2. Pedir explícitamente un `agent` puede fallar de dos formas distintas (ver tabla siguiente): que ese agente no esté permitido para tu cliente, o que no exista en OpenClaw.
 3. Una conversación existente (`conversation` con un id) ya tiene su agente: es el de la sesión. No hace falta mandar `agent`; si lo mandas y es otro, el gateway cierra con 4101 (`conversation agent mismatch`). A ese agente se le aplican las mismas comprobaciones (lista permitida y roster).
+4. El agente se fija al abrir la sesión: una sesión que dura días lo conserva al cambiar de día, y cambiar el `default_agent` del cliente sin quitar el agente actual de `allowed_agents` no le afecta hasta que reconectes. Si el administrador sí lo quita, la sesión se cierra con 4020 y los push de ese agente (de otra conversación) dejan de llegarte.
 
 ### Errores de handshake (el servidor cierra la conexión)
 

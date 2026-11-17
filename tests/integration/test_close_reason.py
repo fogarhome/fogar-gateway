@@ -239,3 +239,17 @@ def test_an_idle_close_is_the_only_close(client, monkeypatch, closes):
             while True:
                 ws.receive_json()
     assert closes == [(1000, "session ended")]
+
+
+def test_corrupt_allowed_agents_in_db_closes_1011(client, db_engine, caplog):
+    """C-r7-2: un `allowed_agents` ilegible (fila editada a mano) cierra el handshake con 1011,
+    con solo el tipo en el log, no con un traceback sin cierre."""
+    with Session(db_engine) as s:
+        s.get(ClientRecord, CLIENT_ID).allowed_agents = '{"no": "lista"}'
+        s.commit()
+    with client.websocket_connect("/ws/stream") as ws:
+        ws.send_json(HANDSHAKE)
+        with pytest.raises(WebSocketDisconnect) as exc:
+            ws.receive_text()
+    assert exc.value.code == 1011
+    assert "ValueError" in caplog.text and "lista" not in caplog.text

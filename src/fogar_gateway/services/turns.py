@@ -394,6 +394,8 @@ class TurnController:
     ) -> None:
         self._client_id = client_id
         self._config = config
+        # C-r7-1: el `allowed_agents` vigente; la revalidación del bridge lo refresca.
+        self.allowed_agents = config.allowed_agents
         self._wants_text = "text" in handshake.output_mode
         self._wants_audio = "audio" in handshake.output_mode
         # `turn_progress` (#254) va con los mensajes de diagnóstico del turno: `status`.
@@ -805,7 +807,21 @@ class TurnController:
         if run_id is not None:
             self._turn_registry.abort_run(run_id)
 
+    def _agent_allowed(self, session_key: str) -> bool:
+        allowed = self.allowed_agents
+        parts = session_key.split(":")
+        if allowed is None or len(parts) < 3 or parts[0] != "agent":
+            return True
+        return parts[1].lower() in {a.lower() for a in allowed}
+
     async def _push_start(self, session_key: str, run_id: str | None = None) -> None:
+        if not self._agent_allowed(session_key):
+            # C-r7-1: push de un agente retirado de allowed_agents (conversación de otro día,
+            # clave legacy): no llega al cliente y se para en OpenClaw.
+            logger.info(f"[{self._client_id}] push de un agente no permitido: descartado")
+            self._abort_run(run_id)
+            await self._orchestrator.abort(session_key)
+            return
         if not self._config.push_enabled:
             return  # el push entero se descarta; su fin no encuentra push abierto
         while True:

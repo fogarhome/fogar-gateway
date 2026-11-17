@@ -177,6 +177,11 @@ async def gateway_websocket(websocket: WebSocket):
         gateway_stats.handshake_rejected("invalid_key")
         await send_close(websocket, Close.INVALID_CREDENTIAL)
         return
+    except ValueError as e:
+        # C-r7-2: fila con `allowed_agents` corrupto (editada a mano): solo el tipo, nunca el valor.
+        logger.error(f"request_id={request_id} Configuración del cliente ilegible: {describe_error(e)}")
+        await send_close(websocket, Close.SETUP_FAILED)
+        return
     # La credencial ya no hace falta: la sesión guarda el handshake sin el admin_token.
     handshake = handshake.model_copy(update={"admin_token": None})
 
