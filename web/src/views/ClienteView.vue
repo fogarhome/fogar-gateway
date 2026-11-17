@@ -93,9 +93,9 @@ const trabajando = ref(false)
 async function rotar(): Promise<void> {
   trabajando.value = true
   try {
-    const r = await rotateClientKey(id.value)
-    claveNueva.value = r.client_key
-    cliente.value = r
+    const { client_key, ...resto } = await rotateClientKey(id.value)
+    claveNueva.value = client_key
+    cliente.value = resto // sin la clave: solo vive en claveNueva mientras se enseña
     void clients.refresh()
   } catch {
     toast('bad', 'No he podido rotar la clave', 'La clave de antes sigue valiendo.')

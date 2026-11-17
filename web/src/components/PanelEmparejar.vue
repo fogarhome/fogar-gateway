@@ -7,21 +7,42 @@ import FgBoton from './FgBoton.vue'
 
 // Emparejar un aparato: abre un código de 6 cifras (10 min, un solo uso) y espera a que el aparato lo
 // canjee. El código solo vive aquí: no se guarda ni se registra. Al cerrar el panel, se anula.
+// La cuenta atrás va desde que llega el código, no contra `expires_at`: el reloj del navegador puede
+// ir desfasado. 600 s es CODE_TTL_S de services/pairing.py (el servidor no manda la duración).
+const DURACION_MS = 600_000
 const emit = defineEmits<{ cerrar: []; emparejado: [clientId: string, nombre: string | null] }>()
 
 const abierto = shallowRef<PairingOpened | null>(null)
 const estado = ref<PairingState | 'abriendo' | 'error'>('abriendo')
 const error = ref('')
 const ahora = ref(Date.now())
+let recibido = 0
+let fuera = false // el panel ya se cerró o se desmontó
 let sondeo: ReturnType<typeof setInterval> | undefined
 let reloj: ReturnType<typeof setInterval> | undefined
 
+/** Anula el código recibido salvo que ya se haya usado: aunque aquí parezca caducado, puede seguir abierto. */
+function anular(): void {
+  const p = abierto.value
+  abierto.value = null
+  if (p && estado.value !== 'used') void cancelPairing(p.id).catch(() => undefined)
+}
+
 async function abrir(): Promise<void> {
+  anular() // «Otro código» no deja el anterior abierto
   estado.value = 'abriendo'
   try {
-    abierto.value = await openPairing()
+    const p = await openPairing()
+    if (fuera) {
+      void cancelPairing(p.id).catch(() => undefined)
+      return
+    }
+    abierto.value = p
+    recibido = Date.now()
+    ahora.value = recibido
     estado.value = 'open'
   } catch (e) {
+    if (fuera) return
     estado.value = 'error'
     error.value =
       e instanceof ApiError && e.kind === 'conflict'
@@ -45,7 +66,7 @@ async function comprobar(): Promise<void> {
 const restante = computed(() => {
   const p = abierto.value
   if (!p) return 0
-  return Math.max(0, Math.round((Date.parse(p.expires_at) - ahora.value) / 1000))
+  return Math.max(0, Math.round((recibido + DURACION_MS - ahora.value) / 1000))
 })
 const cuenta = computed(() => `${Math.floor(restante.value / 60)}:${String(restante.value % 60).padStart(2, '0')}`)
 const progreso = computed(() => `${Math.min(100, (restante.value / 600) * 100)}%`)
@@ -53,9 +74,8 @@ const codigo = computed(() => abierto.value?.code ?? '')
 const codigoVisible = computed(() => `${codigo.value.slice(0, 3)} ${codigo.value.slice(3)}`)
 
 async function cerrar(): Promise<void> {
-  const p = abierto.value
-  if (p && estado.value === 'open') void cancelPairing(p.id).catch(() => undefined)
-  abierto.value = null
+  fuera = true
+  anular()
   emit('cerrar')
 }
 
@@ -70,8 +90,8 @@ onMounted(() => {
 onBeforeUnmount(() => {
   clearInterval(sondeo)
   clearInterval(reloj)
-  const p = abierto.value
-  if (p && estado.value === 'open') void cancelPairing(p.id).catch(() => undefined)
+  fuera = true
+  anular()
 })
 </script>
 

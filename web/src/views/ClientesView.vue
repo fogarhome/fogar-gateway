@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, shallowRef } from 'vue'
-import { useRouter } from 'vue-router'
+import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { createClient } from '@/api/admin'
 import { ApiError } from '@/api/http'
 import type { ClientType, ClientWithKey } from '@/api/types'
@@ -83,6 +83,7 @@ function claveCopiada() {
   nuevoTipo.value = ''
   if (id) void router.push(`/clientes/${encodeURIComponent(id)}`)
 }
+onBeforeRouteLeave(() => (creado.value ? window.confirm('La clave nueva no se vuelve a enseñar. ¿Salir sin copiarla?') : true))
 function emparejado(clientId: string, nombre: string | null) {
   toast('ok', `${nombre ?? 'El aparato'} ya habla con Fogar`, 'Revisa sus ajustes si quieres cambiarlos.')
   panel.value = null
@@ -98,8 +99,8 @@ function emparejado(clientId: string, nombre: string | null) {
         <h1 class="fg-h1">{{ titulo }}</h1>
         <p class="fg-sub">Cada uno entra con su propia clave. Para añadir otro, empareja con un código; no hace falta copiar claves.</p>
       </div>
-      <FgBoton :disabled="!!creado" @click="panel = 'crear'">Crear a mano</FgBoton>
-      <FgBoton variante="principal" icono="mas" :disabled="!!creado" @click="panel = 'emparejar'">Emparejar un aparato</FgBoton>
+      <FgBoton :disabled="!!creado || creando" @click="panel = 'crear'">Crear a mano</FgBoton>
+      <FgBoton variante="principal" icono="mas" :disabled="!!creado || creando" @click="panel = 'emparejar'">Emparejar un aparato</FgBoton>
     </header>
 
     <div class="cuerpo">
@@ -171,7 +172,7 @@ function emparejado(clientId: string, nombre: string | null) {
           </div>
           <div class="acciones">
             <FgBoton type="submit" variante="principal" :ocupado="creando">Crear y ver la clave</FgBoton>
-            <FgBoton @click="panel = null">Cancelar</FgBoton>
+            <FgBoton :disabled="creando" @click="panel = null">Cancelar</FgBoton>
           </div>
         </form>
       </aside>
