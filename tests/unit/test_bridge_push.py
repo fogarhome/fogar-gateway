@@ -170,6 +170,20 @@ async def test_push_of_another_conversation_while_one_is_open_is_dropped(make_pu
     ev("turn_end", sk_b, "rb2")
     await bridge.push_idle()
     assert [m["type"] for m in (await sent(bridge))[4:]] == ["turn_start", "token", "turn_end"]
+    bridge.orchestrator.abort.assert_not_awaited()  # otra conversación: no es nuestra para abortar
+
+
+async def test_own_conversation_push_dropped_under_another_is_aborted(make_push_bridge):
+    """R-1 (revisión de C-r8-1): push abierto de otra conversación y llega uno de la propia:
+    se descarta y se para en OpenClaw, para que un `send` no se pliegue en su run (#219)."""
+    bridge, _ = make_push_bridge(output_mode=("text",))
+    sk_other = "agent:main:hab_sito:ayer"
+    bridge.enqueue_push("turn_start", sk_other, "ra")
+    bridge.enqueue_push("turn_start", SK, "rb")
+    bridge.enqueue_push("turn_end", sk_other, "ra")
+    await bridge.push_idle()
+    bridge.orchestrator.abort.assert_awaited_once_with(SK)
+    assert [m["type"] for m in await sent(bridge)] == ["turn_start", "turn_end"]
 
 
 async def test_revalidation_refreshes_allowed_agents_for_pushes(make_push_bridge, monkeypatch):

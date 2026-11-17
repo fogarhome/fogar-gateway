@@ -848,6 +848,10 @@ class TurnController:
                     # (su texto y su fin irían al push abierto y lo cortarían).
                     logger.info(f"[{self._client_id}] push de otra conversación: descartado")
                     self._abort_run(run_id)
+                    # En la clave propia se para también en OpenClaw: con su run fuera de
+                    # _active_runs, un `send` no lo abortaría y se plegaría en él (#219).
+                    if self._may_abort(session_key):
+                        await self._orchestrator.abort(session_key)
                     return
                 if self._push is not None:
                     # #84: los `agent start` intermedios (tool use, varios pasos) no abren
