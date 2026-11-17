@@ -1,5 +1,7 @@
+import asyncio
 import logging
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
@@ -9,6 +11,7 @@ from fogar_gateway.core.logging import pin_websockets_logging
 from fogar_gateway.services.speech.elevenlabs.common import (
     classify_close,
     classify_exception,
+    close_ws,
     ws_url,
 )
 from fogar_gateway.services.speech.factory import build_tts_provider
@@ -85,3 +88,21 @@ def test_factory_builds_elevenlabs_tts_and_stt():
     assert build_stt_provider(s, "elevenlabs").name == "elevenlabs"
     with pytest.raises(ValueError, match="no soportado"):
         build_stt_provider(s, "nope")
+
+
+async def test_close_ws_aborts_a_socket_that_does_not_close_in_time(monkeypatch):
+    """E-r8-3: si ws.close() no termina en CLOSE_GRACE_S se aborta el transporte."""
+    from fogar_gateway.services.speech.elevenlabs import common
+
+    monkeypatch.setattr(common, "CLOSE_GRACE_S", 0.01)
+
+    class WS:
+        state = None
+        transport = MagicMock()
+
+        async def close(self):
+            await asyncio.sleep(3600)
+
+    ws = WS()
+    await close_ws(ws)
+    ws.transport.abort.assert_called_once()

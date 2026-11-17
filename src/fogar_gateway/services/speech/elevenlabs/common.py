@@ -16,6 +16,7 @@ from typing import Literal
 from urllib.parse import quote, urlencode
 
 from websockets.exceptions import ConnectionClosed, InvalidStatus
+from websockets.protocol import State
 
 from fogar_gateway.core.logging import pin_websockets_logging
 from fogar_gateway.services.reconnection import describe_error
@@ -55,6 +56,10 @@ async def close_ws(ws) -> None:
         await asyncio.wait_for(ws.close(), CLOSE_GRACE_S)
     except Exception as e:  # noqa: BLE001 — limpieza; incluye TimeoutError
         logger.debug("ElevenLabs: cierre del socket falló (%s)", describe_error(e))
+    finally:
+        # E-r8-3: wait_for solo cancela close(); sin abort el socket seguiría abierto.
+        if ws.state is not State.CLOSED:
+            ws.transport.abort()
 
 
 async def json_messages(ws) -> AsyncIterator[dict]:

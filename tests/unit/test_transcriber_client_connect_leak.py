@@ -49,7 +49,7 @@ async def test_connect_closes_socket_when_handshake_fails():
         recv_payloads=[json.dumps({"type": "error", "code": "auth_failed", "message": "bad token"})]
     )
 
-    with patch("websockets.connect", side_effect=lambda url: fake_ws):
+    with patch("websockets.connect", side_effect=lambda url, **k: fake_ws):
         with pytest.raises(Exception) as exc_info:
             await TranscriberClient(url="test:1", client_id="c1").connect()
 
@@ -66,7 +66,7 @@ async def test_connect_times_out_and_closes_socket_when_ready_never_arrives(monk
     monkeypatch.setattr(settings, "TRANSCRIBER_READY_TIMEOUT_S", 0.05)
     fake_ws = FakeSocket()  # recv() blocks forever
 
-    with patch("websockets.connect", side_effect=lambda url: fake_ws):
+    with patch("websockets.connect", side_effect=lambda url, **k: fake_ws):
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(
                 TranscriberClient(url="test:1", client_id="c1").connect(), timeout=2.0
@@ -82,7 +82,7 @@ async def test_connect_succeeds_when_ready_arrives_in_time(monkeypatch):
     monkeypatch.setattr(settings, "TRANSCRIBER_READY_TIMEOUT_S", 1.0)
     fake_ws = FakeSocket(recv_payloads=[json.dumps({"type": "ready", "session_id": "s1"})])
 
-    with patch("websockets.connect", side_effect=lambda url: fake_ws):
+    with patch("websockets.connect", side_effect=lambda url, **k: fake_ws):
         client = TranscriberClient(url="test:1", client_id="c1")
         await client.connect()
 
@@ -95,7 +95,7 @@ async def test_connect_cancelled_closes_socket():
     """#221: si cancelan connect() con el socket ya abierto, el socket se cierra."""
     fake_ws = FakeSocket()  # recv() se queda esperando `ready`
 
-    with patch("websockets.connect", side_effect=lambda url: fake_ws):
+    with patch("websockets.connect", side_effect=lambda url, **k: fake_ws):
         client = TranscriberClient(url="test:1", client_id="c1")
         task = asyncio.create_task(client.connect())
         while not fake_ws.sent_frames:

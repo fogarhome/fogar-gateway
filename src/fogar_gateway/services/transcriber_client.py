@@ -60,7 +60,8 @@ class TranscriberClient:
         ok = False
         self.closed_after_end = False  # _end_sent baja con el `ready`: hasta entonces se retiene el audio
         try:
-            self.ws = await websockets.connect(f"ws://{self.url}/api/stt")
+            # E-r8-1: close_timeout=1 (no los 10 s por defecto) en el cierre tras un connect fallido.
+            self.ws = await websockets.connect(f"ws://{self.url}/api/stt", close_timeout=1)
 
             config = TranscriberConfig(language=language, token=token, vad_thold=vad_thold)
             logger.info(
@@ -212,16 +213,17 @@ class TranscriberClient:
     async def close(self):
         self._closing = True
         self._is_ready = False
-        if self.ws:
+        ws = self.ws  # E-r8-2: un connect cancelado lo pone a None mientras se espera
+        if ws:
             # `websockets.asyncio` has no `.closed` (G-01, #214): close() is idempotent,
             # so no state check is needed. A failure is logged (type only), never swallowed.
             try:
-                await self.ws.close()
+                await ws.close()
             except Exception as e:  # noqa: BLE001 — limpieza: el fallo se registra
                 logger.warning(
                     f"[{self.client_id}] Transcriber close falló ({type(e).__name__})"
                 )
             finally:
                 # A-r7-1: cancelado esperando a un peer que no lee, el socket no queda abierto.
-                if self.ws.state is not State.CLOSED:
-                    self.ws.transport.abort()
+                if ws.state is not State.CLOSED:
+                    ws.transport.abort()
