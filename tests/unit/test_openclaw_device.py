@@ -191,8 +191,11 @@ def test_device_token_is_kept_per_openclaw_address(store):
     assert "devtok-SECRET" not in repr(stored)
     assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
     assert store.load_or_create() == identity  # guardar el token no toca la clave
-    assert store.clear_token("127.0.0.1:18789") is False
-    assert store.clear_token("10.0.0.5:18789") is True
+    assert store.clear_token("127.0.0.1:18789", "devtok-SECRET") is False
+    # B-r6-3: otro token (uno más nuevo guardado por otro proceso) no se borra
+    assert store.clear_token("10.0.0.5:18789", "devtok-OLD") is False
+    assert store.token_for("10.0.0.5:18789") is not None
+    assert store.clear_token("10.0.0.5:18789", "devtok-SECRET") is True
     assert store.token_for("10.0.0.5:18789") is None
 
 
@@ -345,7 +348,7 @@ def test_two_writer_processes_never_lose_the_identity(store):
         "s = DeviceStore(Path(sys.argv[1]))\n"
         "for i in range(40):\n"
         "    s.save_token(sys.argv[2], f'tok-{i}', ['operator.read'])\n"
-        "    s.clear_token(sys.argv[2])\n"
+        "    s.clear_token(sys.argv[2], f'tok-{i}')\n"
         "s.save_token(sys.argv[2], 'final', ['operator.read'])\n"
     )
     procs = [subprocess.Popen([sys.executable, "-c", code, str(store.path), gw])

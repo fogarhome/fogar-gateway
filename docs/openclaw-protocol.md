@@ -548,6 +548,9 @@ Observed/decided while hardening the gateway's boundary with OpenClaw (audit G-0
   text is compared and emitted, after joining the halves; a high surrogate at the end waits for
   its pair. A binary frame (OpenClaw sends text) is always cleaned the same way, since a raw
   surrogate there carries no `\ud` escape (C-r4-1); its encoding is left to `json.loads`.
+  A frame whose routing would change by cleaning (the frame `id`, `payload.sessionKey`,
+  `runId` or `runIds`) or whose `payload` stops being an object (a key that collides once
+  cleaned, `"payload\ud800"`) is dropped instead (audit 3.0 r5/r6, B-r5-1, B-r6-1, B-r6-2).
 
 ---
 
@@ -839,8 +842,9 @@ runs; file I/O runs in `asyncio.to_thread`, with one read per connect (identity 
 `fogar-gw migrate --from-docker` copies it from `DIR/data/` when present (read-only source, 0600,
 never over an existing one). Every challenge with a nonce is signed. A stored token for the
 configured `OPENCLAW_HOST:OPENCLAW_PORT` is preferred over `OPENCLAW_TOKEN`; on
-`AUTH_DEVICE_TOKEN_MISMATCH`/`AUTH_SCOPE_MISMATCH` the gateway drops it and retries once, on a new
-socket, with the shared token. **`fogar-gw onboard` never uses the stored device token**
+`AUTH_DEVICE_TOKEN_MISMATCH`/`AUTH_SCOPE_MISMATCH` the gateway drops it (only if the file still
+holds that same token: a newer one another process saved meanwhile is kept; audit 3.0 r6, B-r6-3)
+and retries once, on a new socket, with the shared token. **`fogar-gw onboard` never uses the stored device token**
 (`OpenClawClient(use_device_token=False)`): it tests the token that was pasted, still signing so
 pairing is detected.
 
@@ -965,6 +969,9 @@ The gateway uses them only through `OpenClawClient.request`, which refuses any m
 
 ## Change log of this file
 
+- **2026-11-17**: lone surrogates: a frame whose `id` or `payload.runIds` would change by cleaning,
+  or whose `payload` would stop being an object, is dropped; a rejected device token is deleted
+  only if it is still the stored one (audit 3.0 r6, B-r6-1..3).
 - **2026-11-16**: lone surrogates: the halves of an emoji split between two `chat` deltas are
   joined before cleaning; binary frames are always cleaned (audit 3.0 r4, B-r4-1, C-r4-1).
 - **2026-11-16**: "Frame size, malformed frames and connection end" gains lone surrogates

@@ -356,14 +356,15 @@ class DeviceStore:
             self._put_token(data, gateway, token, new, role)
             return "scopes_updated"
 
-    def clear_token(self, gateway: str) -> bool:
-        """Borra el token de `gateway` (si es el guardado). True si había uno."""
+    def clear_token(self, gateway: str, token: str) -> bool:
+        """Borra el token `token` de `gateway` si sigue siendo el guardado. True si lo borró.
+        B-r6-3: uno distinto es más nuevo (otro proceso, p. ej. `onboard`) y se conserva."""
         with self._locked():
             data = self._read()
             if data is None:
                 return False
             stored = _token_from_record(data.get("device_token"))
-            if stored is None or stored.gateway != gateway:
+            if stored is None or stored.gateway != gateway or stored.token != token:
                 return False
             DeviceIdentity.from_record(data)
             del data["device_token"]

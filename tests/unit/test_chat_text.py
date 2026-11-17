@@ -295,6 +295,34 @@ def test_loads_frame_drops_a_frame_whose_routing_key_would_change(key, event):
         _loads_frame(json.dumps({"type": "event", "event": event, "payload": payload}))
 
 
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"type": "res", "id": "q\ud800", "ok": True, "payload": {"status": "ok"}},
+        {"type": "res", "id": "q", "ok": True, "payload": {"runIds": ["r\ud800"]}},
+    ],
+)
+def test_loads_frame_drops_a_frame_whose_id_or_run_ids_would_change(frame):
+    """B-r6-1: el `id` de la trama y `payload.runIds` también enrutan: si limpiarlos los
+    cambiaría, la trama se descarta como con sessionKey/runId."""
+    import json
+
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    with pytest.raises(ValueError):
+        _loads_frame(json.dumps(frame))
+
+
+def test_loads_frame_rejects_a_payload_that_stops_being_an_object():
+    """B-r6-2: "payload" + surrogate suelto, limpio, choca con "payload" y puede dejar un payload no dict:
+    ValueError (la vía que _recv_matching y _listen saltan), no AttributeError."""
+    from fogar_gateway.services.openclaw.client import _loads_frame
+
+    raw = '{"type": "res", "id": "q", "payload": {"ok": 1}, "payload\\ud800": "x"}'
+    with pytest.raises(ValueError):
+        _loads_frame(raw)
+
+
 def test_loads_frame_binary_chat_keeps_text_halves():
     """B-r5-3: trama binaria (utf-16 con surrogates crudos): deltaText conserva la mitad para
     ChatTextTracker, el resto se limpia y una sessionKey con surrogate descarta la trama."""

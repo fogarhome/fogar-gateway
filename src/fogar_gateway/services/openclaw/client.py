@@ -244,16 +244,27 @@ def _loads_frame(raw: str | bytes):
     payload = frame.get("payload") if isinstance(frame, dict) else None
     if not isinstance(payload, dict):
         return without_lone_surrogates(frame)
-    routing = [payload.get(k) for k in _ROUTING_KEYS]
+    routing = _routing(frame, payload)
     text = {}
     if frame.get("event") == "chat":
         text = {k: payload.pop(k) for k in ("deltaText", "message") if k in payload}
     frame = without_lone_surrogates(frame)
-    # B-r5-1: una clave limpiada sería la de otra sesión; la trama se descarta (_listen).
-    if [frame["payload"].get(k) for k in _ROUTING_KEYS] != routing:
+    payload = frame.get("payload")
+    # B-r6-2: una clave que choca al limpiar ("payload\ud800") puede dejar un payload no dict.
+    if not isinstance(payload, dict):
+        raise ValueError("lone surrogate in a frame key")
+    # B-r5-1, B-r6-1: una clave limpiada sería la de otra sesión, turno o petición; la trama
+    # se descarta (_listen).
+    if _routing(frame, payload) != routing:
         raise ValueError("lone surrogate in a routing key")
-    frame["payload"].update(text)
+    payload.update(text)
     return frame
+
+
+def _routing(frame: dict, payload: dict) -> list:
+    """Lo que enruta una trama: su `id` (respuesta a una petición) y las claves de sesión y
+    turno del payload (`runIds`: los turnos que cortó un `chat.abort`)."""
+    return [frame.get("id"), payload.get("runIds"), *(payload.get(k) for k in _ROUTING_KEYS)]
 
 
 _ROUTING_KEYS = ("sessionKey", "runId")
@@ -390,7 +401,7 @@ class OpenClawClient:
                 details = error.get("details") if isinstance(error, dict) else None
                 detail_code = _safe_error_code(details)
                 if rejected and plan.method == "device_token" and detail_code in _DEVICE_TOKEN_REJECTED:
-                    await self._forget_device_token(detail_code)
+                    await self._forget_device_token(detail_code, plan.token)
                     raise _DeviceTokenRejected()
                 if rejected and detail_code in _IDENTITY_REQUIRED and plan.device is None:
                     cause = plan.identity_error or "challenge_without_nonce"
@@ -543,14 +554,14 @@ class OpenClawClient:
         self.access.device_id = identity.device_id
         return identity, stored
 
-    async def _forget_device_token(self, detail_code: str) -> None:
+    async def _forget_device_token(self, detail_code: str, token: str) -> None:
         logger.warning(
             "OpenClaw rechazó el token de dispositivo (detail=%s): se borra y se reintenta con "
             "el token compartido",
             detail_code,
         )
         try:
-            await asyncio.to_thread(self._device_store.clear_token, self._gateway)
+            await asyncio.to_thread(self._device_store.clear_token, self._gateway, token)
         except (DeviceFileError, OSError) as e:
             logger.warning(
                 "OpenClaw: no se pudo borrar el token de dispositivo (%s)", describe_error(e)
