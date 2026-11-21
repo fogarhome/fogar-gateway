@@ -199,6 +199,25 @@ class PairRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Sesión de usuario (M20)
+# ---------------------------------------------------------------------------
+
+# Una capacidad del dispositivo (pantalla, micrófono…): se guarda y se enseña, aún no decide nada.
+Capability = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$")]
+Capabilities = Annotated[list[Capability], Field(max_length=32)]
+
+
+class LoginRequest(BaseModel):
+    """`POST /auth/login`: la cuenta y el dispositivo que inicia sesión (pasa a ser personal)."""
+
+    username: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
+    password: Annotated[str, StringConstraints(min_length=1, max_length=1024)]
+    device_name: _Name
+    client_type: ClientType | None = None
+    capabilities: Capabilities | None = None
+
+
+# ---------------------------------------------------------------------------
 # Conversaciones (M19)
 # ---------------------------------------------------------------------------
 

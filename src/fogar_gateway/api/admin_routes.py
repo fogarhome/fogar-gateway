@@ -117,7 +117,12 @@ def list_clients(session: Session = Depends(get_db_session)) -> list[ClientRespo
 
 
 def create_client_record(
-    session: Session, body: ClientCreate, *, client_id: str | None = None
+    session: Session,
+    body: ClientCreate,
+    *,
+    client_id: str | None = None,
+    user_id: str | None = None,
+    capabilities: list[str] | None = None,
 ) -> ClientRecord:
     """Crea el cliente: la única vía, la usan `POST /admin/clients`, el emparejamiento (#317) y
     el cliente «Panel web» (M19, el único con `client_id` fijo). Guarda solo el hash de
@@ -125,6 +130,8 @@ def create_client_record(
     _check_agent_consistency(body.default_agent, body.allowed_agents)
     data = _lists_to_json(body.model_dump())
     data["key_hash"] = hash_key(data.pop("client_key") or new_key())
+    data["user_id"] = user_id  # M20: con usuario, un dispositivo personal (un inicio de sesión)
+    data["capabilities"] = json.dumps(capabilities) if capabilities is not None else None
     if client_id is not None:
         data["id"] = client_id
     record = ClientRecord(**data)
@@ -236,21 +243,31 @@ def update_client(
     return ClientResponse.from_record(rec)
 
 
-def _retire_client_record(client_id: str) -> None:
+def retire_client(session: Session, rec: ClientRecord) -> None:
     """Retirar, no borrar (M20): sus conversaciones conservan hogar y dispositivo. La clave pasa
-    a un valor que nadie conoce, así que su sesión cae con 4200 en la siguiente revalidación."""
+    a un valor que nadie conoce. Sus sesiones vivas las corta `close_client_sessions`."""
+    rec.retired_at = datetime.now(UTC)
+    rec.is_active = False
+    rec.key_hash = hash_key(new_key())  # nadie conoce la clave: ya no vale
+    session.add(rec)
+    session.commit()
+
+
+def close_client_sessions(app: FastAPI, client_id: str) -> None:
+    """Cierra ya (4200) las sesiones vivas de un cliente, sin esperar a la revalidación."""
+    for bridge in app.state.client_registry.for_client(client_id):
+        bridge.revoke()
+
+
+def _retire_client_record(client_id: str) -> None:
     with Session(get_engine()) as session:
-        rec = _get_or_404(session, client_id)
-        rec.retired_at = datetime.now(UTC)
-        rec.is_active = False
-        rec.key_hash = hash_key(new_key())  # nadie conoce la clave: ya no vale
-        session.add(rec)
-        session.commit()
+        retire_client(session, _get_or_404(session, client_id))
 
 
 @router.delete("/clients/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_client(client_id: str) -> None:
+async def delete_client(client_id: str, request: Request) -> None:
     await asyncio.to_thread(_retire_client_record, client_id)
+    close_client_sessions(request.app, client_id)
 
 
 @router.post("/clients/{client_id}/rotate-key", response_model=ClientWithKey)

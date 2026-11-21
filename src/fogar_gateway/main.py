@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 
 from fogar_gateway import paths
 from fogar_gateway.api.admin_routes import router as admin_router
+from fogar_gateway.api.auth_routes import router as auth_router
 from fogar_gateway.api.conversation_routes import router as conversation_router
 from fogar_gateway.api.health_routes import router as health_router
 from fogar_gateway.api.openai_routes import router as openai_router
@@ -33,6 +34,7 @@ from fogar_gateway.core.startup_checks import (
 )
 from fogar_gateway.core.transport import TransportCaptureMiddleware
 from fogar_gateway.db.database import dispose_engine, require_database, run_migrations
+from fogar_gateway.services.auth import LoginLimiter
 from fogar_gateway.services.conversations import ConversationService, LegacyImport, TitleCache
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
@@ -190,6 +192,7 @@ async def _lifespan_body(app: FastAPI):
     app.state.legacy_import = legacy_import
     app.state.session_registry = SessionRegistry()
     app.state.pairing = PairingStore()  # códigos de emparejamiento, en memoria (#317)
+    app.state.login_limiter = LoginLimiter()  # intentos de inicio de sesión, en memoria (M20)
 
     try:
         yield
@@ -262,6 +265,7 @@ app.include_router(stream_router)  # WS /ws/stream
 app.include_router(openai_router)  # HTTP /v1/*
 app.include_router(health_router)  # HTTP /healthz, /ready
 app.include_router(admin_router)  # HTTP /admin/*
+app.include_router(auth_router)  # HTTP /auth/* (M20)
 app.include_router(conversation_router)  # HTTP /admin/conversations
 app.include_router(pairing_public_router)  # HTTP /.well-known/fogar-gateway, /pair
 app.include_router(pairing_admin_router)  # HTTP /admin/pairing

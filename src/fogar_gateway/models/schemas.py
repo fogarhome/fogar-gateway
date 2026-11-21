@@ -19,6 +19,8 @@ class Client(BaseModel):
     key_hash: str  # nunca la clave: solo su hash (M20), con el que se revalida la sesión
     is_active: bool
     name: str = ""
+    user_id: str | None = None  # M20: None = dispositivo del hogar; con valor, personal
+    home_id: str = "home"
 
     model_config = ConfigDict(extra="allow")
 

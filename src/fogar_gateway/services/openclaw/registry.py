@@ -437,6 +437,10 @@ class ClientRegistry:
         # que aún no se importó (OpenClaw estaba caído al arrancar).
         return self.get(client_id_from_session_key(session_key))
 
+    def for_client(self, client_id: str) -> list[Any]:
+        """Las sesiones vivas de un cliente (una copia)."""
+        return list(self._clients.get(client_id, ()))
+
     def bridges(self) -> list[Any]:
         return [b for live in self._clients.values() for b in live]
 

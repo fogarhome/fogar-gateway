@@ -91,6 +91,8 @@ class DbClient:
         client = Client(
             id=record.id,
             key_hash=record.key_hash,
+            user_id=record.user_id,
+            home_id=record.home_id,
             is_active=record.is_active,
             name=record.name,
         )
