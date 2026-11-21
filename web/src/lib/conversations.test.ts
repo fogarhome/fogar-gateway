@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { canWrite, conversationKind, conversationTitle } from './conversations'
+import { canWrite, conversationKind, conversationScope, conversationTitle } from './conversations'
 
 const now = new Date(2026, 10, 14, 12)
 const base = { title: null, kind: 'created', day: null, created_at: new Date(2026, 10, 12, 9).toISOString() }
@@ -22,7 +22,9 @@ describe('conversationKind y canWrite', () => {
     expect([conversationKind('default'), conversationKind('legacy'), conversationKind('created')]).toEqual(['diaria', 'de antes', null])
   })
   it('el panel escribe solo en las suyas', () => {
-    expect(canWrite({ client_id: 'panel-web' })).toBe(true)
-    expect(canWrite({ client_id: 'tele-salon' })).toBe(false)
+    expect(canWrite({ client_id: 'mi-navegador' }, 'mi-navegador')).toBe(true)
+    expect(canWrite({ client_id: 'tele-salon' }, 'mi-navegador')).toBe(false)
+    expect(canWrite({ client_id: 'mi-navegador' }, null)).toBe(false)
+    expect([conversationScope({ owner_user_id: 'u1' }), conversationScope({ owner_user_id: null })]).toEqual(['privada', 'del hogar'])
   })
 })

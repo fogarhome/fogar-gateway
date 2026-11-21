@@ -6,38 +6,58 @@ import FgBoton from '@/components/FgBoton.vue'
 import FgCampo from '@/components/FgCampo.vue'
 import FondoVivo from '@/components/FondoVivo.vue'
 import LineaViva from '@/components/LineaViva.vue'
-import { useSessionStore } from '@/stores/session'
+import { deviceName } from '@/lib/device'
+import { type SessionUser, useSessionStore } from '@/stores/session'
 
+// Cada persona entra con su cuenta (4.0). Este navegador pasa a ser uno de sus dispositivos.
 const router = useRouter()
 const session = useSessionStore()
 
-const token = ref('')
+const usuario = ref('')
+const clave = ref('')
 const recordar = ref(false)
 const error = ref<string | null>(null)
 const ocupado = ref(false)
 
 const MENSAJES: Partial<Record<ApiError['kind'], string>> = {
-  unauthorized: 'Ese token no vale. Revísalo y vuelve a probar.',
-  'not-configured': 'El gateway no tiene token de administrador. Ponlo con «fogar-gw config set ADMIN_TOKEN» y reinícialo.',
+  unauthorized: 'Usuario o contraseña incorrectos.',
+  forbidden:
+    'Sin HTTPS no se envía una contraseña desde la red de casa: iría en claro. Entra por HTTPS (fogar-gw access setup) o desde la tailnet.',
+  'too-many': 'Demasiados intentos. Espera un poco y vuelve a probar.',
   network: 'No llego al gateway. Comprueba que está encendido y en esta dirección.',
 }
 
+interface Login {
+  client_id: string
+  client_key: string
+  user: SessionUser
+}
+
 async function entrar(): Promise<void> {
-  const valor = token.value.trim()
   if (ocupado.value) return
-  if (!valor) {
-    error.value = 'Escribe el token de administrador.'
+  if (!usuario.value.trim() || !clave.value) {
+    error.value = 'Escribe tu usuario y tu contraseña.'
     return
   }
   ocupado.value = true
   error.value = null
   try {
-    // Cualquier lectura de /admin sirve para comprobar el token antes de guardarlo.
-    await api('/admin/state', { token: valor })
-    session.signIn(valor, recordar.value)
-    await router.replace('/')
+    const r = await api<Login>('/auth/login', {
+      token: null,
+      method: 'POST',
+      body: JSON.stringify({
+        username: usuario.value.trim(),
+        password: clave.value,
+        device_name: deviceName(navigator.userAgent),
+        client_type: 'web',
+        capabilities: ['screen'],
+      }),
+    })
+    clave.value = ''
+    session.signIn(r.client_key, r.client_id, r.user, recordar.value)
+    await router.replace(session.isAdmin ? '/' : '/conversaciones')
   } catch (e) {
-    error.value = (e instanceof ApiError && MENSAJES[e.kind]) || 'Algo ha fallado al conectar. Prueba otra vez.'
+    error.value = (e instanceof ApiError && MENSAJES[e.kind]) || 'Algo ha fallado al entrar. Prueba otra vez.'
   } finally {
     ocupado.value = false
   }
@@ -49,15 +69,19 @@ async function entrar(): Promise<void> {
     <section class="marca" aria-label="Fogar">
       <FondoVivo :calor="0.45" :humo="0.9" />
       <div class="linea"><LineaViva etiqueta="Fogar" /></div>
-      <p class="fg-suave lema">El gateway de tu casa. Desde aquí ves si todo responde y gestionas los aparatos que hablan con Fogar.</p>
+      <p class="fg-suave lema">El gateway de tu casa. Desde aquí hablas con Fogar y, si eres quien lo cuida, ves si todo responde.</p>
     </section>
     <main class="lado">
       <form novalidate @submit.prevent="entrar">
         <div class="intro">
-          <h1 class="fg-h1">Hola. Conectemos con tu gateway.</h1>
-          <p class="fg-suave">Pon el token de administrador. Lo ves en el gateway con <code>fogar-gw config get ADMIN_TOKEN</code>.</p>
+          <h1 class="fg-h1">Hola. Entra con tu cuenta.</h1>
+          <p class="fg-suave">
+            Cada persona de casa tiene la suya. ¿Aún no hay ninguna? Crea la del dueño en el gateway con
+            <code>fogar-gw users add NOMBRE --role owner</code>.
+          </p>
         </div>
-        <FgCampo v-model="token" etiqueta="Token de administrador" type="password" autocomplete="current-password" :error="error" />
+        <FgCampo v-model="usuario" etiqueta="Usuario" autocomplete="username" />
+        <FgCampo v-model="clave" etiqueta="Contraseña" type="password" autocomplete="current-password" :error="error" />
         <label class="recordar">
           <input v-model="recordar" type="checkbox" role="switch" />
           <span>Recordar en este navegador</span>

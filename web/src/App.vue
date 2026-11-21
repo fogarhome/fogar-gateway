@@ -5,7 +5,8 @@ import BarraLateral from './components/BarraLateral.vue'
 import FgAvisos from './components/FgAvisos.vue'
 import { useClientsStore } from './stores/clients'
 import { useLiveStore } from './stores/live'
-import { useSessionStore } from './stores/session'
+import { api, ApiError } from './api/http'
+import { type SessionUser, useSessionStore } from './stores/session'
 
 const route = useRoute()
 const router = useRouter()
@@ -16,14 +17,34 @@ const clients = useClientsStore()
 const isPublic = computed(() => Boolean(route.meta.public))
 const nombre = ref<string>()
 
-// El estado vivo arranca en cuanto hay token y se para al salir.
+// El estado vivo y los clientes, solo para quien cuida del hogar (dueño o administrador).
 watch(
-  () => session.token,
-  (token) => {
-    if (token) {
+  () => session.token && session.isAdmin,
+  (admin) => {
+    if (admin) {
       live.start(() => void router.replace('/conectar'))
       void clients.refresh()
     } else live.halt()
+  },
+  { immediate: true },
+)
+
+// Al abrir con una sesión guardada: quién soy ahora (el rol puede haber cambiado) y, si el
+// dispositivo se retiró o la persona se desactivó, otra vez a Conectar.
+watch(
+  () => session.token,
+  async (token) => {
+    if (!token) return
+    try {
+      const me = await api<{ user: SessionUser }>('/auth/me')
+      session.setUser(me.user)
+      if (route.meta.admin && !session.isAdmin) await router.replace('/conversaciones')
+    } catch (e) {
+      if (e instanceof ApiError && e.kind === 'unauthorized') {
+        session.signOut()
+        await router.replace('/conectar')
+      }
+    }
   },
   { immediate: true },
 )

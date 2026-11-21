@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Iconos de interfaz: SVG lineales de trazo 1,75 redondeado en currentColor (fogar-brand: «propuesto»).
 // Decorativos: el texto de al lado o el aria-label del botón dice qué son.
-export type IconoNombre = 'estado' | 'sesiones' | 'clientes' | 'menu' | 'mas' | 'buscar' | 'izquierda' | 'derecha' | 'cerrar' | 'copiar' | 'conversaciones' | 'enviar' | 'parar'
+export type IconoNombre = 'estado' | 'sesiones' | 'clientes' | 'menu' | 'mas' | 'buscar' | 'izquierda' | 'derecha' | 'cerrar' | 'copiar' | 'conversaciones' | 'enviar' | 'parar' | 'personas' | 'dispositivos'
 
 defineProps<{ nombre: IconoNombre; tam?: number }>()
 </script>
@@ -35,5 +35,7 @@ defineProps<{ nombre: IconoNombre; tam?: number }>()
     <path v-else-if="nombre === 'conversaciones'" d="M5 5h14a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-8l-4 3.5V16H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1z" />
     <path v-else-if="nombre === 'enviar'" d="M12 19V5M6 11l6-6 6 6" />
     <rect v-else-if="nombre === 'parar'" x="7" y="7" width="10" height="10" rx="2" />
+    <template v-else-if="nombre === 'personas'"><circle cx="9" cy="8" r="3.5" /><path d="M2.5 20c.6-3.6 3.2-6 6.5-6s5.9 2.4 6.5 6M16 4.6a3.5 3.5 0 0 1 0 6.8M18.5 14.4c1.7.9 2.8 2.9 3 5.6" /></template>
+    <template v-else-if="nombre === 'dispositivos'"><rect x="7" y="2.5" width="10" height="19" rx="2" /><path d="M11 18.5h2" /></template>
   </svg>
 </template>

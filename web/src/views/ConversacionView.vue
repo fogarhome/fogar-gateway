@@ -15,7 +15,7 @@ import { formatClock, formatRelative } from '@/lib/format'
 import { useConversationsStore } from '@/stores/conversations'
 import { useSessionStore } from '@/stores/session'
 
-// Una conversación: lo que se dijo (de OpenClaw) y, si es del panel, el chat en vivo para seguirla.
+// Una conversación: lo que se dijo (de OpenClaw) y, si se empezó en este navegador, el chat en vivo.
 // Las de otros aparatos solo se leen (M19).
 const route = useRoute()
 const conversations = useConversationsStore()
@@ -23,7 +23,7 @@ const session = useSessionStore()
 
 const id = computed(() => String(route.params.id ?? ''))
 const conv = computed(() => conversations.byId.get(id.value) ?? null)
-const escribible = computed(() => !!conv.value && canWrite(conv.value))
+const escribible = computed(() => !!conv.value && canWrite(conv.value, session.deviceId))
 const texto = ref('')
 
 // Lo dicho hasta ahora.
@@ -56,7 +56,7 @@ async function cargarHistoria(limit = 200): Promise<void> {
   }
 }
 
-// El chat en vivo, solo en las del panel.
+// El chat en vivo, solo en las de este navegador.
 const chat = shallowRef<ChatSession | null>(null)
 function cerrarChat(): void {
   chat.value?.dispose()
@@ -189,7 +189,7 @@ watch(firma, () => {
     </header>
 
     <p v-if="conv && !escribible" class="nota">
-      Solo lectura: es de «{{ conv.client_name }}». Desde el panel se escribe en sus propias conversaciones; empieza una en
+      Solo lectura: se empezó en «{{ conv.client_name }}», y escribir aquí cortaría a ese aparato. Empieza una tuya en
       <RouterLink to="/conversaciones">Conversaciones</RouterLink>.
     </p>
 
@@ -214,7 +214,7 @@ watch(firma, () => {
       <section v-if="estado.connection === 'elsewhere'" class="banner" role="status" aria-labelledby="h-fuera">
         <div>
           <h2 id="h-fuera" class="fg-h2">Abierta en otro sitio</h2>
-          <p class="fg-suave">Esta conversación está abierta en otra pestaña o ventana del panel, y allí sigue. Si la sigues aquí, se cierra allí.</p>
+          <p class="fg-suave">Esta conversación está abierta en otra pestaña o ventana, y allí sigue. Si la sigues aquí, se cierra allí.</p>
         </div>
         <FgBoton variante="principal" @click="seguirAqui">Seguir aquí</FgBoton>
       </section>

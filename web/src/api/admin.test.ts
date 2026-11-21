@@ -34,7 +34,7 @@ describe('conversaciones (M19)', () => {
   it('los errores llegan con su código estable', async () => {
     reply(503, { detail: 'orchestrator_unavailable' })
     await expect(getConversationMessages('x')).rejects.toMatchObject({ status: 503, message: 'orchestrator_unavailable' })
-    reply(409, { detail: 'panel_client_inactive' })
-    await expect(getConversationAgents()).rejects.toMatchObject({ kind: 'conflict', message: 'panel_client_inactive' })
+    reply(401, { detail: 'not_authenticated' })
+    await expect(getConversationAgents()).rejects.toMatchObject({ kind: 'unauthorized', message: 'not_authenticated' })
   })
 })

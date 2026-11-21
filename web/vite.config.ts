@@ -15,6 +15,8 @@ export default defineConfig({
   server: {
     proxy: {
       '/admin': { target, changeOrigin: true },
+      '/auth': { target, changeOrigin: true },
+      '/.well-known': { target, changeOrigin: true },
       '/ready': { target, changeOrigin: true },
       '/healthz': { target, changeOrigin: true },
       '/v1': { target, changeOrigin: true },

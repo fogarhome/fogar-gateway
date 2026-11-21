@@ -39,7 +39,7 @@ def _show_key(out: Out, data: dict[str, Any]) -> None:
 
 
 # Campos que devuelve el gateway pero no se editan.
-READ_ONLY = {"id", "key_fp", "created_at", "client_key"}
+READ_ONLY = {"id", "key_fp", "created_at", "client_key", "user_id", "capabilities", "last_seen_at"}
 
 
 def set_values(pairs: tuple[str, ...], fields: Iterable[str]) -> dict[str, Any]:

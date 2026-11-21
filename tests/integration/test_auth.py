@@ -63,6 +63,7 @@ def test_login_creates_a_personal_device_and_returns_its_token_once(http, db_eng
     assert device.user_id == users["sito"] and device.home_id == "home"
     assert device.key_hash == hash_key(body["client_key"])
     assert device.capabilities == '["screen", "mic"]' and device.client_type == "app"
+    assert device.last_seen_at is not None
 
 
 @pytest.mark.parametrize(

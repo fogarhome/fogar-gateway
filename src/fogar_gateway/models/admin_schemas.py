@@ -125,6 +125,10 @@ class ClientResponse(BaseModel):
     default_agent: str | None
     allowed_agents: list[str] | None
     created_at: datetime
+    # M20: de quién es (null = del hogar), qué sabe hacer y cuándo entró por última vez.
+    user_id: str | None = None
+    capabilities: list[str] | None = None
+    last_seen_at: datetime | None = None
     # Pipeline config
     stt_language: str
     stt_vad_thold: float
@@ -151,6 +155,9 @@ class ClientResponse(BaseModel):
             allowed_agents=[a.lower() for a in json.loads(r.allowed_agents)]
             if r.allowed_agents else None,
             created_at=r.created_at,
+            user_id=r.user_id,
+            capabilities=json.loads(r.capabilities) if r.capabilities else None,
+            last_seen_at=r.last_seen_at,
             stt_language=r.stt_language,
             stt_vad_thold=r.stt_vad_thold,
             tts_voice=r.tts_voice,

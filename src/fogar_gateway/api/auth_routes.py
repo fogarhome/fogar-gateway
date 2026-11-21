@@ -19,6 +19,7 @@ con `Retry-After`), `invalid_credentials` (401), `not_authenticated` (401).
 import asyncio
 import logging
 import math
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -111,6 +112,10 @@ def login(body: LoginRequest, request: Request) -> dict[str, Any]:
             user_id=user.id,
             capabilities=body.capabilities,
         )
+        device.last_seen_at = datetime.now(UTC)  # acaba de entrar
+        session.add(device)
+        session.commit()
+        session.refresh(device)
         home = session.get(HomeRecord, device.home_id)
         logger.info(
             "Inicio de sesión: usuario %s, dispositivo %s (fp=%s)",

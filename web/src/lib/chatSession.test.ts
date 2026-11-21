@@ -53,9 +53,9 @@ describe('createChatSession', () => {
   })
   afterEach(() => vi.useRealTimers())
 
-  it('entra con el token de administrador en su conversación, sin pedir agente', () => {
+  it('entra con el token de este navegador (su client_key) en su conversación, sin pedir agente', () => {
     const s = session()
-    expect(last().sent[0]).toEqual({ admin_token: 'secreto', input_mode: 'text', output_mode: ['text', 'status'], conversation: 'c1' })
+    expect(last().sent[0]).toEqual({ client_key: 'secreto', input_mode: 'text', output_mode: ['text', 'status'], conversation: 'c1' })
     expect(s.state.connection).toBe('ready')
     expect(s.state.agent).toBe('main')
   })
