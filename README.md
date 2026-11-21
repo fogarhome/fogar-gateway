@@ -5,7 +5,8 @@ La puerta de entrada de Fogar en casa. Un solo servicio que reconoce cada aparat
 - **Aparatos**: Fogar TV, el cliente de voz (Mac y Android), la app de iPhone y Home Assistant. Un aparato nuevo **descubre el gateway y se empareja con un código de 6 cifras**, sin copiar claves.
 - **Asistente**: los turnos de voz y texto van a [OpenClaw](docs/openclaw-protocol.md), que elige el agente y sus herramientas. El gateway lleva el turno de principio a fin: streaming, interrupciones (barge-in) y avisos que llegan sin preguntar (push).
 - **Voz**: transcripción (STT) y síntesis (TTS) con los servicios propios de Fogar, con ElevenLabs o desactivadas. Sin voz, el texto sigue funcionando.
-- **Administración**: un panel web en `/` (estado en vivo, conversaciones y chat con Fogar, sesiones y clientes) y la CLI `fogar-gw` (diagnóstico, configuración, servicio, logs y emparejamiento).
+- **Personas** (4.0): cada persona de casa entra con su cuenta. Lo que habla desde sus dispositivos es suyo; lo que se habla desde la tele o los altavoces es del hogar. Dueño, administradores y miembros, como en Home Assistant.
+- **Administración**: un panel web en `/` (estado en vivo, conversaciones y chat con Fogar, sesiones, clientes y personas) y la CLI `fogar-gw` (diagnóstico, configuración, servicio, logs, emparejamiento y personas).
 - **Instalación**: un comando instala, verifica OpenClaw y la voz contra los servicios reales, lo deja como servicio de usuario y te dice cómo llegar al panel: desde casa, por Tailscale o por tu propio dominio.
 
 ```
@@ -17,8 +18,8 @@ La puerta de entrada de Fogar en casa. Un solo servicio que reconoce cada aparat
   Home Assistant     ──┘ emparejan└── /v1/*           API compatible OpenAI ┘──► TTS: propio · ElevenLabs · off
 
   Tú, desde casa, Tailscale o tu dominio:
-    navegador ──► /           panel web (estado, conversaciones, sesiones, clientes)
-    terminal  ──► fogar-gw    CLI sobre /admin/* (doctor, config, servicio, logs, pair)
+    navegador ──► /           panel web, con tu cuenta (/auth): conversaciones y, si cuidas del hogar, el resto
+    terminal  ──► fogar-gw    CLI sobre /admin/* con ADMIN_TOKEN (doctor, config, servicio, logs, pair, users)
 ```
 
 La identidad y la configuración de cada aparato viven en una base de datos SQLite local (`<base>/data/gateway.db`, con `<base>` = `~/.fogar-gateway` por defecto). Requiere OpenClaw **2026.6.11 o posterior**.
@@ -73,7 +74,28 @@ Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la guía completa 
 
 Los dos son públicos: detrás de un proxy o un túnel también llegan desde internet. `/pair` solo acepta un código abierto por el administrador, y 5 códigos erróneos seguidos anulan todos los abiertos. El protocolo para clientes está en [`docs/client-protocol.md` §0](docs/client-protocol.md#0-descubrir-el-gateway-y-emparejarse).
 
-### Admin (requiere `X-Admin-Token`)
+### Personas y sesiones (`/auth`, 4.0)
+
+**El hogar y sus personas.** Una instalación es un hogar. Cada persona tiene una cuenta con un rol: **dueño** (siempre hay al menos uno activo), **administrador** (el hogar entero, salvo tocar a un dueño o dar ese rol) o **miembro** (lo suyo y lo común). Hay dos clases de dispositivo:
+
+- **Del hogar**: los que se emparejan con un código (la tele, los altavoces, Home Assistant). No se sabe quién habla: lo que se dice desde ellos es **del hogar**, y desde ellos solo se ven las conversaciones del hogar.
+- **Personales**: cada inicio de sesión (la web, una app). Lo que se dice desde ellos es **privado** de su persona, y desde ellos se ven las suyas y las del hogar. Nadie lee las privadas de otro, tampoco un dueño; solo la CLI con `ADMIN_TOKEN`, que es la máquina.
+
+La privacidad es **dentro de Fogar**: OpenClaw, su panel y sus otros canales (Telegram…) ven todas las sesiones. Cada persona habla con su agente o, si no tiene, con el de lo común (`/admin/home`); si varias comparten agente, comparten su memoria aunque las conversaciones sean privadas, y la web lo avisa.
+
+| Endpoint | Método | Auth | Descripción |
+|----------|--------|------|-------------|
+| `/auth/login` | POST | usuario y contraseña | `{"username", "password", "device_name", "client_type"?, "capabilities"?}` → `201 {"client_id", "client_key", "user", "home"}`: este aparato pasa a ser un dispositivo personal y `client_key` es su token, la única vez que se ve. Errores: `401 invalid_credentials` (siempre el mismo), `403 insecure_transport`, `429 too_many_attempts` con `Retry-After` |
+| `/auth/me` | GET | Bearer | `{"user": {id, username, display_name, role}, "home", "device"}` |
+| `/auth/devices` | GET | Bearer | Mis dispositivos con sesión (`current` marca este) |
+| `/auth/devices/{id}` | DELETE | Bearer | Retira uno de los míos: su token deja de valer y sus sesiones se cierran ya (4200) |
+| `/auth/logout` | POST | Bearer | Retira el dispositivo de esta petición |
+
+El token va como `Authorization: Bearer <client_key>` en `/auth` y `/admin`, y como `client_key` en el WebSocket. Es opaco, se guarda solo su SHA-256 y se busca en la base de datos en cada petición: no caduca ni se refresca, y retirar el dispositivo o desactivar a la persona lo corta al momento. **La contraseña solo viaja cifrada**: el login se acepta por HTTPS (también detrás de `tailscale serve` o `cloudflared` en esta máquina), y por HTTP solo desde esta misma máquina o la tailnet; desde la LAN por HTTP responde `403 insecure_transport` (pon HTTPS con `fogar-gw access setup`). Tras 5 fallos seguidos, por IP o por cuenta, la espera se dobla con cada uno (hasta 5 min). Quitar un dispositivo o cerrar sesión lo **retira**, no lo borra: sus conversaciones conservan su hogar y su dispositivo.
+
+Las personas se gestionan desde la web (Personas) o con `fogar-gw users`. **Si el dueño pierde la contraseña**, la recuperación es en la máquina del gateway: `fogar-gw users reset-password USUARIO`.
+
+### Admin (`X-Admin-Token` de la máquina, o Bearer de un dueño o administrador)
 
 | Endpoint | Método | Descripción |
 |----------|--------|-------------|
@@ -84,11 +106,11 @@ Los dos son públicos: detrás de un proxy o un túnel también llegan desde int
 | `/admin/transcriber/status` | GET | Estado del proveedor STT activo (`provider`; con fogar, reachability en vivo; con ElevenLabs, salud cacheada + `counters`) |
 | `/admin/tts/status` | GET | Estado del proveedor TTS activo (`provider`, breaker, último error; con ElevenLabs, `counters`) |
 | `/admin/speech` | GET | Proveedores de voz activos (`stt`, `tts`) y puerta de audio efectiva |
-| `/admin/clients` | GET | Lista clientes (sin `client_key`; la huella `key_fp`) |
+| `/admin/clients` | GET | Lista clientes (sin `client_key`; la huella `key_fp`), con `user_id` (`null` = del hogar), `capabilities` y `last_seen_at`. Un inicio de sesión también es un cliente |
 | `/admin/clients` | POST | Crear cliente; la respuesta trae su `client_key`, la única vez que se ve (se genera, o se importa una existente de ≥ 32 caracteres) |
 | `/admin/clients/{id}` | GET | Detalle de un cliente |
 | `/admin/clients/{id}` | PATCH | Actualizar cliente (campos parciales) |
-| `/admin/clients/{id}` | DELETE | Borrar cliente |
+| `/admin/clients/{id}` | DELETE | Retirar cliente: su clave deja de valer y sus sesiones se cierran ya (4200); sigue en la BD con sus conversaciones y no sale en la lista |
 | `/admin/clients/{id}/rotate-key` | POST | Rotar `client_key` (la respuesta trae la nueva) |
 | `/admin/pairing` | POST | Abrir un código de emparejamiento con la plantilla del cliente (los campos de `POST /admin/clients`, nombre opcional y sin clave). La respuesta trae el código, la única vez que se ve. Como mucho 5 abiertos (409) |
 | `/admin/pairing` | GET | Códigos abiertos (sin el código) |
@@ -96,13 +118,19 @@ Los dos son públicos: detrás de un proxy o un túnel también llegan desde int
 | `/admin/pairing/{id}` | DELETE | Anular un código abierto |
 | `/admin/state` | GET | Instantánea viva: versión, uptime, flujos `/admin/state/stream` abiertos (`gateway.dashboards`), estado de servicios (el de OpenClaw, con su acceso: `scopes`, `admin`, `auth_method`, `pairing`, `pairing_request_id`, `identity_error`, `device_id` y, para el panel, `approve_command` con el emparejamiento pendiente e `identity_error_text` con `identity_required`; nunca secretos), contadores y una fila por sesión |
 | `/admin/state/stream` | GET | La misma instantánea por SSE cada segundo; cada stream termina solo a los 25 s, el cliente debe reconectar (`EventSource` lo hace solo) |
-| `/admin/conversations` | GET | Conversaciones de todos los clientes (filtro `?client_id=`), la última en hablarse primero: `id`, `client_id`, `client_name`, `agent`, `kind` (`default`, `created`, `legacy`), `day`, `created_at`, `last_turn_at`, `turn_count` y `title`, que se lee de OpenClaw (`sessions.list`, en caché 20 s, y un fallo, 5 s; `null` si no lo tiene o no responde; la lista nunca falla por eso). No salen las del día en las que nunca se habló (un cliente que conectó y calló) |
-| `/admin/conversations/{id}/messages` | GET | Lo dicho, de OpenClaw (`chat.history`), normalizado a `{role, text, timestamp}` (solo `user` y `assistant`); `?limit=` 1–1000 (200). `503 orchestrator_unavailable` con OpenClaw caído, `502 orchestrator_error` si lo rechaza |
-| `/admin/conversations` | POST | Conversación nueva del panel web (`{"agent"?}`; sin agente, el de la cascada). El agente se valida como en el handshake (`422 agent_not_permitted`/`agent_not_available`) |
-| `/admin/conversations/agents` | GET | Para el selector del panel: `{"agents", "default"}`, los agentes del roster de OpenClaw que el panel web puede usar (su `allowed_agents`; sin roster, esa lista o `[]`) y el que le tocaría sin elegir (`null` si ese no le está permitido). Es una lectura: no crea la ficha del panel. `409 panel_client_inactive` con el panel desactivado |
+| `/admin/conversations` | GET | **Cualquier persona** (no solo dueños y administradores): las que puede ver, las del hogar y las suyas; la máquina, todas (filtro `?client_id=`), la última en hablarse primero: `id`, `client_id`, `client_name`, `agent`, `kind` (`default`, `created`, `legacy`), `day`, `created_at`, `last_turn_at`, `turn_count`, `owner_user_id` (`null` = del hogar) y `title`, que se lee de OpenClaw (`sessions.list`, en caché 20 s, y un fallo, 5 s; `null` si no lo tiene o no responde; la lista nunca falla por eso). No salen las del día en las que nunca se habló (un cliente que conectó y calló) |
+| `/admin/conversations/{id}/messages` | GET | Cualquier persona, de una que pueda ver (si no, 404). Lo dicho, de OpenClaw (`chat.history`), normalizado a `{role, text, timestamp}` (solo `user` y `assistant`); `?limit=` 1–1000 (200). `503 orchestrator_unavailable` con OpenClaw caído, `502 orchestrator_error` si lo rechaza |
+| `/admin/conversations` | POST | Cualquier persona: conversación nueva de su dispositivo, privada (`{"agent"?}`; sin agente, el de la cascada). El agente se valida como en el handshake (`422 agent_not_permitted`/`agent_not_available`). La máquina no tiene dispositivo: `403 user_required` |
+| `/admin/conversations/agents` | GET | Cualquier persona, para el selector de la web: `{"agents", "default"}`, los agentes del roster de OpenClaw que su dispositivo puede usar (su `allowed_agents`; sin roster, esa lista o `[]`) y el que le tocaría sin elegir (`null` si ese no le está permitido). La máquina, sin política de ningún dispositivo |
+| `/admin/users` | GET | Personas del hogar: `id`, `username`, `display_name`, `role`, `agent` (el suyo; `null`, el de lo común), `is_active`, `created_at`, `effective_agent` y `agent_shared` |
+| `/admin/users` | POST | Alta: `{"username", "display_name", "password" (8+), "role"?, "agent"?}`. `409 username_taken` |
+| `/admin/users/{id}` | PATCH | `display_name`, `role`, `agent` (`null` vuelve al de lo común), `is_active`. Desactivar corta ya sus dispositivos |
+| `/admin/users/{id}/password` | PUT | Contraseña nueva (`{"password"}`); las sesiones abiertas siguen |
+| `/admin/users/{id}` | DELETE | Borra a la persona, sus dispositivos y sus conversaciones privadas del gateway (en OpenClaw quedan hasta que se limpie su agente) |
+| `/admin/home` | GET, PATCH | El hogar: `name` y `agent`, el de lo común (`null` = la cascada de siempre) |
 | `/admin/access` | GET | Vías para llegar al gateway (`public`, `tailscale_https`, `tailscale`, `lan`), cada una con su estado (`ok`, `protegida`, `otro_gateway`, `inalcanzable`, `sin_verificar`) y la recomendada; `{"docker": bool, "routes": [...]}`, en caché 15 s |
 
-Los tres endpoints `*/status` comparten la forma `{"name", "state", "connected_at", "reconnect_attempts", "last_error"}`; los de transcriber y TTS añaden `provider` y, con ElevenLabs, `counters`.
+En `/admin/users`, siempre queda un dueño activo (`409 last_owner`) y solo un dueño o la máquina tocan a un dueño o dan ese rol (`403 owner_only`). Los tres endpoints `*/status` comparten la forma `{"name", "state", "connected_at", "reconnect_attempts", "last_error"}`; los de transcriber y TTS añaden `provider` y, con ElevenLabs, `counters`.
 
 **Conversaciones (M19).** Cada sesión habla en una conversación, que es una sesión de OpenClaw (`agent:{agente}:fogar-{id}`). Quien no elige cae en la del día (una por cliente, agente y día; el día empieza a las `CONVERSATION_DAY_START_HOUR`, y una sesión abierta días pasa a la nueva en su primer turno tras el corte); un cliente puede elegir una de las suyas o crear una (`conversation` en el handshake). El gateway solo guarda el índice (tabla `conversations`, sin texto): lo dicho y el título viven en OpenClaw. Las sesiones de antes de M19 (`agent:{agente}:{client.id}`) se importan una vez como `legacy` al conectar con OpenClaw. Cada conversación es del hogar o privada de una persona, según el dispositivo que la crea (4.0): un dispositivo del hogar abre solo las del hogar; uno personal, también las de su usuario. La web inicia sesión (`/auth/login`) y entra en el WebSocket con su token como `client_key`, como cualquier dispositivo. Quitar un cliente lo **retira** (4.0): su clave deja de valer y sus conversaciones se conservan, siempre con su hogar y su dispositivo; la base de datos lo garantiza con claves foráneas (el gateway activa `PRAGMA foreign_keys` en cada conexión). Protocolo: [`docs/client-protocol.md` §14](docs/client-protocol.md#14-conversaciones).
 
@@ -112,7 +140,7 @@ Los campos de un cliente (`POST`/`PATCH /admin/clients`) están en `src/fogar_ga
 fogar-gw                        # en una terminal: menú interactivo; en un script: la ayuda
 fogar-gw init                   # instalación nueva: <base>, config.env con ADMIN_TOKEN aleatorio y la BD
 fogar-gw onboard [--answers FICHERO]   # asistente: OpenClaw, voz, servicio y dashboard
-fogar-gw token                  # el token del dashboard (ADMIN_TOKEN), solo en una terminal
+fogar-gw token                  # el token de la máquina (ADMIN_TOKEN: la CLI y la recuperación), solo en una terminal
 fogar-gw access                 # desde dónde se llega al gateway, verificado, con la vía recomendada
 fogar-gw access setup           # elige cómo entrar (Tailscale o tu dominio) y después lista las vías
 fogar-gw serve [--create-db]    # arranca el gateway (puerto 8004, host GATEWAY_HOST)
@@ -134,6 +162,11 @@ fogar-gw clients edit <ref> [--name …] [--set tts_speed=1.2 …] [--set output
 fogar-gw clients enable|disable <ref>
 fogar-gw clients rotate-key|remove <ref>    # preguntan; en scripts: fogar-gw --yes clients remove <ref>
 fogar-gw pair [--name …] [--type …] [--agent …] [--set …] [--no-wait]   # código para que un cliente se dé de alta solo
+fogar-gw users list             # personas: rol, agente (* si lo comparte) y si está activa
+fogar-gw users add USUARIO [--name …] [--role owner|admin|member] [--agent …]   # la contraseña, oculta o por stdin
+fogar-gw users edit USUARIO [--name …] [--role …] [--agent …|--common-agent]
+fogar-gw users enable|disable|remove USUARIO
+fogar-gw users reset-password USUARIO   # la recuperación del dueño, en la máquina del gateway
 ```
 
 Opciones globales: van **antes** del subcomando (`fogar-gw --yes clients remove X`; después, click no las reconoce): `--home` (`FOGAR_GATEWAY_HOME`, por defecto `~/.fogar-gateway`), `--url` (`FOGAR_GW_URL`, por defecto `http://127.0.0.1:8004`), `--token` (`FOGAR_GW_TOKEN`; si no, `ADMIN_TOKEN` o `config.env`), `--json` y `--yes`. `FOGAR_GATEWAY_HOME` la leen el gateway y la CLI; `FOGAR_GW_URL` y `FOGAR_GW_TOKEN`, solo la CLI. Códigos de salida: 0 bien, 1 error, 2 uso incorrecto, 3 gateway inalcanzable.
@@ -239,15 +272,15 @@ En una terminal con color empieza con la línea viva de Fogar escribiendo su nom
 
    Lo mismo, en cualquier momento: `fogar-gw access setup`.
 5. Instala el servicio, o lo reinicia si ya estaba instalado (con terminal pregunta antes, porque corta las sesiones abiertas), y pasa `fogar-gw doctor`.
-6. Termina en el dashboard:
+6. «Tu cuenta» (4.0): si el hogar aún no tiene dueño, crea la tuya (usuario, nombre y contraseña dos veces). Con ella entras en el dashboard. Con `--answers`, del campo `owner` (`{"username", "display_name", "password"}`); sin él, solo avisa.
+7. Termina en el dashboard:
    - las vías para llegar al dashboard desde otro aparato: la recomendada («Tu dashboard») y las demás, cada una con su estado (verificada, sin comprobar…). Por la LAN es `http://<IP de la LAN>:8004/` (o la de `GATEWAY_HOST` si escucha en una dirección concreta; si solo escucha en loopback y no hay otra vía, te dice cómo entrar con un túnel SSH: `ssh -L 8004:127.0.0.1:8004 …` desde tu equipo, que solo escucha en su loopback; si el puerto reenviado escucha en otra dirección (`-g`, `ssh -L 0.0.0.0:…`), todo lo que entra por él es loopback para `/v1`, ver [OpenAI-compatible](#openai-compatible-v1-para-home-assistant)). Para verlas o cambiarlas después: `fogar-gw access` y `fogar-gw access setup`;
    - en una terminal con color, un QR de la vía recomendada para abrirla con el móvil;
-   - el token de administración que se pega en él. En una terminal con color no se imprime: se copia al portapapeles (OSC 52, también por ssh; el Terminal de macOS no lo admite, iTerm2 lo pide en sus ajustes y Ghostty, Kitty y WezTerm lo hacen solos). Sin color se imprime en la terminal, y nunca con `--answers`. Siempre dice dónde está (`<base>/config.env`, `ADMIN_TOKEN`) y cómo verlo otra vez: `fogar-gw token`;
-   - el recordatorio de no compartirlo: quien lo tenga controla el gateway.
+   - cómo se entra: con tu usuario y tu contraseña. Por HTTP solo desde este equipo o la tailnet; desde la LAN, por HTTPS (ver [Personas y sesiones](#personas-y-sesiones-auth-40)). El token de administración ya no se imprime ni se copia: es para la CLI y la recuperación, y dice dónde está (`<base>/config.env`, `ADMIN_TOKEN`) y cómo verlo: `fogar-gw token`.
 
-   Después te espera hasta que abres el dashboard y pegas el token («Conectado»); Enter sigue sin esperar. El primer cliente se empareja desde Clientes, en el dashboard. También da la dirección `ws://<host>:8004/ws/stream` para quien configure un cliente a mano.
+   Después te espera hasta que abres el dashboard y entras («Conectado»); Enter sigue sin esperar. El primer cliente se empareja desde Clientes, en el dashboard. También da la dirección `ws://<host>:8004/ws/stream` para quien configure un cliente a mano.
 
-**El token del dashboard:** es la llave del panel y de `/admin`, que no limitan los intentos: necesita al menos 32 caracteres ASCII imprimibles, sin espacios (`fogar-gw init` genera uno aleatorio de 43; `config set ADMIN_TOKEN` rechaza uno más corto y `doctor` lo marca). `fogar-gw token` lo escribe solo en una terminal; en una tubería, un fichero o con `--json` se niega, para que no acabe en un log. No lo pegues en chats ni en capturas. Sin la CLI, está en `config.env` (`ADMIN_TOKEN`), legible solo por tu usuario.
+**El token de administración (`ADMIN_TOKEN`):** desde la 4.0 ya no abre el panel (allí entra cada persona con su cuenta); es la llave de la máquina para `/admin`, la que usa la CLI y con la que se recupera la cuenta del dueño. `/admin` no limita sus intentos: necesita al menos 32 caracteres ASCII imprimibles, sin espacios (`fogar-gw init` genera uno aleatorio de 43; `config set ADMIN_TOKEN` rechaza uno más corto y `doctor` lo marca). `fogar-gw token` lo escribe solo en una terminal; en una tubería, un fichero o con `--json` se niega, para que no acabe en un log. No lo pegues en chats ni en capturas. Sin la CLI, está en `config.env` (`ADMIN_TOKEN`), legible solo por tu usuario.
 
 Si lo cortas a medias, `config.env` queda como estaba más lo ya verificado, y volver a ejecutarlo retoma. También sirve para cambiar de proveedores más adelante (en el menú de `fogar-gw`, «Configurar proveedores»): cada paso que `config.env` ya tiene ofrece primero «Dejar como está», que ni verifica ni escribe nada. Necesita una terminal; para scripts, `fogar-gw onboard --answers respuestas.json` no pregunta nada y un fallo de verificación sale con 1 y su motivo. El fichero lleva secretos: tiene que ser tuyo y con permisos 600. Créalo ya privado, para que no haya un momento en que otros puedan leerlo: `(umask 077; cat > respuestas.json)` y pega el JSON (termina con Ctrl+D), o `install -m 600 /dev/null respuestas.json` antes de editarlo. Escribirlo y después hacer `chmod` deja esa ventana abierta.
 
@@ -346,6 +379,8 @@ Las migraciones de la BD se aplican solas al arrancar y no hay vuelta atrás aut
 ```bash
 curl -fsSL https://github.com/fogarhome/fogar-gateway/releases/latest/download/install.sh | sh
 ```
+
+**De la 3.x a la 4.0: instalación nueva.** La 4.0 empieza un esquema de base de datos nuevo (hogar, personas y dispositivos) y no convierte el de la 3.x: con una BD 3.x el gateway no arranca y lo dice. Copia la carpeta base por si acaso, desinstala (`fogar-gw uninstall --purge`), instala la 4.0 con el comando de arriba y pasa `fogar-gw onboard`, que crea la cuenta del dueño. Después, vuelve a emparejar cada aparato (los códigos de `fogar-gw pair`) y crea las cuentas del resto de la casa (`fogar-gw users add` o la web). Las conversaciones siguen en OpenClaw; el gateway empieza su índice de cero. La web ya no entra con el token: entra con tu cuenta, y por HTTP solo desde la misma máquina o la tailnet.
 
 **Al actualizar a 3.0:** una entrada inválida en `TRUSTED_PROXIES` (también un `/0`, que antes se aceptaba) ya no se ignora: el gateway falla cerrado y Home Assistant sin Bearer recibe 401 en `/v1`. La CLI 2.x aún no lo comprueba: antes de actualizar, revisa `TRUSTED_PROXIES` y `TRUSTED_NETWORKS` a mano en `<base>/config.env` (solo IPs o CIDRs separados por comas, sin `/0` ni `%`). Después, `fogar-gw doctor` (en una actualización nativa, el instalador lo pasa al terminar sobre la base del servicio) o `fogar-gw config validate` te dicen si queda alguna entrada mal. `ADMIN_TOKEN` necesita al menos 32 caracteres: uno más corto sigue funcionando (el gateway arranca y avisa en el log), pero `fogar-gw doctor` y `config validate` lo marcan como fallo y `config set ADMIN_TOKEN` ya no acepta uno así; cámbialo con `fogar-gw config set ADMIN_TOKEN`: `init` genera uno de 43, pero si ya tienes `config.env` no lo toca (y `config unset ADMIN_TOKEN` no se acepta). Cuentan solo caracteres ASCII imprimibles sin espacios. Los plazos y backoffs (`HANDSHAKE_TIMEOUT_S`, `TURN_TIMEOUT_S`, `IDLE_TIMEOUT_S`, `PUSH_TTS_DRAIN_TIMEOUT_S`, `TTS_AUTH_TIMEOUT_S`, `TRANSCRIBER_READY_TIMEOUT_S`, `TRANSCRIBER_RECONNECT_MAX_DURATION` y los `*_RECONNECT_*_BACKOFF`) deben ser mayores que 0, y ningún número decimal admite `inf` ni `nan`: con uno así el gateway ya no arranca (antes arrancaba inservible). Si el servicio no arranca tras actualizar, el instalador lo dice, pasa igualmente `fogar-gw doctor` y termina con error. `config validate` lo marca y se corrige con `fogar-gw config set <AJUSTE> <valor>` o `fogar-gw config unset <AJUSTE>` (vuelve al valor por defecto), que funcionan aunque la configuración no valide: solo rechazan un valor que deje inválido el propio ajuste (y `config unset ADMIN_TOKEN`). Si tras el cambio queda algún fallo, en ese u otro ajuste, lo avisan sin deshacer nada; `config validate` y `doctor` dicen si la configuración es válida. Además, un `X-Real-IP` de loopback ya solo cuenta si el peer del proxy también es loopback: un proxy en este host que llega por la IP de LAN o por el bridge de Docker (p. ej. 172.17.0.1) con `X-Real-IP: 127.0.0.1` ya no queda exento y debe usar Bearer.
 

@@ -8,7 +8,7 @@ Guía completa para implementar clientes que se conecten a fogar-gateway. Cubre 
 
 ## Índice
 
-0. [Descubrir el gateway y emparejarse](#0-descubrir-el-gateway-y-emparejarse)
+0. [Descubrir el gateway y emparejarse (o iniciar sesión)](#0-descubrir-el-gateway-y-emparejarse)
 1. [Conexión y handshake](#1-conexión-y-handshake)
 2. [Mensaje ready](#2-mensaje-ready)
 3. [Enviar audio de micrófono](#3-enviar-audio-de-micrófono)
@@ -30,6 +30,8 @@ Guía completa para implementar clientes que se conecten a fogar-gateway. Cubre 
 ## 0. Descubrir el gateway y emparejarse
 
 Antes de la sesión, tu cliente necesita dos cosas: **dónde está el gateway** y **su `client_key`**. Las dos pueden venir de la configuración (un administrador creó el cliente con `fogar-gw clients add` y te pasó la clave), pero lo cómodo es que el cliente las consiga solo. Esta sección es lo que tiene que implementar.
+
+**Dos clases de cliente (4.0).** Un aparato **del hogar**, de uso compartido (una tele, un altavoz), **se empareja** con un código: no se sabe quién habla y lo que se dice es del hogar. Un aparato **personal** (una app en el móvil de alguien, su Mac) **inicia sesión** con la cuenta de su persona: lo que se dice es privado de ella y ve también las conversaciones del hogar. Elige una de las dos; un aparato no cambia de clase (para pasar de una a otra, retira la clave y haz lo otro).
 
 ### Encontrar el gateway
 
@@ -90,9 +92,29 @@ Después abre la sesión normal (§1) con esa `client_key`.
 
 **Intentos fallidos:** mientras haya códigos abiertos, cada `400` cuenta (un código caducado o ya usado también), sea de quien sea, y al quinto seguido se anulan todos los abiertos (un canje correcto pone la cuenta a 0); el administrador tiene que abrir otro. Es la defensa contra quien intente adivinar, porque `/pair` puede estar expuesto a internet a través de un proxy. El cliente no puede saber cuántos intentos quedan: si tras un `400` el usuario está seguro del código, dile que pida uno nuevo.
 
+### Iniciar sesión (cliente personal, 4.0)
+
+Para un aparato de una persona: la persona escribe **su usuario y su contraseña** una vez, y el cliente guarda el token que recibe.
+
+```http
+POST https://<host>/auth/login
+Content-Type: application/json
+
+{"username": "ana", "password": "…", "device_name": "iPhone de Ana", "client_type": "app", "capabilities": ["screen", "mic", "speaker"]}
+```
+
+| Respuesta | Qué significa |
+|-----------|---------------|
+| `201 {"client_id", "client_key", "user": {"id", "username", "display_name", "role"}, "home": {"id", "name"}}` | Dentro. `client_key` es el token de este aparato: **solo llega aquí, una vez**. Guárdalo como una contraseña (en el Llavero, nunca en un log) y úsalo como `client_key` en el handshake (§1) y como `Authorization: Bearer` en `/auth` y `/admin` |
+| `401 {"detail": "invalid_credentials"}` | Usuario o contraseña incorrectos, o cuenta desactivada (siempre el mismo) |
+| `403 {"detail": "insecure_transport"}` | Por HTTP desde la red de casa la contraseña iría en claro: el gateway solo la acepta por HTTPS, o por HTTP desde su propia máquina o la tailnet. Usa la URL `https://` del gateway |
+| `429 {"detail": "too_many_attempts"}` + `Retry-After` | Demasiados fallos seguidos (por IP o por cuenta): espera esos segundos |
+
+**El token no caduca ni se refresca:** vale hasta que se retira. `GET /auth/me` (con Bearer) dice quién eres y tu rol; `POST /auth/logout` retira este aparato (al cerrar sesión, **borra también lo que tengas en caché de esa persona**: un iPad puede ser compartido); `GET /auth/devices` y `DELETE /auth/devices/{id}`, los aparatos de la persona. Una contraseña nunca va en el handshake ni se guarda en el cliente.
+
 ### Cuando la clave deja de valer
 
-Si al abrir la sesión el gateway cierra con **4010**, o una sesión abierta se cierra con **4200** (§13), el administrador ha borrado, desactivado o rotado tu cliente. Mira el código, no el texto del `reason`. Borra la clave guardada y vuelve a la pantalla de emparejamiento. Ningún otro cierre (handshake mal formado, agente no permitido, conversación no encontrada, conversación abierta en otra sesión) invalida la clave. No reintentes en bucle con la misma clave.
+Si al abrir la sesión el gateway cierra con **4010**, o una sesión abierta se cierra con **4200** (§13), la clave ya no vale: el administrador retiró, desactivó o rotó tu cliente o, si es personal, la persona cerró sesión en él, lo retiró desde otro aparato o la desactivaron. Mira el código, no el texto del `reason`. Borra la clave guardada y vuelve a la pantalla de emparejamiento (o, si es personal, a la de iniciar sesión). Ningún otro cierre (handshake mal formado, agente no permitido, conversación no encontrada, conversación abierta en otra sesión) invalida la clave. No reintentes en bucle con la misma clave.
 
 ---
 
