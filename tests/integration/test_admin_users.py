@@ -195,3 +195,50 @@ def test_each_user_sees_the_home_and_their_own(http, admin_headers, db_engine, o
     assert listed(admin_headers) == {home.id, anas["id"]}  # la máquina, todo
     r = http.get(f"/admin/conversations/{anas['id']}/messages", headers=sito)
     assert r.status_code == 404
+
+
+# ── Agentes por persona y de lo común (paso 8) ──────────────────────────────
+
+
+def test_each_person_talks_to_their_agent_and_the_home_to_its_own(
+    http, admin_headers, db_engine, owner_id
+):
+    import asyncio
+
+    _create(http, admin_headers, "ana", agent="openclaw")
+    ana = _bearer(http, "ana")
+    sito = _bearer(http, "sito")
+    created = http.post("/admin/conversations", json={}, headers=ana).json()
+    assert created["agent"] == "openclaw"  # el suyo
+    assert http.post("/admin/conversations", json={}, headers=sito).json()["agent"] == "main"
+
+    r = http.patch("/admin/home", json={"agent": "A"}, headers=admin_headers)
+    assert r.status_code == 200 and r.json() == {"id": "home", "name": "Mi hogar", "agent": "a"}
+    assert http.post("/admin/conversations", json={}, headers=sito).json()["agent"] == "a"
+    with Session(db_engine) as s:
+        tv = ClientRecord(name="Tele", key_hash="h-tv")
+        s.add(tv)
+        s.commit()
+        tv_id = tv.id
+    conv = asyncio.run(app.state.conversations.default_for(tv_id, "main"))
+    assert conv.owner_user_id is None
+    from fogar_gateway.services.db_client import db_client
+
+    _, config = asyncio.run(db_client.revalidate("h-tv"))
+    assert config.household_agent == "a"  # un dispositivo del hogar, el de lo común
+
+
+def test_the_list_warns_when_people_share_an_agent(http, admin_headers, owner_id):
+    _create(http, admin_headers, "ana")
+    _create(http, admin_headers, "pilar", agent="openclaw")
+    users = {u["username"]: u for u in http.get("/admin/users", headers=admin_headers).json()}
+    assert (users["sito"]["effective_agent"], users["sito"]["agent_shared"]) == ("main", True)
+    assert (users["ana"]["effective_agent"], users["ana"]["agent_shared"]) == ("main", True)
+    assert (users["pilar"]["effective_agent"], users["pilar"]["agent_shared"]) == ("openclaw", False)
+
+
+def test_home_patch_validates(http, admin_headers):
+    assert http.patch("/admin/home", json={"name": None}, headers=admin_headers).status_code == 422
+    assert http.patch("/admin/home", json={"x": 1}, headers=admin_headers).status_code == 422
+    r = http.patch("/admin/home", json={"name": "Casa", "agent": None}, headers=admin_headers)
+    assert r.json() == {"id": "home", "name": "Casa", "agent": None}

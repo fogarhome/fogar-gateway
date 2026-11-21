@@ -9,6 +9,12 @@ administrador).
   PATCH  /admin/users/{id}             — nombre, rol, agente, activo
   PUT    /admin/users/{id}/password    — contraseña nueva (la recuperación de la CLI)
   DELETE /admin/users/{id}             — borra al usuario, sus dispositivos y sus conversaciones
+  GET    /admin/home                   — el hogar: nombre y agente de lo común
+  PATCH  /admin/home                   — cambia el nombre o el agente de lo común
+
+Cada usuario sale con su `effective_agent` (el suyo, el de lo común, `DEFAULT_AGENT`, el de
+OpenClaw o `main`) y `agent_shared`: lo atiende el mismo agente que a otra persona, así que su
+memoria es común aunque las conversaciones sean privadas. La web lo avisa.
 
 Reglas:
 - **Siempre queda al menos un dueño activo:** no se borra, degrada ni desactiva al último (409
@@ -22,6 +28,7 @@ Reglas:
 
 import asyncio
 from datetime import datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
@@ -30,9 +37,16 @@ from sqlmodel import Session, col, select
 
 from fogar_gateway.api.admin_routes import close_client_sessions
 from fogar_gateway.api.deps import Caller, Principal, require_admin
+from fogar_gateway.core.config import settings
 from fogar_gateway.db.database import get_engine
-from fogar_gateway.db.models import DEFAULT_HOME_ID, ClientRecord, MembershipRecord, UserRecord
-from fogar_gateway.models.admin_schemas import PasswordSet, UserCreate, UserUpdate
+from fogar_gateway.db.models import (
+    DEFAULT_HOME_ID,
+    ClientRecord,
+    HomeRecord,
+    MembershipRecord,
+    UserRecord,
+)
+from fogar_gateway.models.admin_schemas import HomeUpdate, PasswordSet, UserCreate, UserUpdate
 from fogar_gateway.services.auth import hash_password
 
 router = APIRouter(prefix="/admin/users", dependencies=[Depends(require_admin)])
@@ -46,6 +60,8 @@ class UserResponse(BaseModel):
     agent: str | None
     is_active: bool
     created_at: datetime
+    effective_agent: str | None = None  # solo en la lista
+    agent_shared: bool | None = None  # solo en la lista
 
 
 def _view(user: UserRecord, m: MembershipRecord) -> UserResponse:
@@ -53,6 +69,17 @@ def _view(user: UserRecord, m: MembershipRecord) -> UserResponse:
         id=user.id, username=user.username, display_name=user.display_name, role=m.role,
         agent=m.agent, is_active=user.is_active, created_at=user.created_at,
     )
+
+
+def _fallback_agent(home: HomeRecord | None, gateway_info: Any) -> str:
+    """El agente de quien no tiene uno propio: el de lo común y, si no, la cascada de siempre."""
+    default = gateway_info.default_agent_id if gateway_info is not None else None
+    return (
+        (home.agent if home is not None else None)
+        or settings.DEFAULT_AGENT
+        or default
+        or "main"
+    ).lower()
 
 
 def _get(session: Session, user_id: str) -> tuple[UserRecord, MembershipRecord]:
@@ -97,7 +124,7 @@ def _device_ids(session: Session, user_id: str) -> list[str]:
 
 
 @router.get("", response_model=list[UserResponse])
-def list_users() -> list[UserResponse]:
+def list_users(request: Request) -> list[UserResponse]:
     with Session(get_engine()) as session:
         rows = session.exec(
             select(UserRecord, MembershipRecord)
@@ -105,7 +132,14 @@ def list_users() -> list[UserResponse]:
             .where(MembershipRecord.home_id == DEFAULT_HOME_ID)
             .order_by(col(UserRecord.created_at))
         ).all()
-    return [_view(u, m) for u, m in rows]
+        home = session.get(HomeRecord, DEFAULT_HOME_ID)
+    fallback = _fallback_agent(home, request.app.state.openclaw.gateway_info)
+    views = [_view(u, m) for u, m in rows]
+    effective = [(m.agent or fallback).lower() for _, m in rows]
+    for view, agent in zip(views, effective, strict=True):
+        view.effective_agent = agent
+        view.agent_shared = effective.count(agent) > 1
+    return views
 
 
 @router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
@@ -210,3 +244,39 @@ async def delete_user(
     if conversations is not None:
         await conversations.load()  # el índice de push ya no debe ver las que se fueron
 
+
+# ── El hogar ──────────────────────────────────────────────────────────────────
+
+home_router = APIRouter(prefix="/admin/home", dependencies=[Depends(require_admin)])
+
+
+class HomeResponse(BaseModel):
+    id: str
+    name: str
+    agent: str | None  # el de lo común; null = la cascada de siempre
+
+
+@home_router.get("", response_model=HomeResponse)
+def get_home() -> HomeResponse:
+    with Session(get_engine()) as session:
+        home = session.get(HomeRecord, DEFAULT_HOME_ID)
+    if home is None:
+        raise HTTPException(status_code=404, detail="Home not found")
+    return HomeResponse(id=home.id, name=home.name, agent=home.agent)
+
+
+@home_router.patch("", response_model=HomeResponse)
+def update_home(body: HomeUpdate) -> HomeResponse:
+    patch = body.model_dump(exclude_unset=True)
+    if patch.get("name", "") is None:
+        raise HTTPException(status_code=422, detail="null_not_allowed")
+    with Session(get_engine()) as session:
+        home = session.get(HomeRecord, DEFAULT_HOME_ID)
+        if home is None:
+            raise HTTPException(status_code=404, detail="Home not found")
+        for field, value in patch.items():
+            setattr(home, field, value)
+        session.add(home)
+        session.commit()
+        session.refresh(home)
+        return HomeResponse(id=home.id, name=home.name, agent=home.agent)

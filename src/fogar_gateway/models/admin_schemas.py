@@ -229,6 +229,15 @@ class UserUpdate(BaseModel):
     is_active: bool | None = None
 
 
+class HomeUpdate(BaseModel):
+    """`PATCH /admin/home`: `agent: null` vuelve a la cascada de siempre."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: _Name | None = None
+    agent: AgentName | None = None
+
+
 class PasswordSet(BaseModel):
     password: Password
 

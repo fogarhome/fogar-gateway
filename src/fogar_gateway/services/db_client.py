@@ -16,7 +16,7 @@ from sqlmodel import Session, col, select, update
 
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
 from fogar_gateway.db.database import get_engine
-from fogar_gateway.db.models import ClientRecord, UserRecord
+from fogar_gateway.db.models import ClientRecord, HomeRecord, MembershipRecord, UserRecord
 from fogar_gateway.models.schemas import Client, ClientConfig
 from fogar_gateway.services.auth import hash_key
 
@@ -99,6 +99,7 @@ class DbClient:
             # Un dispositivo personal vale lo que su usuario (M20): desactivarlo corta sus
             # sesiones en la siguiente revalidación, también por /v1 y el WebSocket.
             user = session.get(UserRecord, record.user_id) if record and record.user_id else None
+            household_agent = _household_agent(session, record) if record is not None else None
 
         # Sin argumentos: el mensaje de la excepción no lleva ni el hash.
         if record is None:
@@ -118,11 +119,23 @@ class DbClient:
         config = ClientConfig(
             **record.model_dump(include=_CONFIG_COLUMNS),
             allowed_agents=_parse_allowed_agents(record.allowed_agents),
+            household_agent=household_agent,
         )
         return client, config
 
 
-_CONFIG_COLUMNS = set(ClientConfig.model_fields) - {"allowed_agents"}
+_CONFIG_COLUMNS = set(ClientConfig.model_fields) - {"allowed_agents", "household_agent"}
+
+
+def _household_agent(session: Session, record: ClientRecord) -> str | None:
+    """El agente que el hogar da a este dispositivo (M20): el de su usuario o, si no tiene o es
+    del hogar, el de lo común."""
+    if record.user_id is not None:
+        membership = session.get(MembershipRecord, (record.user_id, record.home_id))
+        if membership is not None and membership.agent:
+            return membership.agent
+    home = session.get(HomeRecord, record.home_id)
+    return home.agent if home is not None else None
 
 # Singleton — importar este objeto directamente
 db_client = DbClient()

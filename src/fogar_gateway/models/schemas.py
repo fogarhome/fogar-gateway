@@ -41,6 +41,9 @@ class ClientConfig(BaseModel):
     # En minúsculas, como OpenClaw: una fila anterior a la 3.0 puede guardar "Main" (C-1).
     default_agent: Annotated[str, StringConstraints(to_lower=True)] | None = None
     allowed_agents: list[Annotated[str, StringConstraints(to_lower=True)]] | None = None
+    # M20: el agente que el hogar asigna a quien habla por este dispositivo: el de su usuario si
+    # es personal, el de lo común si es del hogar (`memberships.agent` / `homes.agent`).
+    household_agent: Annotated[str, StringConstraints(to_lower=True)] | None = None
 
     model_config = ConfigDict(extra="allow")
 
