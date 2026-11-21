@@ -19,10 +19,9 @@ con `Retry-After`), `invalid_credentials` (401), `not_authenticated` (401).
 import asyncio
 import logging
 import math
-from dataclasses import dataclass
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session, select
 
 from fogar_gateway.api.admin_routes import (
@@ -30,12 +29,11 @@ from fogar_gateway.api.admin_routes import (
     create_client_record,
     retire_client,
 )
-from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
+from fogar_gateway.api.deps import Caller, current_caller
 from fogar_gateway.core.logging import fingerprint_key
 from fogar_gateway.db.database import get_engine
 from fogar_gateway.db.models import ClientRecord, HomeRecord, MembershipRecord, UserRecord
 from fogar_gateway.models.admin_schemas import ClientCreate, LoginRequest
-from fogar_gateway.models.schemas import Client
 from fogar_gateway.services.auth import (
     DUMMY_PASSWORD_HASH,
     LoginLimiter,
@@ -43,58 +41,10 @@ from fogar_gateway.services.auth import (
     new_key,
     verify_password,
 )
-from fogar_gateway.services.db_client import db_client
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth")
-
-_UNAUTHENTICATED = HTTPException(
-    status_code=status.HTTP_401_UNAUTHORIZED,
-    detail="not_authenticated",
-    headers={"WWW-Authenticate": "Bearer"},
-)
-
-
-@dataclass(frozen=True)
-class Caller:
-    """Quien llama con el token de un dispositivo personal."""
-
-    device: Client
-    user: UserRecord
-    membership: MembershipRecord
-
-
-def _limiter(request: Request) -> LoginLimiter:
-    limiter: LoginLimiter = request.app.state.login_limiter
-    return limiter
-
-
-def _user_and_membership(user_id: str, home_id: str) -> tuple[UserRecord, MembershipRecord] | None:
-    with Session(get_engine()) as session:
-        user = session.get(UserRecord, user_id)
-        membership = session.get(MembershipRecord, (user_id, home_id))
-    if user is None or not user.is_active or membership is None:
-        return None
-    return user, membership
-
-
-async def current_caller(authorization: str | None = Header(default=None)) -> Caller:
-    """El dispositivo personal del token, con su usuario activo y su rol en el hogar."""
-    scheme, _, token = (authorization or "").partition(" ")
-    if scheme.lower() != "bearer" or not token:
-        raise _UNAUTHENTICATED
-    try:
-        device, _ = await db_client.get_session(token.strip())
-    except (ClientNotFound, ClientInactive):
-        raise _UNAUTHENTICATED from None
-    if device.user_id is None:  # un dispositivo del hogar no tiene cuenta
-        raise _UNAUTHENTICATED
-    found = await asyncio.to_thread(_user_and_membership, device.user_id, device.home_id)
-    if found is None:
-        raise _UNAUTHENTICATED
-    return Caller(device, *found)
-
 
 def _user_view(user: UserRecord, membership: MembershipRecord) -> dict[str, Any]:
     return {
@@ -114,6 +64,11 @@ def _device_view(rec: ClientRecord, current_id: str | None = None) -> dict[str, 
         "last_seen_at": rec.last_seen_at,
         "current": rec.id == current_id,
     }
+
+
+def _limiter(request: Request) -> LoginLimiter:
+    limiter: LoginLimiter = request.app.state.login_limiter
+    return limiter
 
 
 @router.post("/login", status_code=status.HTTP_201_CREATED)

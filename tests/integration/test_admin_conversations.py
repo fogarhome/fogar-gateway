@@ -34,7 +34,7 @@ def conversations(client):
 
 
 def test_admin_conversations_needs_the_admin_token(client):
-    assert client.get("/admin/conversations").status_code == 422  # sin cabecera
+    assert client.get("/admin/conversations").status_code == 401  # sin cabecera
     r = client.get("/admin/conversations", headers={"x-admin-token": "nope"})
     assert r.status_code == 401
 

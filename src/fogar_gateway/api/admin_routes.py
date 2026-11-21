@@ -3,7 +3,7 @@ admin_routes.py
 ~~~~~~~~~~~~~~~
 /admin/* — gestión y observabilidad del gateway.
 
-Auth: X-Admin-Token header validado contra ADMIN_TOKEN env var (via get_admin_auth).
+Auth (M20, api/deps.require_admin): X-Admin-Token = ADMIN_TOKEN (la CLI) o Bearer de un dueño o administrador.
 
 Clientes:
   GET    /admin/clients              — lista clientes (sin client_key; huella key_fp)
@@ -40,7 +40,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from fogar_gateway._version import __version__
-from fogar_gateway.api.deps import get_admin_auth
+from fogar_gateway.api.deps import require_admin
 from fogar_gateway.db.database import get_db_session, get_engine
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.models.admin_schemas import (
@@ -67,7 +67,7 @@ _open_streams = 0
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/admin", dependencies=[Depends(get_admin_auth)])
+router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])
 
 
 # ---------------------------------------------------------------------------

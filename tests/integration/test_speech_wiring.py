@@ -93,7 +93,7 @@ def test_admin_status_includes_provider(client):
 
 
 def test_admin_speech_requires_token(client):
-    assert client.get("/admin/speech").status_code == 422
+    assert client.get("/admin/speech").status_code == 401
     bad = {"X-Admin-Token": "wrong"}
     assert client.get("/admin/speech", headers=bad).status_code == 401
 

@@ -200,3 +200,38 @@ def test_devices_query_lists_only_live_ones(http, db_engine):
     assert names == {"Mac de Sito", "viejo"}
     with Session(db_engine) as s:
         assert len(s.exec(select(ClientRecord)).all()) == 3  # el retirado sigue en la BD
+
+
+# ── /admin por rol (paso 4) ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("path", ["/admin/clients", "/admin/state", "/admin/pairing",
+                                  "/admin/conversations"])
+def test_admin_is_for_owners_and_admins(http, db_engine, path):
+    _add_user(db_engine, "admi", "admin")
+    owner = _bearer(_login(http).json()["client_key"])
+    admin = _bearer(_login(http, "admi").json()["client_key"])
+    member = _bearer(_login(http, "ana").json()["client_key"])
+    assert http.get(path, headers=owner).status_code == 200
+    assert http.get(path, headers=admin).status_code == 200
+    r = http.get(path, headers=member)
+    assert r.status_code == 403 and r.json()["detail"] == "forbidden"
+
+
+def test_admin_refuses_a_paired_device_key_and_a_bad_admin_token(http, admin_headers):
+    key = http.post("/admin/clients", json={"name": "Tele"}, headers=admin_headers).json()["client_key"]
+    assert http.get("/admin/clients", headers=_bearer(key)).status_code == 401
+    owner = _bearer(_login(http).json()["client_key"])
+    # Un X-Admin-Token presente manda: si no vale, 401 aunque el Bearer sí valga.
+    assert http.get("/admin/clients", headers={**owner, "x-admin-token": "mal"}).status_code == 401
+
+
+def test_a_demoted_user_loses_admin_at_once(http, db_engine, users):
+    owner = _bearer(_login(http).json()["client_key"])
+    assert http.get("/admin/clients", headers=owner).status_code == 200
+    with Session(db_engine) as s:
+        m = s.get(MembershipRecord, (users["sito"], "home"))
+        m.role = "member"
+        s.add(m)
+        s.commit()
+    assert http.get("/admin/clients", headers=owner).status_code == 403

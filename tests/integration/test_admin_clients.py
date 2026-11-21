@@ -201,9 +201,9 @@ def test_rotate_key(http):
 # --- AUTH ---
 
 
-def test_missing_token_returns_422(http):
+def test_missing_token_returns_401(http):
     r = http.get("/admin/clients")
-    assert r.status_code == 422
+    assert r.status_code == 401
 
 
 def test_wrong_token_returns_401(http):

@@ -30,7 +30,7 @@ from sqlmodel import Session
 
 from fogar_gateway._version import __version__
 from fogar_gateway.api.admin_routes import _check_agent_consistency, create_client_record
-from fogar_gateway.api.deps import get_admin_auth
+from fogar_gateway.api.deps import require_admin
 from fogar_gateway.core.config import settings
 from fogar_gateway.core.logging import fingerprint_key
 from fogar_gateway.core.network import client_ip_for_log
@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 INSTANCE_ID: str = secrets.token_hex(8)
 
 public_router = APIRouter()
-admin_router = APIRouter(prefix="/admin/pairing", dependencies=[Depends(get_admin_auth)])
+admin_router = APIRouter(prefix="/admin/pairing", dependencies=[Depends(require_admin)])
 
 
 def gateway_name() -> str:

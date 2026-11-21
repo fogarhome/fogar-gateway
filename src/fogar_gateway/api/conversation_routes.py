@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from fogar_gateway.api.admin_routes import existing_panel_config, panel_session
-from fogar_gateway.api.deps import get_admin_auth
+from fogar_gateway.api.deps import require_admin
 from fogar_gateway.core.agent_policy import AgentPolicyError, resolve_agent
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
 from fogar_gateway.models.admin_schemas import (
@@ -48,7 +48,7 @@ from fogar_gateway.services.openclaw.client import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/admin/conversations", dependencies=[Depends(get_admin_auth)])
+router = APIRouter(prefix="/admin/conversations", dependencies=[Depends(require_admin)])
 
 
 def _utc(value: datetime) -> datetime:

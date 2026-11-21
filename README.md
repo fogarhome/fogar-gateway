@@ -144,7 +144,7 @@ Opciones globales: van **antes** del subcomando (`fogar-gw --yes clients remove 
 - **`--import-key`** lee la clave de stdin, nunca de un argumento.
 - **En Docker:** `docker exec fogar_gateway fogar-gw …`. La imagen fija `FOGAR_GATEWAY_HOME=/app`, así que `doctor` encuentra la BD del volumen. Sin `-t` no hay terminal: no se abre el menú y `rotate-key`/`remove` necesitan `--yes` (o usa `docker exec -it`). Con `GATEWAY_HOST` en una IP de la LAN, pasa `--url http://<esa IP>:8004`.
 
-Auth: header `X-Admin-Token`. Sin header → 422. Token incorrecto → 401. `ADMIN_TOKEN` vacío → 503.
+Auth (4.0): `X-Admin-Token` = `ADMIN_TOKEN` (la CLI, en la máquina del gateway) o `Authorization: Bearer <token>` de un dispositivo con sesión (`/auth/login`) de un **dueño o administrador**; un miembro recibe `403 forbidden`. Sin credenciales o con un token que no vale → `401`. Si llega `X-Admin-Token`, manda él aunque haya Bearer. `ADMIN_TOKEN` vacío y `X-Admin-Token` presente → 503.
 
 **Límites de toda la API HTTP:** un cuerpo de más de 1 MiB recibe `413 {"detail": "request body too large"}` antes de cualquier validación o autenticación (cuenta los bytes recibidos, también sin `Content-Length`). Un `422` lista campo, tipo y mensaje de cada error, nunca el valor recibido. No hay `/docs`, `/redoc` ni `/openapi.json`: la referencia es esta página.
 

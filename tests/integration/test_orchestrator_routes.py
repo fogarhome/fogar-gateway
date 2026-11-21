@@ -20,7 +20,7 @@ def test_old_named_routes_are_gone(client, admin_headers):
 
 def test_get_orchestrator_status_requires_admin_token(client):
     response = client.get("/admin/orchestrator/status")
-    assert response.status_code == 422
+    assert response.status_code == 401
 
 
 def test_post_orchestrator_reconnect_accepted(client, admin_headers):

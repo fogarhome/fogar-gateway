@@ -35,7 +35,7 @@ SNAPSHOT_KEYS = {
 def test_state_requires_admin_token(client, monkeypatch, path):
     from fogar_gateway.core.config import settings
 
-    assert client.get(path).status_code == 422
+    assert client.get(path).status_code == 401
     assert client.get(path, headers={"x-admin-token": "wrong"}).status_code == 401
     monkeypatch.setattr(settings, "ADMIN_TOKEN", "")
     assert client.get(path, headers={"x-admin-token": "anything"}).status_code == 503

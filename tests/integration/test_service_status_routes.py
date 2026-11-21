@@ -21,7 +21,7 @@ def test_get_transcriber_status_unreachable(client, admin_headers):
 
 def test_get_transcriber_status_requires_admin_token(client):
     response = client.get("/admin/transcriber/status")
-    assert response.status_code == 422
+    assert response.status_code == 401
 
 
 def test_get_tts_status_default_connected(client, admin_headers):
@@ -35,4 +35,4 @@ def test_get_tts_status_default_connected(client, admin_headers):
 
 def test_get_tts_status_requires_admin_token(client):
     response = client.get("/admin/tts/status")
-    assert response.status_code == 422
+    assert response.status_code == 401

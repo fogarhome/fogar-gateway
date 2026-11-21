@@ -1,10 +1,10 @@
 """Tests para validación de admin token (deps.py → get_admin_auth)."""
 
 
-def test_missing_admin_token_returns_422(client):
-    """Sin X-Admin-Token header → FastAPI devuelve 422 (header requerido ausente)."""
+def test_missing_credentials_returns_401(client):
+    """Sin X-Admin-Token ni Bearer → 401 (M20: dos formas de entrar, ninguna obligatoria)."""
     r = client.get("/admin/orchestrator/status")
-    assert r.status_code == 422
+    assert r.status_code == 401 and r.json()["detail"] == "not_authenticated"
 
 
 def test_invalid_admin_token_returns_401(client):
