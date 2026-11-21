@@ -116,19 +116,8 @@ def test_missing_db_is_a_failure_and_doctor_never_creates_it(base):
     assert not (base / "data").exists()
 
 
-INITIAL = "21cb0cf4f6f9"  # src/fogar_gateway/migrations/versions/21cb0cf4f6f9_initial_schema.py
-
-
-def test_pending_migrations_is_a_warning(base):
-    _make_db(base / "data" / "old.db", INITIAL)
-    with open(base / "config.env", "a") as f:
-        f.write("DATABASE_URL=sqlite:///data/old.db\n")
-    found = checks(run("--json", "doctor"))
-    assert found["base de datos"]["level"] == "warn"
-    assert INITIAL in found["base de datos"]["detail"]
-
-
 def test_unknown_migration_is_a_failure(base):
+    # También una BD 3.x (sus revisiones ya no existen: la 4.0 empieza un esquema nuevo).
     _make_db(base / "data" / "new.db", "ffff_del_futuro")
     with open(base / "config.env", "a") as f:
         f.write("DATABASE_URL=sqlite:///data/new.db\n")

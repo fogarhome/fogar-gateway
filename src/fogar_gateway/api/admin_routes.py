@@ -32,6 +32,7 @@ import logging
 import secrets
 import time
 from collections import defaultdict
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
@@ -76,7 +77,7 @@ router = APIRouter(prefix="/admin", dependencies=[Depends(get_admin_auth)])
 
 def _get_or_404(session: Session, client_id: str) -> ClientRecord:
     rec = session.get(ClientRecord, client_id)
-    if rec is None:
+    if rec is None or rec.retired_at is not None:
         raise HTTPException(status_code=404, detail="Client not found")
     return rec
 
@@ -111,7 +112,7 @@ def _lists_to_json(data: dict[str, Any]) -> dict[str, Any]:
 
 @router.get("/clients", response_model=list[ClientResponse])
 def list_clients(session: Session = Depends(get_db_session)) -> list[ClientResponse]:
-    records = session.exec(select(ClientRecord)).all()
+    records = session.exec(select(ClientRecord).where(ClientRecord.retired_at.is_(None))).all()  # type: ignore[union-attr]
     return [ClientResponse.from_record(r) for r in records]
 
 
@@ -233,20 +234,21 @@ def update_client(
     return ClientResponse.from_record(rec)
 
 
-def _delete_client_record(client_id: str) -> None:
+def _retire_client_record(client_id: str) -> None:
+    """Retirar, no borrar (M20): sus conversaciones conservan hogar y dispositivo. La clave pasa
+    a un valor que nadie conoce, así que su sesión cae con 4200 en la siguiente revalidación."""
     with Session(get_engine()) as session:
-        session.delete(_get_or_404(session, client_id))
+        rec = _get_or_404(session, client_id)
+        rec.retired_at = datetime.now(UTC)
+        rec.is_active = False
+        rec.client_key = secrets.token_urlsafe(32)
+        session.add(rec)
         session.commit()
 
 
 @router.delete("/clients/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_client(client_id: str, request: Request) -> None:
-    await asyncio.to_thread(_delete_client_record, client_id)
-    # Sus conversaciones se van con él por ON DELETE CASCADE (M19; lo dicho sigue en OpenClaw).
-    # El índice, hecho ya el commit y en el hilo del loop, como cualquier otro cambio suyo.
-    conversations = getattr(request.app.state, "conversations", None)
-    if conversations is not None:
-        conversations.index.forget_client(client_id)
+async def delete_client(client_id: str) -> None:
+    await asyncio.to_thread(_retire_client_record, client_id)
 
 
 @router.post("/clients/{client_id}/rotate-key", response_model=ClientWithKey)

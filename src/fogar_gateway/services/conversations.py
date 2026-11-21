@@ -107,9 +107,6 @@ class ConversationIndex:
     def replace_all(self, conversations: list[Conversation]) -> None:
         self._by_key = {c.session_key: c for c in conversations}
 
-    def forget_client(self, client_id: str) -> None:
-        self._by_key = {k: c for k, c in self._by_key.items() if c.client_id != client_id}
-
     def __len__(self) -> int:
         return len(self._by_key)
 

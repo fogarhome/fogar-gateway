@@ -153,11 +153,13 @@ def test_defaults():
 
 
 async def test_client_recreated_with_same_key_but_new_id_revokes_the_session(server, db_engine):
-    """Borrar y recrear con la MISMA clave (otro id) dentro de la ventana: sigue siendo
-    otro cliente, la sesión del anterior debe cerrarse."""
+    """La MISMA clave pasa a otro cliente (otro id) dentro de la ventana: es otro cliente, la
+    sesión del anterior debe cerrarse. (El anterior ya no se borra, M20: se le cambia la clave.)"""
     ws = await _open(server)
     with Session(db_engine) as s:
-        s.delete(s.get(ClientRecord, CLIENT_ID))
+        old = s.get(ClientRecord, CLIENT_ID)
+        old.client_key = "otra-clave"
+        s.add(old)
         s.commit()
         s.add(ClientRecord(id="otro-id", name="Nuevo", client_key=VALID_KEY, is_active=True))
         s.commit()

@@ -232,13 +232,13 @@ def rotate_key(ctx: click.Context, ref: str) -> None:
 @click.argument("ref")
 @click.pass_context
 def remove(ctx: click.Context, ref: str) -> None:
-    """Borra un cliente."""
+    """Retira un cliente: su clave deja de valer y sus conversaciones se conservan."""
     client = api.from_context(ctx)
     target = _find(client, ref)
-    confirm(ctx, f"¿Borrar el cliente «{target['name']}»?")
+    confirm(ctx, f"¿Retirar el cliente «{target['name']}»? Su clave dejará de valer.")
     client.request("DELETE", f"/admin/clients/{target['id']}")
     out = _out(ctx)
     if out.as_json:
         out.json({"id": target["id"], "removed": True})
     else:
-        out.message(f"Cliente «{target['name']}» borrado.")
+        out.message(f"Cliente «{target['name']}» retirado.")

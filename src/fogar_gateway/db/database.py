@@ -34,6 +34,10 @@ class DatabaseMissing(RuntimeError):
     """No hay BD en la ruta configurada y no se ha pedido crearla."""
 
 
+class DatabaseFromOldVersion(DatabaseMissing):
+    """La BD es de una versión anterior a la 4.0: no se convierte (M20, instalación nueva)."""
+
+
 def _ensure_sqlite_dir(database_url: str) -> None:
     """Crea el directorio padre del fichero SQLite si no existe (issue #124).
 
@@ -106,7 +110,28 @@ def run_migrations() -> None:
     `alembic_version` (anterior a Alembic) ya no se sella: falla al crear la tabla (#265).
     """
     _require_db()  # antes de Alembic: el error sale tal cual, sin envolver
-    command.upgrade(_alembic_config(), "head")
+    cfg = _alembic_config()
+    _refuse_old_schema(cfg)
+    command.upgrade(cfg, "head")
+
+
+def _refuse_old_schema(cfg: Config) -> None:
+    """Una BD con una revisión que no es de esta cadena (la 3.x) no se toca: M20 empezó un
+    esquema nuevo sin migración de datos."""
+    from alembic.script import ScriptDirectory
+    from sqlalchemy import inspect, text
+
+    with get_engine().connect() as conn:
+        if "alembic_version" not in inspect(conn).get_table_names():
+            return
+        current = conn.execute(text("SELECT version_num FROM alembic_version")).scalars().all()
+    known = {rev.revision for rev in ScriptDirectory.from_config(cfg).walk_revisions()}
+    if any(rev not in known for rev in current):
+        raise DatabaseFromOldVersion(
+            "La base de datos es de una versión anterior a la 4.0 y no se convierte. "
+            "Instala de cero en otro directorio base (`fogar-gw --home DIR init`) o mueve "
+            "este gateway.db a otro sitio y ejecuta `fogar-gw init`."
+        )
 
 
 def get_db_session() -> Generator[Session, None, None]:

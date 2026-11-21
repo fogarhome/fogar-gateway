@@ -6,6 +6,7 @@ from datetime import UTC, date, datetime
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from fogar_gateway.core.config import settings
@@ -191,14 +192,14 @@ def test_with_both_main_and_Main_the_default_is_the_one_with_history(service, en
         assert service._default_for("tv", "main", day).id == rows[1].id
 
 
-async def test_deleting_a_client_cascades_to_its_conversations(service, engine):
-    """PRAGMA foreign_keys=ON en cada conexión (db/database.py): ON DELETE CASCADE vale."""
+async def test_a_client_with_conversations_cannot_be_deleted(service, engine):
+    """PRAGMA foreign_keys=ON en cada conexión (db/database.py): la conversación guarda siempre
+    su dispositivo (M20), así que un dispositivo con conversaciones se retira, no se borra."""
     conv = await service.create("web", "main")
-    with Session(engine) as s:
+    with pytest.raises(IntegrityError), Session(engine) as s:
         s.delete(s.get(ClientRecord, "web"))
         s.commit()
-    assert await service.get(conv.id) is None
-    assert await service.list_rows() == []
+    assert (await service.get(conv.id)) is not None
 
 
 async def test_a_conversation_for_a_missing_client_fails_cleanly(service, clock):

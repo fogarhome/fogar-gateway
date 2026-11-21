@@ -220,14 +220,25 @@ def test_create_with_the_panel_disabled_is_a_conflict(client, admin_headers, db_
     assert (r.status_code, r.json()) == (409, {"detail": "panel_client_inactive"})
 
 
-def test_deleting_a_client_deletes_its_conversations(client, admin_headers, conversations, db_engine):
+def test_removing_a_client_retires_it_and_keeps_its_conversations(
+    client, admin_headers, conversations, db_engine
+):
+    """M20: quitar un dispositivo lo retira; sus conversaciones siguen con su hogar y él."""
     import asyncio
+
+    from fogar_gateway.db.models import ClientRecord
 
     conv = asyncio.run(conversations.default_for(CLIENT_ID, "main"))
     assert client.delete(f"/admin/clients/{CLIENT_ID}", headers=admin_headers).status_code == 204
     with Session(db_engine) as s:
-        assert s.exec(select(ConversationRecord)).all() == []
-    assert conversations.index.get(conv.session_key) is None
+        (kept,) = s.exec(select(ConversationRecord)).all()
+        retired = s.get(ClientRecord, CLIENT_ID)
+    assert (kept.id, kept.client_id, kept.home_id) == (conv.id, CLIENT_ID, "home")
+    assert retired.retired_at is not None and not retired.is_active
+    assert retired.client_key != VALID_KEY  # su clave ya no vale
+    assert conversations.index.get(conv.session_key) is not None
+    assert client.get(f"/admin/clients/{CLIENT_ID}", headers=admin_headers).status_code == 404
+    assert all(c["id"] != CLIENT_ID for c in client.get("/admin/clients", headers=admin_headers).json())
 
 
 # ── /v1 (Home Assistant): la misma regla diaria ──────────────────────────────
