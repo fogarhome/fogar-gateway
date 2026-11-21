@@ -493,7 +493,7 @@ class FogarBridge:
         while True:
             await _sleep(settings.SESSION_REVALIDATE_INTERVAL_S)
             try:
-                current, config = await db_client.get_session(self.client.client_key)
+                current, config = await db_client.revalidate(self.client.key_hash)
                 if current.id != self.client.id:
                     # Borrado y recreado con la MISMA clave: es otro cliente.
                     await self._revoke_session()

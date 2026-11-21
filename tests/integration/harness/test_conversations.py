@@ -16,6 +16,7 @@ from sqlmodel import Session
 from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord, ConversationRecord
 from fogar_gateway.services import conversations as conv_mod
+from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.conversations import ConversationService, session_key_for
 from tests.integration.conftest import ADMIN_TOKEN, CLIENT_ID
 from tests.integration.harness.conftest import assert_turns_paired, of_type
@@ -239,7 +240,7 @@ async def test_a_chosen_conversation_never_changes_day_and_can_be_resumed(harnes
 
 async def test_a_conversation_of_another_client_is_refused(harness, db_engine):
     with Session(db_engine) as s:
-        s.add(ClientRecord(id="otro", name="Otro", client_key="otra-clave-de-cliente"))
+        s.add(ClientRecord(id="otro", name="Otro", key_hash=hash_key("otra-clave-de-cliente")))
         s.commit()
     foreign = await ConversationService(db_engine).create("otro", "main")
 

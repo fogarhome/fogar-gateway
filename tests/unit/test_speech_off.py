@@ -34,7 +34,7 @@ async def test_off_providers_never_touch_network():
     # La sesión STT se comporta como un transcriber caído que ya no reintenta.
     callbacks = SttCallbacks(AsyncMock(), AsyncMock(), AsyncMock(), AsyncMock())
     session = stt.open_session(
-        client=Client(id="c1", client_key="k", is_active=True),
+        client=Client(id="c1", key_hash="k", is_active=True),
         params=SttParams("es", 0.4),
         callbacks=callbacks,
     )

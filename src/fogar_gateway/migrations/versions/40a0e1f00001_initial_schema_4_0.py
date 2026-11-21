@@ -51,7 +51,7 @@ def upgrade() -> None:
     sa.Column('home_id', sqlmodel.sql.sqltypes.AutoString(), nullable=False),
     sa.Column('user_id', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
     sa.Column('name', sqlmodel.sql.sqltypes.AutoString(), nullable=False),
-    sa.Column('client_key', sqlmodel.sql.sqltypes.AutoString(), nullable=False),
+    sa.Column('key_hash', sqlmodel.sql.sqltypes.AutoString(), nullable=False),
     sa.Column('is_active', sa.Boolean(), nullable=False),
     sa.Column('client_type', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
     sa.Column('default_agent', sqlmodel.sql.sqltypes.AutoString(), nullable=True),
@@ -76,7 +76,7 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('id', 'home_id', name='uq_clients_id_home')
     )
-    op.create_index(op.f('ix_clients_client_key'), 'clients', ['client_key'], unique=True)
+    op.create_index(op.f('ix_clients_key_hash'), 'clients', ['key_hash'], unique=True)
     op.create_index(op.f('ix_clients_home_id'), 'clients', ['home_id'], unique=False)
     op.create_index(op.f('ix_clients_user_id'), 'clients', ['user_id'], unique=False)
     op.create_table('memberships',
@@ -122,7 +122,7 @@ def downgrade() -> None:
     op.drop_table('memberships')
     op.drop_index(op.f('ix_clients_user_id'), table_name='clients')
     op.drop_index(op.f('ix_clients_home_id'), table_name='clients')
-    op.drop_index(op.f('ix_clients_client_key'), table_name='clients')
+    op.drop_index(op.f('ix_clients_key_hash'), table_name='clients')
     op.drop_table('clients')
     op.drop_index(op.f('ix_users_username'), table_name='users')
     op.drop_table('users')

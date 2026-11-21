@@ -8,6 +8,7 @@ from sqlmodel import Session
 from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.main import app
+from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.protocol import OrchestratorEvent
 from tests.integration.conftest import CLIENT_ID, default_conversation_key
 
@@ -583,7 +584,7 @@ def test_chat_completions_with_inactive_client_key_returns_401(client, db_engine
             ClientRecord(
                 id="inactive-client",
                 name="Inactive",
-                client_key="inactive-key",
+                key_hash=hash_key("inactive-key"),
                 is_active=False,
             )
         )

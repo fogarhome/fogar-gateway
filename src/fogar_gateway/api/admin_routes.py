@@ -29,7 +29,6 @@ Observabilidad:
 import asyncio
 import json
 import logging
-import secrets
 import time
 from collections import defaultdict
 from datetime import UTC, datetime
@@ -51,6 +50,7 @@ from fogar_gateway.models.admin_schemas import (
     ClientWithKey,
 )
 from fogar_gateway.models.schemas import Client, ClientConfig
+from fogar_gateway.services.auth import hash_key, new_key
 from fogar_gateway.services.db_client import db_client
 from fogar_gateway.services.openclaw.models import OrchestratorAccess, access_texts
 from fogar_gateway.services.reconnection import ServiceStatus
@@ -120,10 +120,11 @@ def create_client_record(
     session: Session, body: ClientCreate, *, client_id: str | None = None
 ) -> ClientRecord:
     """Crea el cliente: la única vía, la usan `POST /admin/clients`, el emparejamiento (#317) y
-    el cliente «Panel web» (M19, el único con `client_id` fijo)."""
+    el cliente «Panel web» (M19, el único con `client_id` fijo). Guarda solo el hash de
+    `body.client_key` (M20): quien necesite enseñar la clave la pone en `body` antes."""
     _check_agent_consistency(body.default_agent, body.allowed_agents)
     data = _lists_to_json(body.model_dump())
-    data["client_key"] = data["client_key"] or secrets.token_urlsafe(32)
+    data["key_hash"] = hash_key(data.pop("client_key") or new_key())
     if client_id is not None:
         data["id"] = client_id
     record = ClientRecord(**data)
@@ -165,31 +166,30 @@ def ensure_panel_client(session: Session) -> ClientRecord:
         return record
 
 
-def _panel_key() -> str:
+def _panel_key_hash() -> str:
     with Session(get_engine()) as session:
-        return ensure_panel_client(session).client_key
+        return ensure_panel_client(session).key_hash
 
 
 async def panel_session() -> tuple[Client, ClientConfig]:
     """`(Client, ClientConfig)` del panel web, como `db_client.get_session`: lanza
     `ClientInactive` si el administrador lo desactivó."""
-    key = await asyncio.to_thread(_panel_key)
-    return await db_client.get_session(key)
+    return await db_client.revalidate(await asyncio.to_thread(_panel_key_hash))
 
 
-def _existing_panel_key() -> str | None:
+def _existing_panel_key_hash() -> str | None:
     with Session(get_engine()) as session:
         record = session.get(ClientRecord, PANEL_CLIENT_ID)
-        return record.client_key if record is not None else None
+        return record.key_hash if record is not None else None
 
 
 async def existing_panel_config() -> ClientConfig | None:
     """La configuración del panel web sin crear su ficha (para lecturas): None si aún no existe,
     `ClientInactive` si el administrador lo desactivó."""
-    key = await asyncio.to_thread(_existing_panel_key)
-    if key is None:
+    key_hash = await asyncio.to_thread(_existing_panel_key_hash)
+    if key_hash is None:
         return None
-    _, config = await db_client.get_session(key)
+    _, config = await db_client.revalidate(key_hash)
     return config
 
 
@@ -198,7 +198,9 @@ def create_client(
     body: ClientCreate,
     session: Session = Depends(get_db_session),
 ) -> ClientWithKey:
-    return ClientWithKey.from_record(create_client_record(session, body))
+    key = body.client_key or new_key()
+    record = create_client_record(session, body.model_copy(update={"client_key": key}))
+    return ClientWithKey.from_record(record, key)
 
 
 @router.get("/clients/{client_id}", response_model=ClientResponse)
@@ -241,7 +243,7 @@ def _retire_client_record(client_id: str) -> None:
         rec = _get_or_404(session, client_id)
         rec.retired_at = datetime.now(UTC)
         rec.is_active = False
-        rec.client_key = secrets.token_urlsafe(32)
+        rec.key_hash = hash_key(new_key())  # nadie conoce la clave: ya no vale
         session.add(rec)
         session.commit()
 
@@ -258,7 +260,8 @@ def rotate_client_key(
 ) -> ClientWithKey:
     rec = _get_or_404(session, client_id)
     for _ in range(_ROTATE_KEY_ATTEMPTS):
-        rec.client_key = secrets.token_urlsafe(32)
+        key = new_key()
+        rec.key_hash = hash_key(key)
         session.add(rec)
         try:
             session.commit()
@@ -272,7 +275,7 @@ def rotate_client_key(
             status_code=status.HTTP_409_CONFLICT, detail="could not generate a unique client_key"
         ) from None
     session.refresh(rec)
-    return ClientWithKey.from_record(rec)
+    return ClientWithKey.from_record(rec, key)
 
 
 # ---------------------------------------------------------------------------

@@ -67,7 +67,7 @@ class ClientRecord(SQLModel, table=True):
         default=None, foreign_key="users.id", index=True, ondelete="CASCADE"
     )
     name: str
-    client_key: str = Field(unique=True, index=True)
+    key_hash: str = Field(unique=True, index=True)  # SHA-256 de la clave (services/auth.py)
     is_active: bool = Field(default=True)
     client_type: str | None = Field(default=None)
     default_agent: str | None = Field(default=None)

@@ -15,6 +15,7 @@ from starlette.testclient import TestClient
 from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.main import app
+from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.protocol import OrchestratorEvent
 from tests.integration.conftest import (
     CLIENT_ID,
@@ -128,7 +129,7 @@ def test_disabled_barge_in_does_not_interrupt_in_flight_response(
             ClientRecord(
                 id=CLIENT_ID,
                 name=CLIENT_NAME,
-                client_key=VALID_KEY,
+                key_hash=hash_key(VALID_KEY),
                 is_active=True,
                 barge_in_enabled=False,
                 barge_in_min_chars=5,

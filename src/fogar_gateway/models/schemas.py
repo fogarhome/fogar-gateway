@@ -16,7 +16,7 @@ class Client(BaseModel):
     """Registro de cliente resuelto desde la BD local."""
 
     id: str
-    client_key: str
+    key_hash: str  # nunca la clave: solo su hash (M20), con el que se revalida la sesión
     is_active: bool
     name: str = ""
 

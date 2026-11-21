@@ -8,6 +8,7 @@ from sqlmodel import SQLModel, create_engine
 
 from fogar_gateway.db import database as db_database
 from fogar_gateway.db.models import ClientRecord
+from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.db_client import db_client
 
 
@@ -30,7 +31,7 @@ async def _insert(engine, key, default_agent=None, allowed_agents=None):
         s.add(
             ClientRecord(
                 name="t",
-                client_key=key,
+                key_hash=hash_key(key),
                 is_active=True,
                 default_agent=default_agent,
                 allowed_agents=allowed_agents,

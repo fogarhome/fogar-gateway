@@ -78,7 +78,7 @@ async def start_fake(**kw) -> FakeElevenLabsStt:
 
 def open_session(provider, rec: Rec, cid="c1"):
     s = provider.open_session(
-        client=Client(id=cid, client_key="k", is_active=True),
+        client=Client(id=cid, key_hash="k", is_active=True),
         params=SttParams(language="es", vad_threshold=0.0),
         callbacks=rec.callbacks(),
     )

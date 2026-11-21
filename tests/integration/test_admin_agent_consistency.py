@@ -8,6 +8,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
 from fogar_gateway.core.logging import fingerprint_key
+from fogar_gateway.services.auth import hash_key
 
 ADMIN_TOKEN = "test-admin-token"
 HEADERS = {"x-admin-token": ADMIN_TOKEN}
@@ -131,7 +132,7 @@ def _legacy_inconsistent(db_engine):
     with Session(db_engine) as s:
         rec = ClientRecord(
             name="legacy",
-            client_key="legacy-key-0123456789",
+            key_hash=hash_key("legacy-key-0123456789"),
             default_agent="x",
             allowed_agents=json.dumps(["a"]),
         )
@@ -164,7 +165,7 @@ def _fake_tokens(monkeypatch, values):
 
     it = iter(values)
     last = values[-1]
-    monkeypatch.setattr(admin_routes.secrets, "token_urlsafe", lambda n=None: next(it, last))
+    monkeypatch.setattr(admin_routes, "new_key", lambda: next(it, last))
 
 
 def test_rotate_key_collision_retries_with_new_key(http, monkeypatch):

@@ -25,7 +25,7 @@ def test_fresh_db_upgrades_from_scratch(tmp_path, monkeypatch):
     assert "clients" in tables
     assert "alembic_version" in tables
     columns = {c["name"] for c in inspect(engine).get_columns("clients")}
-    assert {"id", "home_id", "user_id", "client_key", "tool_calls_enabled"} <= columns
+    assert {"id", "home_id", "user_id", "key_hash", "tool_calls_enabled"} <= columns
     assert {"homes", "users", "memberships", "conversations"} <= set(tables)
 
 
@@ -83,7 +83,7 @@ def _insert_client(c, client_id: str, home: str = "home", user: str | None = Non
     from sqlalchemy import text
 
     c.execute(text(
-        "INSERT INTO clients (id, home_id, user_id, name, client_key, is_active, created_at, "
+        "INSERT INTO clients (id, home_id, user_id, name, key_hash, is_active, created_at, "
         "stt_language, stt_vad_thold, tts_voice, tts_speed, barge_in_enabled, "
         "barge_in_min_chars, silence_timeout_s, max_silence_turns, push_enabled, "
         "tool_calls_enabled) VALUES (:id, :home, :user, 'X', :id, 1, '2026-11-21', 'es', 0, "

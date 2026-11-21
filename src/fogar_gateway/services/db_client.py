@@ -17,6 +17,7 @@ from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
 from fogar_gateway.db.database import get_engine
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.models.schemas import Client, ClientConfig
+from fogar_gateway.services.auth import hash_key
 
 logger = logging.getLogger(__name__)
 
@@ -69,22 +70,27 @@ class DbClient:
             ClientNotFound: la key no existe.
             ClientInactive: el cliente está desactivado.
         """
-        return await asyncio.to_thread(self._lookup, client_key)
+        return await asyncio.to_thread(self._lookup, hash_key(client_key))
 
-    def _lookup(self, client_key: str) -> tuple[Client, ClientConfig]:
+    async def revalidate(self, key_hash: str) -> tuple[Client, ClientConfig]:
+        """Como `get_session`, desde el hash que ya guarda la sesión (la clave no se guarda)."""
+        return await asyncio.to_thread(self._lookup, key_hash)
+
+    def _lookup(self, key_hash: str) -> tuple[Client, ClientConfig]:
         with Session(self._get_engine()) as session:
             record: ClientRecord | None = session.exec(
-                select(ClientRecord).where(ClientRecord.client_key == client_key)
+                select(ClientRecord).where(ClientRecord.key_hash == key_hash)
             ).first()
 
+        # Sin argumentos: el mensaje de la excepción no lleva ni el hash.
         if record is None:
-            raise ClientNotFound(client_key)
+            raise ClientNotFound()
         if not record.is_active:
-            raise ClientInactive(client_key)
+            raise ClientInactive()
 
         client = Client(
             id=record.id,
-            client_key=record.client_key,
+            key_hash=record.key_hash,
             is_active=record.is_active,
             name=record.name,
         )

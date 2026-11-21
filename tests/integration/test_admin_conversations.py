@@ -10,6 +10,7 @@ from sqlmodel import Session, select
 from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord, ConversationRecord
 from fogar_gateway.services import conversations as conv_mod
+from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.openclaw.client import OrchestratorRequestError
 from tests.integration.conftest import CLIENT_ID, VALID_KEY
 
@@ -235,7 +236,7 @@ def test_removing_a_client_retires_it_and_keeps_its_conversations(
         retired = s.get(ClientRecord, CLIENT_ID)
     assert (kept.id, kept.client_id, kept.home_id) == (conv.id, CLIENT_ID, "home")
     assert retired.retired_at is not None and not retired.is_active
-    assert retired.client_key != VALID_KEY  # su clave ya no vale
+    assert retired.key_hash != hash_key(VALID_KEY)  # su clave ya no vale
     assert conversations.index.get(conv.session_key) is not None
     assert client.get(f"/admin/clients/{CLIENT_ID}", headers=admin_headers).status_code == 404
     assert all(c["id"] != CLIENT_ID for c in client.get("/admin/clients", headers=admin_headers).json())

@@ -18,6 +18,7 @@ from starlette.testclient import TestClient
 from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.main import app
+from fogar_gateway.services.auth import hash_key
 from tests.integration.conftest import (
     CLIENT_ID,
     CLIENT_NAME,
@@ -165,7 +166,7 @@ def test_transcriber_connect_uses_stt_language_from_config(mock_services, db_eng
             ClientRecord(
                 id=CLIENT_ID,
                 name=CLIENT_NAME,
-                client_key=VALID_KEY,
+                key_hash=hash_key(VALID_KEY),
                 is_active=True,
                 stt_language="fr",
             )
@@ -212,7 +213,7 @@ def test_tts_connect_uses_voice_and_speed_from_config(mock_services, db_engine, 
             ClientRecord(
                 id=CLIENT_ID,
                 name=CLIENT_NAME,
-                client_key=VALID_KEY,
+                key_hash=hash_key(VALID_KEY),
                 is_active=True,
                 tts_voice="bf_emma",
                 tts_speed=1.2,

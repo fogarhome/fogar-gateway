@@ -95,7 +95,7 @@ def _patch_db_client(monkeypatch):
     async def _get_session(client_key):
         assert client_key == CLIENT_KEY
         return (
-            Client(id=CLIENT_ID, client_key=CLIENT_KEY, is_active=True),
+            Client(id=CLIENT_ID, key_hash=CLIENT_KEY, is_active=True),
             ClientConfig(),
         )
 

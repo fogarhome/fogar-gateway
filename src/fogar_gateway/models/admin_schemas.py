@@ -14,7 +14,6 @@ from typing import Annotated, Literal
 from fastapi import Path, Query
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-from fogar_gateway.core.logging import fingerprint_key
 from fogar_gateway.core.session_key import AGENT_ID_PATTERN
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.models.schemas import CREDENTIAL_MAX_LEN, OutputMode
@@ -144,7 +143,7 @@ class ClientResponse(BaseModel):
         return cls(
             id=r.id,
             name=r.name,
-            key_fp=fingerprint_key(r.client_key),
+            key_fp=r.key_hash[:8],  # = fingerprint_key(clave): los 8 primeros del SHA-256
             is_active=r.is_active,
             client_type=r.client_type,
             # Una fila de la 2.x puede tener "Main": se devuelve como la usa el gateway (C-1).
@@ -172,8 +171,8 @@ class ClientWithKey(ClientResponse):
     client_key: str
 
     @classmethod
-    def from_record(cls, r: ClientRecord) -> "ClientWithKey":
-        return cls(**ClientResponse.from_record(r).model_dump(), client_key=r.client_key)
+    def from_record(cls, r: ClientRecord, key: str) -> "ClientWithKey":  # type: ignore[override]
+        return cls(**ClientResponse.from_record(r).model_dump(), client_key=key)
 
 
 # ---------------------------------------------------------------------------

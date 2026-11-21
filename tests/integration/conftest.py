@@ -18,6 +18,7 @@ from starlette.testclient import TestClient
 from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.main import app
+from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.openclaw.models import GatewayInfo
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
 from fogar_gateway.services.protocol import OrchestratorEvent, OrchestratorProtocol
@@ -85,7 +86,7 @@ def seed_client(db_engine):
             ClientRecord(
                 id=CLIENT_ID,
                 name=CLIENT_NAME,
-                client_key=VALID_KEY,
+                key_hash=hash_key(VALID_KEY),
                 is_active=True,
             )
         )

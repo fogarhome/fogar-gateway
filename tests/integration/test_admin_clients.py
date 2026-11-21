@@ -5,6 +5,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
 from fogar_gateway.core.logging import fingerprint_key
+from fogar_gateway.services.auth import hash_key
 
 ADMIN_TOKEN = "test-admin-token"
 HEADERS = {"x-admin-token": ADMIN_TOKEN}
@@ -307,10 +308,29 @@ def test_legacy_row_with_unknown_client_type_is_still_readable(http, db_engine):
     from fogar_gateway.db.models import ClientRecord
 
     with Session(db_engine) as s:
-        rec = ClientRecord(name="Old", client_key="legacy-key", client_type="e2e-test")
+        rec = ClientRecord(name="Old", key_hash=hash_key("legacy-key"), client_type="e2e-test")
         s.add(rec)
         s.commit()
         client_id = rec.id
     r = http.get(f"/admin/clients/{client_id}", headers=HEADERS)
     assert r.status_code == 200
     assert r.json()["client_type"] == "e2e-test"
+
+
+def test_the_db_never_holds_a_client_key(http, db_engine):
+    """M20: solo el SHA-256 de la clave; la clave sale una vez (crear, rotar) y nunca se guarda."""
+    from sqlalchemy import text
+
+    created = http.post("/admin/clients", json={"name": "A"}, headers=HEADERS).json()
+    rotated = http.post(f"/admin/clients/{created['id']}/rotate-key", headers=HEADERS).json()
+    imported = "imported-key-" + "x" * 32
+    r = http.post("/admin/clients", json={"name": "B", "client_key": imported}, headers=HEADERS)
+    assert r.status_code == 201
+    with db_engine.connect() as c:
+        dump = "\n".join(c.connection.iterdump())
+    for key in (created["client_key"], rotated["client_key"], imported):
+        assert key not in dump
+    with db_engine.connect() as c:
+        hashes = set(c.execute(text("SELECT key_hash FROM clients")).scalars())
+    assert {hash_key(rotated["client_key"]), hash_key(imported)} <= hashes
+    assert hash_key(created["client_key"]) not in hashes  # la rotada ya no vale

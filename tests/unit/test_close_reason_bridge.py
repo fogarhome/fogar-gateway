@@ -86,7 +86,7 @@ async def test_silence_timeout_reason(make_reason_bridge, monkeypatch):
 async def test_revoked_reason(make_reason_bridge, monkeypatch):
     monkeypatch.setattr(settings, "SESSION_REVALIDATE_INTERVAL_S", 0.0)
     monkeypatch.setattr(
-        "fogar_gateway.services.bridge.db_client.get_session", AsyncMock(side_effect=ClientInactive())
+        "fogar_gateway.services.bridge.db_client.revalidate", AsyncMock(side_effect=ClientInactive())
     )
     bridge = make_reason_bridge()
     await asyncio.wait_for(bridge._session_revalidation_loop(), timeout=1.0)
@@ -99,7 +99,7 @@ async def test_corrupt_allowed_agents_on_revalidation_closes_1011(make_reason_br
     cierra con 1011 (como el handshake, C-r7-2), con solo el tipo en el log."""
     monkeypatch.setattr(settings, "SESSION_REVALIDATE_INTERVAL_S", 0.0)
     monkeypatch.setattr(
-        "fogar_gateway.services.bridge.db_client.get_session",
+        "fogar_gateway.services.bridge.db_client.revalidate",
         AsyncMock(side_effect=ValueError("allowed_agents secreto")),
     )
     bridge = make_reason_bridge()

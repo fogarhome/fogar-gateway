@@ -12,6 +12,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord, ConversationRecord
 from fogar_gateway.services import conversations as conv_mod
+from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.conversations import (
     Conversation,
     ConversationClientMissing,
@@ -34,7 +35,7 @@ def engine(tmp_path):
     SQLModel.metadata.create_all(engine)
     with Session(engine) as s:
         for cid in ("tv", "web"):
-            s.add(ClientRecord(id=cid, name=cid.upper(), client_key=f"key-{cid}"))
+            s.add(ClientRecord(id=cid, name=cid.upper(), key_hash=hash_key(f"key-{cid}")))
         s.commit()
     return engine
 

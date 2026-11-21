@@ -15,6 +15,7 @@ from click.testing import CliRunner
 
 from fogar_gateway.cli import migrate
 from fogar_gateway.cli.app import cli
+from fogar_gateway.services.auth import hash_key
 
 ROOT = Path(__file__).resolve().parents[2]
 ENV = (
@@ -46,7 +47,7 @@ def template(tmp_path_factory):
 
     engine = create_engine(f"sqlite:///{base / 'data' / 'gateway.db'}")
     with Session(engine) as session:
-        session.add_all(ClientRecord(id=i, name=i, client_key=f"k-{i}") for i in ("b-id", "a-id"))
+        session.add_all(ClientRecord(id=i, name=i, key_hash=hash_key(f"k-{i}")) for i in ("b-id", "a-id"))
         session.commit()
     engine.dispose()
     return base
