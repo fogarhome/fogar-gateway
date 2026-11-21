@@ -18,6 +18,7 @@ MAIN = [
     ("Estado", "status", ["status"]),
     ("Diagnóstico", "doctor", ["doctor"]),
     ("Clientes", "clients", None),
+    ("Personas", "users", ["users", "list"]),
     ("Vías de acceso", "access", ["access"]),
     ("Emparejar un cliente", "pair", ["pair"]),
     ("Configuración", "config", ["config", "show"]),

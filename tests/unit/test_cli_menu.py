@@ -57,7 +57,7 @@ def test_ctrl_c_leaves_cleanly(answers):
 
 
 def test_status_from_the_menu(answers, use_api):
-    use_api(FakeApi({("GET", "/admin/state"): STATE}))
+    use_api(FakeApi({("GET", "/admin/state"): STATE, ("GET", "/admin/users"): []}))
     answers.extend(["status", "exit"])
     r = run()
     assert r.exit_code == 0, r.output

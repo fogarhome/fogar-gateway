@@ -24,6 +24,16 @@ from fogar_gateway import paths
 TIMEOUT_S = 5.0
 
 
+# Códigos estables de /admin (M20) en castellano; el resto sale tal cual.
+CODES = {
+    "last_owner": "Es el último dueño activo: el hogar siempre tiene uno. Haz dueño a otra "
+                  "persona antes.",
+    "owner_only": "Eso solo lo puede hacer un dueño.",
+    "username_taken": "Ese nombre de usuario ya existe.",
+    "user_required": "Hace falta una persona con sesión, no la máquina.",
+}
+
+
 class ApiError(click.ClickException):
     def __init__(self, message: str, exit_code: int = 1) -> None:
         super().__init__(message)
@@ -156,7 +166,7 @@ class Api:
             return ApiError(_validation_message(detail), 2)
         if e.code >= 500:
             return ApiError(f"Error del gateway ({e.code}).")
-        return ApiError(str(detail or f"Error {e.code}."))
+        return ApiError(CODES.get(str(detail), str(detail or f"Error {e.code}.")))
 
 
 def from_context(ctx: click.Context) -> Api:

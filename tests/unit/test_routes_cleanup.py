@@ -99,7 +99,11 @@ def _patch_db_client(monkeypatch):
             ClientConfig(),
         )
 
+    async def _touch(client_id, capabilities):
+        return None
+
     monkeypatch.setattr(routes.db_client, "get_session", _get_session)
+    monkeypatch.setattr(routes.db_client, "touch", _touch)
 
 
 async def test_ready_send_failure_leaves_no_zombie_bridge():

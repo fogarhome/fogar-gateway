@@ -615,7 +615,8 @@ jobs:
           {"openclaw_host": "127.0.0.1", "openclaw_port": 18789, "openclaw_token": "$FAKE_OPENCLAW_TOKEN",
            "stt": {"provider": "off"},
            "tts": {"provider": "fogar", "url": "127.0.0.1:$port", "token": "$FAKE_TTS_TOKEN"},
-           "first_client": {"name": "smoke", "type": "web"}}
+           "first_client": {"name": "smoke", "type": "web"},
+           "owner": {"username": "duena", "display_name": "Dueña", "password": "smoke-contraseña"}}
           EOF
           [ "$(stat -c %a "$RUNNER_TEMP/answers.json")" = 600 ]
           # La salida lleva la clave del cliente: solo se enseña si falla.
@@ -623,11 +624,14 @@ jobs:
             cat "$RUNNER_TEMP/onboard.txt"; exit 1
           fi
           [ "$(systemctl --user is-active fogar-gateway.service)" = active ]
-          # El final lleva al dashboard: URL, dónde está el token y cómo verlo, nunca su valor.
+          # El final lleva al dashboard: URL y la cuenta con la que se entra (M20); del token, solo
+          # dónde está y cómo verlo, nunca su valor.
           admin=$(sed -n 's/^ADMIN_TOKEN=//p' ~/.fogar-gateway/config.env)
           [ -n "$admin" ]
           grep -q 'Tu dashboard: http://.*:8004/' "$RUNNER_TEMP/onboard.txt"
-          grep -qF "$HOME/.fogar-gateway/config.env (ADMIN_TOKEN)" "$RUNNER_TEMP/onboard.txt"
+          grep -qF "ADMIN_TOKEN, en $HOME/.fogar-gateway/config.env" "$RUNNER_TEMP/onboard.txt"
+          grep -qF "tu usuario «duena» y tu contraseña" "$RUNNER_TEMP/onboard.txt"
+          ! grep -qF "smoke-contraseña" "$RUNNER_TEMP/onboard.txt"
           ! grep -qF "$admin" "$RUNNER_TEMP/onboard.txt"
           # `fogar-gw token` sin terminal se niega y no escribe el token.
           rc=0

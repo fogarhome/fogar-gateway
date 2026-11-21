@@ -516,3 +516,24 @@ def test_stored_token_with_unknown_scopes(base):
     store.save_token(f"127.0.0.1:{port}", "devtok-x", None)
     detail = checks(run("--json", "doctor"))[ACCESS]["detail"]
     assert "permisos: desconocidos" in detail
+
+
+def _people(db: Path, owner_active: bool | None) -> None:
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE users (id TEXT, is_active BOOLEAN)")
+    con.execute("CREATE TABLE memberships (user_id TEXT, home_id TEXT, role TEXT)")
+    if owner_active is not None:
+        con.execute("INSERT INTO users VALUES ('u1', ?)", (owner_active,))
+        con.execute("INSERT INTO memberships VALUES ('u1', 'home', 'owner')")
+    con.commit()
+    con.close()
+
+
+@pytest.mark.parametrize(("owner", "level"), [(True, "ok"), (False, "warn"), (None, "warn")])
+def test_doctor_says_whether_the_home_has_an_owner(base, owner, level):
+    """M20: sin un dueño activo nadie entra en el dashboard."""
+    _people(base / "data" / "gateway.db", owner)
+    found = checks(run("--json", "doctor"))
+    assert found["dueño"]["level"] == level
+    if level == "warn":
+        assert "fogar-gw users add" in found["dueño"]["detail"]

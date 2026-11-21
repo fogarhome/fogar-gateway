@@ -41,6 +41,10 @@ LAN_IP = "192.0.2.10"
 DEFAULT = object()  # en la cola de `tty`: acepta el valor por defecto de la pregunta
 
 
+OWNER = {"id": "u1", "username": "sito", "display_name": "Sito", "role": "owner",
+         "is_active": True}
+
+
 @pytest.fixture()
 def gw(monkeypatch, tmp_path, use_api):
     """Base sin config.env (con la BD), unidad en un XDG temporal y todo lo externo parcheado."""
@@ -102,6 +106,8 @@ def gw(monkeypatch, tmp_path, use_api):
     monkeypatch.setattr(verify, "detect_openclaw", detect)
     # Con terminal, el asistente acaba esperando al dashboard: aquí ya hay uno conectado.
     st.api = use_api(FakeApi({("GET", "/admin/clients"): [],
+                              # M20: ya hay dueño (sus tests propios, abajo, lo quitan).
+                              ("GET", "/admin/users"): [OWNER],
                               ("POST", "/admin/clients"): {**CLIENT, "client_key": CLIENT_KEY},
                               ("GET", "/admin/state"): {"gateway": {"dashboards": 1}}}))
     monkeypatch.setattr(onboard_mod, "_enter_pressed", lambda timeout: True)  # nunca espera
@@ -731,22 +737,80 @@ def test_answers_never_show_the_admin_token(gw, tmp_path, monkeypatch):
     r = onboard(write_answers(tmp_path))
     assert r.exit_code == 0, r.output
     assert ADMIN not in r.output
-    assert f"{gw.env} (ADMIN_TOKEN)" in r.output and "`fogar-gw token`" in r.output
-    assert "No lo compartas" in r.output
+    assert f"{gw.env}) es para la CLI" in r.output and "`fogar-gw token`" in r.output
+    assert "tu usuario «sito» y tu contraseña" in r.output  # M20: se entra con la cuenta
     assert ("GET", "/admin/state", None) not in gw.api.calls  # sin terminal no espera
 
 
 @pytest.mark.parametrize("terminal", [False, True])
-def test_interactive_shows_the_token_only_on_a_terminal(gw, tty, monkeypatch, terminal):
+def test_the_dashboard_is_entered_with_the_account_never_the_token(gw, tty, monkeypatch, terminal):
+    """M20: el token ya no abre la web; no se enseña ni en una terminal."""
     if terminal:  # el stdout de CliRunner no es una terminal
         monkeypatch.setattr(output, "_isatty", lambda: True)
         monkeypatch.setenv("NO_COLOR", "1")  # texto plano: la salida de rich no la captura CliRunner
     tty.queue.extend(["127.0.0.1", "18789", OC_TOKEN, "off", "off"])
     r = run("onboard")
     assert r.exit_code == 0, r.output
-    assert (f"Token: {ADMIN}" in r.output) is terminal
-    assert (ADMIN in r.output) is terminal
+    assert ADMIN not in r.output
+    assert "tu usuario «sito» y tu contraseña" in r.output
     assert f"Tu dashboard: http://{LAN_IP}:8004/" in r.output and "`fogar-gw token`" in r.output
+
+
+# ── Tu cuenta: el dueño (M20) ────────────────────────────────────────────────
+
+
+def _no_owner(gw, created_username="ana"):
+    gw.api.responses[("GET", "/admin/users")] = []
+    gw.api.responses[("POST", "/admin/users")] = {**OWNER, "username": created_username}
+
+
+def test_answers_create_the_owner(gw, tmp_path):
+    _no_owner(gw)
+    owner = {"username": "ana", "display_name": "Ana", "password": "contraseña larga"}
+    r = onboard(write_answers(tmp_path, owner=owner))
+    assert r.exit_code == 0, r.output
+    assert ("POST", "/admin/users", {**owner, "role": "owner"}) in gw.api.calls
+    assert "contraseña larga" not in r.output
+    assert "tu usuario «ana»" in r.output
+
+
+def test_answers_without_owner_only_warn(gw, tmp_path):
+    _no_owner(gw)
+    r = onboard(write_answers(tmp_path))
+    assert r.exit_code == 0, r.output
+    assert not [c for c in gw.api.calls if c[:2] == ("POST", "/admin/users")]
+    assert "fogar-gw users add NOMBRE --role owner" in r.output
+
+
+@pytest.mark.parametrize("owner", [{"username": "ana", "display_name": "Ana", "password": "corta"},
+                                   {"username": "ana", "display_name": "Ana"}])
+def test_answers_owner_is_validated_before_anything(gw, tmp_path, owner):
+    r = onboard(write_answers(tmp_path, owner=owner))
+    assert r.exit_code == 2
+    assert "owner" in r.output and "corta" not in r.output
+
+
+def test_an_existing_owner_is_not_asked_again(gw, tty):
+    tty.queue.extend(["127.0.0.1", "18789", OC_TOKEN, "off", "off"])
+    r = run("onboard")
+    assert r.exit_code == 0, r.output
+    assert "Ya hay dueño: «sito»" in r.output
+    assert not asked(tty, "password", "Contraseña")
+
+
+def test_interactive_creates_the_owner_and_retries_on_mismatch(gw, tty, monkeypatch):
+    _no_owner(gw)
+    monkeypatch.setattr("getpass.getuser", lambda: "Ana.G")
+    tty.queue.extend(["127.0.0.1", "18789", OC_TOKEN, "off", "off",
+                      DEFAULT, "Ana", "contraseña larga", "otra distinta",  # no coinciden
+                      DEFAULT, DEFAULT, "contraseña larga", "contraseña larga"])
+    r = run("onboard")
+    assert r.exit_code == 0, r.output
+    assert "No coinciden" in r.output
+    posts = [c[2] for c in gw.api.calls if c[:2] == ("POST", "/admin/users")]
+    assert posts == [{"username": "ana.g", "display_name": "Ana.G", "password": "contraseña larga",
+                      "role": "owner"}]
+    assert "contraseña larga" not in r.output
 
 
 @pytest.mark.parametrize("how", ["enter", "ctrl_c"])
