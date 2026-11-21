@@ -18,6 +18,7 @@ from fogar_gateway.api.openai_routes import router as openai_router
 from fogar_gateway.api.pairing_routes import admin_router as pairing_admin_router
 from fogar_gateway.api.pairing_routes import public_router as pairing_public_router
 from fogar_gateway.api.routes import router as stream_router
+from fogar_gateway.api.user_routes import router as user_router
 from fogar_gateway.api.web_routes import WEB_DIR, web_available
 from fogar_gateway.api.web_routes import router as web_router
 from fogar_gateway.core.body_limit import BodySizeLimitMiddleware
@@ -266,6 +267,7 @@ app.include_router(openai_router)  # HTTP /v1/*
 app.include_router(health_router)  # HTTP /healthz, /ready
 app.include_router(admin_router)  # HTTP /admin/*
 app.include_router(auth_router)  # HTTP /auth/* (M20)
+app.include_router(user_router)  # HTTP /admin/users (M20)
 app.include_router(conversation_router)  # HTTP /admin/conversations
 app.include_router(pairing_public_router)  # HTTP /.well-known/fogar-gateway, /pair
 app.include_router(pairing_admin_router)  # HTTP /admin/pairing

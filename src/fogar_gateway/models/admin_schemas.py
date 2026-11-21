@@ -207,6 +207,37 @@ Capability = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$"
 Capabilities = Annotated[list[Capability], Field(max_length=32)]
 
 
+Role = Literal["owner", "admin", "member"]
+Username = Annotated[
+    str, StringConstraints(strip_whitespace=True, to_lower=True, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+]
+# Mínimo de 8: una contraseña la elige una persona; el límite de intentos hace el resto.
+Password = Annotated[str, StringConstraints(min_length=8, max_length=1024)]
+
+
+class UserCreate(BaseModel):
+    username: Username
+    display_name: _Name
+    password: Password
+    role: Role = "member"
+    agent: AgentName | None = None
+
+
+class UserUpdate(BaseModel):
+    """Solo lo que llega cambia; `agent: null` vuelve al del hogar."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: _Name | None = None
+    role: Role | None = None
+    agent: AgentName | None = None
+    is_active: bool | None = None
+
+
+class PasswordSet(BaseModel):
+    password: Password
+
+
 class LoginRequest(BaseModel):
     """`POST /auth/login`: la cuenta y el dispositivo que inicia sesión (pasa a ser personal)."""
 

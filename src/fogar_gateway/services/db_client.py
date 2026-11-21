@@ -15,7 +15,7 @@ from sqlmodel import Session, select
 
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
 from fogar_gateway.db.database import get_engine
-from fogar_gateway.db.models import ClientRecord
+from fogar_gateway.db.models import ClientRecord, UserRecord
 from fogar_gateway.models.schemas import Client, ClientConfig
 from fogar_gateway.services.auth import hash_key
 
@@ -81,11 +81,14 @@ class DbClient:
             record: ClientRecord | None = session.exec(
                 select(ClientRecord).where(ClientRecord.key_hash == key_hash)
             ).first()
+            # Un dispositivo personal vale lo que su usuario (M20): desactivarlo corta sus
+            # sesiones en la siguiente revalidación, también por /v1 y el WebSocket.
+            user = session.get(UserRecord, record.user_id) if record and record.user_id else None
 
         # Sin argumentos: el mensaje de la excepción no lleva ni el hash.
         if record is None:
             raise ClientNotFound()
-        if not record.is_active:
+        if not record.is_active or (record.user_id is not None and (user is None or not user.is_active)):
             raise ClientInactive()
 
         client = Client(
