@@ -320,19 +320,41 @@ def test_handshake_validation_error_log_has_no_key_material(client, caplog):
 
 
 @pytest.mark.parametrize(
-    "credentials",
-    [{}, {"client_key": VALID_KEY, "admin_token": "test-admin-token"}],
-    ids=["none", "both"],
+    "credentials", [{}, {"admin_token": "test-admin-token"}], ids=["none", "admin_token"]
 )
-def test_handshake_needs_exactly_one_credential(client, caplog, credentials):
-    """M19: `client_key` o `admin_token`, una de las dos; el log no lleva ninguna."""
-    with caplog.at_level(logging.ERROR), pytest.raises(Exception):
+def test_handshake_needs_a_client_key(client, caplog, credentials):
+    """M20: siempre `client_key` (la web también); un `admin_token` ya no entra. El log no lo lleva."""
+    with caplog.at_level(logging.ERROR), pytest.raises(WebSocketDisconnect) as exc:
         with client.websocket_connect("/ws/stream") as ws:
             ws.send_json({**credentials, "input_mode": "text", "output_mode": ["text"]})
             ws.receive_text()
-    assert "value_error" in caplog.text
+    assert exc.value.code == 4000
+    assert "client_key" in caplog.text and "missing" in caplog.text
     assert "test-admin-token" not in caplog.text
-    assert VALID_KEY not in caplog.text
+
+
+@pytest.mark.parametrize("caps", [["Pantalla"], ["x" * 33], ["a"] * 33, "screen"])
+def test_handshake_capabilities_are_validated(client, caps):
+    with pytest.raises(WebSocketDisconnect) as exc, client.websocket_connect("/ws/stream") as ws:
+        ws.send_json({"client_key": VALID_KEY, "input_mode": "text", "output_mode": ["text"],
+                      "capabilities": caps})
+        ws.receive_text()
+    assert exc.value.code == 4000
+
+
+def test_handshake_stores_capabilities_and_last_seen(client, db_engine):
+    from sqlmodel import Session
+
+    from fogar_gateway.db.models import ClientRecord
+    from tests.integration.conftest import CLIENT_ID
+
+    with client.websocket_connect("/ws/stream") as ws:
+        ws.send_json({"client_key": VALID_KEY, "input_mode": "text", "output_mode": ["text"],
+                      "capabilities": ["screen", "mic"]})
+        assert ws.receive_json()["type"] == "ready"
+    with Session(db_engine) as s:
+        rec = s.get(ClientRecord, CLIENT_ID)
+    assert rec.capabilities == '["screen", "mic"]' and rec.last_seen_at is not None
 
 
 @pytest.mark.parametrize("conversation", ["", "x" * 65])
@@ -345,7 +367,7 @@ def test_handshake_conversation_is_validated(client, conversation):
         ws.receive_text()
 
 
-@pytest.mark.parametrize("field", ["client_key", "admin_token"])
+@pytest.mark.parametrize("field", ["client_key"])
 @pytest.mark.parametrize("value", ["\ud800", "k" * 1025], ids=["surrogate", "huge"])
 def test_handshake_credential_is_validated(client, caplog, field, value):
     """Auditoría 3.0, D-5: un surrogate suelto o un valor enorme es un handshake inválido

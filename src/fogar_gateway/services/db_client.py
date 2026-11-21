@@ -10,8 +10,9 @@ Interfaz pública invariante:
 import asyncio
 import json
 import logging
+from datetime import UTC, datetime
 
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select, update
 
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
 from fogar_gateway.db.database import get_engine
@@ -71,6 +72,20 @@ class DbClient:
             ClientInactive: el cliente está desactivado.
         """
         return await asyncio.to_thread(self._lookup, hash_key(client_key))
+
+    async def touch(self, client_id: str, capabilities: list[str] | None) -> None:
+        """El dispositivo acaba de entrar (M20): `last_seen_at` y, si las manda, sus capacidades."""
+        await asyncio.to_thread(self._touch, client_id, capabilities)
+
+    def _touch(self, client_id: str, capabilities: list[str] | None) -> None:
+        values: dict[str, object] = {"last_seen_at": datetime.now(UTC)}
+        if capabilities is not None:
+            values["capabilities"] = json.dumps(capabilities)
+        with Session(self._get_engine()) as session:
+            session.exec(  # type: ignore[call-overload]
+                update(ClientRecord).where(col(ClientRecord.id) == client_id).values(**values)
+            )
+            session.commit()
 
     async def revalidate(self, key_hash: str) -> tuple[Client, ClientConfig]:
         """Como `get_session`, desde el hash que ya guarda la sesión (la clave no se guarda)."""

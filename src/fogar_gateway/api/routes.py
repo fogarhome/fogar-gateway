@@ -6,8 +6,6 @@ import time
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
-from fogar_gateway.api.admin_routes import panel_session
-from fogar_gateway.api.deps import admin_token_matches
 from fogar_gateway.core.agent_policy import AgentPolicyError, AgentPolicyKind, resolve_agent
 from fogar_gateway.core.config import settings
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
@@ -53,19 +51,11 @@ class _Rejected(Exception):
 
 
 async def _authenticate(handshake: Handshake) -> tuple[Client, ClientConfig, str]:
-    """`(Client, ClientConfig, quién para el log)` de la credencial del handshake.
-
-    `admin_token` (M19): el panel web, que entra como el cliente «Panel web» si coincide con
-    ADMIN_TOKEN (`deps.admin_token_matches`, la misma comprobación que `/admin`). Lanza
-    ClientNotFound/ClientInactive.
-    """
-    if handshake.admin_token is not None:
-        if not admin_token_matches(handshake.admin_token):
-            raise ClientNotFound("panel")
-        client, config = await panel_session()
-        return client, config, "panel"
-    key = handshake.client_key or ""  # Handshake exige una de las dos credenciales
+    """`(Client, ClientConfig, quién para el log)` de la `client_key` del handshake: un
+    dispositivo emparejado o uno con sesión (M20). Lanza ClientNotFound/ClientInactive."""
+    key = handshake.client_key
     client, config = await db_client.get_session(key)
+    await db_client.touch(client.id, handshake.capabilities)
     return client, config, f"fp={fingerprint_key(key)}"
 
 
@@ -169,8 +159,8 @@ async def gateway_websocket(websocket: WebSocket):
     try:
         client, config, who = await _authenticate(handshake)
     except (ClientNotFound, ClientInactive):
-        # El admin_token nunca va al log, ni su huella; la client_key solo como huella.
-        who = "panel" if handshake.client_key is None else f"fp={fingerprint_key(handshake.client_key)}"
+        # La client_key solo como huella.
+        who = f"fp={fingerprint_key(handshake.client_key)}"
         logger.warning(
             f"request_id={request_id} source_ip={client_ip_for_log(websocket)} "
             f"{who} Handshake rechazado: credencial inválida o cliente inactivo."
@@ -183,9 +173,6 @@ async def gateway_websocket(websocket: WebSocket):
         logger.error(f"request_id={request_id} Configuración del cliente ilegible: {describe_error(e)}")
         await send_close(websocket, Close.SETUP_FAILED)
         return
-    # La credencial ya no hace falta: la sesión guarda el handshake sin el admin_token.
-    handshake = handshake.model_copy(update={"admin_token": None})
-
     logger.info(f"request_id={request_id} client_id={client.id} {who} Handshake verificado.")
 
     # 3. INSTANCIAR EL PUENTE DE MICROSERVICIOS

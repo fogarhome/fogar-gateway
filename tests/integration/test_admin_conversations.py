@@ -129,75 +129,89 @@ def test_messages_limit_is_validated_and_passed_to_chat_history(
     )
 
 
-# ── POST: una conversación nueva del panel web ───────────────────────────────
+# ── POST: una conversación nueva de un usuario, de su dispositivo (M20) ──────
+
+USER_KEY = "token-del-mac-de-sito-0123456789abcdef"
 
 
-def test_create_uses_the_cascade_and_the_installation_default(
-    client, admin_headers, monkeypatch
-):
-    r = client.post("/admin/conversations", headers=admin_headers, json={})
+@pytest.fixture
+def user(db_engine):
+    """Sito, miembro, con un dispositivo personal (el «Mac de Sito») ya con sesión."""
+    from fogar_gateway.db.models import MembershipRecord, UserRecord
+
+    with Session(db_engine) as s:
+        s.add(UserRecord(id="sito", username="sito", display_name="Sito", password_hash="x"))
+        s.commit()
+        s.add(MembershipRecord(user_id="sito", home_id="home", role="member"))
+        s.add(ClientRecord(id="mac", name="Mac de Sito", key_hash=hash_key(USER_KEY),
+                           user_id="sito", client_type="app"))
+        s.commit()
+    return {"authorization": f"Bearer {USER_KEY}"}
+
+
+def _set_device(db_engine, **fields):
+    with Session(db_engine) as s:
+        device = s.get(ClientRecord, "mac")
+        for name, value in fields.items():
+            setattr(device, name, value)
+        s.add(device)
+        s.commit()
+
+
+def test_create_uses_the_cascade_and_the_installation_default(client, user, monkeypatch):
+    r = client.post("/admin/conversations", headers=user, json={})
     assert r.status_code == 201
     assert (r.json()["agent"], r.json()["kind"]) == ("main", "created")  # el de OpenClaw
 
     monkeypatch.setattr(settings, "DEFAULT_AGENT", "a")  # #245: también de una conversación nueva
-    r = client.post("/admin/conversations", headers=admin_headers, json={})
+    r = client.post("/admin/conversations", headers=user, json={})
     assert (r.json()["agent"], r.json()["client_id"], r.json()["client_name"]) == (
-        "a", "panel-web", "Panel web"
+        "a", "mac", "Mac de Sito"
     )
+    assert r.json()["owner_user_id"] == "sito"
 
 
-def test_create_validates_the_agent_like_the_handshake(client, admin_headers, db_engine):
-    r = client.post("/admin/conversations", headers=admin_headers, json={"agent": "openclaw"})
+def test_the_machine_has_no_device_to_create_one(client, admin_headers):
+    r = client.post("/admin/conversations", headers=admin_headers, json={})
+    assert (r.status_code, r.json()) == (403, {"detail": "user_required"})
+
+
+def test_create_validates_the_agent_like_the_handshake(client, user, db_engine):
+    r = client.post("/admin/conversations", headers=user, json={"agent": "openclaw"})
     assert r.status_code == 201 and r.json()["agent"] == "openclaw"
-    r = client.post("/admin/conversations", headers=admin_headers, json={"agent": "nope"})
+    r = client.post("/admin/conversations", headers=user, json={"agent": "nope"})
     assert (r.status_code, r.json()) == (422, {"detail": "agent_not_available"})
-    with Session(db_engine) as s:
-        panel = s.get(ClientRecord, "panel-web")
-        panel.allowed_agents = '["a"]'
-        s.add(panel)
-        s.commit()
-    r = client.post("/admin/conversations", headers=admin_headers, json={"agent": "openclaw"})
+    _set_device(db_engine, allowed_agents='["a"]')
+    r = client.post("/admin/conversations", headers=user, json={"agent": "openclaw"})
     assert (r.status_code, r.json()) == (422, {"detail": "agent_not_permitted"})
-    r = client.post("/admin/conversations", headers=admin_headers, json={"agent": "", "x": 1})
+    r = client.post("/admin/conversations", headers=user, json={"agent": "", "x": 1})
     assert r.status_code == 422
 
 
-def _set_panel(db_engine, **fields):
-    with Session(db_engine) as s:
-        panel = s.get(ClientRecord, "panel-web")
-        for name, value in fields.items():
-            setattr(panel, name, value)
-        s.add(panel)
-        s.commit()
-
-
-def test_agents_for_a_new_conversation_follow_the_panel_policy(
-    client, admin_headers, db_engine, mock_orchestrator, monkeypatch
+def test_agents_for_a_new_conversation_follow_the_device_policy(
+    client, user, admin_headers, db_engine, mock_orchestrator, monkeypatch
 ):
-    r = client.get("/admin/conversations/agents", headers=admin_headers)
+    r = client.get("/admin/conversations/agents", headers=user)
     assert (r.status_code, r.json()) == (200, {"agents": ["main", "a", "openclaw"], "default": "main"})
-    with Session(db_engine) as s:  # una lectura: no crea la ficha del panel
-        assert s.get(ClientRecord, "panel-web") is None
-    client.post("/admin/conversations", headers=admin_headers, json={})  # ahora sí existe
     monkeypatch.setattr(settings, "DEFAULT_AGENT", "a")
-    assert client.get("/admin/conversations/agents", headers=admin_headers).json()["default"] == "a"
-    _set_panel(db_engine, allowed_agents='["openclaw"]')
-    # El de la cascada ("a") no le está permitido al panel: no hay agente por defecto.
-    r = client.get("/admin/conversations/agents", headers=admin_headers)
+    assert client.get("/admin/conversations/agents", headers=user).json()["default"] == "a"
+    _set_device(db_engine, allowed_agents='["openclaw"]')
+    # El de la cascada ("a") no le está permitido a su dispositivo: no hay agente por defecto.
+    r = client.get("/admin/conversations/agents", headers=user)
     assert r.json() == {"agents": ["openclaw"], "default": None}
-    mock_orchestrator.gateway_info = None  # OpenClaw sin conectar: sin roster, sus permitidos
+    # La máquina: sin política de ningún dispositivo.
     assert client.get("/admin/conversations/agents", headers=admin_headers).json() == {
+        "agents": ["main", "a", "openclaw"], "default": "a"
+    }
+    mock_orchestrator.gateway_info = None  # OpenClaw sin conectar: sin roster, sus permitidos
+    assert client.get("/admin/conversations/agents", headers=user).json() == {
         "agents": ["openclaw"], "default": None
     }
-    _set_panel(db_engine, allowed_agents=None, is_active=False)
-    r = client.get("/admin/conversations/agents", headers=admin_headers)
-    assert (r.status_code, r.json()) == (409, {"detail": "panel_client_inactive"})
-    _set_panel(db_engine, is_active=True)
-    r = client.get("/admin/conversations/agents", headers=admin_headers)
-    assert r.json() == {"agents": [], "default": "a"}
+    _set_device(db_engine, is_active=False)
+    assert client.get("/admin/conversations/agents", headers=user).status_code == 401
 
 
-def test_conversation_dates_carry_their_utc_offset(client, admin_headers, conversations):
+def test_conversation_dates_carry_their_utc_offset(client, admin_headers, user, conversations):
     import asyncio
 
     conv = asyncio.run(conversations.create(CLIENT_ID, "main"))
@@ -206,19 +220,8 @@ def test_conversation_dates_carry_their_utc_offset(client, admin_headers, conver
     # SQLite las guarda sin zona; salen en UTC con su desplazamiento, no como hora local.
     for field in ("created_at", "last_turn_at"):
         assert datetime.fromisoformat(row[field]).utcoffset() is not None, field
-    created = client.post("/admin/conversations", headers=admin_headers, json={}).json()
+    created = client.post("/admin/conversations", headers=user, json={}).json()
     assert datetime.fromisoformat(created["created_at"]).utcoffset() is not None
-
-
-def test_create_with_the_panel_disabled_is_a_conflict(client, admin_headers, db_engine):
-    client.post("/admin/conversations", headers=admin_headers, json={})
-    with Session(db_engine) as s:
-        panel = s.get(ClientRecord, "panel-web")
-        panel.is_active = False
-        s.add(panel)
-        s.commit()
-    r = client.post("/admin/conversations", headers=admin_headers, json={})
-    assert (r.status_code, r.json()) == (409, {"detail": "panel_client_inactive"})
 
 
 def test_removing_a_client_retires_it_and_keeps_its_conversations(

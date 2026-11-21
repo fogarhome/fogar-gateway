@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 
 from fogar_gateway.core.session_key import AGENT_ID_PATTERN
 from fogar_gateway.db.models import ClientRecord
-from fogar_gateway.models.schemas import CREDENTIAL_MAX_LEN, OutputMode
+from fogar_gateway.models.schemas import CREDENTIAL_MAX_LEN, Capabilities, OutputMode
 
 # Etiqueta de cliente. Solo se valida la ENTRADA (create/update/CLI); la respuesta
 # sigue siendo `str` para no romper la lectura de filas antiguas con valores libres (#122).
@@ -202,11 +202,6 @@ class PairRequest(BaseModel):
 # Sesión de usuario (M20)
 # ---------------------------------------------------------------------------
 
-# Una capacidad del dispositivo (pantalla, micrófono…): se guarda y se enseña, aún no decide nada.
-Capability = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$")]
-Capabilities = Annotated[list[Capability], Field(max_length=32)]
-
-
 Role = Literal["owner", "admin", "member"]
 Username = Annotated[
     str, StringConstraints(strip_whitespace=True, to_lower=True, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -260,8 +255,8 @@ HistoryLimit = Annotated[int, Query(ge=1, le=1000)]
 
 
 class ConversationCreate(BaseModel):
-    """`POST /admin/conversations`: una conversación nueva del panel web. Sin `agent`, el de la
-    cascada (`default_agent` del panel, `DEFAULT_AGENT`, el de OpenClaw)."""
+    """`POST /admin/conversations`: una conversación nueva del usuario, de su dispositivo. Sin
+    `agent`, el de la cascada (`default_agent` del dispositivo, `DEFAULT_AGENT`, el de OpenClaw)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -285,7 +280,7 @@ class ConversationResponse(BaseModel):
 
 
 class ConversationAgents(BaseModel):
-    """`GET /admin/conversations/agents`: con qué agentes puede empezar el panel una conversación
+    """`GET /admin/conversations/agents`: con qué agentes puede empezar quien llama una conversación
     y cuál tocaría sin elegir (None si el de la cascada no le está permitido)."""
 
     agents: list[str]

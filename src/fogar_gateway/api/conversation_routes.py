@@ -10,10 +10,11 @@ y las que crea son suyas (de su dispositivo).
                                              (caché de TITLES_TTL_S; si no responde, null)
   GET  /admin/conversations/{id}/messages  — lo dicho, de `chat.history` (`limit`, 200 por defecto);
                                              503 `orchestrator_unavailable` sin OpenClaw
-  POST /admin/conversations                — conversación nueva del panel web (agente validado
-                                             como en el handshake)
-  GET  /admin/conversations/agents         — los agentes con los que el panel puede empezar una
-                                             y el que tocaría sin elegir (para su selector)
+  POST /admin/conversations                — conversación nueva del usuario, de su dispositivo
+                                             (agente validado como en el handshake); la máquina,
+                                             403 `user_required`
+  GET  /admin/conversations/agents         — los agentes con los que quien llama puede empezar
+                                             una y el que tocaría sin elegir (para su selector)
 
 El gateway no guarda texto: títulos y mensajes se leen de OpenClaw en cada petición y nunca se
 registran en el log.
@@ -24,7 +25,6 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from fogar_gateway.api.admin_routes import existing_panel_config, panel_session
 from fogar_gateway.api.deps import Caller, Principal, current_principal
 from fogar_gateway.core.agent_policy import AgentPolicyError, resolve_agent
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
@@ -110,17 +110,10 @@ async def get_conversation_agents(
     request: Request, principal: Principal = Depends(current_principal)
 ) -> ConversationAgents:
     """Los del roster de OpenClaw que quien llama puede usar (`allowed_agents` de su dispositivo;
-    la máquina, los del panel) y el de la cascada. Sin roster (OpenClaw sin conectar), su
-    `allowed_agents` (o ninguno). Mismas reglas que el POST, pero es una lectura: no crea la ficha
-    del panel (sin ficha, las de por defecto)."""
-    config: ClientConfig | None
-    if isinstance(principal, Caller):
-        config = await _caller_config(principal)
-    else:
-        try:
-            config = await existing_panel_config()
-        except (ClientNotFound, ClientInactive):
-            raise HTTPException(status_code=409, detail="panel_client_inactive") from None
+    la máquina, todos) y el de la cascada. Sin roster (OpenClaw sin conectar), su
+    `allowed_agents` (o ninguno). Mismas reglas que el POST."""
+    # La máquina no tiene dispositivo: la cascada sin la política de ningún cliente.
+    config = await _caller_config(principal) if isinstance(principal, Caller) else None
     info = request.app.state.openclaw.gateway_info
     allowed = config.allowed_agents if config is not None else None
     if info is not None:
@@ -164,14 +157,10 @@ async def get_conversation_messages(
 async def create_conversation(
     body: ConversationCreate, request: Request, principal: Principal = Depends(current_principal)
 ) -> ConversationResponse:
-    if isinstance(principal, Caller):  # la suya: de su dispositivo, privada
-        client_id, config = principal.device.id, await _caller_config(principal)
-    else:
-        try:
-            client, config = await panel_session()
-        except (ClientNotFound, ClientInactive):
-            raise HTTPException(status_code=409, detail="panel_client_inactive") from None
-        client_id = client.id
+    if not isinstance(principal, Caller):
+        # Una conversación es de un dispositivo (M20): la máquina no tiene ninguno.
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="user_required")
+    client_id, config = principal.device.id, await _caller_config(principal)  # de su dispositivo
     try:
         agent = resolve_agent(
             requested=body.agent,
@@ -183,9 +172,9 @@ async def create_conversation(
     service = request.app.state.conversations
     try:
         conversation = await service.create(client_id, agent)
-    except ConversationClientMissing:  # el panel, borrado entre medias
-        raise HTTPException(status_code=409, detail="panel_client_inactive") from None
+    except ConversationClientMissing:  # su dispositivo, retirado entre medias
+        raise HTTPException(status_code=401, detail="not_authenticated") from None
     row = await service.row(conversation.id)
-    if row is None:  # borrada entre medias (el panel, con sus conversaciones)
-        raise HTTPException(status_code=409, detail="panel_client_inactive")
+    if row is None:  # borrada entre medias (su usuario, con sus conversaciones)
+        raise HTTPException(status_code=401, detail="not_authenticated")
     return _response(row)

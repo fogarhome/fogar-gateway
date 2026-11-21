@@ -9,6 +9,7 @@ import asyncio
 import json
 from datetime import datetime
 
+import httpx
 import pytest
 import websockets
 from sqlmodel import Session
@@ -18,10 +19,8 @@ from fogar_gateway.db.models import ClientRecord, ConversationRecord, UserRecord
 from fogar_gateway.services import conversations as conv_mod
 from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.conversations import ConversationService, session_key_for
-from tests.integration.conftest import ADMIN_TOKEN, CLIENT_ID
+from tests.integration.conftest import CLIENT_ID
 from tests.integration.harness.conftest import assert_turns_paired, of_type
-
-PANEL = {"client_key": None, "admin_token": ADMIN_TOKEN}
 
 
 class Clock:
@@ -352,45 +351,58 @@ async def test_turn_end_reason_for_each_way_a_turn_ends(harness, monkeypatch):
     assert_turns_paired(client.messages)
 
 
-# ── El panel web entra con el ADMIN_TOKEN ────────────────────────────────────
+# ── Un usuario inicia sesión y chatea (M20; antes, el panel con el ADMIN_TOKEN) ──
 
 
-async def test_admin_token_enters_as_the_panel_web_client(harness, caplog):
-    panel = await harness.connect(handshake=PANEL)
-    assert panel.ready["session_id"].startswith("panel-web:")
-    msgs = await run_turn(panel, "hola desde la web")
-    assert of_type(msgs, "turn_start")[0]["conversation"] == panel.ready["conversation"]["id"]
-    await panel.ws.close()
-    await harness.connect(handshake=PANEL)  # la ficha se crea una sola vez
-
+async def _login(harness, username: str = "sito") -> dict:
+    """Alta del usuario (por la máquina) e inicio de sesión desde un dispositivo nuevo."""
     async with harness.admin() as admin:
-        clients = (await admin.get("/admin/clients")).json()
-    panels = [c for c in clients if c["name"] == "Panel web"]
-    assert [(c["id"], c["client_type"]) for c in panels] == [("panel-web", "web")]
-    assert "client_key" not in panels[0]
-    assert ADMIN_TOKEN not in caplog.text
+        r = await admin.post("/admin/users", json={
+            "username": username, "display_name": username.title(), "password": "contraseña larga",
+        })
+        assert r.status_code in (201, 409), r.text
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{harness.port}") as http:
+        r = await http.post("/auth/login", json={
+            "username": username, "password": "contraseña larga", "device_name": "Web",
+            "client_type": "web",
+        })
+        assert r.status_code == 201, r.text
+        return r.json()
 
 
-@pytest.mark.parametrize("token", ["wrong-token", ""])
-async def test_a_wrong_admin_token_is_refused(harness, token):
-    client = await harness.open(handshake={"client_key": None, "admin_token": token})
-    closed = await closed_by_gateway(client)
-    assert (closed.rcvd.code, closed.rcvd.reason) == (4010, "invalid or inactive credential")
-
-
-async def test_the_panel_resumes_a_conversation_created_from_admin(harness):
+async def test_a_logged_in_device_chats_in_a_private_conversation(harness, caplog):
+    session = await _login(harness)
+    me = await harness.connect(handshake={"client_key": session["client_key"]})
+    assert me.ready["session_id"].startswith(f"{session['client_id']}:")
+    msgs = await run_turn(me, "hola desde la web")
+    assert of_type(msgs, "turn_start")[0]["conversation"] == me.ready["conversation"]["id"]
     async with harness.admin() as admin:
-        r = await admin.post("/admin/conversations", json={})
+        rows = (await admin.get("/admin/conversations")).json()
+    (row,) = [r for r in rows if r["id"] == me.ready["conversation"]["id"]]
+    assert row["owner_user_id"] == session["user"]["id"]  # privada: de su dispositivo
+    assert session["client_key"] not in caplog.text
+
+
+async def test_a_user_resumes_a_conversation_created_from_admin(harness):
+    session = await _login(harness)
+    bearer = {"authorization": f"Bearer {session['client_key']}"}
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{harness.port}") as http:
+        r = await http.post("/admin/conversations", json={}, headers=bearer)
         assert r.status_code == 201, r.text
         created = r.json()
-    assert (created["client_id"], created["kind"], created["agent"]) == ("panel-web", "created", "main")
+    assert (created["client_id"], created["kind"], created["agent"]) == (
+        session["client_id"], "created", "main"
+    )
 
-    panel = await harness.connect(handshake={**PANEL, "conversation": created["id"]})
-    assert panel.ready["conversation"] == {"id": created["id"], "agent": "main"}
-    await run_turn(panel, "hola")
+    me = await harness.connect(
+        handshake={"client_key": session["client_key"], "conversation": created["id"]}
+    )
+    assert me.ready["conversation"] == {"id": created["id"], "agent": "main"}
+    await run_turn(me, "hola")
 
     async with harness.admin() as admin:
-        rows = (await admin.get("/admin/conversations", params={"client_id": "panel-web"})).json()
+        rows = (await admin.get("/admin/conversations",
+                                params={"client_id": session["client_id"]})).json()
         history = (await admin.get(f"/admin/conversations/{created['id']}/messages")).json()
     (row,) = [r for r in rows if r["id"] == created["id"]]
     assert row["turn_count"] == 1 and row["last_turn_at"] is not None

@@ -49,9 +49,7 @@ from fogar_gateway.models.admin_schemas import (
     ClientUpdate,
     ClientWithKey,
 )
-from fogar_gateway.models.schemas import Client, ClientConfig
 from fogar_gateway.services.auth import hash_key, new_key
-from fogar_gateway.services.db_client import db_client
 from fogar_gateway.services.openclaw.models import OrchestratorAccess, access_texts
 from fogar_gateway.services.reconnection import ServiceStatus
 from fogar_gateway.services.stats import gateway_stats
@@ -148,56 +146,6 @@ def create_client_record(
         ) from None
     session.refresh(record)
     return record
-
-
-# El panel web entra con el ADMIN_TOKEN (handshake `admin_token`, M19) como este cliente: una
-# ficha normal (se ve, se edita y se desactiva como las demás), creada la primera vez que hace
-# falta. Su client_key no se enseña nunca (no se usa: el panel no la conoce).
-PANEL_CLIENT_ID = "panel-web"
-PANEL_CLIENT_NAME = "Panel web"
-
-
-def ensure_panel_client(session: Session) -> ClientRecord:
-    """La ficha del cliente «Panel web»; la crea por la vía única si no existe."""
-    record = session.get(ClientRecord, PANEL_CLIENT_ID)
-    if record is not None:
-        return record
-    body = ClientCreate(name=PANEL_CLIENT_NAME, client_type="web", output_mode=["text"])
-    try:
-        return create_client_record(session, body, client_id=PANEL_CLIENT_ID)
-    except HTTPException:
-        # Otra petición la creó a la vez (409 de create_client_record): es esa.
-        record = session.get(ClientRecord, PANEL_CLIENT_ID)
-        if record is None:
-            raise
-        return record
-
-
-def _panel_key_hash() -> str:
-    with Session(get_engine()) as session:
-        return ensure_panel_client(session).key_hash
-
-
-async def panel_session() -> tuple[Client, ClientConfig]:
-    """`(Client, ClientConfig)` del panel web, como `db_client.get_session`: lanza
-    `ClientInactive` si el administrador lo desactivó."""
-    return await db_client.revalidate(await asyncio.to_thread(_panel_key_hash))
-
-
-def _existing_panel_key_hash() -> str | None:
-    with Session(get_engine()) as session:
-        record = session.get(ClientRecord, PANEL_CLIENT_ID)
-        return record.key_hash if record is not None else None
-
-
-async def existing_panel_config() -> ClientConfig | None:
-    """La configuración del panel web sin crear su ficha (para lecturas): None si aún no existe,
-    `ClientInactive` si el administrador lo desactivó."""
-    key_hash = await asyncio.to_thread(_existing_panel_key_hash)
-    if key_hash is None:
-        return None
-    _, config = await db_client.revalidate(key_hash)
-    return config
 
 
 @router.post("/clients", response_model=ClientWithKey, status_code=status.HTTP_201_CREATED)
