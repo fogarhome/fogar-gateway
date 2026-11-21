@@ -162,3 +162,36 @@ def test_deleting_a_user_takes_their_devices_and_private_conversations(
         keys = [c.session_key for c in s.exec(select(ConversationRecord)).all()]
     assert keys == ["agent:main:fogar-hogar"]  # la del hogar se queda
     assert http.delete(f"/admin/users/{member_id}", headers=admin_headers).status_code == 404
+
+
+# ── Conversaciones vistas por cada usuario (paso 6) ─────────────────────────
+
+
+def test_each_user_sees_the_home_and_their_own(http, admin_headers, db_engine, owner_id):
+    _create(http, admin_headers, "ana")
+    sito, ana = _bearer(http, "sito"), _bearer(http, "ana")
+    with Session(db_engine) as s:
+        tv = ClientRecord(name="Tele", key_hash="h-tv")
+        s.add(tv)
+        s.commit()
+        tv_id = tv.id
+    import asyncio
+
+    service = app.state.conversations
+    home = asyncio.run(service.create(tv_id, "main"))
+    created = http.post("/admin/conversations", json={}, headers=ana)
+    assert created.status_code == 201, created.text
+    anas = created.json()
+    with Session(db_engine) as s:
+        ana_id = s.exec(select(UserRecord).where(UserRecord.username == "ana")).one().id
+    assert anas["owner_user_id"] == ana_id  # la crea desde su dispositivo: es suya
+
+    def listed(headers):
+        rows = http.get("/admin/conversations", headers=headers).json()
+        return {r["id"] for r in rows}
+
+    assert listed(ana) == {home.id, anas["id"]}
+    assert listed(sito) == {home.id}  # ni el dueño lee lo privado de otro
+    assert listed(admin_headers) == {home.id, anas["id"]}  # la máquina, todo
+    r = http.get(f"/admin/conversations/{anas['id']}/messages", headers=sito)
+    assert r.status_code == 404

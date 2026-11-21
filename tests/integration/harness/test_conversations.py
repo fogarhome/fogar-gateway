@@ -14,7 +14,7 @@ import websockets
 from sqlmodel import Session
 
 from fogar_gateway.core.config import settings
-from fogar_gateway.db.models import ClientRecord, ConversationRecord
+from fogar_gateway.db.models import ClientRecord, ConversationRecord, UserRecord
 from fogar_gateway.services import conversations as conv_mod
 from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.conversations import ConversationService, session_key_for
@@ -238,11 +238,17 @@ async def test_a_chosen_conversation_never_changes_day_and_can_be_resumed(harnes
     assert said(harness, session_key_for("main", chosen)) == ["uno", "dos", "tres"]
 
 
-async def test_a_conversation_of_another_client_is_refused(harness, db_engine):
+async def test_a_private_conversation_of_someone_else_is_refused(harness, db_engine):
+    """M20: el cliente de prueba es del hogar; la conversación privada de una persona (creada desde
+    su dispositivo personal) no se abre desde él."""
     with Session(db_engine) as s:
-        s.add(ClientRecord(id="otro", name="Otro", key_hash=hash_key("otra-clave-de-cliente")))
+        s.add(UserRecord(id="ana", username="ana", display_name="Ana", password_hash="x"))
+        s.commit()
+        s.add(ClientRecord(id="otro", name="Otro", key_hash=hash_key("otra-clave-de-cliente"),
+                           user_id="ana"))
         s.commit()
     foreign = await ConversationService(db_engine).create("otro", "main")
+    assert foreign.owner_user_id == "ana"
 
     for conversation in (foreign.id, "no-existe"):
         client = await harness.open(handshake={"conversation": conversation})

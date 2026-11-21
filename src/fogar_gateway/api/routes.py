@@ -71,18 +71,19 @@ async def _authenticate(handshake: Handshake) -> tuple[Client, ClientConfig, str
 
 async def _open_conversation(
     service: ConversationService,
-    client_id: str,
+    client: Client,
     config: ClientConfig,
     handshake: Handshake,
     gateway_info: GatewayInfo | None,
 ) -> SessionConversation:
-    """La conversación de la sesión: la pedida (`conversation`, solo del propio cliente), una
-    nueva (`"new"`) o, sin pedir, la del día. Lanza `_Rejected` (41xx, 402x)."""
+    """La conversación de la sesión: la pedida (`conversation`, una que pueda ver: del hogar o,
+    desde un dispositivo personal, de su usuario; M20), una nueva (`"new"`) o, sin pedir, la del
+    día. Lanza `_Rejected` (41xx, 402x)."""
     requested = handshake.conversation
     existing = None
     if requested is not None and requested != NEW:
         try:
-            existing = await service.get_owned(client_id, requested)
+            existing = await service.get_visible(requested, client.home_id, client.user_id)
         except ConversationNotFound:
             raise _Rejected(
                 "conversation_not_found", Close.CONVERSATION_NOT_FOUND, "conversation"
@@ -103,9 +104,9 @@ async def _open_conversation(
         conversation = existing
     elif requested == NEW:
         # Se guarda tras el health check, junto a claim_conversation (C-3).
-        conversation = new_conversation(client_id, agent)
+        conversation = new_conversation(client.id, agent)
     else:
-        conversation = await service.default_for(client_id, agent)
+        conversation = await service.default_for(client.id, agent)
     return SessionConversation(conversation, explicit=requested is not None, service=service)
 
 
@@ -195,7 +196,7 @@ async def gateway_websocket(websocket: WebSocket):
     # conversación pedida (del propio cliente) o la del día.
     try:
         conversation = await _open_conversation(
-            app_state.conversations, client.id, config, handshake, openclaw.gateway_info
+            app_state.conversations, client, config, handshake, openclaw.gateway_info
         )
     except _Rejected as e:
         logger.warning(f"[{client.id}] Handshake rechazado: {e.kind}")

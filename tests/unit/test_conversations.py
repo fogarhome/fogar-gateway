@@ -126,13 +126,13 @@ async def test_created_conversations_are_always_new(service):
     assert a.id != b.id and a.kind == b.kind == "created" and a.day is None
 
 
-async def test_a_conversation_of_another_client_is_not_found(service):
+async def test_a_home_conversation_opens_from_any_home_device(service):
+    """M20: la del hogar se abre desde cualquier dispositivo del hogar (antes, solo desde el suyo).
+    Lo privado: tests/unit/test_conversation_visibility.py."""
     web = await service.create("web", "main")
-    assert (await service.get_owned("web", web.id)) == web
+    assert (await service.get_visible(web.id, "home", None)) == web
     with pytest.raises(ConversationNotFound):
-        await service.get_owned("tv", web.id)
-    with pytest.raises(ConversationNotFound):
-        await service.get_owned("tv", "does-not-exist")
+        await service.get_visible("does-not-exist", "home", None)
 
 
 async def test_note_turn_counts_and_stamps(service, engine):

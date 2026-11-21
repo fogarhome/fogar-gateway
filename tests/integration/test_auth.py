@@ -205,8 +205,7 @@ def test_devices_query_lists_only_live_ones(http, db_engine):
 # ── /admin por rol (paso 4) ─────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("path", ["/admin/clients", "/admin/state", "/admin/pairing",
-                                  "/admin/conversations"])
+@pytest.mark.parametrize("path", ["/admin/clients", "/admin/state", "/admin/pairing"])
 def test_admin_is_for_owners_and_admins(http, db_engine, path):
     _add_user(db_engine, "admi", "admin")
     owner = _bearer(_login(http).json()["client_key"])

@@ -55,7 +55,7 @@ def test_list_has_titles_from_openclaw(client, admin_headers, conversations, moc
     assert row == {
         "id": conv.id, "client_id": CLIENT_ID, "client_name": "Test Client", "agent": "main",
         "kind": "default", "day": conv.day.isoformat(), "created_at": row["created_at"],
-        "last_turn_at": row["last_turn_at"], "turn_count": 1, "title": "La cena",
+        "last_turn_at": row["last_turn_at"], "turn_count": 1, "title": "La cena", "owner_user_id": None,
     }
     assert row["last_turn_at"] is not None
     client.get("/admin/conversations", headers=admin_headers)

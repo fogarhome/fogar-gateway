@@ -1,7 +1,9 @@
 """
 conversation_routes.py
 ~~~~~~~~~~~~~~~~~~~~~~
-/admin/conversations — las conversaciones de todos los clientes (M19). Auth: X-Admin-Token.
+/admin/conversations — conversaciones (M19). Auth (M20): la máquina (`X-Admin-Token`) las ve
+todas; un usuario (Bearer, cualquier rol) ve las del hogar y las suyas, nunca las privadas de otro,
+y las que crea son suyas (de su dispositivo).
 
   GET  /admin/conversations                — lista (filtro `client_id`), la última en hablarse
                                              primero, sin las del día vacías; el título, de OpenClaw
@@ -23,7 +25,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from fogar_gateway.api.admin_routes import existing_panel_config, panel_session
-from fogar_gateway.api.deps import require_admin
+from fogar_gateway.api.deps import Caller, Principal, current_principal
 from fogar_gateway.core.agent_policy import AgentPolicyError, resolve_agent
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
 from fogar_gateway.models.admin_schemas import (
@@ -36,11 +38,13 @@ from fogar_gateway.models.admin_schemas import (
     ConversationResponse,
     HistoryLimit,
 )
+from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.conversations import (
     ConversationClientMissing,
     ConversationRow,
     history_messages,
 )
+from fogar_gateway.services.db_client import db_client
 from fogar_gateway.services.openclaw.client import (
     ORCHESTRATOR_UNAVAILABLE_ERROR,
     OrchestratorRequestError,
@@ -48,7 +52,7 @@ from fogar_gateway.services.openclaw.client import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/admin/conversations", dependencies=[Depends(require_admin)])
+router = APIRouter(prefix="/admin/conversations")
 
 
 def _utc(value: datetime) -> datetime:
@@ -69,28 +73,54 @@ def _response(row: ConversationRow, title: str | None = None) -> ConversationRes
         last_turn_at=_utc(r.last_turn_at) if r.last_turn_at is not None else None,
         turn_count=r.turn_count,
         title=title,
+        owner_user_id=r.owner_user_id,
     )
+
+
+def _visible_to(principal: Principal) -> tuple[str, str | None] | None:
+    if isinstance(principal, Caller):
+        return principal.device.home_id, principal.user.id
+    return None  # la máquina
+
+
+async def _caller_config(caller: Caller) -> ClientConfig:
+    try:
+        _, config = await db_client.revalidate(caller.device.key_hash)
+    except (ClientNotFound, ClientInactive):  # retirado entre medias
+        raise HTTPException(status_code=401, detail="not_authenticated") from None
+    return config
 
 
 @router.get("", response_model=list[ConversationResponse])
 async def list_conversations(
-    request: Request, client_id: ClientIdFilter = None
+    request: Request,
+    client_id: ClientIdFilter = None,
+    principal: Principal = Depends(current_principal),
 ) -> list[ConversationResponse]:
-    rows = await request.app.state.conversations.list_rows(client_id)
+    rows = await request.app.state.conversations.list_rows(
+        client_id, visible_to=_visible_to(principal)
+    )
     cache = request.app.state.conversation_titles
     titles = await cache.get(request.app.state.openclaw) if rows else {}
     return [_response(row, titles.get(row.record.session_key.lower())) for row in rows]
 
 
 @router.get("/agents", response_model=ConversationAgents)
-async def get_conversation_agents(request: Request) -> ConversationAgents:
-    """Los del roster de OpenClaw que el panel puede usar (`allowed_agents`) y el de la cascada.
-    Sin roster (OpenClaw sin conectar), su `allowed_agents` (o ninguno). Mismas reglas que el POST,
-    pero es una lectura: no crea la ficha del panel (sin ficha, las de por defecto)."""
-    try:
-        config = await existing_panel_config()
-    except (ClientNotFound, ClientInactive):
-        raise HTTPException(status_code=409, detail="panel_client_inactive") from None
+async def get_conversation_agents(
+    request: Request, principal: Principal = Depends(current_principal)
+) -> ConversationAgents:
+    """Los del roster de OpenClaw que quien llama puede usar (`allowed_agents` de su dispositivo;
+    la máquina, los del panel) y el de la cascada. Sin roster (OpenClaw sin conectar), su
+    `allowed_agents` (o ninguno). Mismas reglas que el POST, pero es una lectura: no crea la ficha
+    del panel (sin ficha, las de por defecto)."""
+    config: ClientConfig | None
+    if isinstance(principal, Caller):
+        config = await _caller_config(principal)
+    else:
+        try:
+            config = await existing_panel_config()
+        except (ClientNotFound, ClientInactive):
+            raise HTTPException(status_code=409, detail="panel_client_inactive") from None
     info = request.app.state.openclaw.gateway_info
     allowed = config.allowed_agents if config is not None else None
     if info is not None:
@@ -106,10 +136,14 @@ async def get_conversation_agents(request: Request) -> ConversationAgents:
 
 @router.get("/{conversation_id}/messages", response_model=ConversationMessages)
 async def get_conversation_messages(
-    conversation_id: ConversationIdPath, request: Request, limit: HistoryLimit = 200
+    conversation_id: ConversationIdPath,
+    request: Request,
+    limit: HistoryLimit = 200,
+    principal: Principal = Depends(current_principal),
 ) -> ConversationMessages:
     conversation = await request.app.state.conversations.get(conversation_id)
-    if conversation is None:
+    visible = _visible_to(principal)
+    if conversation is None or (visible is not None and not conversation.visible_to(*visible)):
         raise HTTPException(status_code=404, detail="Conversation not found")
     try:
         payload = await request.app.state.openclaw.request(
@@ -127,11 +161,17 @@ async def get_conversation_messages(
 
 
 @router.post("", response_model=ConversationResponse, status_code=status.HTTP_201_CREATED)
-async def create_conversation(body: ConversationCreate, request: Request) -> ConversationResponse:
-    try:
-        client, config = await panel_session()
-    except (ClientNotFound, ClientInactive):
-        raise HTTPException(status_code=409, detail="panel_client_inactive") from None
+async def create_conversation(
+    body: ConversationCreate, request: Request, principal: Principal = Depends(current_principal)
+) -> ConversationResponse:
+    if isinstance(principal, Caller):  # la suya: de su dispositivo, privada
+        client_id, config = principal.device.id, await _caller_config(principal)
+    else:
+        try:
+            client, config = await panel_session()
+        except (ClientNotFound, ClientInactive):
+            raise HTTPException(status_code=409, detail="panel_client_inactive") from None
+        client_id = client.id
     try:
         agent = resolve_agent(
             requested=body.agent,
@@ -142,7 +182,7 @@ async def create_conversation(body: ConversationCreate, request: Request) -> Con
         raise HTTPException(status_code=422, detail=f"agent_{e.kind}") from None
     service = request.app.state.conversations
     try:
-        conversation = await service.create(client.id, agent)
+        conversation = await service.create(client_id, agent)
     except ConversationClientMissing:  # el panel, borrado entre medias
         raise HTTPException(status_code=409, detail="panel_client_inactive") from None
     row = await service.row(conversation.id)

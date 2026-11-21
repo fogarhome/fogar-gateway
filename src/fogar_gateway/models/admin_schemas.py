@@ -281,6 +281,7 @@ class ConversationResponse(BaseModel):
     last_turn_at: datetime | None
     turn_count: int
     title: str | None = None
+    owner_user_id: str | None = None  # M20: null = del hogar; con valor, privada de ese usuario
 
 
 class ConversationAgents(BaseModel):
