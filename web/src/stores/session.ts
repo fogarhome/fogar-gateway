@@ -1,24 +1,48 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 
-const KEY = 'fogar.adminToken'
+// La sesión de esta web (4.0): el token de este navegador como dispositivo personal (de
+// /auth/login) y quién es su persona. El token va como Bearer a /admin y /auth y como
+// client_key al WebSocket; nunca se enseña.
+export type Role = 'owner' | 'admin' | 'member'
+
+export interface SessionUser {
+  id: string
+  username: string
+  display_name: string
+  role: Role
+}
+
+interface Stored {
+  token: string
+  /** Este navegador como dispositivo (su `client_id`): sus conversaciones se escriben aquí. */
+  deviceId: string
+  user: SessionUser
+}
+
+const KEY = 'fogar.session'
+const OLD_KEY = 'fogar.adminToken' // la 3.x guardaba aquí el ADMIN_TOKEN: ya no sirve
 
 // El almacenamiento del navegador puede fallar (ventana privada, datos bloqueados):
 // cada acceso va protegido y la web sigue funcionando sin recordar nada.
-function read(): string | null {
+function read(): Stored | null {
   try {
-    return localStorage.getItem(KEY) ?? sessionStorage.getItem(KEY)
+    localStorage.removeItem(OLD_KEY)
+    sessionStorage.removeItem(OLD_KEY)
+    const raw = localStorage.getItem(KEY) ?? sessionStorage.getItem(KEY)
+    const parsed = raw ? (JSON.parse(raw) as Partial<Stored>) : null
+    return parsed?.token && parsed.user && parsed.deviceId ? (parsed as Stored) : null
   } catch {
     return null
   }
 }
 
-function write(token: string, remember: boolean): void {
+function write(value: Stored, remember: boolean): void {
   try {
-    ;(remember ? localStorage : sessionStorage).setItem(KEY, token)
+    ;(remember ? localStorage : sessionStorage).setItem(KEY, JSON.stringify(value))
     ;(remember ? sessionStorage : localStorage).removeItem(KEY)
   } catch {
-    // sin almacenamiento: el token vive solo en memoria
+    // sin almacenamiento: la sesión vive solo en memoria
   }
 }
 
@@ -32,17 +56,41 @@ function forget(): void {
 }
 
 export const useSessionStore = defineStore('session', () => {
-  const token = ref<string | null>(read())
+  const stored = read()
+  const token = ref<string | null>(stored?.token ?? null)
+  const user = ref<SessionUser | null>(stored?.user ?? null)
+  const deviceId = ref<string | null>(stored?.deviceId ?? null)
+  let remembered = (() => {
+    try {
+      return localStorage.getItem(KEY) !== null
+    } catch {
+      return false
+    }
+  })()
 
-  function signIn(newToken: string, remember: boolean): void {
+  // Dueño o administrador: el hogar entero. Un miembro, lo suyo y lo común.
+  const isAdmin = computed(() => user.value?.role === 'owner' || user.value?.role === 'admin')
+
+  function signIn(newToken: string, newDeviceId: string, newUser: SessionUser, remember: boolean): void {
     token.value = newToken
-    write(newToken, remember)
+    deviceId.value = newDeviceId
+    user.value = newUser
+    remembered = remember
+    write({ token: newToken, deviceId: newDeviceId, user: newUser }, remember)
+  }
+
+  /** Lo que diga /auth/me (el rol puede haber cambiado desde otro sitio). */
+  function setUser(newUser: SessionUser): void {
+    user.value = newUser
+    if (token.value && deviceId.value) write({ token: token.value, deviceId: deviceId.value, user: newUser }, remembered)
   }
 
   function signOut(): void {
     token.value = null
+    deviceId.value = null
+    user.value = null
     forget()
   }
 
-  return { token, signIn, signOut }
+  return { token, deviceId, user, isAdmin, signIn, setUser, signOut }
 })

@@ -8,7 +8,7 @@ Guía completa para implementar clientes que se conecten a fogar-gateway. Cubre 
 
 ## Índice
 
-0. [Descubrir el gateway y emparejarse](#0-descubrir-el-gateway-y-emparejarse)
+0. [Descubrir el gateway y emparejarse (o iniciar sesión)](#0-descubrir-el-gateway-y-emparejarse)
 1. [Conexión y handshake](#1-conexión-y-handshake)
 2. [Mensaje ready](#2-mensaje-ready)
 3. [Enviar audio de micrófono](#3-enviar-audio-de-micrófono)
@@ -30,6 +30,8 @@ Guía completa para implementar clientes que se conecten a fogar-gateway. Cubre 
 ## 0. Descubrir el gateway y emparejarse
 
 Antes de la sesión, tu cliente necesita dos cosas: **dónde está el gateway** y **su `client_key`**. Las dos pueden venir de la configuración (un administrador creó el cliente con `fogar-gw clients add` y te pasó la clave), pero lo cómodo es que el cliente las consiga solo. Esta sección es lo que tiene que implementar.
+
+**Dos clases de cliente (4.0).** Un aparato **del hogar**, de uso compartido (una tele, un altavoz), **se empareja** con un código: no se sabe quién habla y lo que se dice es del hogar. Un aparato **personal** (una app en el móvil de alguien, su Mac) **inicia sesión** con la cuenta de su persona: lo que se dice es privado de ella y ve también las conversaciones del hogar. Elige una de las dos; un aparato no cambia de clase (para pasar de una a otra, retira la clave y haz lo otro).
 
 ### Encontrar el gateway
 
@@ -90,9 +92,29 @@ Después abre la sesión normal (§1) con esa `client_key`.
 
 **Intentos fallidos:** mientras haya códigos abiertos, cada `400` cuenta (un código caducado o ya usado también), sea de quien sea, y al quinto seguido se anulan todos los abiertos (un canje correcto pone la cuenta a 0); el administrador tiene que abrir otro. Es la defensa contra quien intente adivinar, porque `/pair` puede estar expuesto a internet a través de un proxy. El cliente no puede saber cuántos intentos quedan: si tras un `400` el usuario está seguro del código, dile que pida uno nuevo.
 
+### Iniciar sesión (cliente personal, 4.0)
+
+Para un aparato de una persona: la persona escribe **su usuario y su contraseña** una vez, y el cliente guarda el token que recibe.
+
+```http
+POST https://<host>/auth/login
+Content-Type: application/json
+
+{"username": "ana", "password": "…", "device_name": "iPhone de Ana", "client_type": "app", "capabilities": ["screen", "mic", "speaker"]}
+```
+
+| Respuesta | Qué significa |
+|-----------|---------------|
+| `201 {"client_id", "client_key", "user": {"id", "username", "display_name", "role"}, "home": {"id", "name"}}` | Dentro. `client_key` es el token de este aparato: **solo llega aquí, una vez**. Guárdalo como una contraseña (en el Llavero, nunca en un log) y úsalo como `client_key` en el handshake (§1) y como `Authorization: Bearer` en `/auth` y `/admin` |
+| `401 {"detail": "invalid_credentials"}` | Usuario o contraseña incorrectos, o cuenta desactivada (siempre el mismo) |
+| `403 {"detail": "insecure_transport"}` | Por HTTP desde la red de casa la contraseña iría en claro: el gateway solo la acepta por HTTPS, o por HTTP desde su propia máquina o la tailnet. Usa la URL `https://` del gateway |
+| `429 {"detail": "too_many_attempts"}` + `Retry-After` | Demasiados fallos seguidos (por IP o por cuenta): espera esos segundos |
+
+**El token no caduca ni se refresca:** vale hasta que se retira. `GET /auth/me` (con Bearer) dice quién eres y tu rol; `POST /auth/logout` retira este aparato (al cerrar sesión, **borra también lo que tengas en caché de esa persona**: un iPad puede ser compartido); `GET /auth/devices` y `DELETE /auth/devices/{id}`, los aparatos de la persona. Una contraseña nunca va en el handshake ni se guarda en el cliente.
+
 ### Cuando la clave deja de valer
 
-Si al abrir la sesión el gateway cierra con **4010**, o una sesión abierta se cierra con **4200** (§13), el administrador ha borrado, desactivado o rotado tu cliente. Mira el código, no el texto del `reason`. Borra la clave guardada y vuelve a la pantalla de emparejamiento. Ningún otro cierre (handshake mal formado, agente no permitido, conversación no encontrada, conversación abierta en otra sesión) invalida la clave. No reintentes en bucle con la misma clave.
+Si al abrir la sesión el gateway cierra con **4010**, o una sesión abierta se cierra con **4200** (§13), la clave ya no vale: el administrador retiró, desactivó o rotó tu cliente o, si es personal, la persona cerró sesión en él, lo retiró desde otro aparato o la desactivaron. Mira el código, no el texto del `reason`. Borra la clave guardada y vuelve a la pantalla de emparejamiento (o, si es personal, a la de iniciar sesión). Ningún otro cierre (handshake mal formado, agente no permitido, conversación no encontrada, conversación abierta en otra sesión) invalida la clave. No reintentes en bucle con la misma clave.
 
 ---
 
@@ -113,8 +135,8 @@ El **primer mensaje** que envíes DEBE ser el handshake. Es el único mensaje si
 
 | Campo | Tipo | Requerido | Descripción |
 |-------|------|-----------|-------------|
-| `client_key` | string | ✓ (o `admin_token`) | Clave de autenticación del cliente |
-| `admin_token` | string | — | Solo el panel web del gateway: el `ADMIN_TOKEN` en lugar de `client_key` (una de las dos, nunca las dos). Entra como el cliente «Panel web» (`panel-web`), una ficha normal que el gateway crea la primera vez. Tiene la misma potencia que el `X-Admin-Token` de `/admin`: no lo guardes en un aparato |
+| `client_key` | string | ✓ | Clave del dispositivo: la de un dispositivo **emparejado** (`/pair`, del hogar) o el token de uno **con sesión** (`/auth/login`, personal; 4.0). La web entra igual: ya no hay `admin_token` |
+| `capabilities` | string[] | — | Lo que sabe hacer el aparato (`screen`, `mic`, `speaker`…; minúsculas, cifras, `_` y `-`, hasta 32 de hasta 32 caracteres). El gateway las guarda y las enseña; aún no decide nada con ellas. Sin el campo se conservan las que tenía |
 | `input_mode` | `"audio"` \| `"text"` | ✓ | Cómo enviará datos este cliente |
 | `output_mode` | array | ✓ | Qué quiere recibir: `"text"` (mensajes `token`), `"audio"` (frames TTS), `"status"` (mensajes `turn_progress`, §5, y `pipeline_event`, §15). Los `status` de servicios, `error`, `transcription*` y el control de turnos llegan siempre |
 | `agent` | string | — | Agente OpenClaw a usar; omitir (o vacío) para usar el agente por defecto (ver "Selección de agente" abajo). Un id de OpenClaw: letra o cifra y luego letras, cifras, `_` o `-`, hasta 64; otro valor (con `:`, espacios…) es 4000. Sin distinguir mayúsculas: el gateway lo pasa a minúsculas, como OpenClaw (`"Main"` es `main`, y así llega en `ready.agent`) |
@@ -122,7 +144,7 @@ El **primer mensaje** que envíes DEBE ser el handshake. Es el único mensaje si
 
 ### Selección de agente
 
-El agente efectivo de la sesión no es simplemente "el que pediste o el global": el gateway resuelve una cascada server-side (`agent` del handshake si no está vacío → `default_agent` configurado por el admin para tu `client_key` → `DEFAULT_AGENT`, el de la instalación (#245) → default global de OpenClaw → `"main"`) y aplica dos comprobaciones de política antes de aceptar la conexión: si tu cliente tiene una lista `allowed_agents`, el agente resultante debe estar en ella (una lista vacía lo deniega todo); y si pediste el agente explícitamente, debe existir en el roster de OpenClaw (`src/fogar_gateway/core/agent_policy.py`). Como cliente necesitas saber tres cosas:
+El agente efectivo de la sesión no es simplemente "el que pediste o el global": el gateway resuelve una cascada server-side (`agent` del handshake si no está vacío → `default_agent` configurado por el admin para tu `client_key` → el agente que el hogar da a tu persona (dispositivo con sesión) o a lo común (dispositivo del hogar; 4.0) → `DEFAULT_AGENT`, el de la instalación (#245) → default global de OpenClaw → `"main"`) y aplica dos comprobaciones de política antes de aceptar la conexión: si tu cliente tiene una lista `allowed_agents`, el agente resultante debe estar en ella (una lista vacía lo deniega todo); y si pediste el agente explícitamente, debe existir en el roster de OpenClaw (`src/fogar_gateway/core/agent_policy.py`). Como cliente necesitas saber tres cosas:
 
 1. Si omites `agent` en el handshake, el que acabes usando puede venir de una configuración por-cliente que un admin te haya asignado (no siempre el default global) — comprueba siempre `ready.agent`, no asumas cuál será.
 2. Pedir explícitamente un `agent` puede fallar de dos formas distintas (ver tabla siguiente): que ese agente no esté permitido para tu cliente, o que no exista en OpenClaw.
@@ -135,11 +157,11 @@ El código es el contrato; el `reason` es un texto en inglés para logs y person
 
 | Situación | Código WS | `reason` |
 |-----------|-----------|----------|
-| JSON inválido (también un número de más de 4300 cifras, que antes cerraba con 1006; solo con `HANDSHAKE_MAX_BYTES` por encima de ~4300: con el valor por defecto cierra antes con 4002), que no es un objeto, o campos incorrectos (también un `agent` que no es un id de agente válido); `client_key` y `admin_token` a la vez, o ninguna de las dos | 4000 | `invalid handshake` |
+| JSON inválido (también un número de más de 4300 cifras, que antes cerraba con 1006; solo con `HANDSHAKE_MAX_BYTES` por encima de ~4300: con el valor por defecto cierra antes con 4002), que no es un objeto, o campos incorrectos (también un `agent` que no es un id de agente válido); sin `client_key`, o unas `capabilities` mal formadas | 4000 | `invalid handshake` |
 | El primer mensaje es binario, no texto | 4001 | `handshake must be a text frame` |
 | El handshake supera `HANDSHAKE_MAX_BYTES` (4096 caracteres) | 4002 | `handshake too large` |
 | No se recibe el handshake JSON en los primeros `HANDSHAKE_TIMEOUT_S` (5s por defecto) | 4900 | `handshake timeout` |
-| `client_key` inválida o cliente inactivo; `admin_token` que no es el `ADMIN_TOKEN` (o el gateway no tiene ninguno), o el cliente «Panel web» desactivado | 4010 | `invalid or inactive credential` |
+| `client_key` inválida, cliente inactivo o retirado, o usuario desactivado (dispositivo con sesión) | 4010 | `invalid or inactive credential` |
 | El agente efectivo no está en la lista permitida para este cliente (`allowed_agents`) | 4020 | `agent not permitted` |
 | El agente pedido no existe en OpenClaw | 4021 | `agent not available` |
 | `conversation` no existe o es de otro cliente (no se distingue) | 4100 | `conversation not found` |
@@ -725,7 +747,7 @@ El cliente escribe; el gateway sintetiza audio con el texto de la respuesta.
 
 | Mensaje | Formato | Cuándo |
 |---------|---------|--------|
-| Handshake | `{"client_key":"...","input_mode":"...","output_mode":[...],"agent":"...","conversation":"..."}` (o `admin_token` en lugar de `client_key`, solo el panel web) | Primer mensaje, obligatorio |
+| Handshake | `{"client_key":"...","input_mode":"...","output_mode":[...],"agent":"...","conversation":"...","capabilities":[...]}` | Primer mensaje, obligatorio |
 | Fin de audio | `{"type":"end"}` | `input_mode="audio"` — usuario termina de hablar |
 | Enviar texto | `{"type":"send","text":"..."}` | Envía texto al orquestador |
 | Cancelar turno | `{"type":"cancel"}` | Cancela turno activo (o el push que suena, §10) sin iniciar uno nuevo |
@@ -811,10 +833,10 @@ Los códigos estándar se quedan donde el significado es de transporte y el est�
 | 1011 | `orchestrator unavailable` | Handshake: OpenClaw no responde al health check (antes llega `status` `orchestrator` `unavailable`) | Con espera |
 | 1011 | `internal error` | La sesión termina por un fallo interno del gateway (antes o después del `ready`) | Con espera |
 | 1013 | `client too slow` | No lees al ritmo al que el gateway escribe (`CLIENT_SEND_TIMEOUT_S`); si no reanudas la lectura en 2 s, verás 1006 | Con espera |
-| 4000 | `invalid handshake` | JSON inválido, campos incorrectos, `client_key` y `admin_token` a la vez o ninguna | No, hay que arreglar algo (bug del cliente) |
+| 4000 | `invalid handshake` | JSON inválido, campos incorrectos o sin `client_key` | No, hay que arreglar algo (bug del cliente) |
 | 4001 | `handshake must be a text frame` | El primer mensaje es binario | No, hay que arreglar algo (bug del cliente) |
 | 4002 | `handshake too large` | El handshake supera `HANDSHAKE_MAX_BYTES` | No, hay que arreglar algo (bug del cliente) |
-| 4010 | `invalid or inactive credential` | `client_key` o `admin_token` no válidos, o el cliente está desactivado | No, hay que arreglar algo: vuelve a emparejar (§0) |
+| 4010 | `invalid or inactive credential` | `client_key` no válida, o el cliente está desactivado o retirado | No, hay que arreglar algo: vuelve a emparejar (§0) |
 | 4020 | `agent not permitted` | El agente no está en `allowed_agents` del cliente, en el handshake o, con la sesión abierta, porque el administrador lo quitó (`SESSION_REVALIDATE_INTERVAL_S`; antes recibes el `turn_end` (`closed`) del turno abierto). La clave sigue valiendo | No, hay que arreglar algo: otro agente, o que el administrador lo permita |
 | 4021 | `agent not available` | El agente pedido no existe en OpenClaw | No, hay que arreglar algo: otro agente |
 | 4100 | `conversation not found` | La conversación pedida no existe o no es tuya | No, hay que arreglar algo: olvida ese id; sin `conversation` o con `"new"` |
@@ -868,7 +890,7 @@ Las reglas son las mismas para todos los clientes; el gateway no mira el tipo de
 
 - **Sin `conversation` en el handshake**, la sesión cae en la **conversación del día**: una por cliente, agente y día. El día empieza a las `CONVERSATION_DAY_START_HOUR` (5:00 por defecto, hora local del gateway). Se evalúa **al empezar cada turno tuyo**: una sesión que sigue abierta al pasar el corte (una tele con el socket abierto días) pasa a la conversación del día nuevo en su primer turno después, y lo verás en `turn_start.conversation`. `ready.conversation` es la del momento de conectar. Un push no cambia la conversación de la sesión.
 - **Con `"conversation": "new"`**, el gateway crea una conversación nueva para tu cliente (solo si la sesión llega a `ready`: un handshake que acaba en 1011 no deja una conversación vacía); **con el `id` de una de tus conversaciones** (el que te dio `ready.conversation.id`), la retomas: OpenClaw sigue el hilo. Una sesión que eligió conversación **no cambia nunca de día** por sí sola. Solo puedes pedir conversaciones de tu propio cliente: cualquier otro id cierra con 4100 (`conversation not found`). Una conversación fija su agente (§1).
-- **Una conversación, una sesión.** Si una sesión nueva abre una conversación que otra sesión tiene abierta (la misma del día, o el mismo id), la vieja se cierra con 4102 (`conversation opened elsewhere`, §9), después de recibir el `turn_end` de su turno abierto. Solo la desplaza una sesión que ya pasó el health check, justo antes de su `ready`, y la nueva espera a que la vieja suelte su turno: lo que la vieja tenía en marcha en OpenClaw nunca corta el primer turno de la nueva. Un cliente que reconecta antes de que caiga su socket viejo no queda con dos sesiones vivas. Quien recibe ese 4102 no debe reconectar solo a la misma conversación (§9): un cliente que puede tener varias sesiones a la vez (varias pestañas del panel web, que comparten el cliente «Panel web») debe abrir cada una en su conversación (`"new"` o un id), nunca en la del día.
+- **Una conversación, una sesión.** Si una sesión nueva abre una conversación que otra sesión tiene abierta (la misma del día, o el mismo id), la vieja se cierra con 4102 (`conversation opened elsewhere`, §9), después de recibir el `turn_end` de su turno abierto. Solo la desplaza una sesión que ya pasó el health check, justo antes de su `ready`, y la nueva espera a que la vieja suelte su turno: lo que la vieja tenía en marcha en OpenClaw nunca corta el primer turno de la nueva. Un cliente que reconecta antes de que caiga su socket viejo no queda con dos sesiones vivas. Quien recibe ese 4102 no debe reconectar solo a la misma conversación (§9): un cliente que puede tener varias sesiones a la vez (varias pestañas de la web con la misma sesión) debe abrir cada una en su conversación (`"new"` o un id), nunca en la del día.
 - **Push:** llega a la sesión que tiene abierta su conversación; si ninguna la tiene, a la sesión más reciente de su cliente (§10).
 - **Conversaciones de antes de M19.** Antes, cada cliente tenía una única sesión de OpenClaw por agente. El gateway las importa una vez como conversaciones `legacy` de su cliente (se pueden leer y retomar por su id); desde M19 un cliente sin `conversation` empieza cada día una conversación nueva en vez de seguir en aquella.
 - **Home Assistant (`/v1`)** sigue la misma regla del día para su cliente (con `Authorization: Bearer`).
@@ -876,7 +898,7 @@ Las reglas son las mismas para todos los clientes; el gateway no mira el tipo de
 > **Incompatibilidad de protocolo — M19**
 > La sesión de OpenClaw ya no es una por cliente y agente para siempre: es la de la conversación. Un cliente que no manda `conversation` empieza conversación (y contexto) nuevo cada día a las `CONVERSATION_DAY_START_HOUR`, y abrir dos sesiones del mismo cliente en la misma conversación cierra la primera con 4102 (`conversation opened elsewhere`). Un cliente que necesite dos sesiones a la vez debe abrirlas en conversaciones distintas (`"new"` o ids distintos).
 
-**El panel web** entra con `admin_token` (§1) como el cliente «Panel web»: crea sus conversaciones con `POST /admin/conversations` (o `"conversation": "new"`) y las retoma por su id. Escribir en la conversación de otro cliente no está permitido.
+**Quién abre qué (4.0).** Una conversación es del hogar o de una persona, según el dispositivo que la crea: la de un dispositivo **personal** (con sesión) es privada de su usuario; la de uno **del hogar** (emparejado), del hogar. Desde un dispositivo del hogar se abren solo las del hogar; desde uno personal, las del hogar y las de su usuario, también las empezadas en otro de sus dispositivos. Pedir una que no se puede ver es 4100, igual que una que no existe. Un aviso (push) de una conversación privada nunca llega a un dispositivo del hogar. La web inicia sesión (`/auth/login`), entra con su token como `client_key`, crea sus conversaciones con `POST /admin/conversations` (o `"conversation": "new"`) y las retoma por su id.
 
 ---
 

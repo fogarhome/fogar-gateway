@@ -90,6 +90,11 @@ export interface ClientResponse {
   default_agent: string | null
   allowed_agents: string[] | null // null = sin límite, [] = ninguno
   created_at: string
+  /** 4.0: `null`, un aparato del hogar (emparejado); con valor, la sesión de esa persona. */
+  user_id?: string | null
+  /** Lo que sabe hacer (lo manda el propio aparato); solo se enseña. */
+  capabilities?: string[] | null
+  last_seen_at?: string | null
   stt_language: string
   stt_vad_thold: number
   tts_voice: string
@@ -202,6 +207,8 @@ export interface Conversation {
   turn_count: number
   /** De OpenClaw; `null` si no lo tiene o no responde. */
   title: string | null
+  /** 4.0: `null`, del hogar; con valor, privada de esa persona. */
+  owner_user_id?: string | null
 }
 
 export interface ConversationMessage {
@@ -220,4 +227,48 @@ export interface ConversationMessages {
 export interface ConversationAgents {
   agents: string[]
   default: string | null
+}
+
+// ── Hogar y personas (4.0) ─────────────────────────────────────────────────
+
+export type UserRole = 'owner' | 'admin' | 'member'
+
+export interface UserRow {
+  id: string
+  username: string
+  display_name: string
+  role: UserRole
+  /** El suyo; `null`, el de lo común. */
+  agent: string | null
+  is_active: boolean
+  created_at: string
+  /** El que la atiende de verdad (el suyo, el del hogar o la cascada). */
+  effective_agent: string | null
+  /** Lo comparte con otra persona: su memoria es común aunque las conversaciones sean privadas. */
+  agent_shared: boolean | null
+}
+
+export interface UserInput {
+  username?: string
+  display_name?: string
+  password?: string
+  role?: UserRole
+  agent?: string | null
+  is_active?: boolean
+}
+
+export interface Home {
+  id: string
+  name: string
+  agent: string | null
+}
+
+export interface MyDevice {
+  id: string
+  name: string
+  client_type: string | null
+  created_at: string
+  last_seen_at: string | null
+  /** Este navegador. */
+  current: boolean
 }

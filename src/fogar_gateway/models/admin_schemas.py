@@ -14,10 +14,9 @@ from typing import Annotated, Literal
 from fastapi import Path, Query
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-from fogar_gateway.core.logging import fingerprint_key
 from fogar_gateway.core.session_key import AGENT_ID_PATTERN
 from fogar_gateway.db.models import ClientRecord
-from fogar_gateway.models.schemas import CREDENTIAL_MAX_LEN, OutputMode
+from fogar_gateway.models.schemas import CREDENTIAL_MAX_LEN, Capabilities, OutputMode
 
 # Etiqueta de cliente. Solo se valida la ENTRADA (create/update/CLI); la respuesta
 # sigue siendo `str` para no romper la lectura de filas antiguas con valores libres (#122).
@@ -126,6 +125,10 @@ class ClientResponse(BaseModel):
     default_agent: str | None
     allowed_agents: list[str] | None
     created_at: datetime
+    # M20: de quién es (null = del hogar), qué sabe hacer y cuándo entró por última vez.
+    user_id: str | None = None
+    capabilities: list[str] | None = None
+    last_seen_at: datetime | None = None
     # Pipeline config
     stt_language: str
     stt_vad_thold: float
@@ -144,7 +147,7 @@ class ClientResponse(BaseModel):
         return cls(
             id=r.id,
             name=r.name,
-            key_fp=fingerprint_key(r.client_key),
+            key_fp=r.key_hash[:8],  # = fingerprint_key(clave): los 8 primeros del SHA-256
             is_active=r.is_active,
             client_type=r.client_type,
             # Una fila de la 2.x puede tener "Main": se devuelve como la usa el gateway (C-1).
@@ -152,6 +155,9 @@ class ClientResponse(BaseModel):
             allowed_agents=[a.lower() for a in json.loads(r.allowed_agents)]
             if r.allowed_agents else None,
             created_at=r.created_at,
+            user_id=r.user_id,
+            capabilities=json.loads(r.capabilities) if r.capabilities else None,
+            last_seen_at=r.last_seen_at,
             stt_language=r.stt_language,
             stt_vad_thold=r.stt_vad_thold,
             tts_voice=r.tts_voice,
@@ -172,8 +178,8 @@ class ClientWithKey(ClientResponse):
     client_key: str
 
     @classmethod
-    def from_record(cls, r: ClientRecord) -> "ClientWithKey":
-        return cls(**ClientResponse.from_record(r).model_dump(), client_key=r.client_key)
+    def from_record(cls, r: ClientRecord, key: str) -> "ClientWithKey":  # type: ignore[override]
+        return cls(**ClientResponse.from_record(r).model_dump(), client_key=key)
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +206,60 @@ class PairRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Sesión de usuario (M20)
+# ---------------------------------------------------------------------------
+
+Role = Literal["owner", "admin", "member"]
+Username = Annotated[
+    str, StringConstraints(strip_whitespace=True, to_lower=True, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+]
+# Mínimo de 8: una contraseña la elige una persona; el límite de intentos hace el resto.
+Password = Annotated[str, StringConstraints(min_length=8, max_length=1024)]
+
+
+class UserCreate(BaseModel):
+    username: Username
+    display_name: _Name
+    password: Password
+    role: Role = "member"
+    agent: AgentName | None = None
+
+
+class UserUpdate(BaseModel):
+    """Solo lo que llega cambia; `agent: null` vuelve al del hogar."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: _Name | None = None
+    role: Role | None = None
+    agent: AgentName | None = None
+    is_active: bool | None = None
+
+
+class HomeUpdate(BaseModel):
+    """`PATCH /admin/home`: `agent: null` vuelve a la cascada de siempre."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: _Name | None = None
+    agent: AgentName | None = None
+
+
+class PasswordSet(BaseModel):
+    password: Password
+
+
+class LoginRequest(BaseModel):
+    """`POST /auth/login`: la cuenta y el dispositivo que inicia sesión (pasa a ser personal)."""
+
+    username: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
+    password: Annotated[str, StringConstraints(min_length=1, max_length=1024)]
+    device_name: _Name
+    client_type: ClientType | None = None
+    capabilities: Capabilities | None = None
+
+
+# ---------------------------------------------------------------------------
 # Conversaciones (M19)
 # ---------------------------------------------------------------------------
 
@@ -211,8 +271,8 @@ HistoryLimit = Annotated[int, Query(ge=1, le=1000)]
 
 
 class ConversationCreate(BaseModel):
-    """`POST /admin/conversations`: una conversación nueva del panel web. Sin `agent`, el de la
-    cascada (`default_agent` del panel, `DEFAULT_AGENT`, el de OpenClaw)."""
+    """`POST /admin/conversations`: una conversación nueva del usuario, de su dispositivo. Sin
+    `agent`, el de la cascada (`default_agent` del dispositivo, `DEFAULT_AGENT`, el de OpenClaw)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -232,10 +292,11 @@ class ConversationResponse(BaseModel):
     last_turn_at: datetime | None
     turn_count: int
     title: str | None = None
+    owner_user_id: str | None = None  # M20: null = del hogar; con valor, privada de ese usuario
 
 
 class ConversationAgents(BaseModel):
-    """`GET /admin/conversations/agents`: con qué agentes puede empezar el panel una conversación
+    """`GET /admin/conversations/agents`: con qué agentes puede empezar quien llama una conversación
     y cuál tocaría sin elegir (None si el de la cascada no le está permitido)."""
 
     agents: list[str]

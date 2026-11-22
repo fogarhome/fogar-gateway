@@ -30,7 +30,7 @@ def test_list_sessions_empty(client, admin_headers):
 
 def test_list_sessions_requires_admin_token(client):
     r = client.get("/admin/sessions")
-    assert r.status_code == 422
+    assert r.status_code == 401
 
 
 def test_list_sessions_shows_active_session(client, admin_headers):

@@ -85,7 +85,7 @@ async def test_transcribe_hola_soy_fogar(live_settings):
         return None
 
     session = provider.open_session(
-        client=Client(id="live", client_key="k", is_active=True),
+        client=Client(id="live", key_hash="k", is_active=True),
         params=SttParams(language="es", vad_threshold=0.0),
         callbacks=SttCallbacks(on_tr, noop, noop, noop),
     )

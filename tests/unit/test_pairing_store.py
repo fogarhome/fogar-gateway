@@ -7,6 +7,7 @@ import pytest
 
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.services import pairing
+from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.pairing import InvalidCode, PairingFull, PairingStore
 
 
@@ -32,7 +33,7 @@ def _create(calls: list[dict] | None = None):
     def create(template: dict) -> ClientRecord:
         if calls is not None:
             calls.append(template)
-        return ClientRecord(id="c1", name=template.get("name", "tele"), client_key="k" * 43)
+        return ClientRecord(id="c1", name=template.get("name", "tele"), key_hash=hash_key("k" * 43))
 
     return create
 
@@ -85,7 +86,7 @@ def test_redeem_is_single_use_under_concurrency(store):
     def slow_create(template: dict) -> ClientRecord:
         calls.append(template)
         time.sleep(0.05)  # si no hubiera candado, el otro hilo entraría aquí
-        return ClientRecord(id="c1", name="tele", client_key="k" * 43)
+        return ClientRecord(id="c1", name="tele", key_hash=hash_key("k" * 43))
 
     def worker() -> None:
         gate.wait()

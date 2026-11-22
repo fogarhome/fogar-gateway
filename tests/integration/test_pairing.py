@@ -12,6 +12,7 @@ from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.main import app
 from fogar_gateway.services import pairing
+from fogar_gateway.services.auth import hash_key
 from tests.integration.conftest import ADMIN_TOKEN, _configure_app_mocks
 
 ADMIN = {"x-admin-token": ADMIN_TOKEN}
@@ -140,7 +141,7 @@ def test_pair_creates_client_with_template(http, db_engine):
     assert body["name"] == "tele"
     assert set(body["gateway"]) == {"name", "version"}
     [row] = _rows(db_engine)
-    assert row.id == body["client_id"] and row.client_key == body["client_key"]
+    assert row.id == body["client_id"] and row.key_hash == hash_key(body["client_key"])
     assert (row.client_type, row.default_agent, row.tts_voice, row.barge_in_enabled) == (
         "screen", "j-assistant", "ef_dora", False,
     )

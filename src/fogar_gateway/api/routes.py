@@ -6,8 +6,6 @@ import time
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
-from fogar_gateway.api.admin_routes import panel_session
-from fogar_gateway.api.deps import admin_token_matches
 from fogar_gateway.core.agent_policy import AgentPolicyError, AgentPolicyKind, resolve_agent
 from fogar_gateway.core.config import settings
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
@@ -53,36 +51,29 @@ class _Rejected(Exception):
 
 
 async def _authenticate(handshake: Handshake) -> tuple[Client, ClientConfig, str]:
-    """`(Client, ClientConfig, quién para el log)` de la credencial del handshake.
-
-    `admin_token` (M19): el panel web, que entra como el cliente «Panel web» si coincide con
-    ADMIN_TOKEN (`deps.admin_token_matches`, la misma comprobación que `/admin`). Lanza
-    ClientNotFound/ClientInactive.
-    """
-    if handshake.admin_token is not None:
-        if not admin_token_matches(handshake.admin_token):
-            raise ClientNotFound("panel")
-        client, config = await panel_session()
-        return client, config, "panel"
-    key = handshake.client_key or ""  # Handshake exige una de las dos credenciales
+    """`(Client, ClientConfig, quién para el log)` de la `client_key` del handshake: un
+    dispositivo emparejado o uno con sesión (M20). Lanza ClientNotFound/ClientInactive."""
+    key = handshake.client_key
     client, config = await db_client.get_session(key)
+    await db_client.touch(client.id, handshake.capabilities)
     return client, config, f"fp={fingerprint_key(key)}"
 
 
 async def _open_conversation(
     service: ConversationService,
-    client_id: str,
+    client: Client,
     config: ClientConfig,
     handshake: Handshake,
     gateway_info: GatewayInfo | None,
 ) -> SessionConversation:
-    """La conversación de la sesión: la pedida (`conversation`, solo del propio cliente), una
-    nueva (`"new"`) o, sin pedir, la del día. Lanza `_Rejected` (41xx, 402x)."""
+    """La conversación de la sesión: la pedida (`conversation`, una que pueda ver: del hogar o,
+    desde un dispositivo personal, de su usuario; M20), una nueva (`"new"`) o, sin pedir, la del
+    día. Lanza `_Rejected` (41xx, 402x)."""
     requested = handshake.conversation
     existing = None
     if requested is not None and requested != NEW:
         try:
-            existing = await service.get_owned(client_id, requested)
+            existing = await service.get_visible(requested, client.home_id, client.user_id)
         except ConversationNotFound:
             raise _Rejected(
                 "conversation_not_found", Close.CONVERSATION_NOT_FOUND, "conversation"
@@ -103,9 +94,9 @@ async def _open_conversation(
         conversation = existing
     elif requested == NEW:
         # Se guarda tras el health check, junto a claim_conversation (C-3).
-        conversation = new_conversation(client_id, agent)
+        conversation = new_conversation(client.id, agent)
     else:
-        conversation = await service.default_for(client_id, agent)
+        conversation = await service.default_for(client.id, agent)
     return SessionConversation(conversation, explicit=requested is not None, service=service)
 
 
@@ -168,8 +159,8 @@ async def gateway_websocket(websocket: WebSocket):
     try:
         client, config, who = await _authenticate(handshake)
     except (ClientNotFound, ClientInactive):
-        # El admin_token nunca va al log, ni su huella; la client_key solo como huella.
-        who = "panel" if handshake.client_key is None else f"fp={fingerprint_key(handshake.client_key)}"
+        # La client_key solo como huella.
+        who = f"fp={fingerprint_key(handshake.client_key)}"
         logger.warning(
             f"request_id={request_id} source_ip={client_ip_for_log(websocket)} "
             f"{who} Handshake rechazado: credencial inválida o cliente inactivo."
@@ -182,9 +173,6 @@ async def gateway_websocket(websocket: WebSocket):
         logger.error(f"request_id={request_id} Configuración del cliente ilegible: {describe_error(e)}")
         await send_close(websocket, Close.SETUP_FAILED)
         return
-    # La credencial ya no hace falta: la sesión guarda el handshake sin el admin_token.
-    handshake = handshake.model_copy(update={"admin_token": None})
-
     logger.info(f"request_id={request_id} client_id={client.id} {who} Handshake verificado.")
 
     # 3. INSTANCIAR EL PUENTE DE MICROSERVICIOS
@@ -195,7 +183,7 @@ async def gateway_websocket(websocket: WebSocket):
     # conversación pedida (del propio cliente) o la del día.
     try:
         conversation = await _open_conversation(
-            app_state.conversations, client.id, config, handshake, openclaw.gateway_info
+            app_state.conversations, client, config, handshake, openclaw.gateway_info
         )
     except _Rejected as e:
         logger.warning(f"[{client.id}] Handshake rechazado: {e.kind}")

@@ -493,7 +493,7 @@ class FogarBridge:
         while True:
             await _sleep(settings.SESSION_REVALIDATE_INTERVAL_S)
             try:
-                current, config = await db_client.get_session(self.client.client_key)
+                current, config = await db_client.revalidate(self.client.key_hash)
                 if current.id != self.client.id:
                     # Borrado y recreado con la MISMA clave: es otro cliente.
                     await self._revoke_session()
@@ -528,15 +528,18 @@ class FogarBridge:
                     f"({type(e).__name__}); se reintenta."
                 )
 
-    async def _revoke_session(self) -> None:
-        """Cierra la sesión con `Close.REVOKED` (4200) por el camino del cierre por política."""
-        logger.warning(f"[{self.client_id}] Cliente revocado (borrado/desactivado/clave rotada).")
-        task = self._start_policy_close(
+    def revoke(self) -> asyncio.Task:
+        """Empieza a cerrar la sesión con `Close.REVOKED` (4200) por el camino del cierre por
+        política, sin esperar: la revalidación lo vería en ≤ 10 s, y /admin y /auth lo hacen ya."""
+        logger.warning(f"[{self.client_id}] Cliente revocado (retirado/desactivado/clave rotada).")
+        return self._start_policy_close(
             Close.REVOKED, "revoked", "session_revoked", status="revoked"
         )
+
+    async def _revoke_session(self) -> None:
         # asyncio.wait, no await: close_all() cancela esta tarea (la de revalidación), y eso
         # no debe cancelar el cierre.
-        await asyncio.wait({task})
+        await asyncio.wait({self.revoke()})
 
     async def displace(self) -> None:
         """Otra sesión abrió la conversación de esta (M19): se cierra con

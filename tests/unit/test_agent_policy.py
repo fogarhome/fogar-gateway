@@ -23,6 +23,7 @@ class _StubGatewayInfo:
 class _StubClientConfig:
     default_agent: str | None = None
     allowed_agents: list[str] | None = None
+    household_agent: str | None = None
 
 
 # --- Tests ----------------------------------------------------------------
@@ -283,3 +284,19 @@ def test_model_alias_ignores_case():
     from fogar_gateway.core.agent_policy import agent_from_model
 
     assert agent_from_model("Fogar-Gateway") is None
+
+
+# --- M20: el agente que el hogar da a la persona o a lo común ---------------
+
+
+def test_household_agent_sits_between_the_device_and_the_installation(monkeypatch):
+    from fogar_gateway.core.config import settings
+
+    monkeypatch.setattr(settings, "DEFAULT_AGENT", "instalacion")
+    gi = _StubGatewayInfo(default_agent_id="gw")
+    assert resolve_agent(None, _StubClientConfig(household_agent="Ana"), gi) == "ana"
+    both = _StubClientConfig(default_agent="del-aparato", household_agent="ana")
+    assert resolve_agent(None, both, gi) == "del-aparato"  # el del dispositivo, antes
+    assert resolve_agent(None, _StubClientConfig(), gi) == "instalacion"
+    with pytest.raises(AgentPolicyError):  # la lista del dispositivo sigue mandando
+        resolve_agent(None, _StubClientConfig(household_agent="ana", allowed_agents=["x"]), gi)

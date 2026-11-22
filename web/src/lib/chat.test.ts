@@ -264,7 +264,7 @@ describe('closeAction', () => {
       expect(closeAction(code)).toBe('stop')
     }
     expect(stopText(4100)).toMatch(/ya no existe/)
-    expect(stopText(4010)).toMatch(/está desactivado/)
+    expect(stopText(4010)).toMatch(/ya no vale/)
     expect(stopText(4101)).toMatch(/no coincide/)
     expect(stopText(4321)).toBe('El gateway no aceptó la conexión del chat.')
   })
@@ -273,7 +273,7 @@ describe('closeAction', () => {
   })
   it('con el acceso retirado (4200) para y lo dice: lo decide la persona', () => {
     expect(closeAction(4200)).toBe('stop')
-    expect(stopText(4200)).toMatch(/Se retiró el acceso del panel/)
+    expect(stopText(4200)).toMatch(/Se retiró el acceso de este navegador/)
   })
   it('un cierre normal (inactividad) espera a que escribas', () => {
     expect(closeAction(1000)).toBe('idle')

@@ -1,10 +1,10 @@
 """Tests for /admin/* authentication."""
 
 
-def test_admin_missing_token_returns_422(client):
-    """No X-Admin-Token header → 422 (missing required header)."""
+def test_admin_missing_token_returns_401(client):
+    """No X-Admin-Token header → 401 (M20: X-Admin-Token or Bearer, neither required)."""
     r = client.get("/admin/sessions")
-    assert r.status_code == 422
+    assert r.status_code == 401
 
 
 def test_admin_wrong_token_returns_401(client):

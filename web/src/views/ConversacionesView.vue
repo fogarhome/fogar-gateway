@@ -5,12 +5,12 @@ import { createConversation, getConversationAgents } from '@/api/admin'
 import { ApiError } from '@/api/http'
 import type { ConversationAgents } from '@/api/types'
 import FgBoton from '@/components/FgBoton.vue'
-import { conversationKind, conversationTitle } from '@/lib/conversations'
+import { conversationKind, conversationScope, conversationTitle } from '@/lib/conversations'
 import { formatRelative } from '@/lib/format'
 import { useConversationsStore } from '@/stores/conversations'
 import { useLiveStore } from '@/stores/live'
 
-// Todo lo que se ha hablado con Fogar en casa, de cada aparato. Lo dicho y el título viven en OpenClaw.
+// Lo que puedes ver (4.0): las del hogar y las tuyas. Lo dicho y el título viven en OpenClaw.
 const router = useRouter()
 const conversations = useConversationsStore()
 const live = useLiveStore()
@@ -50,6 +50,7 @@ const filas = computed(() =>
       titulo: conversationTitle(c, ahora.value),
       sinTitulo: !c.title?.trim(),
       clase: conversationKind(c.kind),
+      ambito: conversationScope(c),
       aparato: c.client_name,
       agente: c.agent,
       cuando: c.last_turn_at ? formatRelative(c.last_turn_at, ahora.value) : 'Sin mensajes todavía',
@@ -65,7 +66,7 @@ const titulo = computed(() => {
   return `${n} ${n === 1 ? 'conversación' : 'conversaciones'} en casa`
 })
 
-// Nueva conversación del panel: con el agente que se elija (por defecto, el que toque).
+// Nueva conversación de este navegador (tuya): con el agente que se elija (por defecto, el que toque).
 const nueva = ref(false)
 const agentes = shallowRef<ConversationAgents | null>(null)
 const agente = ref('')
@@ -92,8 +93,8 @@ const opciones = computed(() => {
 
 function textoError(e: unknown): string {
   if (e instanceof ApiError) {
-    if (e.message === 'panel_client_inactive') return 'El cliente «Panel web» está desactivado. Actívalo en Clientes para escribir desde aquí.'
-    if (e.message === 'agent_not_permitted') return 'Ese agente no está permitido para el panel (agentes permitidos de «Panel web»).'
+    if (e.kind === 'unauthorized') return 'Tu sesión ya no vale: vuelve a entrar.'
+    if (e.message === 'agent_not_permitted') return 'Ese agente no está permitido para este navegador (sus agentes permitidos, en Clientes).'
     if (e.message === 'agent_not_available') return 'OpenClaw no tiene ese agente ahora.'
   }
   return 'No he podido hablar con el gateway. Prueba otra vez.'
@@ -122,7 +123,12 @@ async function empezar(): Promise<void> {
     <header class="titulo">
       <div class="texto">
         <h1 class="fg-h1">{{ titulo }}</h1>
-        <p class="fg-sub">Lo que cada aparato ha hablado con Fogar. Desde aquí se leen todas y se escribe en las del panel.</p>
+        <p class="fg-sub">
+          Las del hogar (la tele, los altavoces) y las tuyas. Se escribe en las que empiezas aquí; las demás se leen.
+        </p>
+        <p class="fg-meta privacidad">
+          La privacidad es dentro de Fogar: OpenClaw, su panel y sus otros canales (Telegram…) ven todas las conversaciones.
+        </p>
       </div>
       <FgBoton variante="principal" icono="mas" :disabled="nueva" @click="abrirNueva">Nueva conversación</FgBoton>
     </header>
@@ -153,6 +159,7 @@ async function empezar(): Promise<void> {
               <tr v-for="f in filas" :key="f.id" :class="{ viva: f.abierta }">
                 <td>
                   <RouterLink :to="`/conversaciones/${encodeURIComponent(f.id)}`" class="nombre" :class="{ 'sin-titulo': f.sinTitulo }">{{ f.titulo }}</RouterLink>
+                  <span class="fg-meta junto"> · {{ f.ambito }}</span>
                   <span v-if="f.abierta" class="fg-meta junto"> · abierta ahora</span>
                   <span v-else-if="f.clase" class="fg-meta junto"> · {{ f.clase }}</span>
                 </td>
@@ -165,7 +172,7 @@ async function empezar(): Promise<void> {
           </table>
         </div>
         <p v-else-if="conversations.loaded" class="fg-meta">
-          Aquí aparece cada conversación en cuanto alguien hable con Fogar: la tele, los altavoces, Home Assistant o tú desde el panel.
+          Aquí aparece cada conversación en cuanto alguien hable con Fogar: la tele, los altavoces, Home Assistant o tú desde aquí.
         </p>
         <p class="fg-meta">Sin título: OpenClaw todavía no le ha puesto uno, o ahora no responde.</p>
       </section>
@@ -173,7 +180,7 @@ async function empezar(): Promise<void> {
       <aside v-if="nueva" class="lado">
         <form class="nueva" novalidate @submit.prevent="empezar">
           <h2 class="fg-h2">Nueva conversación</h2>
-          <p class="fg-suave">Escribes como «Panel web». La conversación se queda con el agente que elijas.</p>
+          <p class="fg-suave">Será tuya: solo tú la ves. Se queda con el agente que elijas.</p>
           <div v-if="opciones.length" class="campo">
             <label for="nueva-agente">Agente</label>
             <select id="nueva-agente" v-model="agente">
@@ -181,8 +188,8 @@ async function empezar(): Promise<void> {
             </select>
           </div>
           <p v-else-if="agentes" class="error" role="alert">
-            Ahora no hay ningún agente con el que empezar: OpenClaw no ha dado su lista y al panel no le toca ninguno por defecto. Revisa los
-            agentes permitidos de «Panel web» en Clientes.
+            Ahora no hay ningún agente con el que empezar: OpenClaw no ha dado su lista y a este navegador no le toca ninguno por defecto. Revisa sus
+            agentes permitidos en Clientes.
           </p>
           <p v-else-if="!nuevaError" class="fg-meta">Cargando agentes…</p>
           <p v-if="nuevaError" class="error" role="alert">{{ nuevaError }}</p>

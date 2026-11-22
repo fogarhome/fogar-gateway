@@ -432,10 +432,20 @@ class ClientRegistry:
         """La sesión que recibe un push de `session_key`, o None."""
         conversation = self.index.get(session_key)
         if conversation is not None:
-            return self._open.get(conversation.id) or self.get(conversation.client_id)
+            target = self._open.get(conversation.id) or self.get(conversation.client_id)
+            # M20: lo privado nunca a un dispositivo del hogar ni a uno de otra persona. Su
+            # dispositivo es de su dueño (`_stamp`): esto es la red de seguridad.
+            owner = conversation.owner_user_id
+            if target is not None and owner is not None and target.client.user_id != owner:
+                return None
+            return target
         # Clave sin conversación en el índice: una de antes de M19 (`agent:{agent}:{client.id}`)
         # que aún no se importó (OpenClaw estaba caído al arrancar).
         return self.get(client_id_from_session_key(session_key))
+
+    def for_client(self, client_id: str) -> list[Any]:
+        """Las sesiones vivas de un cliente (una copia)."""
+        return list(self._clients.get(client_id, ()))
 
     def bridges(self) -> list[Any]:
         return [b for live in self._clients.values() for b in live]

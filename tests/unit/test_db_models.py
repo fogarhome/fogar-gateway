@@ -6,6 +6,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from fogar_gateway.db.models import ClientRecord
+from fogar_gateway.services.auth import hash_key
 
 
 def _mem_engine():
@@ -21,8 +22,8 @@ def _mem_engine():
 def test_client_key_unique():
     engine = _mem_engine()
     with pytest.raises(IntegrityError), Session(engine) as s:
-        s.add(ClientRecord(name="A", client_key="dup"))
-        s.add(ClientRecord(name="B", client_key="dup"))
+        s.add(ClientRecord(name="A", key_hash=hash_key("dup")))
+        s.add(ClientRecord(name="B", key_hash=hash_key("dup")))
         s.commit()
 
 
@@ -30,7 +31,7 @@ def test_allowed_agents_json():
     engine = _mem_engine()
     with Session(engine) as s:
         s.add(
-            ClientRecord(name="X", client_key="k2", allowed_agents=json.dumps(["main", "helper"]))
+            ClientRecord(name="X", key_hash=hash_key("k2"), allowed_agents=json.dumps(["main", "helper"]))
         )
         s.commit()
         rec = s.exec(select(ClientRecord)).first()

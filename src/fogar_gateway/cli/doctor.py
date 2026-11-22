@@ -224,6 +224,29 @@ def _check_openclaw_access(state: Any, settings: Any) -> Check:
     return _access_from_file(settings)
 
 
+def _check_owner(path: Path | None) -> Check | None:
+    """M20: sin un dueño activo nadie entra en el dashboard (solo la CLI). En solo lectura; si la
+    BD no se puede leer, ya lo dice `_check_db`."""
+    if path is None or not path.is_file():
+        return None
+    try:
+        con = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            owners = con.execute(
+                "SELECT count(*) FROM memberships m JOIN users u ON u.id = m.user_id "
+                "WHERE m.role = 'owner' AND u.is_active"
+            ).fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    if owners:
+        return _c("ok", "dueño", f"{owners} dueño{'s' if owners > 1 else ''} activo"
+                  f"{'s' if owners > 1 else ''}.")
+    return _c("warn", "dueño", "El hogar no tiene dueño: nadie puede entrar en el dashboard. "
+              "Créalo con `fogar-gw users add NOMBRE --role owner`.")
+
+
 def run_checks(url: str, token: str | None) -> list[Check]:
     out: list[Check] = []
     settings, errors, _ = cfg.load()
@@ -246,6 +269,8 @@ def run_checks(url: str, token: str | None) -> list[Check]:
     held = None
     if settings:
         out.append(_check_db(db, settings.DATABASE_URL))
+        if (owner := _check_owner(db)) is not None:
+            out.append(owner)
         perms = [(paths.home(), 0o700), (paths.config_file(), 0o600),
                  (paths.openclaw_device_file(), 0o600)]
         if db:

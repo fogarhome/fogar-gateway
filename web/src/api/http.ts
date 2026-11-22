@@ -1,6 +1,15 @@
 import { useSessionStore } from '@/stores/session'
 
-export type ApiErrorKind = 'unauthorized' | 'not-configured' | 'not-found' | 'conflict' | 'invalid' | 'network' | 'server'
+export type ApiErrorKind =
+  | 'unauthorized'
+  | 'forbidden'
+  | 'not-configured'
+  | 'not-found'
+  | 'conflict'
+  | 'invalid'
+  | 'too-many'
+  | 'network'
+  | 'server'
 
 export class ApiError extends Error {
   constructor(
@@ -15,7 +24,9 @@ export class ApiError extends Error {
 
 function kindFor(status: number): ApiErrorKind {
   if (status === 401) return 'unauthorized'
-  if (status === 503) return 'not-configured' // /admin sin ADMIN_TOKEN en el gateway
+  if (status === 403) return 'forbidden' // un miembro en lo del hogar, o el login por HTTP en la LAN
+  if (status === 429) return 'too-many' // demasiados intentos de iniciar sesión
+  if (status === 503) return 'not-configured'
   if (status === 404) return 'not-found'
   if (status === 409) return 'conflict'
   if (status === 422) return 'invalid'
@@ -23,17 +34,17 @@ function kindFor(status: number): ApiErrorKind {
 }
 
 export interface RequestOptions extends RequestInit {
-  /** Token que sustituye al guardado (Conectar lo comprueba antes de guardarlo). */
-  token?: string
+  /** Token que sustituye al guardado (null: sin token, como el inicio de sesión). */
+  token?: string | null
   timeoutMs?: number
   /** Códigos que traen un cuerpo válido aunque no sean 2xx (`/ready` responde 503 si cae OpenClaw). */
   okStatuses?: number[]
 }
 
-/** Petición a la API del gateway (mismo origen) con X-Admin-Token. */
+/** Petición a la API del gateway (mismo origen) con el token de este navegador como Bearer. */
 export async function api<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { token, timeoutMs = 10_000, okStatuses = [], headers, ...init } = options
-  const adminToken = token ?? useSessionStore().token
+  const bearer = token === undefined ? useSessionStore().token : token
   const timeout = AbortSignal.timeout(timeoutMs)
   const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout
 
@@ -45,7 +56,7 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
       headers: {
         Accept: 'application/json',
         ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-        ...(adminToken ? { 'X-Admin-Token': adminToken } : {}),
+        ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
         ...headers,
       },
     })

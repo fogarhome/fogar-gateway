@@ -1,4 +1,5 @@
-"""`fogar-gw token`: el token de administración, el que se pega en el dashboard.
+"""`fogar-gw token`: el token de administración de la máquina (la CLI y la recuperación; desde la
+4.0 el dashboard se entra con usuario y contraseña).
 
 Solo lo escribe en una terminal: en una tubería, un fichero o con --json acabaría en un log o en
 un fichero por descuido. No lleva el secreto como argumento, así que tampoco queda en el
@@ -18,7 +19,7 @@ WARNING = ("Es la llave de administración de tu gateway: quien lo tenga lo cont
 @click.command()
 @click.pass_context
 def token(ctx: click.Context) -> None:
-    """El token del dashboard (ADMIN_TOKEN), solo en una terminal."""
+    """El token de administración (ADMIN_TOKEN), solo en una terminal."""
     from fogar_gateway.cli import config as cfg
     from fogar_gateway.cli import output
 

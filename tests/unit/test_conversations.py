@@ -6,11 +6,13 @@ from datetime import UTC, date, datetime
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord, ConversationRecord
 from fogar_gateway.services import conversations as conv_mod
+from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.conversations import (
     Conversation,
     ConversationClientMissing,
@@ -33,7 +35,7 @@ def engine(tmp_path):
     SQLModel.metadata.create_all(engine)
     with Session(engine) as s:
         for cid in ("tv", "web"):
-            s.add(ClientRecord(id=cid, name=cid.upper(), client_key=f"key-{cid}"))
+            s.add(ClientRecord(id=cid, name=cid.upper(), key_hash=hash_key(f"key-{cid}")))
         s.commit()
     return engine
 
@@ -124,13 +126,13 @@ async def test_created_conversations_are_always_new(service):
     assert a.id != b.id and a.kind == b.kind == "created" and a.day is None
 
 
-async def test_a_conversation_of_another_client_is_not_found(service):
+async def test_a_home_conversation_opens_from_any_home_device(service):
+    """M20: la del hogar se abre desde cualquier dispositivo del hogar (antes, solo desde el suyo).
+    Lo privado: tests/unit/test_conversation_visibility.py."""
     web = await service.create("web", "main")
-    assert (await service.get_owned("web", web.id)) == web
+    assert (await service.get_visible(web.id, "home", None)) == web
     with pytest.raises(ConversationNotFound):
-        await service.get_owned("tv", web.id)
-    with pytest.raises(ConversationNotFound):
-        await service.get_owned("tv", "does-not-exist")
+        await service.get_visible("does-not-exist", "home", None)
 
 
 async def test_note_turn_counts_and_stamps(service, engine):
@@ -191,14 +193,14 @@ def test_with_both_main_and_Main_the_default_is_the_one_with_history(service, en
         assert service._default_for("tv", "main", day).id == rows[1].id
 
 
-async def test_deleting_a_client_cascades_to_its_conversations(service, engine):
-    """PRAGMA foreign_keys=ON en cada conexión (db/database.py): ON DELETE CASCADE vale."""
+async def test_a_client_with_conversations_cannot_be_deleted(service, engine):
+    """PRAGMA foreign_keys=ON en cada conexión (db/database.py): la conversación guarda siempre
+    su dispositivo (M20), así que un dispositivo con conversaciones se retira, no se borra."""
     conv = await service.create("web", "main")
-    with Session(engine) as s:
+    with pytest.raises(IntegrityError), Session(engine) as s:
         s.delete(s.get(ClientRecord, "web"))
         s.commit()
-    assert await service.get(conv.id) is None
-    assert await service.list_rows() == []
+    assert (await service.get(conv.id)) is not None
 
 
 async def test_a_conversation_for_a_missing_client_fails_cleanly(service, clock):

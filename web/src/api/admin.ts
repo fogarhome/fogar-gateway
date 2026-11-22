@@ -1,6 +1,10 @@
 import { api } from './http'
 import type {
   ClientInput,
+  Home,
+  MyDevice,
+  UserInput,
+  UserRow,
   ClientResponse,
   ClientWithKey,
   Conversation,
@@ -57,3 +61,17 @@ export const getConversationAgents = () => api<ConversationAgents>('/admin/conve
 /** Conversación nueva del panel web; sin agente, el que toque por defecto. */
 export const createConversation = (agent: string | null) =>
   api<Conversation>('/admin/conversations', { method: 'POST', body: json(agent ? { agent } : {}) })
+
+// Personas y hogar (4.0): /admin/users y /admin/home son de dueños y administradores.
+export const listUsers = () => api<UserRow[]>('/admin/users')
+export const createUser = (body: UserInput) => api<UserRow>('/admin/users', { method: 'POST', body: json(body) })
+export const updateUser = (id: string, body: UserInput) =>
+  api<UserRow>(`/admin/users/${enc(id)}`, { method: 'PATCH', body: json(body) })
+export const deleteUser = (id: string) => api<void>(`/admin/users/${enc(id)}`, { method: 'DELETE' })
+export const getHome = () => api<Home>('/admin/home')
+export const updateHome = (body: Partial<Pick<Home, 'name' | 'agent'>>) =>
+  api<Home>('/admin/home', { method: 'PATCH', body: json(body) })
+
+// Mis dispositivos con sesión: cualquiera.
+export const listMyDevices = () => api<MyDevice[]>('/auth/devices')
+export const retireMyDevice = (id: string) => api<void>(`/auth/devices/${enc(id)}`, { method: 'DELETE' })

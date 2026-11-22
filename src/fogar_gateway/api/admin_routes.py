@@ -3,7 +3,7 @@ admin_routes.py
 ~~~~~~~~~~~~~~~
 /admin/* — gestión y observabilidad del gateway.
 
-Auth: X-Admin-Token header validado contra ADMIN_TOKEN env var (via get_admin_auth).
+Auth (M20, api/deps.require_admin): X-Admin-Token = ADMIN_TOKEN (la CLI) o Bearer de un dueño o administrador.
 
 Clientes:
   GET    /admin/clients              — lista clientes (sin client_key; huella key_fp)
@@ -29,9 +29,9 @@ Observabilidad:
 import asyncio
 import json
 import logging
-import secrets
 import time
 from collections import defaultdict
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
@@ -40,7 +40,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from fogar_gateway._version import __version__
-from fogar_gateway.api.deps import get_admin_auth
+from fogar_gateway.api.deps import require_admin
 from fogar_gateway.db.database import get_db_session, get_engine
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.models.admin_schemas import (
@@ -49,8 +49,7 @@ from fogar_gateway.models.admin_schemas import (
     ClientUpdate,
     ClientWithKey,
 )
-from fogar_gateway.models.schemas import Client, ClientConfig
-from fogar_gateway.services.db_client import db_client
+from fogar_gateway.services.auth import hash_key, new_key
 from fogar_gateway.services.openclaw.models import OrchestratorAccess, access_texts
 from fogar_gateway.services.reconnection import ServiceStatus
 from fogar_gateway.services.stats import gateway_stats
@@ -66,7 +65,7 @@ _open_streams = 0
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/admin", dependencies=[Depends(get_admin_auth)])
+router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +75,7 @@ router = APIRouter(prefix="/admin", dependencies=[Depends(get_admin_auth)])
 
 def _get_or_404(session: Session, client_id: str) -> ClientRecord:
     rec = session.get(ClientRecord, client_id)
-    if rec is None:
+    if rec is None or rec.retired_at is not None:
         raise HTTPException(status_code=404, detail="Client not found")
     return rec
 
@@ -111,18 +110,26 @@ def _lists_to_json(data: dict[str, Any]) -> dict[str, Any]:
 
 @router.get("/clients", response_model=list[ClientResponse])
 def list_clients(session: Session = Depends(get_db_session)) -> list[ClientResponse]:
-    records = session.exec(select(ClientRecord)).all()
+    records = session.exec(select(ClientRecord).where(ClientRecord.retired_at.is_(None))).all()  # type: ignore[union-attr]
     return [ClientResponse.from_record(r) for r in records]
 
 
 def create_client_record(
-    session: Session, body: ClientCreate, *, client_id: str | None = None
+    session: Session,
+    body: ClientCreate,
+    *,
+    client_id: str | None = None,
+    user_id: str | None = None,
+    capabilities: list[str] | None = None,
 ) -> ClientRecord:
     """Crea el cliente: la única vía, la usan `POST /admin/clients`, el emparejamiento (#317) y
-    el cliente «Panel web» (M19, el único con `client_id` fijo)."""
+    el cliente «Panel web» (M19, el único con `client_id` fijo). Guarda solo el hash de
+    `body.client_key` (M20): quien necesite enseñar la clave la pone en `body` antes."""
     _check_agent_consistency(body.default_agent, body.allowed_agents)
     data = _lists_to_json(body.model_dump())
-    data["client_key"] = data["client_key"] or secrets.token_urlsafe(32)
+    data["key_hash"] = hash_key(data.pop("client_key") or new_key())
+    data["user_id"] = user_id  # M20: con usuario, un dispositivo personal (un inicio de sesión)
+    data["capabilities"] = json.dumps(capabilities) if capabilities is not None else None
     if client_id is not None:
         data["id"] = client_id
     record = ClientRecord(**data)
@@ -141,63 +148,14 @@ def create_client_record(
     return record
 
 
-# El panel web entra con el ADMIN_TOKEN (handshake `admin_token`, M19) como este cliente: una
-# ficha normal (se ve, se edita y se desactiva como las demás), creada la primera vez que hace
-# falta. Su client_key no se enseña nunca (no se usa: el panel no la conoce).
-PANEL_CLIENT_ID = "panel-web"
-PANEL_CLIENT_NAME = "Panel web"
-
-
-def ensure_panel_client(session: Session) -> ClientRecord:
-    """La ficha del cliente «Panel web»; la crea por la vía única si no existe."""
-    record = session.get(ClientRecord, PANEL_CLIENT_ID)
-    if record is not None:
-        return record
-    body = ClientCreate(name=PANEL_CLIENT_NAME, client_type="web", output_mode=["text"])
-    try:
-        return create_client_record(session, body, client_id=PANEL_CLIENT_ID)
-    except HTTPException:
-        # Otra petición la creó a la vez (409 de create_client_record): es esa.
-        record = session.get(ClientRecord, PANEL_CLIENT_ID)
-        if record is None:
-            raise
-        return record
-
-
-def _panel_key() -> str:
-    with Session(get_engine()) as session:
-        return ensure_panel_client(session).client_key
-
-
-async def panel_session() -> tuple[Client, ClientConfig]:
-    """`(Client, ClientConfig)` del panel web, como `db_client.get_session`: lanza
-    `ClientInactive` si el administrador lo desactivó."""
-    key = await asyncio.to_thread(_panel_key)
-    return await db_client.get_session(key)
-
-
-def _existing_panel_key() -> str | None:
-    with Session(get_engine()) as session:
-        record = session.get(ClientRecord, PANEL_CLIENT_ID)
-        return record.client_key if record is not None else None
-
-
-async def existing_panel_config() -> ClientConfig | None:
-    """La configuración del panel web sin crear su ficha (para lecturas): None si aún no existe,
-    `ClientInactive` si el administrador lo desactivó."""
-    key = await asyncio.to_thread(_existing_panel_key)
-    if key is None:
-        return None
-    _, config = await db_client.get_session(key)
-    return config
-
-
 @router.post("/clients", response_model=ClientWithKey, status_code=status.HTTP_201_CREATED)
 def create_client(
     body: ClientCreate,
     session: Session = Depends(get_db_session),
 ) -> ClientWithKey:
-    return ClientWithKey.from_record(create_client_record(session, body))
+    key = body.client_key or new_key()
+    record = create_client_record(session, body.model_copy(update={"client_key": key}))
+    return ClientWithKey.from_record(record, key)
 
 
 @router.get("/clients/{client_id}", response_model=ClientResponse)
@@ -233,20 +191,31 @@ def update_client(
     return ClientResponse.from_record(rec)
 
 
-def _delete_client_record(client_id: str) -> None:
+def retire_client(session: Session, rec: ClientRecord) -> None:
+    """Retirar, no borrar (M20): sus conversaciones conservan hogar y dispositivo. La clave pasa
+    a un valor que nadie conoce. Sus sesiones vivas las corta `close_client_sessions`."""
+    rec.retired_at = datetime.now(UTC)
+    rec.is_active = False
+    rec.key_hash = hash_key(new_key())  # nadie conoce la clave: ya no vale
+    session.add(rec)
+    session.commit()
+
+
+def close_client_sessions(app: FastAPI, client_id: str) -> None:
+    """Cierra ya (4200) las sesiones vivas de un cliente, sin esperar a la revalidación."""
+    for bridge in app.state.client_registry.for_client(client_id):
+        bridge.revoke()
+
+
+def _retire_client_record(client_id: str) -> None:
     with Session(get_engine()) as session:
-        session.delete(_get_or_404(session, client_id))
-        session.commit()
+        retire_client(session, _get_or_404(session, client_id))
 
 
 @router.delete("/clients/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_client(client_id: str, request: Request) -> None:
-    await asyncio.to_thread(_delete_client_record, client_id)
-    # Sus conversaciones se van con él por ON DELETE CASCADE (M19; lo dicho sigue en OpenClaw).
-    # El índice, hecho ya el commit y en el hilo del loop, como cualquier otro cambio suyo.
-    conversations = getattr(request.app.state, "conversations", None)
-    if conversations is not None:
-        conversations.index.forget_client(client_id)
+    await asyncio.to_thread(_retire_client_record, client_id)
+    close_client_sessions(request.app, client_id)
 
 
 @router.post("/clients/{client_id}/rotate-key", response_model=ClientWithKey)
@@ -256,7 +225,8 @@ def rotate_client_key(
 ) -> ClientWithKey:
     rec = _get_or_404(session, client_id)
     for _ in range(_ROTATE_KEY_ATTEMPTS):
-        rec.client_key = secrets.token_urlsafe(32)
+        key = new_key()
+        rec.key_hash = hash_key(key)
         session.add(rec)
         try:
             session.commit()
@@ -270,7 +240,7 @@ def rotate_client_key(
             status_code=status.HTTP_409_CONFLICT, detail="could not generate a unique client_key"
         ) from None
     session.refresh(rec)
-    return ClientWithKey.from_record(rec)
+    return ClientWithKey.from_record(rec, key)
 
 
 # ---------------------------------------------------------------------------

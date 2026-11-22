@@ -10,13 +10,15 @@ Interfaz pública invariante:
 import asyncio
 import json
 import logging
+from datetime import UTC, datetime
 
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select, update
 
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
 from fogar_gateway.db.database import get_engine
-from fogar_gateway.db.models import ClientRecord
+from fogar_gateway.db.models import ClientRecord, HomeRecord, MembershipRecord, UserRecord
 from fogar_gateway.models.schemas import Client, ClientConfig
+from fogar_gateway.services.auth import hash_key
 
 logger = logging.getLogger(__name__)
 
@@ -69,22 +71,47 @@ class DbClient:
             ClientNotFound: la key no existe.
             ClientInactive: el cliente está desactivado.
         """
-        return await asyncio.to_thread(self._lookup, client_key)
+        return await asyncio.to_thread(self._lookup, hash_key(client_key))
 
-    def _lookup(self, client_key: str) -> tuple[Client, ClientConfig]:
+    async def touch(self, client_id: str, capabilities: list[str] | None) -> None:
+        """El dispositivo acaba de entrar (M20): `last_seen_at` y, si las manda, sus capacidades."""
+        await asyncio.to_thread(self._touch, client_id, capabilities)
+
+    def _touch(self, client_id: str, capabilities: list[str] | None) -> None:
+        values: dict[str, object] = {"last_seen_at": datetime.now(UTC)}
+        if capabilities is not None:
+            values["capabilities"] = json.dumps(capabilities)
+        with Session(self._get_engine()) as session:
+            session.exec(  # type: ignore[call-overload]
+                update(ClientRecord).where(col(ClientRecord.id) == client_id).values(**values)
+            )
+            session.commit()
+
+    async def revalidate(self, key_hash: str) -> tuple[Client, ClientConfig]:
+        """Como `get_session`, desde el hash que ya guarda la sesión (la clave no se guarda)."""
+        return await asyncio.to_thread(self._lookup, key_hash)
+
+    def _lookup(self, key_hash: str) -> tuple[Client, ClientConfig]:
         with Session(self._get_engine()) as session:
             record: ClientRecord | None = session.exec(
-                select(ClientRecord).where(ClientRecord.client_key == client_key)
+                select(ClientRecord).where(ClientRecord.key_hash == key_hash)
             ).first()
+            # Un dispositivo personal vale lo que su usuario (M20): desactivarlo corta sus
+            # sesiones en la siguiente revalidación, también por /v1 y el WebSocket.
+            user = session.get(UserRecord, record.user_id) if record and record.user_id else None
+            household_agent = _household_agent(session, record) if record is not None else None
 
+        # Sin argumentos: el mensaje de la excepción no lleva ni el hash.
         if record is None:
-            raise ClientNotFound(client_key)
-        if not record.is_active:
-            raise ClientInactive(client_key)
+            raise ClientNotFound()
+        if not record.is_active or (record.user_id is not None and (user is None or not user.is_active)):
+            raise ClientInactive()
 
         client = Client(
             id=record.id,
-            client_key=record.client_key,
+            key_hash=record.key_hash,
+            user_id=record.user_id,
+            home_id=record.home_id,
             is_active=record.is_active,
             name=record.name,
         )
@@ -92,11 +119,23 @@ class DbClient:
         config = ClientConfig(
             **record.model_dump(include=_CONFIG_COLUMNS),
             allowed_agents=_parse_allowed_agents(record.allowed_agents),
+            household_agent=household_agent,
         )
         return client, config
 
 
-_CONFIG_COLUMNS = set(ClientConfig.model_fields) - {"allowed_agents"}
+_CONFIG_COLUMNS = set(ClientConfig.model_fields) - {"allowed_agents", "household_agent"}
+
+
+def _household_agent(session: Session, record: ClientRecord) -> str | None:
+    """El agente que el hogar da a este dispositivo (M20): el de su usuario o, si no tiene o es
+    del hogar, el de lo común."""
+    if record.user_id is not None:
+        membership = session.get(MembershipRecord, (record.user_id, record.home_id))
+        if membership is not None and membership.agent:
+            return membership.agent
+    home = session.get(HomeRecord, record.home_id)
+    return home.agent if home is not None else None
 
 # Singleton — importar este objeto directamente
 db_client = DbClient()

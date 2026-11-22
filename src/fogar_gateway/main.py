@@ -11,12 +11,15 @@ from fastapi.responses import JSONResponse
 
 from fogar_gateway import paths
 from fogar_gateway.api.admin_routes import router as admin_router
+from fogar_gateway.api.auth_routes import router as auth_router
 from fogar_gateway.api.conversation_routes import router as conversation_router
 from fogar_gateway.api.health_routes import router as health_router
 from fogar_gateway.api.openai_routes import router as openai_router
 from fogar_gateway.api.pairing_routes import admin_router as pairing_admin_router
 from fogar_gateway.api.pairing_routes import public_router as pairing_public_router
 from fogar_gateway.api.routes import router as stream_router
+from fogar_gateway.api.user_routes import home_router
+from fogar_gateway.api.user_routes import router as user_router
 from fogar_gateway.api.web_routes import WEB_DIR, web_available
 from fogar_gateway.api.web_routes import router as web_router
 from fogar_gateway.core.body_limit import BodySizeLimitMiddleware
@@ -33,6 +36,7 @@ from fogar_gateway.core.startup_checks import (
 )
 from fogar_gateway.core.transport import TransportCaptureMiddleware
 from fogar_gateway.db.database import dispose_engine, require_database, run_migrations
+from fogar_gateway.services.auth import LoginLimiter
 from fogar_gateway.services.conversations import ConversationService, LegacyImport, TitleCache
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
@@ -190,6 +194,7 @@ async def _lifespan_body(app: FastAPI):
     app.state.legacy_import = legacy_import
     app.state.session_registry = SessionRegistry()
     app.state.pairing = PairingStore()  # códigos de emparejamiento, en memoria (#317)
+    app.state.login_limiter = LoginLimiter()  # intentos de inicio de sesión, en memoria (M20)
 
     try:
         yield
@@ -262,6 +267,9 @@ app.include_router(stream_router)  # WS /ws/stream
 app.include_router(openai_router)  # HTTP /v1/*
 app.include_router(health_router)  # HTTP /healthz, /ready
 app.include_router(admin_router)  # HTTP /admin/*
+app.include_router(auth_router)  # HTTP /auth/* (M20)
+app.include_router(user_router)  # HTTP /admin/users (M20)
+app.include_router(home_router)  # HTTP /admin/home (M20)
 app.include_router(conversation_router)  # HTTP /admin/conversations
 app.include_router(pairing_public_router)  # HTTP /.well-known/fogar-gateway, /pair
 app.include_router(pairing_admin_router)  # HTTP /admin/pairing

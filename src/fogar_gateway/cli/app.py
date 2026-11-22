@@ -30,7 +30,8 @@ COMMANDS: dict[str, tuple[str, str]] = {
     "status": ("fogar_gateway.cli.status:status", "Estado del gateway y sus servicios."),
     "stop": ("fogar_gateway.cli.service:stop", "Para el servicio."),
     "restart": ("fogar_gateway.cli.service:restart", "Reinicia el servicio."),
-    "token": ("fogar_gateway.cli.token:token", "El token del dashboard, solo en una terminal."),
+    "token": ("fogar_gateway.cli.token:token", "El token de administración (CLI y recuperación), solo en una terminal."),
+    "users": ("fogar_gateway.cli.users:users", "Gestiona las personas del hogar."),
     "uninstall": ("fogar_gateway.cli.service:uninstall", "Quita el servicio (con --purge, también los datos)."),
     "version": ("fogar_gateway.cli.version:version", "Versión de la CLI y del gateway."),
 }

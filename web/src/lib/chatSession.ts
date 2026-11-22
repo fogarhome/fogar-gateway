@@ -1,8 +1,8 @@
 import { reactive } from 'vue'
 import { backoffMs, ChatLog, closeAction, stopText, type ServerMessage } from './chat'
 
-// Una conversación del panel en vivo: abre /ws/stream con el token de administrador (entra como el
-// cliente «Panel web») en esa conversación, manda texto y sigue la respuesta token a token.
+// Una conversación en vivo: abre /ws/stream con el token de este navegador (un dispositivo
+// personal, 4.0) en esa conversación, manda texto y sigue la respuesta token a token.
 // El token va solo en el handshake: nunca se registra ni se enseña.
 
 export type Connection =
@@ -65,7 +65,7 @@ export function createChatSession(options: ChatSessionOptions) {
     socket.onopen = () => {
       socket.send(
         JSON.stringify({
-          admin_token: options.token,
+          client_key: options.token,
           input_mode: 'text',
           // `status`: el progreso del turno (`turn_progress`); llegan también los `pipeline_event`, que el chat ignora.
           output_mode: ['text', 'status'],

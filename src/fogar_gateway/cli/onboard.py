@@ -12,8 +12,8 @@ como estaba más lo ya verificado; volver a ejecutarlo retoma, y con terminal of
 
 Con terminal y color (`Out.styled`) se ve la versión de la marca (#328): la entrada con la línea
 viva (`cli/linea_viva.py`), un «● Paso» por paso con su resultado en «■ …», `init`, el servicio y
-`doctor` resumidos en una línea, y un final con el enlace, su QR y el token copiado al portapapeles
-(OSC 52) en vez de impreso. Sin estilo (`--answers`, `--json`, NO_COLOR, sin terminal), la salida
+`doctor` resumidos en una línea, la cuenta del dueño (M20: con ella se entra en el dashboard) y un
+final con el enlace y su QR. Sin estilo (`--answers`, `--json`, NO_COLOR, sin terminal), la salida
 de siempre.
 
 `questionary`, `pydantic`, `rich`, `segno` y los verificadores se importan al usarse (`--help` < 150 ms).
@@ -37,7 +37,7 @@ from fogar_gateway.access import _is_loopback, collect, configured_public_urls
 from fogar_gateway.cli import api
 from fogar_gateway.cli import config as cfg
 from fogar_gateway.cli.access import gateway_instance_id, show_routes
-from fogar_gateway.cli.output import ACCENT, MUTED, Out
+from fogar_gateway.cli.output import MUTED, Out
 
 NO_OPENCLAW = "Sin OpenClaw no se instala el servicio. Vuelve a ejecutar `fogar-gw onboard`."
 # `openclaw config get` siempre lo enseña redactado y no resuelve SecretRefs; `auth-token --show`
@@ -266,6 +266,44 @@ def _voice_step(out: Out, kind: Literal["stt", "tts"], answer: Any,
     verified.update((k, v) for k, v in values.items() if k == ELEVENLABS_KEY)
 
 
+def _owner(ctx: click.Context, out: Out, answers: Any) -> str | None:
+    """La cuenta del dueño (M20): con ella se entra en el dashboard; el `ADMIN_TOKEN` queda para
+    la CLI y la recuperación. Si ya hay un dueño activo, no pregunta. Devuelve su usuario."""
+    client = api.from_context(ctx)
+    owner = next((u for u in client.request("GET", "/admin/users")
+                  if u["role"] == "owner" and u["is_active"]), None)
+    if owner is not None:
+        out.ok(f"Ya hay dueño: «{owner['username']}».")
+        return str(owner["username"])
+    if answers is not None:
+        if answers.owner is None:
+            out.message("Sin dueño: créalo con `fogar-gw users add NOMBRE --role owner`.", MUTED)
+            return None
+        body = {**answers.owner.model_dump(), "role": "owner"}
+        return str(client.request("POST", "/admin/users", body)["username"])
+    import getpass
+    import re
+
+    out.note("Con esta cuenta entras en el dashboard. Cada persona de casa tendrá la suya.")
+    default = re.sub(r"[^a-z0-9._-]", "", getpass.getuser().lower()) or "dueno"
+    while True:
+        username = _ask("text", "Tu nombre de usuario:", default=default)
+        name = _ask("text", "Tu nombre:", default=username.title())
+        password = _ask("password", "Contraseña (8 o más):")
+        if password != _ask("password", "Repítela:"):
+            out.warn("No coinciden; otra vez.")
+            continue
+        try:
+            created = client.request("POST", "/admin/users", {
+                "username": username, "display_name": name, "password": password, "role": "owner",
+            })
+        except api.ApiError as e:  # contraseña corta, nombre no válido o ya usado: se repite
+            out.warn(e.message)
+            continue
+        out.ok(f"Cuenta de «{created['username']}» creada: eres el dueño del hogar.")
+        return str(created["username"])
+
+
 def _first_client(ctx: click.Context, out: Out, answers: Any) -> None:
     """Solo con --answers: el CI crea su cliente. Con terminal, se empareja desde el dashboard."""
     from fogar_gateway.cli import clients
@@ -317,7 +355,7 @@ def _wait_dashboard(ctx: click.Context, out: Out, url: str | None) -> None:
     if out.styled:
         waiting = "Te espero en el dashboard… (Enter para seguir sin esperar)"
     else:
-        out.message("Abre el dashboard en otro aparato y pega el token. Te espero… "
+        out.message("Abre el dashboard en otro aparato y entra con tu cuenta. Te espero… "
                     "(Enter para seguir sin esperar)", MUTED)
         waiting = ""
     with _no_echo(out), _busy(out, waiting):
@@ -362,24 +400,13 @@ def _qr(url: str) -> Any:
     return out
 
 
-def _copy_to_clipboard(value: str) -> None:
-    """OSC 52: la terminal del usuario lo copia en su portapapeles, también por ssh. No hay
-    respuesta: no se sabe si la terminal lo admite (el Terminal de macOS, no)."""
-    import base64
-    import sys
-
-    sys.stdout.write(f"\x1b]52;c;{base64.b64encode(value.encode()).decode()}\x07")
-    sys.stdout.flush()
-
-
 def _dashboard_styled(out: Out, routes: list[Any], settings: Any,
-                      lan: Any) -> str | None:
-    """El final con estilo: el enlace del dashboard, su QR y el token al portapapeles; el token
-    nunca en pantalla. Devuelve la URL recomendada."""
+                      lan: Any, owner: str | None) -> str | None:
+    """El final con estilo: el enlace del dashboard y su QR; se entra con la cuenta del dueño.
+    Devuelve la URL recomendada."""
     from rich.text import Text
 
     from fogar_gateway.cli.access import HTTPS_HINT, _status_text
-    from fogar_gateway.cli.token import WARNING
 
     out.step("Tu dashboard")
     rec = next((r for r in routes if r.recommended), None)
@@ -394,22 +421,24 @@ def _dashboard_styled(out: Out, routes: list[Any], settings: Any,
             out.note(f"{r.url}  ({_status_text(r)})")
     if rec and not rec.https:
         out.note(HTTPS_HINT)
-    _copy_to_clipboard(settings.ADMIN_TOKEN)
-    out.message("  Para entrar, pega el token de administración. Te lo he mandado al portapapeles "
-                "(no se imprime).")
-    out.note(f"Si no está en tu portapapeles (el Terminal de macOS no lo permite), míralo con "
-             f"`fogar-gw token` (está en {paths.config_file()}).")
-    out.note(WARNING)
+    out.message(f"  {_login_hint(owner)}")
     out.ok("Empareja tu primer aparato desde Clientes, en el dashboard.")
     if lan:
         out.note(f"Los clientes se conectan a ws://{urlsplit(lan.url).netloc}/ws/stream")
     return rec.url if rec else None
 
 
-def _dashboard(ctx: click.Context, out: Out, answers: Any, settings: Any) -> None:
+def _login_hint(owner: str | None) -> str:
+    """Cómo se entra en el dashboard (M20): con una cuenta, nunca con el token."""
+    who = f"tu usuario «{owner}»" if owner else "tu usuario"
+    return (f"Para entrar, {who} y tu contraseña. Por HTTP solo se puede iniciar sesión desde este "
+            "equipo o la tailnet; desde la LAN, por HTTPS.")
+
+
+def _dashboard(ctx: click.Context, out: Out, answers: Any, settings: Any,
+               owner: str | None = None) -> None:
     """El final: cómo llegar al dashboard desde otro aparato y con qué token."""
-    from fogar_gateway.cli import output, serve
-    from fogar_gateway.cli.token import WARNING
+    from fogar_gateway.cli import serve
 
     port = serve.PORT
     bind = settings.GATEWAY_HOST
@@ -419,7 +448,7 @@ def _dashboard(ctx: click.Context, out: Out, answers: Any, settings: Any) -> Non
     url = rec.url if rec else None
     lan = next((r for r in routes if r.kind == "lan"), None)
     if routes and out.styled:
-        _wait_dashboard(ctx, out, _dashboard_styled(out, routes, settings, lan))
+        _wait_dashboard(ctx, out, _dashboard_styled(out, routes, settings, lan, owner))
         return
     if routes:
         show_routes(out, routes, "Tu dashboard")
@@ -431,12 +460,9 @@ def _dashboard(ctx: click.Context, out: Out, answers: Any, settings: Any) -> Non
     else:
         out.message(f"Tu dashboard: http://<IP de este equipo>:{port}/ (no encuentro la IP "
                     "de la LAN: mírala con `hostname -I`)")
-    out.message("Para entrar, pega en él el token de administración.")
-    if answers is None and not out.as_json and output._isatty():
-        out.message(f"Token: {settings.ADMIN_TOKEN}", ACCENT)
-    out.message(f"Está en {paths.config_file()} (ADMIN_TOKEN). Para verlo otra vez: "
-                "`fogar-gw token`.")
-    out.message(WARNING, MUTED)
+    out.message(_login_hint(owner))
+    out.message(f"El token de administración (ADMIN_TOKEN, en {paths.config_file()}) es para la "
+                "CLI y la recuperación; verlo: `fogar-gw token`.", MUTED)
     out.message("Empareja tu primer aparato desde Clientes, en el dashboard.")
     if lan:
         out.message(f"Los clientes se conectan a ws://{urlsplit(lan.url).netloc}"
@@ -484,6 +510,11 @@ def _read_answers(path: Path) -> Any:
         name: _Name
         type: ClientType
 
+    class Owner(Strict):  # M20: la cuenta del dueño (el CI la crea; con terminal, se pregunta)
+        username: str = Field(min_length=1, max_length=64)
+        display_name: _Name
+        password: str = Field(min_length=8, max_length=1024)
+
     class Access(Strict):
         tailscale_serve: bool = False
         public_urls: list[str] = Field(default_factory=list)
@@ -506,6 +537,7 @@ def _read_answers(path: Path) -> Any:
         tts: Annotated[Fogar | ElevenLabs | Off, Field(discriminator="provider")]
         first_client: FirstClient | None = None  # el CI; con terminal, desde el dashboard
         access: Access | None = None  # sin él, el paso no se ejecuta (el CI de siempre)
+        owner: Owner | None = None  # sin él y sin dueño, se avisa: `fogar-gw users add`
 
     try:
         answers = Answers.model_validate_json(raw)
@@ -598,8 +630,10 @@ def _run(ctx: click.Context, out: Out, answers: Any) -> None:
             ctx.invoke(doctor.doctor)
         except click.exceptions.Exit:
             out.message("El diagnóstico marca algún fallo (arriba); el asistente sigue.", MUTED)
+    out.step("Tu cuenta")
+    owner = _owner(ctx, out, answers)
     _first_client(ctx, out, answers)
-    _dashboard(ctx, out, answers, settings)
+    _dashboard(ctx, out, answers, settings, owner)
 
 
 @click.command()

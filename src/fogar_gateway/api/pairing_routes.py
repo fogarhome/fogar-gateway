@@ -30,13 +30,14 @@ from sqlmodel import Session
 
 from fogar_gateway._version import __version__
 from fogar_gateway.api.admin_routes import _check_agent_consistency, create_client_record
-from fogar_gateway.api.deps import get_admin_auth
+from fogar_gateway.api.deps import require_admin
 from fogar_gateway.core.config import settings
 from fogar_gateway.core.logging import fingerprint_key
 from fogar_gateway.core.network import client_ip_for_log
 from fogar_gateway.db.database import get_db_session
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.models.admin_schemas import ClientCreate, PairingCreate, PairRequest
+from fogar_gateway.services.auth import new_key
 from fogar_gateway.services.pairing import InvalidCode, Pairing, PairingFull, PairingStore
 
 logger = logging.getLogger(__name__)
@@ -45,7 +46,7 @@ logger = logging.getLogger(__name__)
 INSTANCE_ID: str = secrets.token_hex(8)
 
 public_router = APIRouter()
-admin_router = APIRouter(prefix="/admin/pairing", dependencies=[Depends(get_admin_auth)])
+admin_router = APIRouter(prefix="/admin/pairing", dependencies=[Depends(require_admin)])
 
 
 def gateway_name() -> str:
@@ -80,10 +81,12 @@ def pair(
 ) -> dict[str, Any]:
     offered = body.model_dump(include={"name", "client_type", "output_mode"}, exclude_none=True)
 
+    key = new_key()  # se guarda solo su hash: esta es la única vez que existe en claro
+
     def create(template: dict[str, Any]) -> ClientRecord:
         fields = {**offered, **template}  # manda lo que fijó el administrador
         fields.setdefault("name", f"{fields.get('client_type') or 'cliente'}-{secrets.token_hex(2)}")
-        return create_client_record(session, ClientCreate(**fields))
+        return create_client_record(session, ClientCreate(**{**fields, "client_key": key}))
 
     try:
         record = _store(request).redeem(body.code, create)
@@ -95,12 +98,12 @@ def pair(
         )
         raise HTTPException(status_code=400, detail="invalid or expired code") from None
     logger.info(
-        "Emparejamiento: cliente %s creado (fp=%s)", record.id, fingerprint_key(record.client_key)
+        "Emparejamiento: cliente %s creado (fp=%s)", record.id, fingerprint_key(key)
     )
     return {
         "client_id": record.id,
         "name": record.name,
-        "client_key": record.client_key,
+        "client_key": key,
         "gateway": {"name": gateway_name(), "version": __version__},
     }
 

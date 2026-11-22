@@ -1,9 +1,6 @@
 import type { Conversation } from '@/api/types'
 import { formatShortDate } from './format'
 
-/** El cliente con el que entra el panel en el WebSocket (`admin_token`): sus conversaciones se escriben aquí. */
-export const PANEL_CLIENT_ID = 'panel-web'
-
 /** El título de OpenClaw o, si no lo tiene (o no responde), uno honesto con el día. */
 export function conversationTitle(c: Pick<Conversation, 'title' | 'kind' | 'day' | 'created_at'>, now = new Date()): string {
   const title = c.title?.trim()
@@ -19,5 +16,11 @@ export function conversationKind(kind: string): string | null {
   return null
 }
 
-/** Desde el panel solo se escribe en sus propias conversaciones; las de otros aparatos se leen (M19). */
-export const canWrite = (c: Pick<Conversation, 'client_id'>) => c.client_id === PANEL_CLIENT_ID
+/** Se escribe solo en las conversaciones empezadas en este navegador; las demás que puedes ver se
+ * leen. Abrir aquí la de otro aparato lo cortaría (4102) mientras no haya varios en una (C3). */
+export const canWrite = (c: Pick<Conversation, 'client_id'>, deviceId: string | null) =>
+  deviceId !== null && c.client_id === deviceId
+
+/** De quién es (4.0): privada de su persona o del hogar, la ven todos los de casa. */
+export const conversationScope = (c: Pick<Conversation, 'owner_user_id'>) =>
+  c.owner_user_id ? 'privada' : 'del hogar'

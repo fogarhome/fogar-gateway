@@ -232,12 +232,12 @@ export function closeAction(code: number): CloseAction {
 
 /** Frases de los cierres que paran el chat (`stop`) y tienen una explicación propia. */
 const STOP_TEXT: Partial<Record<number, string>> = {
-  4010: 'El panel no puede escribir: su cliente («Panel web») está desactivado. Actívalo en Clientes.',
-  4020: 'El agente de esta conversación no está permitido para el panel.',
+  4010: 'Tu sesión en este navegador ya no vale (se retiró o te desactivaron). Vuelve a entrar.',
+  4020: 'El agente de esta conversación no está permitido para este navegador.',
   4021: 'El agente de esta conversación no existe en OpenClaw.',
   4100: 'Esta conversación ya no existe en el gateway.',
   4101: 'El agente no coincide con el de la conversación.',
-  4200: 'Se retiró el acceso del panel: su cliente («Panel web») se desactivó, se borró o cambió su clave.',
+  4200: 'Se retiró el acceso de este navegador: se cerró su sesión o te desactivaron. Vuelve a entrar.',
 }
 
 /** La frase para un cierre que para el chat (`stop`). */

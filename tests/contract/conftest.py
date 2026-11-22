@@ -62,7 +62,7 @@ async def stt_harness(request, monkeypatch):
     await provider.start()
     yield SttHarness(
         provider=provider,
-        client=Client(id="c-contract", client_key=SECRET_KEY, is_active=True),
+        client=Client(id="c-contract", key_hash=SECRET_KEY, is_active=True),
         upstream=up,
     )
     await provider.aclose()
@@ -92,7 +92,7 @@ async def _elevenlabs_stt_harness(monkeypatch):
     await provider.start()
     yield SttHarness(
         provider=provider,
-        client=Client(id="c-contract", client_key=SECRET_KEY, is_active=True),
+        client=Client(id="c-contract", key_hash=SECRET_KEY, is_active=True),
         upstream=up,
     )
     await provider.aclose()

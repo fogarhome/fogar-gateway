@@ -15,6 +15,7 @@ from sqlmodel import Session
 from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.main import app
+from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.db_client import db_client
 from fogar_gateway.services.stats import gateway_stats
 from tests.integration.conftest import (
@@ -118,19 +119,19 @@ async def test_out_of_band_db_deactivation_revokes_within_one_interval(server, d
 
 async def test_transient_db_error_does_not_close_the_session(server, monkeypatch):
     calls = {"n": 0, "failed": 0}
-    real = db_client.get_session
+    real = db_client.revalidate
 
-    async def flaky(key):
+    async def flaky(key_hash):
         calls["n"] += 1
-        if calls["n"] in (2, 3):  # la 1.ª es el handshake
+        if calls["n"] in (1, 2):
             calls["failed"] += 1
             raise RuntimeError("database is locked")
-        return await real(key)
+        return await real(key_hash)
 
-    monkeypatch.setattr(db_client, "get_session", flaky)
+    monkeypatch.setattr(db_client, "revalidate", flaky)
     ws = await _open(server)
     await asyncio.sleep(INTERVAL_S * 8)  # varias revalidaciones, las 2 primeras fallan
-    assert calls["failed"] == 2 and calls["n"] > 3
+    assert calls["failed"] == 2 and calls["n"] > 2
     assert ws.close_code is None  # sigue abierta
 
     async with _admin(server) as admin:  # y una revocación posterior sí la corta
@@ -153,13 +154,15 @@ def test_defaults():
 
 
 async def test_client_recreated_with_same_key_but_new_id_revokes_the_session(server, db_engine):
-    """Borrar y recrear con la MISMA clave (otro id) dentro de la ventana: sigue siendo
-    otro cliente, la sesión del anterior debe cerrarse."""
+    """La MISMA clave pasa a otro cliente (otro id) dentro de la ventana: es otro cliente, la
+    sesión del anterior debe cerrarse. (El anterior ya no se borra, M20: se le cambia la clave.)"""
     ws = await _open(server)
     with Session(db_engine) as s:
-        s.delete(s.get(ClientRecord, CLIENT_ID))
+        old = s.get(ClientRecord, CLIENT_ID)
+        old.key_hash = hash_key("otra-clave")
+        s.add(old)
         s.commit()
-        s.add(ClientRecord(id="otro-id", name="Nuevo", client_key=VALID_KEY, is_active=True))
+        s.add(ClientRecord(id="otro-id", name="Nuevo", key_hash=hash_key(VALID_KEY), is_active=True))
         s.commit()
     await _expect_revoked(ws)
 

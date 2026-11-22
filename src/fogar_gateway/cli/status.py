@@ -29,10 +29,13 @@ def _service(svc: dict[str, Any]) -> str:
 def status(ctx: click.Context) -> None:
     """Estado del gateway y sus servicios."""
     out = Out(ctx.find_root().obj["json"])
-    state = api.from_context(ctx).request("GET", "/admin/state")
+    client = api.from_context(ctx)
+    state = client.request("GET", "/admin/state")
     if out.as_json:
         out.json(state)
         return
+    owners = [u for u in client.request("GET", "/admin/users")
+              if u["role"] == "owner" and u["is_active"]]
     # .get con valores por defecto: un gateway de otra versión puede traer otra forma.
     gw, services = state.get("gateway", {}), state.get("services", {})
     uptime = gw.get("uptime_s")
@@ -47,5 +50,7 @@ def status(ctx: click.Context) -> None:
             ("STT", _service(services.get("stt", {}))),
             ("TTS", _service(services.get("tts", {}))),
             ("sesiones", state.get("totals", {}).get("sessions_active", "?")),
+            ("dueño", ", ".join(u["username"] for u in owners)
+             or "ninguno: créalo con `fogar-gw users add NOMBRE --role owner`"),
         ]
     )

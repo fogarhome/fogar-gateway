@@ -32,7 +32,7 @@ from sqlmodel import Session, col, select
 
 from fogar_gateway.core.config import settings
 from fogar_gateway.db.database import get_engine
-from fogar_gateway.db.models import ClientRecord, ConversationRecord
+from fogar_gateway.db.models import DEFAULT_HOME_ID, ClientRecord, ConversationRecord
 from fogar_gateway.services.openclaw.chat_text import extract_message_text
 from fogar_gateway.services.reconnection import describe_error, traceback_no_message
 from fogar_gateway.services.teardown import Teardown
@@ -71,15 +71,27 @@ class Conversation:
     session_key: str
     kind: Kind
     day: date | None = None
+    # M20: el hogar y el dueño salen del dispositivo al guardarla (`_stamp`). Sin dueño, del hogar.
+    home_id: str = DEFAULT_HOME_ID
+    owner_user_id: str | None = None
 
     @classmethod
     def from_record(cls, r: ConversationRecord) -> "Conversation":
         # Filas de antes de C-1 pueden tener el agente en mayúsculas; OpenClaw usa minúsculas.
-        return cls(r.id, r.client_id, r.agent.lower(), r.session_key.lower(), r.kind, r.day)  # type: ignore[arg-type]
+        return cls(
+            r.id, r.client_id, r.agent.lower(), r.session_key.lower(), r.kind, r.day,  # type: ignore[arg-type]
+            r.home_id, r.owner_user_id,
+        )
+
+    def visible_to(self, home_id: str, user_id: str | None) -> bool:
+        """M20: del mismo hogar y, si es privada, solo para su dueño. Un dispositivo del hogar
+        (`user_id` None) ve solo las del hogar; uno personal, las del hogar y las suyas."""
+        return self.home_id == home_id and self.owner_user_id in (None, user_id)
 
 
 class ConversationNotFound(Exception):
-    """El id no existe o es de otro cliente (no se distingue: no se revela que existe)."""
+    """El id no existe o no es visible para quien la pide (no se distingue: no se revela que
+    existe)."""
 
 
 class ConversationClientMissing(Exception):
@@ -106,9 +118,6 @@ class ConversationIndex:
 
     def replace_all(self, conversations: list[Conversation]) -> None:
         self._by_key = {c.session_key: c for c in conversations}
-
-    def forget_client(self, client_id: str) -> None:
-        self._by_key = {k: c for k, c in self._by_key.items() if c.client_id != client_id}
 
     def __len__(self) -> int:
         return len(self._by_key)
@@ -156,6 +165,7 @@ class ConversationService:
             if found is not None:
                 return Conversation.from_record(found)
             record = _new_record(client_id, agent, "default", day)
+            _stamp(s, record)
             s.add(record)
             try:
                 s.commit()
@@ -201,6 +211,7 @@ class ConversationService:
                 id=c.id, client_id=c.client_id, agent=c.agent, session_key=c.session_key, kind=c.kind,
                 day=c.day,
             )
+            _stamp(s, record)
             s.add(record)
             try:
                 s.commit()
@@ -219,10 +230,13 @@ class ConversationService:
             record = s.get(ConversationRecord, conversation_id)
             return Conversation.from_record(record) if record is not None else None
 
-    async def get_owned(self, client_id: str, conversation_id: str) -> Conversation:
-        """La conversación `conversation_id` si es del cliente; si no, ConversationNotFound."""
+    async def get_visible(
+        self, conversation_id: str, home_id: str, user_id: str | None
+    ) -> Conversation:
+        """La conversación si la puede abrir quien la pide (`Conversation.visible_to`); si no,
+        ConversationNotFound."""
         conv = await self.get(conversation_id)
-        if conv is None or conv.client_id != client_id:
+        if conv is None or not conv.visible_to(home_id, user_id):
             raise ConversationNotFound()
         self.index.add(conv)
         return conv
@@ -240,22 +254,40 @@ class ConversationService:
             )
             s.commit()
 
-    async def list_rows(self, client_id: str | None = None) -> list[ConversationRow]:
+    async def list_rows(
+        self, client_id: str | None = None, *, visible_to: tuple[str, str | None] | None = None
+    ) -> list[ConversationRow]:
         """Todas (o las de un cliente), la última en hablarse primero. Sin las del día en
-        las que nunca se habló: las crea el handshake de un cliente que conecta y calla."""
-        return await asyncio.to_thread(self._list, client_id, None)
+        las que nunca se habló: las crea el handshake de un cliente que conecta y calla.
+        `visible_to=(home_id, user_id)` deja solo las que esa persona puede ver; sin él, todas
+        (la máquina: la CLI con `ADMIN_TOKEN`)."""
+        return await asyncio.to_thread(self._list, client_id, None, visible_to)
 
     async def row(self, conversation_id: str) -> ConversationRow | None:
-        rows = await asyncio.to_thread(self._list, None, conversation_id)
+        rows = await asyncio.to_thread(self._list, None, conversation_id, None)
         return rows[0] if rows else None
 
-    def _list(self, client_id: str | None, conversation_id: str | None) -> list[ConversationRow]:
+    def _list(
+        self,
+        client_id: str | None,
+        conversation_id: str | None,
+        visible_to: tuple[str, str | None] | None,
+    ) -> list[ConversationRow]:
         with Session(self._get_engine()) as s:
             query = select(ConversationRecord, ClientRecord.name).join(
                 ClientRecord, col(ClientRecord.id) == ConversationRecord.client_id
             )
             if client_id is not None:
                 query = query.where(ConversationRecord.client_id == client_id)
+            if visible_to is not None:
+                home_id, user_id = visible_to
+                query = query.where(
+                    ConversationRecord.home_id == home_id,
+                    or_(
+                        col(ConversationRecord.owner_user_id).is_(None),
+                        col(ConversationRecord.owner_user_id) == user_id,
+                    ),
+                )
             if conversation_id is not None:
                 query = query.where(ConversationRecord.id == conversation_id)
             else:
@@ -281,7 +313,13 @@ class ConversationService:
         """Un commit por cliente: uno borrado a mitad (la clave foránea rechaza sus filas) no
         tumba la importación de los demás; las suyas, simplemente, no se importan."""
         with Session(self._get_engine()) as s:
-            client_ids = set(s.exec(select(ClientRecord.id)).all())
+            owners = {
+                cid: (home, user)
+                for cid, home, user in s.exec(
+                    select(ClientRecord.id, ClientRecord.home_id, ClientRecord.user_id)
+                ).all()
+            }
+            client_ids = set(owners)
             known = {k.lower() for k in s.exec(select(ConversationRecord.session_key)).all()}
         by_client: dict[str, list[ConversationRecord]] = {}
         for row in rows:
@@ -290,6 +328,8 @@ class ConversationService:
                 continue
             agent, client_id = parsed
             record = _new_record(client_id, agent, "legacy", None, session_key=row["key"])
+            # Un cliente borrado entre medias: su alta la rechaza la clave foránea (abajo).
+            record.home_id, record.owner_user_id = owners.get(client_id, (DEFAULT_HOME_ID, None))
             created = _ms_to_datetime(row.get("createdAt"))
             if created is not None:
                 record.created_at = created
@@ -315,6 +355,15 @@ class ConversationService:
 def new_conversation(client_id: str, agent: str) -> Conversation:
     """Una conversación nueva (`created`), aún sin guardar (`ConversationService.save`)."""
     return Conversation.from_record(_new_record(client_id, agent, "created", None))
+
+
+def _stamp(s: Session, record: ConversationRecord) -> None:
+    """Hogar y dueño de la conversación, los de su dispositivo (M20): la de un dispositivo
+    personal es de su usuario; la de uno del hogar, del hogar."""
+    client = s.get(ClientRecord, record.client_id)
+    if client is None:
+        raise ConversationClientMissing()
+    record.home_id, record.owner_user_id = client.home_id, client.user_id
 
 
 def _require_client(s: Session, client_id: str) -> None:

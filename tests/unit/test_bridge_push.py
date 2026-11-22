@@ -196,7 +196,7 @@ async def test_revalidation_refreshes_allowed_agents_for_pushes(make_push_bridge
     fresh = ClientConfig(allowed_agents=["main"])
     monkeypatch.setattr(settings, "SESSION_REVALIDATE_INTERVAL_S", 0.01)
     monkeypatch.setattr(
-        bridge_module.db_client, "get_session", AsyncMock(return_value=(bridge.client, fresh))
+        bridge_module.db_client, "revalidate", AsyncMock(return_value=(bridge.client, fresh))
     )
     task = asyncio.create_task(bridge._session_revalidation_loop())
     await wait_until(lambda: bridge.turns.allowed_agents == ["main"])

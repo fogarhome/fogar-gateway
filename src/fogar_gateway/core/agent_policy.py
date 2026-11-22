@@ -63,9 +63,11 @@ def resolve_agent(
     Cascade (first non-empty-after-stripping wins):
       1. requested (handshake.agent or body.model)
       2. client_config.default_agent (if client_config is not None and set)
-      3. settings.DEFAULT_AGENT, the installation default (#245), if set
-      4. gateway_info.default_agent_id (if gateway_info is not None)
-      5. "main" (last-resort fallback; preserves legacy REST trusted-origin)
+      3. client_config.household_agent (M20): the device's user's agent, or the home's for a
+         home device, if set
+      4. settings.DEFAULT_AGENT, the installation default (#245), if set
+      5. gateway_info.default_agent_id (if gateway_info is not None)
+      6. "main" (last-resort fallback; preserves legacy REST trusted-origin)
 
     Policy checks, fail-fast in order:
       a. If client_config is not None and client_config.allowed_agents is
@@ -96,6 +98,8 @@ def resolve_agent(
         effective = requested
     elif client_config is not None and client_config.default_agent:
         effective = client_config.default_agent
+    elif client_config is not None and client_config.household_agent:
+        effective = client_config.household_agent
     elif settings.DEFAULT_AGENT:
         effective = settings.DEFAULT_AGENT
     elif gateway_info is not None and gateway_info.default_agent_id:

@@ -49,7 +49,10 @@ const meta = computed(() => {
   const tipo = c.client_type ? label(CLIENT_TYPE, c.client_type) : 'Sin tipo'
   const fecha = parseIso(c.created_at).toLocaleDateString('es-ES', { day: 'numeric', month: 'short', year: 'numeric' })
   const huella = huellaDudosa.value ? 'sin comprobar' : `${c.key_fp.slice(0, 4)} ${c.key_fp.slice(4)}`
-  return `${tipo} · creado el ${fecha} · huella ${huella}`
+  // 4.0: de una persona (un inicio de sesión) o del hogar (emparejado), y lo que sabe hacer.
+  const de = c.user_id ? 'de una persona' : 'del hogar'
+  const sabe = c.capabilities?.length ? ` · sabe: ${c.capabilities.join(', ')}` : ''
+  return `${tipo} · ${de} · creado el ${fecha} · huella ${huella}${sabe}`
 })
 
 const errores = computed(() => (form.value ? validate(form.value) : {}))

@@ -1,6 +1,6 @@
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, StringConstraints, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from fogar_gateway.core.session_key import AGENT_ID_PATTERN
 
@@ -16,9 +16,11 @@ class Client(BaseModel):
     """Registro de cliente resuelto desde la BD local."""
 
     id: str
-    client_key: str
+    key_hash: str  # nunca la clave: solo su hash (M20), con el que se revalida la sesión
     is_active: bool
     name: str = ""
+    user_id: str | None = None  # M20: None = dispositivo del hogar; con valor, personal
+    home_id: str = "home"
 
     model_config = ConfigDict(extra="allow")
 
@@ -39,6 +41,9 @@ class ClientConfig(BaseModel):
     # En minúsculas, como OpenClaw: una fila anterior a la 3.0 puede guardar "Main" (C-1).
     default_agent: Annotated[str, StringConstraints(to_lower=True)] | None = None
     allowed_agents: list[Annotated[str, StringConstraints(to_lower=True)]] | None = None
+    # M20: el agente que el hogar asigna a quien habla por este dispositivo: el de su usuario si
+    # es personal, el de lo común si es del hogar (`memberships.agent` / `homes.agent`).
+    household_agent: Annotated[str, StringConstraints(to_lower=True)] | None = None
 
     model_config = ConfigDict(extra="allow")
 
@@ -51,18 +56,23 @@ class ClientConfig(BaseModel):
 CREDENTIAL_MAX_LEN = 1024
 
 
+# Una capacidad del dispositivo (M20): minúsculas, cifras, `_` y `-`; hasta 32 por dispositivo.
+Capability = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$")]
+Capabilities = Annotated[list[Capability], Field(max_length=32)]
+
+
 class Handshake(BaseModel):
     """
     Configuración inicial que el cliente envía al Gateway al conectar por WebSocket. Define
     qué patas internas del ecosistema se deben encender.
 
-    Credencial: `client_key` o, para el panel web, `admin_token` (M19); una de las dos.
+    Credencial: `client_key`, la clave de un dispositivo emparejado o el token de uno con sesión
+    (`/auth/login`, M20). La web entra igual que cualquier otro dispositivo: ya no hay `admin_token`.
     """
 
     # Con tope (como `conversation`): un valor enorme o un surrogate suelto ("\ud800") falla la
     # validación (cierre 4000) en vez de reventar al codificarlo (auditoría 3.0, D-5).
-    client_key: Annotated[str, StringConstraints(max_length=CREDENTIAL_MAX_LEN)] | None = None
-    admin_token: Annotated[str, StringConstraints(max_length=CREDENTIAL_MAX_LEN)] | None = None
+    client_key: Annotated[str, StringConstraints(max_length=CREDENTIAL_MAX_LEN)]
     input_mode: Literal["audio", "text"]
     output_mode: list[OutputMode]
     # Id de agente de OpenClaw, en minúsculas; None, "" o solo espacios → la cascada de
@@ -76,14 +86,11 @@ class Handshake(BaseModel):
     ) = None
     # Id de una conversación del cliente o "new"; None → la conversación por defecto (M19).
     conversation: Annotated[str, StringConstraints(min_length=1, max_length=64)] | None = None
+    # Lo que el aparato sabe hacer (pantalla, micrófono…; M20): se guarda y se enseña, aún no
+    # decide nada. Sin el campo, se conservan las que ya tenía.
+    capabilities: Capabilities | None = None
 
     model_config = ConfigDict(extra="allow")
-
-    @model_validator(mode="after")
-    def _one_credential(self) -> "Handshake":
-        if (self.client_key is None) == (self.admin_token is None):
-            raise ValueError("client_key or admin_token, exactly one")
-        return self
 
 
 # =====================================================================

@@ -69,7 +69,7 @@ def make_bridge(
     """
     ws = ws if ws is not None else RecWS()
     kwargs = dict(
-        client=Client(id=client_id, client_key="k", is_active=True),
+        client=Client(id=client_id, key_hash="k", is_active=True),
         config=ClientConfig(),
         client_ws=ws,
         orchestrator=AsyncMock(),

@@ -1,5 +1,5 @@
 class ClientNotFound(Exception):
-    """Raised when client_key does not exist in the local DB."""
+    """Raised when no client has that key (or that key hash) in the local DB."""
 
 
 class ClientInactive(Exception):

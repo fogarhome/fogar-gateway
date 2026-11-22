@@ -15,7 +15,7 @@ from fogar_gateway.services.speech.fogar import FogarSttProvider
 from fogar_gateway.services.speech.ports import SttCallbacks, SttParams
 from fogar_gateway.services.tts_reconnecting import ReconnectingTTSClient
 
-CLIENT = Client(id="c1", client_key="the-key", is_active=True)
+CLIENT = Client(id="c1", key_hash="the-key", is_active=True)
 
 
 def _callbacks() -> SttCallbacks:
