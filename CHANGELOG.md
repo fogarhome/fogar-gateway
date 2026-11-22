@@ -1,5 +1,15 @@
 # Changelog
 
+## [4.0.0](https://github.com/fogarhome/fogar-gateway/compare/v3.0.1...v4.0.0) (2026-11-22)
+
+### ⚠ BREAKING CHANGES
+
+* Fogar Gateway 4.0 — el hogar, sus personas y sus dispositivos (M20) ([#396](https://github.com/fogarhome/fogar-gateway/issues/396))
+
+### Features
+
+* Fogar Gateway 4.0 — el hogar, sus personas y sus dispositivos (M20) ([#396](https://github.com/fogarhome/fogar-gateway/issues/396)) ([3da0f23](https://github.com/fogarhome/fogar-gateway/commit/3da0f2350b9d76073f56c0694f8a030f041c93e3)), closes [#395](https://github.com/fogarhome/fogar-gateway/issues/395)
+
 ## [3.0.1](https://github.com/fogarhome/fogar-gateway/compare/v3.0.0...v3.0.1) (2026-11-17)
 
 ### Bug Fixes
