@@ -718,7 +718,7 @@ El cliente no necesita distinguirlos de los turnos normales — el `turn_id` y `
 
 ```json
 // Handshake
-{ "client_key": "...", "input_mode": "text", "output_mode": ["text"] }
+{ "client_key": "...", "protocol": 5, "input_mode": "text", "output_mode": ["text"] }
 
 // Enviar pregunta
 { "type": "send", "text": "¿Qué tiempo hace en Madrid?" }
@@ -734,7 +734,7 @@ El cliente no necesita distinguirlos de los turnos normales — el `turn_id` y `
 
 ```json
 // Handshake
-{ "client_key": "...", "input_mode": "audio", "output_mode": ["audio", "text", "status"] }
+{ "client_key": "...", "protocol": 5, "input_mode": "audio", "output_mode": ["audio", "text", "status"] }
 ```
 
 Flujo: envía PCM Float32 → recibe parciales → envía `end` → recibe `transcription` → envías `send` → recibes `turn_start` + `token` + frames binarios + `turn_end`.
@@ -743,7 +743,7 @@ Flujo: envía PCM Float32 → recibe parciales → envía `end` → recibe `tran
 
 ```json
 // Handshake
-{ "client_key": "...", "input_mode": "audio", "output_mode": ["text"] }
+{ "client_key": "...", "protocol": 5, "input_mode": "audio", "output_mode": ["text"] }
 ```
 
 El transcriptor funciona normalmente pero no se activa TTS. Útil para clientes que quieren transcripción + tokens de texto sin reproducción de audio.
@@ -752,7 +752,7 @@ El transcriptor funciona normalmente pero no se activa TTS. Útil para clientes 
 
 ```json
 // Handshake
-{ "client_key": "...", "input_mode": "text", "output_mode": ["text", "audio"] }
+{ "client_key": "...", "protocol": 5, "input_mode": "text", "output_mode": ["text", "audio"] }
 ```
 
 El cliente escribe; el gateway sintetiza audio con el texto de la respuesta.
@@ -765,7 +765,7 @@ El cliente escribe; el gateway sintetiza audio con el texto de la respuesta.
 
 | Mensaje | Formato | Cuándo |
 |---------|---------|--------|
-| Handshake | `{"client_key":"...","input_mode":"...","output_mode":[...],"agent":"...","conversation":"...","capabilities":[...]}` | Primer mensaje, obligatorio |
+| Handshake | `{"client_key":"...","protocol":5,"input_mode":"...","output_mode":[...],"agent":"...","conversation":"...","capabilities":[...]}` | Primer mensaje, obligatorio |
 | Fin de audio | `{"type":"end"}` | `input_mode="audio"` — usuario termina de hablar |
 | Enviar texto | `{"type":"send","text":"..."}` | Envía texto al orquestador |
 | Cancelar turno | `{"type":"cancel"}` | Cancela turno activo (o el push que suena, §10) sin iniciar uno nuevo |

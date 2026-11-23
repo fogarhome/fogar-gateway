@@ -500,3 +500,11 @@ def test_ready_carries_protocol(client):
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_json({**_V4_HANDSHAKE, "protocol": 5})
         assert ws.receive_json()["protocol"] == 5
+
+
+def test_protocol_rejection_never_logs_client_text(client, caplog):
+    secret = "fgr_SECRETKEYMATERIAL0123456789"
+    with caplog.at_level(logging.DEBUG):
+        assert _close_of(client, {**_V4_HANDSHAKE, "protocol": secret})[0] == 4003
+    assert "SECRETKEY" not in caplog.text
+    assert "protocol=str" in caplog.text

@@ -123,7 +123,9 @@ async def gateway_websocket(websocket: WebSocket):
         if isinstance(msg_data, dict):
             protocol = msg_data.get("protocol")
             if type(protocol) is not int or protocol != PROTOCOL_VERSION:
-                logger.warning(f"Handshake rechazado: protocol={str(protocol)[:40]!r} != {PROTOCOL_VERSION}.")
+                # Solo un entero se registra: otro tipo puede traer la credencial o texto del usuario.
+                shown = protocol if type(protocol) is int else type(protocol).__name__
+                logger.warning(f"Handshake rechazado: protocol={shown} != {PROTOCOL_VERSION}.")
                 gateway_stats.handshake_rejected("protocol")
                 await send_close(websocket, Close.PROTOCOL_UNSUPPORTED)
                 return
