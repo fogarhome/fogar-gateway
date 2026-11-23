@@ -168,6 +168,8 @@ failed push stayed open.
 
 ## Breaking change — OpenClaw 2026.10.5 (2026-10-20, issue #241)
 
+> **2026.11.7:** a queued or absorbed run's `final` carries no `message`; see "Breaking change — 2026.11.7" under "C3 queue behaviour and failure fields".
+
 Captured live against production (2026.10.5) for a one-sentence prompt. Frame order
 (`payload` fields only, text shortened):
 
@@ -296,6 +298,8 @@ frames and the `agent` `run_status`/`thinking` streams are still ignored.
 ---
 
 ## `agent` events of streams other than `lifecycle` (2026-11-14, server 2026.10.5)
+
+> **2026.11.7:** a run drained from OpenClaw's queue gets no lifecycle `start`; see "Breaking change — 2026.11.7" under "C3 queue behaviour and failure fields".
 
 Read in the npm package `openclaw@2026.10.5` (`server-chat`, `builtin-openclaw`, the
 `AgentActivityItemSchema` in `sessions`); not a new live capture. **Gateway bug fixed.**
@@ -987,6 +991,30 @@ throwaway keys `agent:e2e:fogar-probe-<uuid>` (agent `e2e`; this server has no `
 capturing raw frames below `FrameDispatcher`; structure only, no text recorded. Read in the package
 source (`dist/`) where noted. Basis for 5.0 PR 2 (#406) and #397.
 
+### Breaking change — 2026.11.7 (2026-11-23)
+
+These observations contradict rules stated earlier in this file:
+
+1. **A run drained from OpenClaw's queue sends no `agent` lifecycle `phase:"start"`.** An `agent`
+   `stream:"error"` `data {reason: "seq gap", expected, received}` arrives in its place (seen
+   twice). "Only `stream:"lifecycle"` opens … a push" (see "`agent` events of streams other than
+   `lifecycle`") no longer holds for these runs: a turn or push must open on the first event of
+   its `runId`, not on `start`.
+2. **The `chat` `final` of a queued or absorbed run carries no `message`.** The text arrives only
+   in the deltas (queued run), or under the absorbing run's `runId` (steered run). "Breaking
+   change — OpenClaw 2026.10.5" ("`final` carries the full text") holds only for a run that
+   started normally.
+3. **`activeRunIds` / `hasActiveRun` include queued runs**, not only running ones (`sessions.list`
+   and `sessions.changed`: `[B, C, A]` while only A ran). They do not mean "running".
+
+**Stop-point verdicts:**
+
+- **Steer:** a message absorbed by `steer` can be detected **only after it is absorbed**, never at
+  `chat.send` (the ack is `status:"started"` in every case). See "mode `steer`" below.
+- **#397:** **agent missing/forbidden has no structural field.** `chat.send` is refused with
+  `res ok:false` `INVALID_REQUEST`, carrying only `code` and `message`. The other four cases do
+  have fields: see "Failure fields over the WebSocket".
+
 ### Queue mode: where it comes from and how to read it
 
 - Modes (`QUEUE_MODES`): `steer`, `followup`, `collect`, `interrupt`. Resolution: per-session
@@ -1003,10 +1031,14 @@ source (`dist/`) where noted. Basis for 5.0 PR 2 (#406) and #397.
 
 ### `chat.send` while a run is active, mode `steer` (the default)
 
-Same result with the first run using a tool (`read`) and without tools (second message sent at
-the first run's `chat` `status` `starting_model`). In an earlier attempt B landed while A was
-already finishing: it then ran as its own turn after A, like a followup (see below: no `start`,
-a `seq gap` notice, a `final` without `message`). Run A is active, B is sent:
+B was absorbed (the sequence below) in both runs where A was still working when B arrived:
+one where A used a tool (`read`, B sent at A's first tool event), and one without tools (B sent
+at A's `chat` `status` `starting_model`). In a third run without tools, B was sent at A's first
+delta and arrived while A was already finishing. That B was **not** absorbed: it ran as its own
+turn after A, like a followup (see below: no `start`, a `seq gap` notice, a `final` without
+`message`).
+
+Run A is active, B is sent:
 
 1. B's ack: `res ok` `{runId: B, status: "started"}` — **identical to a normal start**; nothing in
    the ack says it will be steered.
@@ -1126,7 +1158,10 @@ How the five #397 cases map (every field is optional, so a classifier needs an `
 ## Change log of this file
 
 - **2026-11-23**: added "C3 queue behaviour and failure fields" (server 2026.11.7, observed live
-  on green-house and read in the package source; #406, #397): `steer` is the default and folds a
+  on green-house with agent `e2e` (no `main` agent there) and read in the package source; #406,
+  #397). **Breaking change — 2026.11.7:** a run drained from the queue gets no lifecycle `start`
+  (a `seq gap` `agent` `stream:"error"` instead), the `final` of a queued or absorbed run carries
+  no `message`, and `activeRunIds` includes queued runs. Also: `steer` is the default and folds a
   concurrent `chat.send` into the active run (`steerTargetRunId`, an empty `final` for the absorbed
   run), `followup` runs queued messages as their own turns, `chat.abort` with a queued `runId`
   cancels only that message, `chat.history` `pendingInputs` lists pending messages,
