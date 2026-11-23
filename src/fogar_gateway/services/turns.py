@@ -816,8 +816,7 @@ class TurnController:
 
     async def _push_start(self, session_key: str, run_id: str | None = None) -> None:
         if not self._agent_allowed(session_key):
-            # C-r7-1: push de un agente retirado de allowed_agents (conversación de otro día,
-            # clave legacy): no llega al cliente y se para en OpenClaw.
+            # C-r7-1: push de un agente retirado de allowed_agents (conversación de otro día): no llega al cliente y se para en OpenClaw.
             logger.info(f"[{self._client_id}] push de un agente no permitido: descartado")
             push = self._push
             if push is not None and push.session_key == session_key:

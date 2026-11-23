@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlmodel import Session, SQLModel, create_engine
 
 from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord, ConversationRecord
@@ -18,7 +18,6 @@ from fogar_gateway.services.conversations import (
     ConversationClientMissing,
     ConversationNotFound,
     ConversationService,
-    LegacyImport,
     SessionConversation,
     TitleCache,
     conversation_day,
@@ -268,7 +267,7 @@ async def test_concurrent_title_requests_share_one_read():
     assert await cache.get(Hanging()) == {} and reads == ["sessions.list"]  # fallo recordado
 
 
-# ── Sesiones de antes de M19 ──────────────────────────────────────────────
+# ── sessions.list, paginado ──────────────────────────────────────────────
 
 
 class FakeOpenClaw:
@@ -285,65 +284,13 @@ class FakeOpenClaw:
         return {"sessions": page, "hasMore": more, "nextOffset": offset + limit if more else None}
 
 
-async def test_legacy_sessions_are_imported_once(service, engine):
-    rows = [
-        {"key": "agent:main:tv", "createdAt": 1_700_000_000_000, "updatedAt": 1_700_000_100_000},
-        {"key": "agent:jota:tv"},
-        {"key": "agent:main:unknown-client"},  # sin cliente: no es nuestra
-        {"key": "agent:main:fogar-xyz"},  # ya es de M19
-        {"key": "agent:main:telegram:direct:42"},  # de otro canal
-        {"key": "global"},
-    ]
+async def test_openclaw_sessions_are_listed_page_by_page_with_titles():
+    rows = [{"key": f"agent:main:fogar-{i}"} for i in range(5)] + [{"nokey": 1}]
     openclaw = FakeOpenClaw(rows, page=2)
-    assert await service.import_legacy(openclaw) == 2
-    assert await service.import_legacy(openclaw) == 0  # idempotente
-    with Session(engine) as s:
-        records = s.exec(select(ConversationRecord)).all()
-    assert sorted((r.session_key, r.client_id, r.agent, r.kind) for r in records) == [
-        ("agent:jota:tv", "tv", "jota", "legacy"),
-        ("agent:main:tv", "tv", "main", "legacy"),
-    ]
-    main = next(r for r in records if r.agent == "main")
-    assert main.created_at.replace(tzinfo=UTC) == datetime.fromtimestamp(1_700_000_000, UTC)
-    assert main.day is None and main.turn_count == 0
-    assert service.index.get("agent:main:tv").client_id == "tv"
-    # Paginado y con archivadas, sin pedir títulos.
-    assert all(p["archived"] == "all" and p["rowMode"] == "compact" for _, p in openclaw.calls)
-
-
-async def test_a_client_deleted_mid_import_does_not_fail_the_others(service, engine, monkeypatch):
-    """Con claves foráneas, un commit por cliente: uno borrado entre la lectura de clientes y
-    su alta no se importa, y los demás sí."""
-    real = conv_mod._legacy_key
-    # La importación leyó los dos clientes; `web` se borra antes de su commit.
-    monkeypatch.setattr(conv_mod, "_legacy_key", lambda key, _ids: real(key, {"tv", "web"}))
-    with Session(engine) as s:
-        s.delete(s.get(ClientRecord, "web"))
-        s.commit()
-    imported = service._import_legacy([{"key": "agent:main:tv"}, {"key": "agent:main:web"}])
-    assert [(c.session_key, c.client_id) for c in imported] == [("agent:main:tv", "tv")]
-
-
-async def test_legacy_import_retries_after_a_failure(service):
-    class Down:
-        calls = 0
-
-        async def request(self, method, params, timeout=10.0):
-            Down.calls += 1
-            if Down.calls == 1:
-                raise RuntimeError("down")
-            return {"sessions": [{"key": "agent:main:tv"}]}
-
-    job = LegacyImport(service, Down())
-    job.kick()
-    await job.wait()
-    assert not job.done
-    job.kick()
-    await job.wait()
-    assert job.done
-    job.kick()  # hecha: no vuelve a preguntar
-    await job.wait()
-    assert Down.calls == 2
+    listed = await conv_mod.list_openclaw_sessions(openclaw)
+    assert [r["key"] for r in listed] == [f"agent:main:fogar-{i}" for i in range(5)]
+    assert len(openclaw.calls) == 3
+    assert all(p["archived"] == "all" and p["includeDerivedTitles"] for _, p in openclaw.calls)
 
 
 # ── Lectura de OpenClaw ───────────────────────────────────────────────────
@@ -481,12 +428,10 @@ def test_push_of_a_conversation_not_open_goes_to_the_clients_last_session():
     assert reg.route(session_key_for("main", "yesterday")) is None
 
 
-def test_push_of_a_key_not_yet_imported_goes_by_its_client_id():
+def test_push_of_a_key_without_a_conversation_goes_nowhere():
     reg = ClientRegistry()
-    tv = object()
-    reg.register("tv", tv, _conv("today"))
-    assert reg.route("agent:main:tv") is tv
-    assert reg.route("agent:main:nobody") is None
+    reg.register("tv", object(), _conv("today"))
+    assert reg.route("agent:main:tv") is None
 
 
 def test_moving_a_session_to_another_conversation():

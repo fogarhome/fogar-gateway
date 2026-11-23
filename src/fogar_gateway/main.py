@@ -37,7 +37,7 @@ from fogar_gateway.core.startup_checks import (
 from fogar_gateway.core.transport import TransportCaptureMiddleware
 from fogar_gateway.db.database import dispose_engine, require_database, run_migrations
 from fogar_gateway.services.auth import LoginLimiter
-from fogar_gateway.services.conversations import ConversationService, LegacyImport, TitleCache
+from fogar_gateway.services.conversations import ConversationService, TitleCache
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.models import OrchestratorAccess
@@ -153,19 +153,7 @@ async def _lifespan_body(app: FastAPI):
 
         return _on_state_change
 
-    # Las sesiones de antes de M19 se importan una vez, con OpenClaw conectado (no al arrancar:
-    # puede estar caído); si falla, se reintenta en la siguiente conexión.
-    legacy_import = LegacyImport(conversations, openclaw)
-    broadcast_orchestrator = _broadcaster("orchestrator")
-
-    def _on_orchestrator_state(state: ConnectionState) -> None:
-        broadcast_orchestrator(state)
-        if state == ConnectionState.CONNECTED:
-            legacy_import.kick()
-
-    openclaw.on_state_change = _on_orchestrator_state
-    if openclaw.status().state == ConnectionState.CONNECTED:
-        legacy_import.kick()
+    openclaw.on_state_change = _broadcaster("orchestrator")
 
     # Proveedores de voz singleton (STT_PROVIDER / TTS_PROVIDER), inyectados al bridge.
     stt = build_stt_provider(settings)
@@ -191,7 +179,6 @@ async def _lifespan_body(app: FastAPI):
     app.state.client_registry = client_registry
     app.state.conversations = conversations
     app.state.conversation_titles = TitleCache()  # títulos de /admin/conversations
-    app.state.legacy_import = legacy_import
     app.state.session_registry = SessionRegistry()
     app.state.pairing = PairingStore()  # códigos de emparejamiento, en memoria (#317)
     app.state.login_limiter = LoginLimiter()  # intentos de inicio de sesión, en memoria (M20)
@@ -211,7 +198,6 @@ async def _lifespan_body(app: FastAPI):
             # 2. Speech providers, then OpenClaw.
             for provider in (speech.stt, speech.tts):
                 await td.step(provider.aclose(), f"cierre del proveedor {provider.name}")
-            await td.step(legacy_import.aclose(), "importación de conversaciones")
             await td.step(app.state.conversation_titles.aclose(), "títulos de conversaciones")
             await td.step(openclaw.close(), "cierre de OpenClaw")
             # 3. Notification tasks still in flight.

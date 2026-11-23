@@ -119,7 +119,7 @@ async def test_push_disabled_client_receives_nothing(make_push_bridge):
 
 async def test_push_of_a_retired_agent_is_dropped_and_aborted(make_push_bridge):
     """C-r7-1: sesión en main y allowed_agents=["main"]: el push de otro agente (conversación
-    de otro día, clave legacy) no llega al cliente y se aborta en OpenClaw."""
+    de otro día) no llega al cliente y se aborta en OpenClaw."""
     bridge, _ = make_push_bridge(output_mode=("text",), config=ClientConfig(allowed_agents=["Main"]))
     await push(bridge, *push_reply("hola", sk="agent:x:hab_sito"))
     assert await sent(bridge) == []

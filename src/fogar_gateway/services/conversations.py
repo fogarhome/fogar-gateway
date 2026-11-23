@@ -1,7 +1,6 @@
 """Conversaciones (M19): reglas, índice en memoria y acceso a la BD.
 
-Una conversación es una sesión de OpenClaw con clave `agent:{agent}:fogar-{id}` (las importadas
-de antes de M19 conservan la suya, `agent:{agent}:{client.id}`). La tabla `conversations` es solo
+Una conversación es una sesión de OpenClaw con clave `agent:{agent}:fogar-{id}`. La tabla `conversations` es solo
 su índice: lo dicho y el título viven en OpenClaw (`chat.history`, `sessions.list`).
 
 Reglas, iguales para todos los clientes (el gateway no mira el tipo de cliente):
@@ -34,12 +33,12 @@ from fogar_gateway.core.config import settings
 from fogar_gateway.db.database import get_engine
 from fogar_gateway.db.models import DEFAULT_HOME_ID, ClientRecord, ConversationRecord
 from fogar_gateway.services.openclaw.chat_text import extract_message_text
-from fogar_gateway.services.reconnection import describe_error, traceback_no_message
+from fogar_gateway.services.reconnection import describe_error
 from fogar_gateway.services.teardown import Teardown
 
 logger = logging.getLogger(__name__)
 
-Kind = Literal["default", "created", "legacy"]
+Kind = Literal["default", "created"]
 # `conversation` del handshake que pide una conversación nueva.
 NEW = "new"
 _KEY_PREFIX = "fogar-"
@@ -47,7 +46,7 @@ _KEY_PREFIX = "fogar-"
 # Reloj de pared local del host (sin zona), como el `atHour` de OpenClaw. Los tests lo cambian.
 _now: Callable[[], datetime] = datetime.now
 
-# sessions.list: filas por página y tope de páginas (importación y títulos).
+# sessions.list: filas por página y tope de páginas (títulos).
 _LIST_PAGE = 500
 _LIST_MAX_PAGES = 20
 
@@ -298,59 +297,6 @@ class ConversationService:
         rows.sort(key=lambda r: _utc(r.record.last_turn_at or r.record.created_at), reverse=True)
         return rows
 
-    # ── Sesiones de antes de M19 ──────────────────────────────────────────
-
-    async def import_legacy(self, orchestrator: _Requester) -> int:
-        """Importa como `legacy` cada sesión de OpenClaw `agent:{agent}:{client.id}` de un
-        cliente que existe. Idempotente: una clave ya importada no se repite."""
-        rows = await list_openclaw_sessions(orchestrator, compact=True)
-        imported = await asyncio.to_thread(self._import_legacy, rows)
-        for conv in imported:
-            self.index.add(conv)
-        return len(imported)
-
-    def _import_legacy(self, rows: list[dict]) -> list[Conversation]:
-        """Un commit por cliente: uno borrado a mitad (la clave foránea rechaza sus filas) no
-        tumba la importación de los demás; las suyas, simplemente, no se importan."""
-        with Session(self._get_engine()) as s:
-            owners = {
-                cid: (home, user)
-                for cid, home, user in s.exec(
-                    select(ClientRecord.id, ClientRecord.home_id, ClientRecord.user_id)
-                ).all()
-            }
-            client_ids = set(owners)
-            known = {k.lower() for k in s.exec(select(ConversationRecord.session_key)).all()}
-        by_client: dict[str, list[ConversationRecord]] = {}
-        for row in rows:
-            parsed = _legacy_key(row.get("key"), client_ids)
-            if parsed is None or row["key"].lower() in known:
-                continue
-            agent, client_id = parsed
-            record = _new_record(client_id, agent, "legacy", None, session_key=row["key"])
-            # Un cliente borrado entre medias: su alta la rechaza la clave foránea (abajo).
-            record.home_id, record.owner_user_id = owners.get(client_id, (DEFAULT_HOME_ID, None))
-            created = _ms_to_datetime(row.get("createdAt"))
-            if created is not None:
-                record.created_at = created
-            record.last_turn_at = _ms_to_datetime(row.get("lastInteractionAt") or row.get("updatedAt"))
-            known.add(record.session_key.lower())
-            by_client.setdefault(client_id, []).append(record)
-        imported: list[Conversation] = []
-        for client_id, records in by_client.items():
-            with Session(self._get_engine()) as s:
-                s.add_all(records)
-                try:
-                    s.commit()
-                except IntegrityError:
-                    s.rollback()
-                    logger.info(f"Importación legacy: el cliente {client_id} ya no existe; se omite")
-                    continue
-                for record in records:
-                    s.refresh(record)
-                imported.extend(Conversation.from_record(r) for r in records)
-        return imported
-
 
 def new_conversation(client_id: str, agent: str) -> Conversation:
     """Una conversación nueva (`created`), aún sin guardar (`ConversationService.save`)."""
@@ -380,19 +326,6 @@ def _new_record(
     return record
 
 
-def _legacy_key(key: object, client_ids: set[str]) -> tuple[str, str] | None:
-    """(agente, client_id) de una clave `agent:{agent}:{client.id}` de un cliente conocido."""
-    if not isinstance(key, str):
-        return None
-    parts = key.split(":")
-    if len(parts) != 3 or parts[0] != "agent" or not parts[1]:
-        return None
-    _, agent, client_id = parts
-    if client_id.startswith(_KEY_PREFIX) or client_id not in client_ids:
-        return None
-    return agent, client_id
-
-
 def _utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
@@ -406,19 +339,17 @@ def _ms_to_datetime(value: object) -> datetime | None:
         return None
 
 
-async def list_openclaw_sessions(orchestrator: _Requester, *, compact: bool = False) -> list[dict]:
+async def list_openclaw_sessions(orchestrator: _Requester) -> list[dict]:
     """Todas las sesiones de OpenClaw (`sessions.list`, archivadas incluidas), paginando.
 
-    Sin `compact`, cada fila trae su título (`includeDerivedTitles`). Lanza lo que lance
+    Cada fila trae su título (`includeDerivedTitles`). Lanza lo que lance
     `orchestrator.request` (OpenClaw caído, rechazo)."""
     rows: list[dict] = []
     offset = 0
     for _ in range(_LIST_MAX_PAGES):
-        params: dict[str, Any] = {"limit": _LIST_PAGE, "offset": offset, "archived": "all"}
-        if compact:
-            params["rowMode"] = "compact"
-        else:
-            params["includeDerivedTitles"] = True
+        params: dict[str, Any] = {
+            "limit": _LIST_PAGE, "offset": offset, "archived": "all", "includeDerivedTitles": True,
+        }
         payload = await orchestrator.request("sessions.list", params)
         page = payload.get("sessions") if isinstance(payload, dict) else None
         if not isinstance(page, list):
@@ -582,42 +513,3 @@ async def note_turn_safely(service: ConversationService, conversation_id: str) -
         await service.note_turn(conversation_id)
     except Exception as e:  # noqa: BLE001 — frontera: el contador nunca rompe el turno
         logger.warning(f"No se pudo anotar el turno de {conversation_id} ({describe_error(e)})")
-
-
-class LegacyImport:
-    """Importa una vez (por proceso) las sesiones de antes de M19 cuando OpenClaw está conectado.
-
-    `kick()` no bloquea: lanza la importación si no se hizo ya ni está en marcha. Si falla
-    (OpenClaw caído a mitad), el siguiente `kick()` (la próxima conexión) la reintenta.
-    """
-
-    def __init__(self, service: ConversationService, orchestrator: _Requester) -> None:
-        self._service = service
-        self._orchestrator = orchestrator
-        self._task: asyncio.Task | None = None
-        self.done = False
-
-    def kick(self) -> None:
-        if self.done or (self._task is not None and not self._task.done()):
-            return
-        self._task = asyncio.create_task(self._run(), name="legacy_conversations_import")
-
-    async def wait(self) -> None:
-        """Espera la importación en marcha (para tests)."""
-        if self._task is not None:
-            await asyncio.wait({self._task})
-
-    async def _run(self) -> None:
-        try:
-            count = await self._service.import_legacy(self._orchestrator)
-        except Exception as e:  # noqa: BLE001 — frontera: se reintenta en la próxima conexión
-            logger.warning(f"Importación de conversaciones anteriores fallida ({describe_error(e)})")
-            logger.debug(f"importación: {traceback_no_message(e)}")
-            return
-        self.done = True
-        if count:
-            logger.info(f"Importadas {count} conversaciones anteriores a M19 (legacy)")
-
-    async def aclose(self) -> None:
-        async with Teardown("importación de conversaciones") as td:
-            await td.cancel(self._task, "importación", 5.0)

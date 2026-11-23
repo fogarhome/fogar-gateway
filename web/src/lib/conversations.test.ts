@@ -19,7 +19,7 @@ describe('conversationTitle', () => {
 
 describe('conversationKind y canWrite', () => {
   it('solo nombra la clase cuando aporta', () => {
-    expect([conversationKind('default'), conversationKind('legacy'), conversationKind('created')]).toEqual(['diaria', 'de antes', null])
+    expect([conversationKind('default'), conversationKind('created')]).toEqual(['diaria', null])
   })
   it('el panel escribe solo en las suyas', () => {
     expect(canWrite({ client_id: 'mi-navegador' }, 'mi-navegador')).toBe(true)

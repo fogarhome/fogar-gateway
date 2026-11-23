@@ -15,6 +15,7 @@ import pytest
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+from tests.fakes.bridge import keyed_conversation
 from tests.fakes.openclaw import MIB, FakeOpenClawServer
 
 SK_A = "agent:main:client-a"
@@ -322,7 +323,7 @@ async def test_push_reaches_registered_bridge_in_order(server):
 
     client, _ = make_client(server.port)
     bridge = FakeBridge()
-    client._dispatcher._clients.register("client-a", bridge)
+    client._dispatcher._clients.register("client-a", bridge, keyed_conversation("client-a"))
     await client.connect()
     try:
         await server.push(SK_A, "hola")
@@ -461,7 +462,7 @@ async def test_abort_absorbs_its_aborted_frame(server):
 
     client, turns = make_client(server.port)
     bridge = FakeBridge()
-    client._dispatcher._clients.register("client-a", bridge)
+    client._dispatcher._clients.register("client-a", bridge, keyed_conversation("client-a"))
     await client.connect()
     try:
         await server.push(SK_A, "aviso", end=False)

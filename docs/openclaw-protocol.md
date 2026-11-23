@@ -493,10 +493,9 @@ OpenClaw server enforces or validates. Consequences observable on the wire:
   would reset a conversation under the same key, so the gateway does the daily cut itself.
 - Push events come back tagged with that `sessionKey`; the gateway routes them through an
   in-memory index `sessionKey → conversation → live session` (`ClientRegistry.route`). A key
-  missing from the index falls back to the pre-M19 rule (`sk.rsplit(":", 1)[-1]` = client id).
+  missing from the index reaches no client (since 4.0.1).
 - **Before M19** the key was `agent:{agent}:{client.id}` (one session per client and agent,
-  forever). The gateway imports those sessions once (`sessions.list`, see below) as `legacy`
-  conversations of their client and keeps their key, so pushes scheduled on them still arrive.
+  forever). Since 4.0.1 the gateway no longer imports those sessions: pushes on them are dropped.
 - The REST trusted-origin legacy path (no Bearer) has no client row, so it keeps the fixed id
   `ha` (`agent:{agent}:ha`) and is not a conversation.
 - Since server 2026.11.1, `chat.send` rejects session keys that do not identify an agent; ours
@@ -614,7 +613,19 @@ Full notes in the team's Obsidian vault (observations of 2026-10 on OpenClaw and
   and later sends its own `final` (OpenClaw appears to fold the message into the running run;
   not verified, no text recorded).
 - Events the gateway ignores today: `agent` streams `run_status`, `assistant`, `thinking`, `item`, `plan`,
-  `usage`; `sessions.changed`, `session.message`.
+  `usage`; `sessions.changed`, `session.message` (since 4.0.1 deliberately, without the
+  "unhandled … possible protocol drift" log: see "`session.message`" below).
+
+### `session.message` (server 2026.11.7, read in the package source)
+
+- Broadcast to the connections subscribed with `sessions.subscribe` (scope `operator.read`) each
+  time a message is appended to a session's transcript (`dist/server-session-events-*.mjs`).
+- Payload fields: `sessionKey`, `agentId`, `message` (an object with `role`: `user`, `assistant`,
+  `system`, `developer`, `tool` or `toolResult`, plus its content), `messageId`, `messageSeq`,
+  `runId` when it belongs to a run, and a session snapshot. It carries user text: never log it.
+- The gateway ignores it: the turn's text already arrives as `chat`. It is a candidate source for
+  E2 (what OpenClaw does ends up in the conversation's history, including messages from other
+  channels) without a plugin.
 
 **Breaking for fogar-gateway as of v1.21.0:** `stream_response()` ends a turn on the first
 `chat` `final` of its `sessionKey` and its queue receives every `chat` event of that key,
@@ -969,6 +980,9 @@ The gateway uses them only through `OpenClawClient.request`, which refuses any m
 
 ## Change log of this file
 
+- **2026-11-23**: added "`session.message`" (server 2026.11.7): known and ignored, no longer
+  logged as drift. Pre-M19 keys are no longer imported and an unindexed push key reaches no
+  client (gateway 4.0.1).
 - **2026-11-17**: lone surrogates: a frame whose `id` or `payload.runIds` would change by cleaning,
   or whose `payload` would stop being an object, is dropped; a rejected device token is deleted
   only if it is still the stored one (audit 3.0 r6, B-r6-1..3).
