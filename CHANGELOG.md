@@ -1,5 +1,11 @@
 # Changelog
 
+## [4.0.1](https://github.com/fogarhome/fogar-gateway/compare/v4.0.0...v4.0.1) (2026-11-23)
+
+### Bug Fixes
+
+* restos de la 4.0 (sin importación legacy, session.message conocido) ([#399](https://github.com/fogarhome/fogar-gateway/issues/399)) ([a8c4522](https://github.com/fogarhome/fogar-gateway/commit/a8c45224e802aba67a2abe016bc479cb87ce9a30))
+
 ## [4.0.0](https://github.com/fogarhome/fogar-gateway/compare/v3.0.1...v4.0.0) (2026-11-22)
 
 ### ⚠ BREAKING CHANGES
