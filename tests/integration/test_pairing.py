@@ -62,9 +62,8 @@ def test_well_known_shape(http):
     r = http.get("/.well-known/fogar-gateway")
     assert r.status_code == 200
     body = r.json()
-    assert set(body) == {"service", "version", "name", "instance_id"}
+    assert set(body) == {"service", "version", "instance_id"}
     assert body["service"] == "fogar-gateway"
-    assert body["name"]  # nombre del equipo por defecto
 
 
 def test_well_known_instance_id_stable_per_process(http):
@@ -73,9 +72,9 @@ def test_well_known_instance_id_stable_per_process(http):
     assert a == b and re.fullmatch(r"[0-9a-f]{16}", a)
 
 
-def test_well_known_uses_gateway_name(http, monkeypatch):
+def test_well_known_does_not_expose_name(http, monkeypatch):
     monkeypatch.setattr(settings, "GATEWAY_NAME", "green-house")
-    assert http.get("/.well-known/fogar-gateway").json()["name"] == "green-house"
+    assert set(http.get("/.well-known/fogar-gateway").json()) == {"service", "version", "instance_id"}
 
 
 # --- /admin/pairing ---
@@ -140,6 +139,7 @@ def test_pair_creates_client_with_template(http, db_engine):
     assert set(body) == {"client_id", "name", "client_key", "gateway"}
     assert body["name"] == "tele"
     assert set(body["gateway"]) == {"name", "version"}
+    assert body["gateway"]["name"]  # el nombre solo sale al canjear un código, nunca en el well-known
     [row] = _rows(db_engine)
     assert row.id == body["client_id"] and row.key_hash == hash_key(body["client_key"])
     assert (row.client_type, row.default_agent, row.tts_voice, row.barge_in_enabled) == (

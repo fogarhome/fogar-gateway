@@ -66,9 +66,8 @@ def pair(
         out.message(f"Caduca a las {expires}.", MUTED)
         return
     try:
-        gateway = client.request("GET", "/.well-known/fogar-gateway")["name"]
         out.message(
-            f"Escríbelo en el cliente para emparejarlo con «{gateway}». Caduca a las {expires}; "
+            f"Escríbelo en el cliente para emparejarlo. Caduca a las {expires}; "
             "Ctrl+C lo anula.",
             MUTED,
         )

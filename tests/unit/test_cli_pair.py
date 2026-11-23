@@ -19,7 +19,6 @@ class PollingApi(FakeApi):
 
     def __init__(self, states, responses=None):
         super().__init__({("POST", "/admin/pairing"): ITEM,
-                          ("GET", "/.well-known/fogar-gateway"): {"name": "green-house"},
                           ("DELETE", "/admin/pairing/p1"): None, **(responses or {})})
         self.states = list(states)
 
@@ -47,7 +46,7 @@ def test_pair_shows_code_and_waits_until_used(use_api):
                                       "client_name": "tele"}]))
     r = run("pair", "--type", "screen")
     assert r.exit_code == 0, r.output
-    assert "482 913" in r.output and "green-house" in r.output
+    assert "482 913" in r.output and "emparejarlo" in r.output
     assert "Cliente «tele» emparejado (id c0ffee00)" in r.output
     assert [c[:2] for c in fake.calls].count(POLL) == 3
 
