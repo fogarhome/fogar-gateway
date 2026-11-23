@@ -103,7 +103,6 @@ export interface ClientResponse {
   barge_in_min_chars: number
   output_mode: OutputMode[] | null
   silence_timeout_s: number
-  max_silence_turns: number
   push_enabled: boolean
   tool_calls_enabled: boolean
 }

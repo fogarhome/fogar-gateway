@@ -53,7 +53,6 @@ export function ownText(texts: Record<string, string>, value: string): string | 
 export const CLOSE_REASON: Record<string, string> = {
   client_disconnect: 'Se fue el cliente',
   idle_timeout: 'Inactividad (5 min)',
-  silence_timeout: 'Silencio al hablar',
   slow_client: 'Cliente lento',
   revoked: 'Acceso retirado',
   agent_revoked: 'Agente retirado',

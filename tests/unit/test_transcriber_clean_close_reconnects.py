@@ -107,7 +107,7 @@ async def test_bridge_does_not_close_session_on_clean_transcriber_drop(make_brid
         w = _wrap(server.sockets[0].getsockname()[1], initial_backoff=10, max_backoff=10)
         await w.start()
         bridge, _ = make_bridge(
-            config=ClientConfig(silence_timeout_s=1, max_silence_turns=1),
+            config=ClientConfig(silence_timeout_s=1),
             input_mode="audio",
             transcriber=w,
         )

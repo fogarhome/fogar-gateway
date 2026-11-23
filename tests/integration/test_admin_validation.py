@@ -87,11 +87,8 @@ def test_create_imported_client_key_is_kept(http):
         {"name": "x", "tts_speed": -1.0},
         {"name": "x", "silence_timeout_s": 0},
         {"name": "x", "silence_timeout_s": -2},
-        {"name": "x", "max_silence_turns": 0},
-        {"name": "x", "max_silence_turns": -1},
         {"name": "x", "barge_in_min_chars": -1},
         {"name": "x", "stt_vad_thold": -0.5},
-        {"name": "x", "max_silence_turns": 10**30},
     ],
 )
 def test_create_invalid_values_return_422(http, payload):
@@ -124,8 +121,6 @@ def test_create_nan_inf_return_422(http, literal):
         {"barge_in_min_chars": None},
         {"silence_timeout_s": None},
         {"silence_timeout_s": -1},
-        {"max_silence_turns": None},
-        {"max_silence_turns": 0},
         {"push_enabled": None},
         {"tool_calls_enabled": None},
     ],

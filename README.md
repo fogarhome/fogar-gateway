@@ -517,7 +517,7 @@ El STT y el TTS pasan por una capa de proveedores (`src/fogar_gateway/services/s
 
 `ELEVENLABS_BASE_URL` y `ELEVENLABS_TTS_MODEL` están en `.env.sample`; el resto de ajustes de ElevenLabs son constantes del adaptador (`src/fogar_gateway/services/speech/elevenlabs/`). El proveedor se elige con `STT_PROVIDER`/`TTS_PROVIDER` al arrancar; cambiarlo exige reiniciar. Con el plan Creator, ElevenLabs conserva el audio y las transcripciones (la retención cero es solo enterprise).
 
-`silence_timeout_s` y `max_silence_turns` (umbral del watchdog de silencio) son campos de configuración **por cliente** en la base de datos, no variables de entorno globales — ver `ClientRecord` en `src/fogar_gateway/db/models.py`.
+`silence_timeout_s` (umbral del aviso de silencio, que nunca cierra la sesión) es un campo de configuración **por cliente** en la base de datos, no una variable de entorno global — ver `ClientRecord` en `src/fogar_gateway/db/models.py`.
 
 ---
 

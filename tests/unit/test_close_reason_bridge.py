@@ -13,7 +13,6 @@ from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.openclaw.registry import TurnRegistry
 from fogar_gateway.services.pipeline_tracker import PipelineTracker
 from fogar_gateway.services.protocol import OrchestratorEvent
-from fogar_gateway.services.reconnection import ConnectionState
 from fogar_gateway.services.stats import gateway_stats
 from tests.fakes.bridge import DirectSender
 
@@ -60,27 +59,6 @@ async def test_idle_timeout_reason(make_reason_bridge, monkeypatch):
     await asyncio.wait_for(bridge._idle_watchdog(), timeout=1.0)
     assert _end_meta(bridge)["reason"] == "idle_timeout"
     assert _closed() == {"idle_timeout": 1}
-
-
-async def test_silence_timeout_reason(make_reason_bridge, monkeypatch):
-    bridge = make_reason_bridge(ClientConfig(silence_timeout_s=1, max_silence_turns=1), "audio")
-    transcriber = MagicMock()
-    transcriber.state = ConnectionState.CONNECTED
-    transcriber.last_transcript_at = None
-    transcriber.close = AsyncMock()
-    bridge.transcriber = transcriber
-    now = time.monotonic()
-    bridge._last_audio_at = now
-    bridge._audio_burst_start = now - 5
-    bridge._last_audio_at = bridge._audio_burst_start = now - 5
-
-    async def _fast_sleep(_):
-        bridge._last_audio_at = time.monotonic()  # cliente enviando audio sin transcripción
-
-    monkeypatch.setattr("fogar_gateway.services.bridge._sleep", _fast_sleep)
-    await asyncio.wait_for(bridge._transcription_watchdog(), timeout=2.0)
-    assert _end_meta(bridge)["reason"] == "silence_timeout"
-    assert _closed() == {"silence_timeout": 1}
 
 
 async def test_revoked_reason(make_reason_bridge, monkeypatch):

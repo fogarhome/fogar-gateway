@@ -39,7 +39,6 @@ _VadThold = Annotated[float, Field(ge=0.0, le=1.0)]
 _Speed = Annotated[float, Field(gt=0.0, le=10.0)]
 _Seconds = Annotated[float, Field(gt=0.0, le=86_400.0)]
 _MinChars = Annotated[int, Field(ge=1, le=10_000)]
-_Turns = Annotated[int, Field(ge=1, le=10_000)]
 
 # Campos de PATCH que mapean a columnas NOT NULL: `null` explícito -> 422.
 _NOT_NULL_UPDATE_FIELDS = (
@@ -52,7 +51,6 @@ _NOT_NULL_UPDATE_FIELDS = (
     "barge_in_enabled",
     "barge_in_min_chars",
     "silence_timeout_s",
-    "max_silence_turns",
     "push_enabled",
     "tool_calls_enabled",
 )
@@ -75,7 +73,6 @@ class ClientCreate(BaseModel):
     barge_in_min_chars: _MinChars = 5
     output_mode: list[OutputMode] | None = None
     silence_timeout_s: _Seconds = 2.0
-    max_silence_turns: _Turns = 3
     push_enabled: bool = True
     tool_calls_enabled: bool = False
 
@@ -102,7 +99,6 @@ class ClientUpdate(BaseModel):
     barge_in_min_chars: _MinChars | None = None
     output_mode: list[OutputMode] | None = None
     silence_timeout_s: _Seconds | None = None
-    max_silence_turns: _Turns | None = None
     push_enabled: bool | None = None
     tool_calls_enabled: bool | None = None
 
@@ -138,7 +134,6 @@ class ClientResponse(BaseModel):
     barge_in_min_chars: int
     output_mode: list[str] | None
     silence_timeout_s: float
-    max_silence_turns: int
     push_enabled: bool
     tool_calls_enabled: bool
 
@@ -166,7 +161,6 @@ class ClientResponse(BaseModel):
             barge_in_min_chars=r.barge_in_min_chars,
             output_mode=json.loads(r.output_mode) if r.output_mode else None,
             silence_timeout_s=r.silence_timeout_s,
-            max_silence_turns=r.max_silence_turns,
             push_enabled=r.push_enabled,
             tool_calls_enabled=r.tool_calls_enabled,
         )

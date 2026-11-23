@@ -35,7 +35,6 @@ class ClientConfig(BaseModel):
     barge_in_enabled: bool = True
     barge_in_min_chars: int = 5
     silence_timeout_s: float = 2.0
-    max_silence_turns: int = 3
     push_enabled: bool = True
     tool_calls_enabled: bool = False
     # En minúsculas, como OpenClaw: una fila anterior a la 3.0 puede guardar "Main" (C-1).
