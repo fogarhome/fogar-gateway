@@ -759,9 +759,8 @@ class FogarBridge:
                         parsed = False
 
                     if not parsed:
-                        if self.handshake.input_mode == "text":
-                            # Texto plano en modo texto — compatibilidad con clientes de texto puro
-                            await self.turns.start_user_turn(text_data)
+                        # 5.0: a non-JSON frame is never a prompt, in any input_mode.
+                        await self._send_invalid_message()
                     elif not isinstance(json_msg, dict):
                         # G-20: a JSON scalar/list (`42`, `[1]`, `"s"`, `true`, `null`)
                         # is not a protocol message. Non-fatal error, session goes on.

@@ -33,7 +33,7 @@ def _collect_until_token(ws, max_messages=15):
 def test_pipeline_events_forwarded_when_status_in_output_mode(client):
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_json(HANDSHAKE_WITH_STATUS)
-        ws.send_text("hola")
+        ws.send_json({"type": "send", "text": "hola"})
         messages = _collect_until_token(ws)
 
     types = [m["type"] for m in messages]
@@ -44,7 +44,7 @@ def test_pipeline_events_forwarded_when_status_in_output_mode(client):
 def test_pipeline_event_has_required_fields(client):
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_json(HANDSHAKE_WITH_STATUS)
-        ws.send_text("hola")
+        ws.send_json({"type": "send", "text": "hola"})
         messages = _collect_until_token(ws)
 
     pipeline_events = [m for m in messages if m.get("type") == "pipeline_event"]
@@ -60,7 +60,7 @@ def test_pipeline_events_not_forwarded_without_status(client):
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_json(HANDSHAKE_TEXT_ONLY)
         ws.receive_json()  # ready
-        ws.send_text("hola")
+        ws.send_json({"type": "send", "text": "hola"})
         turn_start = ws.receive_json()  # turn_start
         assert turn_start["type"] == "turn_start"
         msg = ws.receive_json()  # token
@@ -70,7 +70,7 @@ def test_pipeline_events_not_forwarded_without_status(client):
 def test_session_start_event_is_first(client):
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_json(HANDSHAKE_WITH_STATUS)
-        ws.send_text("hola")
+        ws.send_json({"type": "send", "text": "hola"})
         messages = _collect_until_token(ws)
 
     pipeline_events = [m for m in messages if m.get("type") == "pipeline_event"]
@@ -80,7 +80,7 @@ def test_session_start_event_is_first(client):
 def test_llm_start_and_first_token_events_present(client):
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_json(HANDSHAKE_WITH_STATUS)
-        ws.send_text("hola")
+        ws.send_json({"type": "send", "text": "hola"})
         messages = _collect_until_token(ws)
 
     stages = [m["stage"] for m in messages if m.get("type") == "pipeline_event"]
@@ -94,7 +94,7 @@ def test_session_registered_in_registry_after_connect(client):
 
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_json(HANDSHAKE_WITH_STATUS)
-        ws.send_text("hola")
+        ws.send_json({"type": "send", "text": "hola"})
         _collect_until_token(ws)
 
     sessions = app.state.session_registry.get_all()

@@ -299,6 +299,8 @@ Envía texto al orquestador — ya sea una transcripción confirmada o texto esc
 
 El campo `text` puede diferir de la transcripción original si el usuario la editó.
 
+`send` es la única forma de enviar un prompt, en cualquier `input_mode`. Desde 5.0 un frame de texto que no es JSON (`hola`) ya no arranca un turno, ni siquiera en modo texto: recibe `INVALID_MESSAGE` (§9) y la sesión continúa.
+
 Un surrogate UTF-16 suelto escapado en `text` (`"\ud800"`, JSON válido pero no UTF-8) se quita antes de enviarlo al orquestador; lo mismo con el último mensaje del usuario en `/v1/chat/completions`, con el texto que llega de OpenClaw y con cualquier mensaje que el gateway te envíe (una transcripción, por ejemplo). Se quita sin sustituto: un emoji que OpenClaw parte entre dos fragmentos no hace que se repita el texto.
 
 ### Cancelar turno activo
@@ -638,7 +640,7 @@ Los errores llegan independientemente de `output_mode`:
 | Código | Fatal | Cuándo ocurre |
 |--------|-------|---------------|
 | `TURN_ERROR` | false | Fallo en un turno concreto (orquestador caído/reconectando durante una sesión activa, **o** el turno se cuelga sin progreso — `message: "turn_timeout"`, ver §13); la sesión continúa |
-| `INVALID_MESSAGE` | false | Mensaje de texto del cliente que no es un objeto JSON (`42`, `[1]`, `"s"`, `true`, `null`) o `send` con `text` que no es cadena (#215). La sesión continúa; el mensaje se ignora. En modo texto, un prompt plano que parsea como JSON escalar (`"42"`, `"true"`, `"null"`) también recibe `INVALID_MESSAGE`: los prompts van en `{"type":"send","text":...}` |
+| `INVALID_MESSAGE` | false | Frame de texto del cliente que no es un objeto JSON: texto plano (`hola`), `42`, `[1]`, `"s"`, `true`, `null`; o `send` con `text` que no es cadena (#215). Vale en cualquier `input_mode`: desde 5.0 el texto plano ya no es un prompt (#408), los prompts van en `{"type":"send","text":...}`. La sesión continúa; el mensaje se ignora |
 | `AUTH_FAILED` | true | Documentado para `client_key` inválida o inactiva — en la práctica se señaliza cerrando el WS con 4010, sin este mensaje previo |
 | `AGENT_NOT_FOUND` | true | Documentado para agente inexistente — en la práctica se señaliza cerrando el WS con 4021 (o 4020 si no está permitido), sin este mensaje previo |
 | `ORCHESTRATOR_UNAVAILABLE` | true | Documentado para orquestador no disponible al iniciar — en la práctica se señaliza cerrando el WS con 1011, sin este mensaje previo |
@@ -715,6 +717,8 @@ El cliente no necesita distinguirlos de los turnos normales — el `turn_id` y `
 ## 11. Modos de operación
 
 ### Chat de texto puro
+
+Los prompts van siempre en mensajes `send`; un frame que no es JSON recibe `INVALID_MESSAGE` (§4, §9).
 
 ```json
 // Handshake

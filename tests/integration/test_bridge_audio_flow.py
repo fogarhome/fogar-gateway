@@ -253,7 +253,7 @@ def test_tts_connect_uses_voice_and_speed_from_config(mock_services, db_engine, 
                         "output_mode": ["audio", "text"],
                     }
                 )
-                ws.send_text("test")
+                ws.send_json({"type": "send", "text": "test"})
                 try:
                     ws.receive_json()
                 except Exception:

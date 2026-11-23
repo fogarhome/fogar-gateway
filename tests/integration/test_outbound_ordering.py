@@ -28,7 +28,7 @@ def _drain_until_turn_end(ws, limit=40):
 def test_ready_precedes_turn_and_turn_start_precedes_tokens(client):
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_json(HANDSHAKE)
-        ws.send_text("hola")
+        ws.send_json({"type": "send", "text": "hola"})
         msgs = _drain_until_turn_end(ws)
 
     types = [m["type"] for m in msgs]
