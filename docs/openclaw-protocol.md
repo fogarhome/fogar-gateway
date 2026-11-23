@@ -611,7 +611,8 @@ Full notes in the team's Obsidian vault (observations of 2026-10 on OpenClaw and
   new `runId`), no error. The new run gets **no lifecycle/status/delta events of its own**;
   it ends with a `chat` `final` carrying its `runId` while the original run keeps streaming
   and later sends its own `final` (OpenClaw appears to fold the message into the running run;
-  not verified, no text recorded).
+  not verified, no text recorded). Confirmed on 2026.11.7 (it is `steer`, the default queue
+  mode): see "C3 queue behaviour and failure fields".
 - Events the gateway ignores today: `agent` streams `run_status`, `assistant`, `thinking`, `item`, `plan`,
   `usage`; `sessions.changed`, `session.message` (since 4.0.1 deliberately, without the
   "unhandled … possible protocol drift" log: see "`session.message`" below).
@@ -978,8 +979,159 @@ The gateway uses them only through `OpenClawClient.request`, which refuses any m
 - Not checked live: an archived session's history (OpenClaw's docs say requesting history restores
   it from cold storage) and the `deltaCursor` catch-up. The gateway does not use the cursor.
 
+## C3 queue behaviour and failure fields (2026-11-23, server 2026.11.7)
+
+Observed live on green-house (OpenClaw 2026.11.7, loopback, connected as `gateway-client`/`backend`
+with the shared token, the gateway's device identity and `caps: ["chat-queue-status"]`) with
+throwaway keys `agent:e2e:fogar-probe-<uuid>` (agent `e2e`; this server has no `main` agent),
+capturing raw frames below `FrameDispatcher`; structure only, no text recorded. Read in the package
+source (`dist/`) where noted. Basis for 5.0 PR 2 (#406) and #397.
+
+### Queue mode: where it comes from and how to read it
+
+- Modes (`QUEUE_MODES`): `steer`, `followup`, `collect`, `interrupt`. Resolution: per-session
+  override (`/queue <mode>`) → `messages.queue.byChannel.<channel>` → `messages.queue.mode` →
+  default **`steer`**. green-house sets nothing, so every session is `steer`.
+- **Read it with `sessions.list`:** each row has `queueMode` (the session override, `null` if none)
+  and `effectiveQueueMode` (resolved). Observed `null`/`steer` on a fresh session, then
+  `followup`/`followup` right after `/queue followup`.
+- `/queue followup` sent as a `chat.send` message is a command: ack `status:"started"`, then at
+  once a `chat` `final` with a `message` (the command's reply) and **no** lifecycle, status or
+  `agent` events. Two `session.message` (user, assistant) are appended to the transcript.
+- `chat.send` also accepts a per-message `queueMode` param (`ChatSendParamsSchema`, read in the
+  source; not tried live).
+
+### `chat.send` while a run is active, mode `steer` (the default)
+
+Same result with the first run using a tool (`read`) and without tools (second message sent at
+the first run's `chat` `status` `starting_model`). In an earlier attempt B landed while A was
+already finishing: it then ran as its own turn after A, like a followup (see below: no `start`,
+a `seq gap` notice, a `final` without `message`). Run A is active, B is sent:
+
+1. B's ack: `res ok` `{runId: B, status: "started"}` — **identical to a normal start**; nothing in
+   the ack says it will be steered.
+2. `sessions.changed`: `activeRunIds: [B, A]`.
+3. When A reaches a runtime boundary (after a tool result, or after the model call), B's user
+   message is appended: `session.message` `role:"user"`, `messageId` M, no `runId`,
+   `message.idempotencyKey` = `"<B>:user"`. **The same `messageId` comes again** a few ms later
+   with `message.__openclaw.steerTargetRunId: A` (the run that absorbed it); `activeRunIds` is
+   back to `[A]`.
+4. `chat` `final` for B: `{runId: B, seq: 1, sessionKey, state}` — **no `message`, no `agentId`,
+   no `stopReason`**. B has no lifecycle, status, delta or tool events at all.
+5. **The answer to B comes under A's `runId`:** A keeps streaming (another `agent` `phase:"model"`,
+   deltas, then `finishing`, `end`) and the assistant message after B's has `__openclaw.runId: A`.
+   A's `final` carries the whole reply.
+
+So a steered message is recognisable on the wire, though only once it is absorbed, not at
+`chat.send`: (a) `session.message` with `__openclaw.steerTargetRunId` = the active run, linked
+to B by `idempotencyKey` `"<B>:user"`; (b) B's terminal `chat` `final` is `seq: 1` with no
+`message` and no prior event of B. Before that, B looks the same as a queued message (see below).
+
+### `chat.send` while a run is active, mode `followup`
+
+Session in `followup` (via `/queue followup`); A running, then B and C sent back to back:
+
+- Acks: `{runId, status: "started"}` for both. Again no "queued" marker in the ack. (Only one ack
+  carried `messageSeq`: the first send after `/queue` on an existing idle session; first sends on
+  fresh sessions and the queued ones did not. Do not rely on it.)
+- **No `session.message` for B or C while they wait.** `sessions.list` row: `hasActiveRun: true`,
+  `activeRunIds: [B, C, A]` (queued runs are listed as active).
+- **`chat.history` shows them:** `pendingInputs` = `{items, total, queuedCount}`; each item
+  `{id, acceptedAt, state: "queued", message, runId, queued: true}` (`runId` = the `chat.send`
+  runId); the answer also has `inFlightRun` while A runs. This is the usable "pending" source.
+- **`chat.abort {sessionKey, runId: C}` while C waits:** `chat` `state:"aborted"`
+  `stopReason:"rpc"` (`seq: 1`) for C, `agent` lifecycle `phase:"end"` with `aborted: true`,
+  `status: "cancelled"`, `providerStarted: false`, then `res ok {ok, aborted: true, runIds: [C]}`.
+  **A is not touched** (keeps streaming to its `final`), C never runs, and `pendingInputs` keeps
+  it as `state: "cancelled"` (`queuedCount: 0`).
+- After A's `final`, **B runs as its own turn under its own `runId`**: `session.message` of B's user
+  message (`status` `queued`, then `running`), `agent` `run_status`, `chat` `status`
+  `starting_model`, lifecycle `model`/`finishing`/`end` (`completionSource: "reply-dispatch"`),
+  deltas, and a `chat` `final` **without `message`** (text only in the deltas).
+- **B's `agent` lifecycle `phase:"start"` did not reach us:** instead `agent` `stream:"error"`
+  `data {reason: "seq gap", expected: 3, received: 4}` (OpenClaw's own seq-gap notice,
+  `server-chat-*.mjs`). Same for a run that started right as the previous one ended in `steer`
+  mode. A queued run must not depend on `start` to open a turn (this also affects today's push
+  path: `FrameDispatcher` opens a push only on lifecycle `start`).
+- The queue notice (`broadcastChatQueueNotice`, a `chat` `delta` with a `text`, only to clients
+  that declare the `chat-queue-status` cap) is sent only for an explicit `/followup <msg>` or when
+  the queue is full (read in the source); it was not seen here. It carries text only, no marker.
+- Not tried: `collect` and `interrupt`.
+
+### `session.message`
+
+Arrives when a message is **appended to the transcript**, not when `chat.send` is accepted: for a
+message sent to an idle session right after the ack (`status` `queued`, then again `running`);
+for a steered one only when it is injected (1 s and 5.6 s after its ack in the two runs); for a
+queued followup only when its turn starts. The same `messageId` can arrive two or three times
+(status updates, `steerTargetRunId` added): dedupe by `messageId`. It is not a "pending" signal;
+`chat.history` `pendingInputs` is.
+
+### Stable message ids (`chat.history` vs `session.message`)
+
+- A `chat.history` message has **no top-level `id`/`messageId`**. Its id is
+  `message.__openclaw.id` (string) with `__openclaw.seq` (integer); assistant rows also carry
+  `__openclaw.runId`, user rows `__openclaw.idempotencyKey` (`"<runId>:user"`).
+- They are the same ids as `session.message`: `messageId` = `__openclaw.id` and `messageSeq` =
+  `__openclaw.seq` for every history message (10/10 across two sessions, including a steered one).
+
+### Failure fields over the WebSocket (#397)
+
+**`chat` `state:"error"`** (closed schema `ChatErrorEventSchema`): `runId`, `sessionKey`, `seq`,
+`agentId`, `errorMessage` (text: never forward or log), `stopReason?`, `suppressErrorNotice?`,
+`message?`, `usage?`, and two structural fields:
+
+- `errorKind?` — enum `refusal`, `timeout`, `rate_limit`, `context_length`, `state_contention`,
+  `unknown`. Derived from the run's terminal `errorKind`, else from the error: `rate_limit` covers
+  failover reasons `rate_limit` and `overloaded`, `context_length` covers `context_overflow`.
+- `errorDetail?` — closed object, every field optional: `provider`, `model`, `failoverReason`,
+  `providerRuntimeFailureKind`, `providerErrorCode`, `providerErrorType`, `httpStatus` (100–599),
+  `providerErrorMessagePreview` (text: never forward or log). Projected from the `agent` error's
+  `errorObservation`.
+
+**`agent` lifecycle `phase:"error"`** `data`: `error` (text), `startedAt`, `endedAt`,
+`executionSettled`, and optionally `errorObservation` (same keys as `errorDetail`), `stopReason`,
+`timeoutPhase`, `aborted`, `providerStarted`, `livenessState`, `replayInvalid`, `terminalReceipt`,
+`terminalReply`. **`agent` lifecycle `phase:"fallback_step"`** `data`: `fallbackStepFromModel`,
+`fallbackStepToModel?`, `fallbackStepFromFailureReason?` (a failover reason),
+`fallbackStepFromFailureDetail?` (text), `fallbackStepChainPosition?`, `fallbackStepFinalOutcome`
+(`succeeded`, `next_fallback`, `chain_exhausted`).
+
+Enumerations (read in the source):
+
+- `failoverReason` (`FAILOVER_REASONS`): `auth`, `auth_permanent`, `format`, `rate_limit`,
+  `overloaded`, `billing`, `server_error`, `timeout`, `tls_certificate`, `context_overflow`,
+  `model_not_found`, `session_expired`, `empty_response`, `no_error_details`, `unclassified`,
+  `unknown`.
+- `providerRuntimeFailureKind`: `auth_invalid_token`, `auth_refresh`, `auth_scope`, `dns`,
+  `empty_response`, `gateway_storage`, `no_error_details`, `proxy`, `refresh_contention`,
+  `replay_invalid`, `sandbox_blocked`, `schema`, `timeout`, `unclassified`, `upstream_html`.
+- `providerErrorType` is the provider's own error type (redacted, free-form); `httpStatus` an int.
+
+Observed live: a `chat.send` with `timeoutMs: 50` → `agent` `phase:"error"` with
+`timeoutPhase: "provider"`, `providerStarted: true`, `aborted: false`, `livenessState: "paused"`,
+no `errorObservation`; then `chat` `state:"error"` with `errorKind: "timeout"` and no `errorDetail`.
+The other cases were not provoked live (they need a broken credential, quota or model).
+
+How the five #397 cases map (every field is optional, so a classifier needs an `unknown` fallback):
+
+| Case | Structural signal |
+|---|---|
+| Auth failed (expired/invalid key) | `errorDetail.failoverReason` `auth`/`auth_permanent`/`session_expired`, or `providerRuntimeFailureKind` `auth_invalid_token`/`auth_refresh`/`auth_scope`, or `httpStatus` 401/403; also `fallback_step.fallbackStepFromFailureReason` (the 2026-11-01 no-credentials failure had a `fallback_step` but no `errorObservation`, so read both) |
+| Model unavailable, no fallback | `failoverReason` `model_not_found` (also `fallback_step.fallbackStepFromFailureReason`), with `fallbackStepFinalOutcome: "chain_exhausted"` when there was a chain |
+| Rate limit / quota | `errorKind: "rate_limit"`, or `failoverReason` `rate_limit`/`overloaded`/`billing`, or `httpStatus` 429/402 |
+| Timeout | `errorKind: "timeout"` (seen live), `failoverReason`/`providerRuntimeFailureKind` `timeout`, `agent` `timeoutPhase` |
+| Agent missing/forbidden | **not a run error:** `chat.send` is refused before any run with `res ok:false` `error.code: "INVALID_REQUEST"`, `error` keys `code` and `message` only (no `details`, no `retryable`); seen live for an unknown agent id. Only the code is structural: OpenClaw gives no field that tells this case apart; the gateway's own context (`agents.list` roster, `resolve_agent`) does |
+
 ## Change log of this file
 
+- **2026-11-23**: added "C3 queue behaviour and failure fields" (server 2026.11.7, observed live
+  on green-house and read in the package source; #406, #397): `steer` is the default and folds a
+  concurrent `chat.send` into the active run (`steerTargetRunId`, an empty `final` for the absorbed
+  run), `followup` runs queued messages as their own turns, `chat.abort` with a queued `runId`
+  cancels only that message, `chat.history` `pendingInputs` lists pending messages,
+  `sessions.list` `effectiveQueueMode`, history ids = `session.message` ids, and the `errorKind`/
+  `errorDetail` failure fields.
 - **2026-11-23**: added "`session.message`" (server 2026.11.7): known and ignored, no longer
   logged as drift. Pre-M19 keys are no longer imported and an unindexed push key reaches no
   client (gateway 4.0.1).
