@@ -92,6 +92,10 @@ class FrameDispatcher:
             await self._handle_agent_lifecycle(payload)
         elif event == "session.tool":
             await self._handle_session_tool(payload)
+        elif event == "session.message":
+            # Known, not drift: a transcript append of a subscribed session (the turn already
+            # reaches the client by `chat`). A candidate feed for E2 (history).
+            return
         else:
             self._note_unhandled(f"event {event!r}")
 

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -8,7 +9,7 @@ from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
 from fogar_gateway.services.reconnection import ConnectionState, ServiceStatus
-from tests.fakes.bridge import push, sent
+from tests.fakes.bridge import keyed_conversation, push, sent
 from tests.fakes.openclaw import SendOnlyOpenClawWS
 
 
@@ -111,7 +112,7 @@ async def test_chat_event_routes_to_session_queue():
 async def test_chat_event_no_active_turn_routes_to_client_registry():
     dispatcher, turn_reg, client_reg = make_dispatcher()
     bridge = MagicMock()
-    client_reg.register("client-a", bridge)
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     payload = {
         "sessionKey": "agent:main:client-a",
         "runId": "r1",
@@ -134,7 +135,7 @@ async def test_chat_event_no_session_key_ignored():
 async def test_agent_lifecycle_start_calls_on_push_turn_start():
     dispatcher, _, client_reg = make_dispatcher()
     bridge = MagicMock()
-    client_reg.register("client-a", bridge)
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     payload = {
         "sessionKey": "agent:main:client-a",
         "runId": "r1",
@@ -150,7 +151,7 @@ async def test_agent_lifecycle_start_calls_on_push_turn_start():
 async def test_agent_lifecycle_end_calls_on_push_turn_end():
     dispatcher, _, client_reg = make_dispatcher()
     bridge = MagicMock()
-    client_reg.register("client-a", bridge)
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     payload = {
         "sessionKey": "agent:main:client-a",
         "runId": "r1",
@@ -170,7 +171,7 @@ async def test_agent_lifecycle_start_suppressed_when_normal_turn_active():
     dispatcher, turn_reg, client_reg = make_dispatcher()
     q = turn_reg.register("req-1", "agent:main:client-a")
     bridge = MagicMock()
-    client_reg.register("client-a", bridge)
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     payload = {
         "sessionKey": "agent:main:client-a",
         "runId": "r1",
@@ -192,7 +193,7 @@ async def test_agent_lifecycle_end_always_forwarded_regardless_of_normal_turn():
     dispatcher, turn_reg, client_reg = make_dispatcher()
     turn_reg.register("req-1", "agent:main:client-a")
     bridge = MagicMock()
-    client_reg.register("client-a", bridge)
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     payload = {
         "sessionKey": "agent:main:client-a",
         "runId": "r1",
@@ -273,7 +274,7 @@ async def test_session_tool_update_phase_is_dropped():
 async def test_session_tool_no_active_turn_routes_to_client_registry():
     dispatcher, turn_reg, client_reg = make_dispatcher()
     bridge = MagicMock()
-    client_reg.register("client-a", bridge)
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     payload = {
         "sessionKey": "agent:main:client-a",
         "data": {"phase": "start", "name": "exec", "toolCallId": "call-1", "args": {}},
@@ -301,7 +302,7 @@ async def test_dispatcher_chat_event_push_disabled_client_receives_nothing(make_
     must not reach the client — the acceptance criterion verbatim."""
     dispatcher, _, client_reg = make_dispatcher()
     bridge, _ = make_real_bridge(push_enabled=False)
-    client_reg.register("hab_sito", bridge)
+    client_reg.register("hab_sito", bridge, keyed_conversation("hab_sito"))
 
     payload = {"sessionKey": "agent:main:hab_sito", "runId": "r1", "seq": 1, "deltaText": "Push!"}
     frame = {"type": "event", "event": "chat", "payload": payload}
@@ -316,7 +317,7 @@ async def test_dispatcher_chat_event_push_disabled_client_receives_nothing(make_
 async def test_dispatcher_session_tool_push_disabled_client_receives_nothing(make_real_bridge):
     dispatcher, _, client_reg = make_dispatcher()
     bridge, _ = make_real_bridge(push_enabled=False, tool_calls_enabled=True)
-    client_reg.register("hab_sito", bridge)
+    client_reg.register("hab_sito", bridge, keyed_conversation("hab_sito"))
 
     payload = {
         "sessionKey": "agent:main:hab_sito",
@@ -346,7 +347,7 @@ async def test_dispatcher_full_push_lifecycle_disabled_client_receives_nothing(m
     turn_start/turn_end pair."""
     dispatcher, _, client_reg = make_dispatcher()
     bridge, _ = make_real_bridge(push_enabled=False, tool_calls_enabled=True)
-    client_reg.register("hab_sito", bridge)
+    client_reg.register("hab_sito", bridge, keyed_conversation("hab_sito"))
 
     await dispatcher.dispatch(
         {
@@ -397,7 +398,7 @@ async def test_dispatcher_agent_lifecycle_suppressed_full_sequence_with_active_t
     content still reaches the normal turn's queue."""
     dispatcher, turn_reg, client_reg = make_dispatcher()
     bridge, _ = make_real_bridge(push_enabled=True, tool_calls_enabled=True)
-    client_reg.register("hab_sito", bridge)
+    client_reg.register("hab_sito", bridge, keyed_conversation("hab_sito"))
     q = turn_reg.register("req-1", "agent:main:hab_sito")
 
     await dispatcher.dispatch(
@@ -474,7 +475,7 @@ async def test_agent_lifecycle_end_closes_push_turn_opened_before_normal_turn(ma
     push path dead for the rest of the session."""
     dispatcher, turn_reg, client_reg = make_dispatcher()
     bridge, _ = make_real_bridge(push_enabled=True)
-    client_reg.register("hab_sito", bridge)
+    client_reg.register("hab_sito", bridge, keyed_conversation("hab_sito"))
 
     # Genuine push starts first — no normal turn registered yet.
     await dispatcher.dispatch(
@@ -531,7 +532,7 @@ async def test_dispatch_agent_end_does_not_wait_for_slow_tts_drain(make_bridge, 
     tts = AsyncMock()
     tts.connect = AsyncMock(return_value=stream)
     bridge, _ = make_bridge(client_id="hab_sito", output_mode=("audio", "text"), tts=tts)
-    client_reg.register("hab_sito", bridge)
+    client_reg.register("hab_sito", bridge, keyed_conversation("hab_sito"))
     await push(bridge, ("turn_start", "agent:main:hab_sito"))
 
     await asyncio.wait_for(
@@ -561,7 +562,7 @@ async def test_dispatch_keeps_the_112_decision_synchronous_in_listen(make_real_b
     suppress an already-enqueued start."""
     dispatcher, turn_reg, client_reg = make_dispatcher()
     bridge, _ = make_real_bridge(push_enabled=True)
-    client_reg.register("hab_sito", bridge)
+    client_reg.register("hab_sito", bridge, keyed_conversation("hab_sito"))
 
     await dispatcher.dispatch(
         {
@@ -652,7 +653,7 @@ def _tool(run_id):
 async def test_frames_of_an_abandoned_turn_never_reach_the_next_turn_nor_a_push():
     dispatcher, turn_reg, client_reg = make_dispatcher()
     bridge = MagicMock()
-    client_reg.register("client-a", bridge)
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     turn_reg.register("req-1", SK)
     await dispatcher.dispatch(_ack("req-1", "run-1"))
     turn_reg.abandon("req-1")  # barge-in: the turn is aborted
@@ -676,7 +677,7 @@ async def test_frames_of_an_abandoned_turn_never_reach_the_next_turn_nor_a_push(
 async def test_a_turn_aborted_before_its_ack_gets_its_run_tombstoned_by_the_late_ack():
     dispatcher, turn_reg, client_reg = make_dispatcher()
     bridge = MagicMock()
-    client_reg.register("client-a", bridge)
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     turn_reg.register("req-1", SK)
     turn_reg.abandon("req-1")
     turn_reg.unregister(SK, "req-1")
@@ -688,7 +689,7 @@ async def test_a_turn_aborted_before_its_ack_gets_its_run_tombstoned_by_the_late
 async def test_chat_abort_answer_tombstones_the_runs_it_aborted():
     dispatcher, turn_reg, client_reg = make_dispatcher()
     bridge = MagicMock()
-    client_reg.register("client-a", bridge)
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     res = {"type": "res", "id": "abort-1", "ok": True, "payload": {"ok": True, "aborted": True, "runIds": ["run-9"]}}
     await dispatcher.dispatch(res)
     await dispatcher.dispatch(_agent("run-9", "start"))
@@ -715,7 +716,7 @@ async def test_agent_error_phase_is_forwarded_as_turn_error():
     """#300: a failed push run ends with `error`; the bridge closes it with reason error."""
     dispatcher, _, client_reg = make_dispatcher()
     bridge = MagicMock()
-    client_reg.register("client-a", bridge)
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     await dispatcher.dispatch(_agent("run-1", "error"))
     bridge.enqueue_push.assert_called_once_with("turn_error", SK, run_id="run-1")
 
@@ -898,7 +899,7 @@ async def test_only_the_lifecycle_stream_opens_or_ends_a_push(stream, phase):
     `start` to open one."""
     dispatcher, turn_reg, client_reg = make_dispatcher()
     bridge = MagicMock()
-    client_reg.register("client-a", bridge)
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     await dispatcher.dispatch(_agent_stream(stream, phase))
     bridge.enqueue_push.assert_not_called()
     assert turn_reg.active_runs(SK) == ["r1"]  # the run is still alive
@@ -910,7 +911,7 @@ async def test_only_the_lifecycle_stream_opens_or_ends_a_push(stream, phase):
 async def test_the_lifecycle_stream_still_opens_and_ends_a_push(phase, kind):
     dispatcher, _, client_reg = make_dispatcher()
     bridge = MagicMock()
-    client_reg.register("client-a", bridge)
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     await dispatcher.dispatch(_agent_stream("lifecycle", phase))
     bridge.enqueue_push.assert_called_once_with(kind, SK, run_id="r1")
 
@@ -918,7 +919,7 @@ async def test_the_lifecycle_stream_still_opens_and_ends_a_push(phase, kind):
 async def test_an_item_end_does_not_close_the_open_push(make_real_bridge):
     dispatcher, _, client_reg = make_dispatcher()
     bridge, _ = make_real_bridge()
-    client_reg.register("hab_sito", bridge)
+    client_reg.register("hab_sito", bridge, keyed_conversation("hab_sito"))
     sk = "agent:main:hab_sito"
     await dispatcher.dispatch(_agent_stream("lifecycle", "start", sk=sk))
     await bridge.push_idle()
@@ -931,3 +932,18 @@ async def test_an_item_end_does_not_close_the_open_push(make_real_bridge):
     await bridge.push_idle()
     assert not push_open(bridge)
     assert [m["type"] for m in await sent(bridge)] == ["turn_start", "turn_end"]
+
+
+async def test_session_message_is_known_not_drift_and_reaches_nobody(caplog):
+    dispatcher, turn_reg, client_reg = make_dispatcher()
+    q = turn_reg.register("req-1", "agent:main:client-a")
+    bridge = MagicMock()
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
+    payload = {"sessionKey": "agent:main:client-a", "message": {"role": "assistant"}, "messageSeq": 3}
+    with caplog.at_level(logging.DEBUG, logger="fogar_gateway.services.openclaw.dispatcher"):
+        await dispatcher.dispatch({"type": "event", "event": "session.message", "payload": payload})
+        await dispatcher.dispatch({"type": "event", "event": "brand.new", "payload": {}})
+    assert q.empty() and not bridge.enqueue_push.called
+    drift = [r.getMessage() for r in caplog.records if "unhandled" in r.getMessage()]
+    assert drift == ["unhandled OpenClaw event 'brand.new' (first occurrence; further ones are "
+                     "logged at DEBUG) — possible protocol drift, see docs/openclaw-protocol.md"]

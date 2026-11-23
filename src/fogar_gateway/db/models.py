@@ -119,7 +119,7 @@ class ConversationRecord(SQLModel, table=True):
     )
     agent: str
     session_key: str = Field(unique=True, index=True)
-    kind: str  # default | created | legacy
+    kind: str  # default | created
     day: date | None = Field(default=None)  # solo `default`
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     last_turn_at: datetime | None = Field(default=None)

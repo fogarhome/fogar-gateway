@@ -7,23 +7,7 @@ from fogar_gateway.services.openclaw.registry import (
     ClientRegistry,
     TurnInProgress,
     TurnRegistry,
-    client_id_from_session_key,
 )
-
-# --- client_id_from_session_key ---
-
-
-def test_client_id_simple():
-    assert client_id_from_session_key("agent:main:hab_sito") == "hab_sito"
-
-
-def test_client_id_with_colons():
-    assert client_id_from_session_key("agent:plants:telegram:direct:5239228928") == "5239228928"
-
-
-def test_client_id_two_parts():
-    assert client_id_from_session_key("agent:assistant:probe-test") == "probe-test"
-
 
 # --- TurnRegistry ---
 

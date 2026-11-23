@@ -10,15 +10,6 @@ from fogar_gateway.services.reconnection import describe_error
 logger = logging.getLogger(__name__)
 
 
-def client_id_from_session_key(session_key: str) -> str:
-    """Extract client_id as the last segment after the last colon.
-
-    "agent:main:hab_sito"                     → "hab_sito"
-    "agent:plants:telegram:direct:5239228928" → "5239228928"
-    """
-    return session_key.rsplit(":", 1)[-1]
-
-
 # Stable, distinguishable error content for a rejected duplicate registration —
 # defined once here so callers (OpenClawClient.stream_response, the /v1/*
 # route layer) can recognize this specific failure instead of duplicating a
@@ -439,9 +430,7 @@ class ClientRegistry:
             if target is not None and owner is not None and target.client.user_id != owner:
                 return None
             return target
-        # Clave sin conversación en el índice: una de antes de M19 (`agent:{agent}:{client.id}`)
-        # que aún no se importó (OpenClaw estaba caído al arrancar).
-        return self.get(client_id_from_session_key(session_key))
+        return None
 
     def for_client(self, client_id: str) -> list[Any]:
         """Las sesiones vivas de un cliente (una copia)."""

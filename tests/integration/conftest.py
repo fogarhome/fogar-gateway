@@ -162,7 +162,7 @@ def make_mock_orchestrator(tokens: list[str] = None) -> OrchestratorProtocol:
     mock.close = AsyncMock()
     mock.ping = AsyncMock(return_value=True)
     mock.abort = AsyncMock()
-    # Lecturas de OpenClaw (M19): sin sesiones (la importación legacy del arranque no encuentra nada).
+    # Lecturas de OpenClaw (M19): sin sesiones.
     mock.request = AsyncMock(return_value={"sessions": [], "hasMore": False})
     mock.trigger_reconnect = MagicMock(return_value=True)
     mock.stream_response = _stream

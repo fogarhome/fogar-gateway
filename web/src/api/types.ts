@@ -192,14 +192,14 @@ export interface SessionList {
 
 // Conversaciones (M19): src/api/conversation_routes.py. El gateway no guarda texto: título y mensajes
 // los lee de OpenClaw en cada petición.
-export type ConversationKind = 'default' | 'created' | 'legacy'
+export type ConversationKind = 'default' | 'created'
 
 export interface Conversation {
   id: string
   client_id: string
   client_name: string
   agent: string
-  /** `default`: la del día; `created`: elegida o nueva; `legacy`: de antes de M19. */
+  /** `default`: la del día; `created`: elegida o nueva. */
   kind: ConversationKind | string
   day: string | null
   created_at: string

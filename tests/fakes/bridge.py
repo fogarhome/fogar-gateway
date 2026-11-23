@@ -94,16 +94,22 @@ CONVERSATION_ID = "conv-1"
 
 
 def fixed_conversation(client_id: str = "u", agent: str = "main", **kwargs) -> SessionConversation:
-    """A session conversation that never changes day, on the pre-M19 key `agent:{agent}:{client_id}`
-    (like an imported legacy conversation), so push tests keep their `agent:main:<client>` keys."""
-    conv = Conversation(
-        id=kwargs.pop("id", CONVERSATION_ID),
+    """A session conversation that never changes day, on the key `agent:{agent}:{client_id}`,
+    so push tests keep their `agent:main:<client>` keys."""
+    conv = keyed_conversation(client_id, agent, kwargs.pop("id", CONVERSATION_ID))
+    return SessionConversation(conv, explicit=True, **kwargs)
+
+
+def keyed_conversation(client_id: str, agent: str = "main", id: str | None = None) -> Conversation:
+    """A conversation on the key `agent:{agent}:{client_id}`: register it with the session so
+    a push on that key routes to it (only indexed keys are routed)."""
+    return Conversation(
+        id=id or f"conv-{client_id}",
         client_id=client_id,
         agent=agent,
         session_key=make_session_key(agent, client_id),
-        kind="legacy",
+        kind="created",
     )
-    return SessionConversation(conv, explicit=True, **kwargs)
 
 
 async def sent(bridge) -> list:

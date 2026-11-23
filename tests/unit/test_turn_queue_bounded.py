@@ -9,6 +9,7 @@ import fogar_gateway.services.openclaw.registry as registry_mod
 from fogar_gateway.core.config import settings
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+from tests.fakes.bridge import keyed_conversation
 
 SK = "agent:main:client-a"
 
@@ -109,7 +110,7 @@ def _make():
     turns = TurnRegistry(max_queue_size=2)
     clients = ClientRegistry()
     bridge = MagicMock()
-    clients.register("client-a", bridge)
+    clients.register("client-a", bridge, keyed_conversation("client-a"))
     return FrameDispatcher(turns, clients), turns, bridge
 
 

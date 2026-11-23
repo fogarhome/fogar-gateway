@@ -9,10 +9,9 @@ export function conversationTitle(c: Pick<Conversation, 'title' | 'kind' | 'day'
   return `Sin título · ${formatShortDate(c.created_at, now)}`
 }
 
-/** Qué clase de conversación es, solo cuando aporta: la del día (diaria) y las de antes de M19. */
+/** Qué clase de conversación es, solo cuando aporta: la del día (diaria). */
 export function conversationKind(kind: string): string | null {
   if (kind === 'default') return 'diaria'
-  if (kind === 'legacy') return 'de antes'
   return null
 }
 
