@@ -19,6 +19,7 @@ class PollingApi(FakeApi):
 
     def __init__(self, states, responses=None):
         super().__init__({("POST", "/admin/pairing"): ITEM,
+                          ("GET", "/admin/home"): {"name": "green-house"},
                           ("DELETE", "/admin/pairing/p1"): None, **(responses or {})})
         self.states = list(states)
 
@@ -29,6 +30,9 @@ class PollingApi(FakeApi):
             if isinstance(state, BaseException):
                 raise state
             return {**ITEM, **state}
+        if isinstance(self.responses.get((method, path)), BaseException):
+            self.calls.append((method, path, body))
+            raise self.responses[(method, path)]
         return super().request(method, path, body)
 
 
@@ -41,12 +45,21 @@ def run(*args):
     return CliRunner().invoke(cli, list(args))
 
 
+def test_pair_without_home_name_still_shows_code(use_api):
+    # sin nombre de casa (p. ej. sin permiso): el código se muestra igual, sin la frase «con la casa»
+    use_api(PollingApi([{"state": "used", "client_id": "c0ffee00-1", "client_name": "tele"}],
+                       responses={("GET", "/admin/home"): pair_mod.api.ApiError("forbidden")}))
+    r = run("pair", "--type", "screen")
+    assert r.exit_code == 0, r.output
+    assert "482 913" in r.output and "con la casa" not in r.output
+
+
 def test_pair_shows_code_and_waits_until_used(use_api):
     fake = use_api(PollingApi([{}, {}, {"state": "used", "client_id": "c0ffee00-1",
                                       "client_name": "tele"}]))
     r = run("pair", "--type", "screen")
     assert r.exit_code == 0, r.output
-    assert "482 913" in r.output and "emparejarlo" in r.output
+    assert "482 913" in r.output and "con la casa «green-house»" in r.output
     assert "Cliente «tele» emparejado (id c0ffee00)" in r.output
     assert [c[:2] for c in fake.calls].count(POLL) == 3
 

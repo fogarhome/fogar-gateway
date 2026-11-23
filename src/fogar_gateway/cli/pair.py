@@ -66,8 +66,13 @@ def pair(
         out.message(f"Caduca a las {expires}.", MUTED)
         return
     try:
+        try:  # el nombre de la casa es solo para la frase: si no se lee, va sin él
+            casa = client.request("GET", "/admin/home")["name"]
+        except api.ApiError:
+            casa = None
+        con_casa = f" con la casa «{casa}»" if casa else ""
         out.message(
-            f"Escríbelo en el cliente para emparejarlo. Caduca a las {expires}; "
+            f"Escríbelo en el cliente para emparejarlo{con_casa}. Caduca a las {expires}; "
             "Ctrl+C lo anula.",
             MUTED,
         )
