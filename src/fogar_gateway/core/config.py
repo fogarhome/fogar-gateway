@@ -1,40 +1,17 @@
-import logging
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, StringConstraints, field_validator, model_validator
+from pydantic import Field, SecretStr, StringConstraints, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from fogar_gateway import paths
 from fogar_gateway.access import parse_public_urls
 from fogar_gateway.core.session_key import AGENT_ID_PATTERN
 
-_logger = logging.getLogger(__name__)
-
-# Keys that older installs still carry in config.env: accepted and ignored (with one WARNING per
-# process, F-r7-3: the CLI builds Settings many times and may run this module more than once)
-# so an upgrade does not turn them into "Extra inputs are not permitted".
-RETIRED_KEYS = frozenset({"ORCHESTRATOR_RECONNECT_MAX_DURATION"})  # #272: single endless loop
-
 
 class Settings(BaseSettings):
     # Nunca el .env del directorio actual: <base>/config.env (o --home / FOGAR_GATEWAY_HOME).
     # Ningún plazo admite inf ni nan (D-r7-1): un HANDSHAKE_TIMEOUT_S=inf no caduca nunca.
     model_config = SettingsConfigDict(env_file=paths.config_file(), allow_inf_nan=False)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _drop_retired_keys(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
-            return data
-        retired = sorted(k for k in data if isinstance(k, str) and k.upper() in RETIRED_KEYS)
-        if retired and not getattr(_logger, "retired_warned", False):
-            _logger.retired_warned = True  # type: ignore[attr-defined]  # shared by every copy
-            _logger.warning(
-                "Config: %s is obsolete and ignored (remove it from config.env).", ", ".join(retired)
-            )
-        if retired:
-            data = {k: v for k, v in data.items() if k not in retired}
-        return data
 
     # Base de datos interna. Una ruta SQLite relativa cuelga del directorio base, también el
     # default: el engine, Alembic, el candado y `fogar-gw doctor` ven la misma ruta absoluta.
@@ -104,12 +81,6 @@ class Settings(BaseSettings):
     # fogar nunca la usa.
     STT_AUDIO_GATE: Literal["off", "energy"] = "energy"
 
-    # shortcut: "auto" (default until #264) == "energy"; drop once no .env in production carries it.
-    @field_validator("STT_AUDIO_GATE", mode="before")
-    @classmethod
-    def _legacy_auto_gate(cls, v: object) -> object:
-        return "energy" if v == "auto" else v
-
     STT_GATE_RMS_DBFS: float = -45.0
     OPENCLAW_HOST: str = "127.0.0.1"
     OPENCLAW_PORT: int = 18789
@@ -149,9 +120,6 @@ class Settings(BaseSettings):
     # Tope de cada paso del cierre de una sesión (cancelar el turno, el push, las tareas,
     # cerrar el transcriber y el tracker) y del drenado de su cola de salida (#221).
     SESSION_TEARDOWN_S: float = Field(default=5.0, gt=0)
-    # Obsoleto e ignorado (#221): el cierre ya no espera al turno en curso. Se acepta para
-    # que un .env antiguo no impida arrancar (avisa con un WARNING al arrancar).
-    SHUTDOWN_DRAIN_S: float | None = None
     LOG_FORMAT: Literal["text", "json"] = "text"
 
     # Drenado del audio TTS de un push al cerrar su turno (issue #130 S3a): tope de tiempo

@@ -31,7 +31,6 @@ from fogar_gateway.core.startup_checks import (
     acquire_single_process_lock,
     check_speech_settings,
     release_single_process_lock,
-    warn_deprecated_settings,
     warn_insecure_tokens,
 )
 from fogar_gateway.core.transport import TransportCaptureMiddleware
@@ -93,7 +92,6 @@ async def _lifespan_body(app: FastAPI):
     logger.info("BD inicializada")
     warn_if_open_proxy_config()
     warn_insecure_tokens(settings)
-    warn_deprecated_settings(settings)
     # B-r4-2: `websockets` a DEBUG volcaría las tramas de OpenClaw (el connect lleva el token),
     # no solo las de ElevenLabs.
     pin_websockets_logging()
