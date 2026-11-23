@@ -718,7 +718,28 @@ async def test_agent_error_phase_is_forwarded_as_turn_error():
     bridge = MagicMock()
     client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     await dispatcher.dispatch(_agent("run-1", "error"))
-    bridge.enqueue_push.assert_called_once_with("turn_error", SK, run_id="run-1")
+    # #397: with its `data`, which the push classifies into a stable code.
+    bridge.enqueue_push.assert_called_once_with("turn_error", {"phase": "error"}, run_id="run-1")
+
+
+async def test_a_fallback_step_reaches_the_normal_turn_of_its_session():
+    """#397: the turn remembers the run's fallback failure reason (no push for it)."""
+    dispatcher, turn_reg, client_reg = make_dispatcher()
+    bridge = MagicMock()
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
+    q = turn_reg.register("req-1", SK)
+    turn_reg.note_run("req-1", "run-1")
+    await dispatcher.dispatch(_agent("run-1", "fallback_step"))
+    assert _drain(q) == [("agent", {"phase": "fallback_step"})]
+    bridge.enqueue_push.assert_not_called()
+
+
+async def test_a_fallback_step_without_a_normal_turn_goes_to_the_push():
+    dispatcher, _, client_reg = make_dispatcher()
+    bridge = MagicMock()
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
+    await dispatcher.dispatch(_agent("run-1", "fallback_step"))
+    bridge.enqueue_push.assert_called_once_with("fallback", {"phase": "fallback_step"}, run_id="run-1")
 
 
 def _drain(q):
@@ -913,7 +934,8 @@ async def test_the_lifecycle_stream_still_opens_and_ends_a_push(phase, kind):
     bridge = MagicMock()
     client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     await dispatcher.dispatch(_agent_stream("lifecycle", phase))
-    bridge.enqueue_push.assert_called_once_with(kind, SK, run_id="r1")
+    arg = {"phase": "error"} if phase == "error" else SK
+    bridge.enqueue_push.assert_called_once_with(kind, arg, run_id="r1")
 
 
 async def test_an_item_end_does_not_close_the_open_push(make_real_bridge):

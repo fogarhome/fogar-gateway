@@ -357,7 +357,7 @@ Señala que el turno terminó. **Todo turno con `turn_start` recibe exactamente 
 | `reason` | Cuándo |
 |---|---|
 | `done` | Terminó solo: la respuesta completa (o el push, con su fin) |
-| `error` | Falló: va precedido de su `error` `TURN_ERROR` (§9), salvo un push cuyo agente falla |
+| `error` | Falló: va precedido de su `error` `TURN_ERROR` (§9), también un push cuyo agente falla (desde 5.0, #397) |
 | `cancelled` | Tu `cancel` (también el de un `send` que aún no había empezado: recibe su par igual) |
 | `interrupted` | Hablaste encima: un barge-in (§7) o una transcripción final con el turno en curso. Sustituye al antiguo mensaje `interrupted` |
 | `replaced` | Un `send` nuevo lo sustituyó (también corta un push que sonaba, y un `send` anterior que aún no había empezado: recibe su par igual) |
@@ -656,11 +656,18 @@ El `message` de un `TURN_ERROR` es siempre uno de estos códigos fijos, nunca el
 |---|---|
 | `orchestrator_unavailable` | El orquestador (OpenClaw) no está conectado o está reconectando al empezar el turno |
 | `orchestrator_send_failed` | El gateway no pudo escribir la petición del turno al orquestador (conexión rota) |
-| `orchestrator_error` | OpenClaw rechazó el turno (`res` con `ok:false`), el agente falló después de aceptarlo, o falló algo interno en el camino hacia él |
+| `orchestrator_error` | OpenClaw rechazó el turno (`res` con `ok:false`), el agente falló después de aceptarlo sin una causa de las de abajo, o falló algo interno en el camino hacia él |
+| `orchestrator_auth_failed` | El agente falló porque OpenClaw no pudo autenticarse con el proveedor del modelo (clave caducada, inválida o sin permiso). Lo arregla quien administra OpenClaw, no reintentar |
+| `orchestrator_model_unavailable` | El modelo del agente no existe o no está disponible, y no quedó ningún modelo de respaldo |
+| `orchestrator_rate_limited` | El proveedor del modelo limitó las peticiones, está sobrecargado o sin saldo/cuota. Puede funcionar más tarde |
+| `orchestrator_timeout` | El modelo o el agente tardó demasiado y OpenClaw cortó el turno (distinto de `turn_timeout`, que corta el gateway) |
+| `orchestrator_agent_unavailable` | El agente de la conversación ya no está disponible para este dispositivo (fuera de su lista de agentes permitidos o del roster de OpenClaw). El gateway lo decide antes de enviar nada a OpenClaw |
 | `orchestrator_disconnected` | La conexión con el orquestador se cerró con el turno en vuelo |
 | `turn_timeout` | El orquestador no mandó nada durante `TURN_TIMEOUT_S` (§13); también en un push (§10) |
 | `turn_overflow` | El gateway no pudo procesar los eventos del turno al ritmo de llegada (§13) |
 | `turn_in_progress` | Ya hay un turno en curso para esa sesión (`/v1`: HTTP 409) |
+
+**Desde 5.0 (#397)** los cinco códigos `orchestrator_auth_failed`, `orchestrator_model_unavailable`, `orchestrator_rate_limited`, `orchestrator_timeout` y `orchestrator_agent_unavailable` sustituyen a `orchestrator_error` cuando el gateway sabe la causa: los cuatro primeros salen solo de campos estructurales de OpenClaw (nunca de su texto), el último de la política de agentes del propio gateway. Cualquier otro código que no conozcas trátalo como `orchestrator_error`. Un push cuyo agente falla también recibe su `TURN_ERROR` antes del `turn_end` (`reason: "error"`).
 
 **Cambio de contrato (#228):** antes, `message` podía ser `send failed: <texto de la excepción>`, `not connected`, el `error` crudo de OpenClaw (p. ej. `{'code': ..., 'message': ...}`) o el `str(e)` de una excepción interna. Si tu cliente comparaba esos textos, usa los códigos de la tabla.
 

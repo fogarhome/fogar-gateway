@@ -24,7 +24,7 @@ from fogar_gateway.services.speech.ports import SttCallbacks, SttParams
 from fogar_gateway.services.transcriber_client import TranscriberClient
 from fogar_gateway.services.transcriber_reconnecting import ReconnectingTranscriberClient
 from fogar_gateway.services.tts_client import TTSClient
-from tests.fakes.bridge import run_turn, sent
+from tests.fakes.bridge import push, run_turn, sent
 
 SECRET = "SECRET-INTERNAL"
 
@@ -65,6 +65,56 @@ async def test_turn_error_relays_orchestrator_error_code(make_bridge):
     await sent(bridge)
 
     assert ws.of("error")[0]["message"] == "turn_timeout"
+
+
+async def test_failed_push_gets_a_classified_turn_error_without_text(make_bridge, caplog):
+    """#397: un push cuyo agente falla recibe su TURN_ERROR con el código clasificado (aquí por
+    el `fallback_step` previo del mismo run); ningún texto de OpenClaw sale."""
+    caplog.set_level(logging.DEBUG)
+    bridge, ws = make_bridge()
+    step = {
+        "phase": "fallback_step",
+        "fallbackStepFromFailureReason": "auth",
+        "fallbackStepFromFailureDetail": SECRET,
+        "fallbackStepFinalOutcome": "chain_exhausted",
+    }
+    failed = {"phase": "error", "error": SECRET, "errorObservation": {"providerErrorMessagePreview": SECRET}}
+    await push(bridge, ("turn_start", "sk"), ("fallback", step), ("turn_error", failed))
+    await sent(bridge)
+
+    assert ws.types() == ["turn_start", "error", "turn_end"]
+    assert ws.of("error")[0]["message"] == "orchestrator_auth_failed"
+    assert ws.of("turn_end")[0]["reason"] == "error"
+    assert SECRET not in json.dumps(ws.sent, default=str)
+    assert SECRET not in _logged(caplog)
+    await bridge.close_all()
+
+
+@pytest.mark.parametrize(
+    ("allowed", "roster"), [(["otro"], None), (None, ["otro"])]
+)
+async def test_agent_unavailable_is_a_turn_error_before_chat_send(make_bridge, allowed, roster):
+    """#397 (decisión a): el agente de la sesión ya no está en `allowed_agents` o en el roster de
+    OpenClaw: el turno acaba con orchestrator_agent_unavailable sin llegar a chat.send."""
+    from fogar_gateway.services.openclaw.models import GatewayInfo
+
+    bridge, ws = make_bridge()
+    bridge.turns.allowed_agents = allowed
+    if roster is not None:
+        bridge.orchestrator.gateway_info = GatewayInfo("otro", 1000, 1 << 20, agents=roster)
+    called = []
+
+    async def s(*a, **k):
+        called.append(a)
+        yield OrchestratorEvent(type="status", content="done")
+
+    bridge.orchestrator.stream_response = s
+    await run_turn(bridge, "x")
+    await sent(bridge)
+
+    assert ws.of("error")[0]["message"] == "orchestrator_agent_unavailable"
+    assert ws.of("turn_end")[0]["reason"] == "error"
+    assert called == []
 
 
 async def test_openclaw_reconnect_last_error_has_no_raw_text(caplog):

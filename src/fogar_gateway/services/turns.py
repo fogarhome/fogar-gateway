@@ -33,6 +33,11 @@ from fogar_gateway.models.schemas import ClientConfig, Handshake
 from fogar_gateway.services import orchestration
 from fogar_gateway.services.conversations import SessionConversation
 from fogar_gateway.services.openclaw.chat_text import ChatTextTracker
+from fogar_gateway.services.openclaw.failures import (
+    ORCHESTRATOR_AGENT_UNAVAILABLE_ERROR,
+    classify_failure,
+    fallback_reason,
+)
 from fogar_gateway.services.openclaw.models import ToolCallEvent
 from fogar_gateway.services.openclaw.registry import TurnRegistry
 from fogar_gateway.services.outbound import ClientGone, OutboundSender, log_send_failed
@@ -95,6 +100,7 @@ class Turn:
     session_key: str | None = None  # push: sesión de OpenClaw en la que corre
     conversation_id: str | None = None  # su conversación (None: push de una clave desconocida)
     run_id: str | None = None  # push: el runId de OpenClaw de su `agent start`
+    fallback_reason: str | None = None  # push: la del último `fallback_step` de su run (#397)
     task: asyncio.Task | None = None  # user: la tarea que lo ejecuta
     opened: bool = False  # su turn_start ya está en la cola del cliente
     ended: bool = False  # su turn_end ya está en la cola (o se abandonó al cerrar)
@@ -631,6 +637,15 @@ class TurnController:
 
         El TTS se conecta a la vez (auditoría 3.0, E-2): un fogar-speaker colgado no retrasa el
         texto; solo el `turn_end`, que espera a la voz como antes."""
+        session_key = self._session_key()
+        if not self._agent_available(session_key):
+            # #397 (decisión a): la política del gateway, antes del chat.send. Solo el gateway
+            # sabe qué agentes puede usar cada dispositivo; OpenClaw solo diría INVALID_REQUEST.
+            code = ORCHESTRATOR_AGENT_UNAVAILABLE_ERROR
+            logger.warning(f"[{self._client_id}] Turno sin agente disponible: {code}")
+            gateway_stats.turn_error(code)
+            await self._send_turn_error(turn, code)
+            return "error"
         if not self._wants_audio:
             return await self._stream(turn, text, None)
         pending = _PendingTts(lambda: self._connect_tts(turn), self._config.tts_voice or "", self._client_id)
@@ -729,9 +744,9 @@ class TurnController:
     def enqueue_push(self, kind: str, arg: Any, run_id: str | None = None) -> None:
         """Encola un evento de push para el worker (#130 S3a). Síncrono, nunca bloquea: lo
         llama el bucle de OpenClaw vía FrameDispatcher. `kind`: "turn_start" | "chat" |
-        "tool" | "turn_end" | "turn_error"; `arg`: la session_key (turn_*) o el payload
-        (chat/tool); `run_id`: el runId del evento, si lo trae. No hace nada una vez que la
-        sesión se cierra."""
+        "tool" | "fallback" | "turn_end" | "turn_error"; `arg`: la session_key (turn_start,
+        turn_end), el payload (chat/tool) o el `data` del `agent` (fallback/turn_error, #397);
+        `run_id`: el runId del evento, si lo trae. No hace nada una vez que la sesión se cierra."""
         if self._closing:
             return
         if self._push_worker is None or self._push_worker.done():
@@ -777,8 +792,12 @@ class TurnController:
                     await self._push_chat(arg)
                 elif kind == "tool":
                     await self._push_tool(arg)
-                elif kind in ("turn_end", "turn_error"):
-                    await self._push_end(failed=kind == "turn_error")
+                elif kind == "fallback":
+                    self._push_fallback(arg, run_id)
+                elif kind == "turn_end":
+                    await self._push_end()
+                elif kind == "turn_error":
+                    await self._push_end(failure=arg)
                 else:
                     logger.warning(f"[{self._client_id}] push event desconocido: {kind!r}")
             except Exception as e:  # noqa: BLE001 — frontera: un evento roto no para el worker
@@ -806,6 +825,17 @@ class TurnController:
     def _abort_run(self, run_id: str | None) -> None:
         if run_id is not None:
             self._turn_registry.abort_run(run_id)
+
+    def _agent_available(self, session_key: str) -> bool:
+        """#397: el agente de la clave sigue en `allowed_agents` y, si se conoce el roster de
+        OpenClaw, en él (un roster stale se refresca al reconectar)."""
+        if not self._agent_allowed(session_key):
+            return False
+        info = self._orchestrator.gateway_info
+        parts = session_key.split(":")
+        if info is None or not info.agents or len(parts) < 3 or parts[0] != "agent":
+            return True
+        return parts[1].lower() in info.agents
 
     def _agent_allowed(self, session_key: str) -> bool:
         allowed = self.allowed_agents
@@ -940,17 +970,29 @@ class TurnController:
         except Exception as e:  # noqa: BLE001 — frontera: envío a un cliente que puede haberse ido
             self._log_send_failed("tool_call del push", e)
 
-    async def _push_end(self, *, failed: bool) -> None:
-        """Fin del agente (`end`, o `error` #300): su audio termina de sonar y se cierra."""
+    def _push_fallback(self, data: dict, run_id: str | None) -> None:
+        """#397: un `fallback_step` del run del push abierto: su razón, para clasificar su error."""
+        push = self._push
+        if push is not None and not push.ended and not _other_run(push.run_id, run_id):
+            push.fallback_reason = fallback_reason(data, push.fallback_reason)
+
+    async def _push_end(self, *, failure: dict | None = None) -> None:
+        """Fin del agente (`end`, o `error` #300 con su `data`): su audio termina de sonar y se
+        cierra. Si falló, antes su TURN_ERROR con el código clasificado (#397)."""
         push = self._push
         if push is None or push.ended:
             # #84: un fin sin push abierto (huérfano o ya cerrado) no emite nada.
             logger.debug(f"[{self._client_id}] push_turn_end ignorado: no hay push abierto")
             return
         push.finishing = True
+        if failure is not None:
+            code = classify_failure(failure, fallback_reason=push.fallback_reason)
+            logger.warning(f"[{self._client_id}] push {push.turn_id} falló en OpenClaw: {code}")
+            gateway_stats.turn_error(code)
+            await self._send_turn_error(push, code)
         if push.tts is not None:
             await push.tts.finish()
-        await self._end(push, "error" if failed else "done")
+        await self._end(push, "done" if failure is None else "error")
 
     async def _push_timed_out(self) -> None:
         """#286: un push sin progreso en TURN_TIMEOUT_S se cierra como el turno normal."""

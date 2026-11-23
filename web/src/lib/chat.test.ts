@@ -116,7 +116,14 @@ describe('ChatLog al volver a leer lo dicho', () => {
 
   it('se queda el turno que no llegó a OpenClaw con tu mensaje; los demás errores ya están en OpenClaw', () => {
     const log = new ChatLog('c1')
-    const turns = ['orchestrator_unavailable', 'orchestrator_send_failed', 'orchestrator_error', 'turn_timeout']
+    const turns = [
+      'orchestrator_unavailable',
+      'orchestrator_send_failed',
+      'orchestrator_agent_unavailable',
+      'orchestrator_error',
+      'orchestrator_auth_failed',
+      'turn_timeout',
+    ]
     turns.forEach((code, i) => {
       log.sent(log.addUser(`pregunta ${code}`))
       log.apply(start(`t-${i}`))
@@ -132,6 +139,8 @@ describe('ChatLog al volver a leer lo dicho', () => {
       ['assistant', '', 'orchestrator_unavailable'],
       ['user', 'pregunta orchestrator_send_failed', undefined],
       ['assistant', '', 'orchestrator_send_failed'],
+      ['user', 'pregunta orchestrator_agent_unavailable', undefined],
+      ['assistant', '', 'orchestrator_agent_unavailable'],
     ])
   })
 

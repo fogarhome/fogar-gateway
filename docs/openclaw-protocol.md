@@ -158,10 +158,11 @@ Observed on green-house (structure only):
    `error`, `startedAt`, `endedAt`, `executionSettled`); no `start` phase was seen;
 3. `chat` **`state: "error"`** with `errorMessage` (and `runId`, `seq`).
 
-How the gateway reacts: a `chat` `state: "error"` ends a normal turn at once with
-`orchestrator_error` and without `chat.abort` (the run is already over); `errorMessage` never
-reaches the client or the logs. An `agent` `phase: "error"` closes a push turn the same way as
-`end`. Before #300 the normal turn waited for `turn_timeout` (`TURN_TIMEOUT_S`, 120 s) and a
+How the gateway reacts: a `chat` `state: "error"` ends a normal turn at once without
+`chat.abort` (the run is already over), with a stable code classified from its structural
+fields (since #397, see "Failure fields over the WebSocket"; `orchestrator_error` when they say
+nothing); `errorMessage` never reaches the client or the logs. An `agent` `phase: "error"` closes
+a push turn like `end`, after its `TURN_ERROR` with the classified code (since #397). Before #300 the normal turn waited for `turn_timeout` (`TURN_TIMEOUT_S`, 120 s) and a
 failed push stayed open.
 
 ---
@@ -567,7 +568,8 @@ them to a log. What it does instead:
 | Situation | Client sees (`TURN_ERROR.message` / `/v1` error) | Log |
 |---|---|---|
 | `chat.send` can't be written | `orchestrator_send_failed` | WARNING with the exception *type* only |
-| `res` with `ok:false` for a turn | `orchestrator_error` | WARNING with OpenClaw's short `error.code` only (see below) |
+| `res` with `ok:false` for a turn | `orchestrator_error` (no structural field tells more, #397) | WARNING with OpenClaw's short `error.code` only (see below) |
+| `chat` `state:"error"`, or a push's `agent` `phase:"error"` | the code classified from structural fields (#397, below), else `orchestrator_error` | WARNING with that code only |
 | Not connected / reconnecting | `orchestrator_unavailable` | — |
 | Connection ends mid-turn | `orchestrator_disconnected` (#213) | type / close codes only |
 | `turn_timeout`, `turn_overflow`, `turn_in_progress` | same literals (unchanged) | — |
@@ -1155,7 +1157,27 @@ How the five #397 cases map (every field is optional, so a classifier needs an `
 | Timeout | `errorKind: "timeout"` (seen live), `failoverReason`/`providerRuntimeFailureKind` `timeout`, `agent` `timeoutPhase` |
 | Agent missing/forbidden | **not a run error:** `chat.send` is refused before any run with `res ok:false` `error.code: "INVALID_REQUEST"`, `error` keys `code` and `message` only (no `details`, no `retryable`); seen live for an unknown agent id. Only the code is structural: OpenClaw gives no field that tells this case apart; the gateway's own context (`agents.list` roster, `resolve_agent`) does |
 
+How the gateway reacts (#397, `src/fogar_gateway/services/openclaw/failures.py`,
+`classify_failure`): it reads only the structural fields above, never `errorMessage`, `error`,
+`providerErrorMessagePreview` or `fallbackStepFromFailureDetail`. First match wins:
+`failoverReason` → `providerRuntimeFailureKind` → `httpStatus` (of `errorDetail`, or
+`errorObservation` in an `agent` error) → `errorKind` → a non-empty `timeoutPhase` → the
+`fallbackStepFromFailureReason` of the run's last `fallback_step` (forgotten when a step ends
+`succeeded`). The dispatcher hands a lifecycle `fallback_step` to the normal turn of its run (or to
+the open push). Codes: `auth`/`auth_permanent`/`session_expired`, `auth_invalid_token`/
+`auth_refresh`/`auth_scope`, 401/403 → `orchestrator_auth_failed`; `model_not_found` →
+`orchestrator_model_unavailable`; `rate_limit`/`overloaded`/`billing`, 429/402, `errorKind`
+`rate_limit` → `orchestrator_rate_limited`; `timeout` (any of the three), `timeoutPhase` →
+`orchestrator_timeout`; anything else (`refusal`, `context_length`, `state_contention`,
+`unknown`, a new value, a wrong type, nothing) → `orchestrator_error`. A bare `res`
+`INVALID_REQUEST` stays `orchestrator_error`: the agent case is decided by the gateway before
+`chat.send` (`orchestrator_agent_unavailable` when the session's agent left the device's
+`allowed_agents` or the roster of the last connect; the handshake keeps its 4020/4021 closes and
+`/v1` its 403).
+
 ## Change log of this file
+
+- **2026-11-23**: "Failure fields over the WebSocket" gains how the gateway classifies them (#397).
 
 - **2026-11-23**: added "C3 queue behaviour and failure fields" (server 2026.11.7, observed live
   on green-house with agent `e2e` (no `main` agent there) and read in the package source; #406,
