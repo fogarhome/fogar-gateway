@@ -43,7 +43,7 @@ def test_state_requires_admin_token(client, monkeypatch, path):
 
 def test_state_shape_with_active_session(client, admin_headers):
     with client.websocket_connect("/ws/stream") as ws:
-        ws.send_json({"client_key": VALID_KEY, "input_mode": "text", "output_mode": ["text"]})
+        ws.send_json({"client_key": VALID_KEY, "protocol": 5, "input_mode": "text", "output_mode": ["text"]})
         assert ws.receive_json()["type"] == "ready"
         ws.send_json({"type": "send", "text": "MARCADOR-6g"})
         for _ in range(20):

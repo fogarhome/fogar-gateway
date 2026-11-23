@@ -7,7 +7,7 @@ import queue
 import re
 import threading
 import time
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from uuid import UUID
 
 import pytest
@@ -143,6 +143,7 @@ def test_invalid_client_key_log_is_safe_and_correlatable(client, caplog, monkeyp
             ws.send_json(
                 {
                     "client_key": key,
+                    "protocol": 5,
                     "input_mode": "text",
                     "output_mode": ["text"],
                 }
@@ -186,6 +187,7 @@ def test_valid_text_mode_handshake_connection_stays_open(client, caplog):
             ws.send_json(
                 {
                     "client_key": VALID_KEY,
+                    "protocol": 5,
                     "input_mode": "text",
                     "output_mode": ["text"],
                 }
@@ -251,6 +253,7 @@ def test_ready_carries_requested_and_live_capabilities_when_audio(client, monkey
         ws.send_json(
             {
                 "client_key": VALID_KEY,
+                "protocol": 5,
                 "input_mode": "audio",
                 "output_mode": ["audio", "text"],
             }
@@ -287,6 +290,7 @@ def test_ready_uses_both_sections_for_text_only_handshake(client):
         ws.send_json(
             {
                 "client_key": VALID_KEY,
+                "protocol": 5,
                 "input_mode": "text",
                 "output_mode": ["text"],
             }
@@ -312,7 +316,7 @@ def test_handshake_validation_error_log_has_no_key_material(client, caplog):
     key = "Zq9xKLMNOPQRSTUVWXYZabcdefghij0123456789"
     with caplog.at_level(logging.ERROR), pytest.raises(Exception):
         with client.websocket_connect("/ws/stream") as ws:
-            ws.send_json({"client_key": key, "output_mode": ["text"]})  # falta input_mode
+            ws.send_json({"client_key": key, "protocol": 5, "output_mode": ["text"]})  # falta input_mode
             ws.receive_text()
     assert "handshake" in caplog.text.lower()  # el error sigue registrándose
     assert key[:6] not in caplog.text
@@ -326,7 +330,7 @@ def test_handshake_needs_a_client_key(client, caplog, credentials):
     """M20: siempre `client_key` (la web también); un `admin_token` ya no entra. El log no lo lleva."""
     with caplog.at_level(logging.ERROR), pytest.raises(WebSocketDisconnect) as exc:
         with client.websocket_connect("/ws/stream") as ws:
-            ws.send_json({**credentials, "input_mode": "text", "output_mode": ["text"]})
+            ws.send_json({**credentials, "protocol": 5, "input_mode": "text", "output_mode": ["text"]})
             ws.receive_text()
     assert exc.value.code == 4000
     assert "client_key" in caplog.text and "missing" in caplog.text
@@ -336,7 +340,7 @@ def test_handshake_needs_a_client_key(client, caplog, credentials):
 @pytest.mark.parametrize("caps", [["Pantalla"], ["x" * 33], ["a"] * 33, "screen"])
 def test_handshake_capabilities_are_validated(client, caps):
     with pytest.raises(WebSocketDisconnect) as exc, client.websocket_connect("/ws/stream") as ws:
-        ws.send_json({"client_key": VALID_KEY, "input_mode": "text", "output_mode": ["text"],
+        ws.send_json({"client_key": VALID_KEY, "protocol": 5, "input_mode": "text", "output_mode": ["text"],
                       "capabilities": caps})
         ws.receive_text()
     assert exc.value.code == 4000
@@ -349,7 +353,7 @@ def test_handshake_stores_capabilities_and_last_seen(client, db_engine):
     from tests.integration.conftest import CLIENT_ID
 
     with client.websocket_connect("/ws/stream") as ws:
-        ws.send_json({"client_key": VALID_KEY, "input_mode": "text", "output_mode": ["text"],
+        ws.send_json({"client_key": VALID_KEY, "protocol": 5, "input_mode": "text", "output_mode": ["text"],
                       "capabilities": ["screen", "mic"]})
         assert ws.receive_json()["type"] == "ready"
     with Session(db_engine) as s:
@@ -361,7 +365,7 @@ def test_handshake_stores_capabilities_and_last_seen(client, db_engine):
 def test_handshake_conversation_is_validated(client, conversation):
     with pytest.raises(Exception), client.websocket_connect("/ws/stream") as ws:
         ws.send_json(
-            {"client_key": VALID_KEY, "input_mode": "text", "output_mode": ["text"],
+            {"client_key": VALID_KEY, "protocol": 5, "input_mode": "text", "output_mode": ["text"],
              "conversation": conversation}
         )
         ws.receive_text()
@@ -372,7 +376,7 @@ def test_handshake_conversation_is_validated(client, conversation):
 def test_handshake_credential_is_validated(client, caplog, field, value):
     """Auditoría 3.0, D-5: un surrogate suelto o un valor enorme es un handshake inválido
     (4000), no un UnicodeEncodeError con traceback."""
-    raw = json.dumps({field: value, "input_mode": "text", "output_mode": ["text"]})
+    raw = json.dumps({field: value, "protocol": 5, "input_mode": "text", "output_mode": ["text"]})
     with caplog.at_level(logging.ERROR), pytest.raises(WebSocketDisconnect) as exc:
         with client.websocket_connect("/ws/stream") as ws:
             ws.send_text(raw)
@@ -443,7 +447,7 @@ def test_client_gone_during_health_check_is_a_clean_disconnect(
     caplog.set_level(logging.INFO)
 
     with client.websocket_connect("/ws/stream") as ws:
-        ws.send_json({"client_key": VALID_KEY, "input_mode": "text", "output_mode": ["text"]})
+        ws.send_json({"client_key": VALID_KEY, "protocol": 5, "input_mode": "text", "output_mode": ["text"]})
         with pytest.raises(Exception):
             ws.receive_text()
 
@@ -455,3 +459,44 @@ def test_client_gone_during_health_check_is_a_clean_disconnect(
     assert app.state.client_registry.get(CLIENT_ID) is None
     sessions = app.state.session_registry.get_all()
     assert len(sessions) == 1 and sessions[0].ended_at is not None
+
+
+# --- Versión de protocolo (5.0) ---------------------------------------------
+
+_V4_HANDSHAKE = {"client_key": VALID_KEY, "input_mode": "text", "output_mode": ["text"]}
+
+
+def _close_of(client, payload) -> tuple[int, str]:
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect("/ws/stream") as ws:
+            ws.send_json(payload)
+            ws.receive_json()
+    return exc.value.code, exc.value.reason
+
+
+def test_handshake_without_protocol_closes_4003(client):
+    with patch(
+        "fogar_gateway.api.routes.db_client.get_session", new_callable=AsyncMock
+    ) as get_session:
+        assert _close_of(client, _V4_HANDSHAKE) == (4003, "protocol version not supported")
+    get_session.assert_not_called()
+
+
+@pytest.mark.parametrize("value", [4, 6, True, "5", 5.5, None])
+def test_handshake_with_other_protocol_closes_4003(client, value):
+    assert _close_of(client, {**_V4_HANDSHAKE, "protocol": value})[0] == 4003
+
+
+def test_old_handshake_with_unknown_shape_still_closes_4003(client):
+    old = {"client_key": VALID_KEY, "output_mode": ["text"]}  # sin protocol ni input_mode
+    assert _close_of(client, old)[0] == 4003
+
+
+def test_non_object_handshake_still_closes_4000(client):
+    assert _close_of(client, [5])[0] == 4000
+
+
+def test_ready_carries_protocol(client):
+    with client.websocket_connect("/ws/stream") as ws:
+        ws.send_json({**_V4_HANDSHAKE, "protocol": 5})
+        assert ws.receive_json()["protocol"] == 5

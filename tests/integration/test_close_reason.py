@@ -15,7 +15,7 @@ from fogar_gateway.main import app
 from fogar_gateway.services.stats import gateway_stats
 from tests.integration.conftest import CLIENT_ID, VALID_KEY
 
-HANDSHAKE = {"client_key": VALID_KEY, "input_mode": "text", "output_mode": ["text"]}
+HANDSHAKE = {"client_key": VALID_KEY, "protocol": 5, "input_mode": "text", "output_mode": ["text"]}
 
 
 def _wait_for(predicate, timeout=5.0):

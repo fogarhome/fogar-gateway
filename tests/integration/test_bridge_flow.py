@@ -12,6 +12,7 @@ from tests.integration.conftest import VALID_KEY
 
 HANDSHAKE_TEXT = {
     "client_key": VALID_KEY,
+    "protocol": 5,
     "input_mode": "text",
     "output_mode": ["text"],
 }
@@ -75,7 +76,7 @@ def _receive_until(ws, kind: str) -> list[dict]:
 def test_session_with_voice_off_stays_open_in_text(voice_off, client):
     """Voz `off`: la sesión de voz arranca degradada como con los servicios caídos y sigue en texto."""
     with client.websocket_connect("/ws/stream") as ws:
-        ws.send_json({"client_key": VALID_KEY, "input_mode": "audio", "output_mode": ["text", "audio"]})
+        ws.send_json({"client_key": VALID_KEY, "protocol": 5, "input_mode": "audio", "output_mode": ["text", "audio"]})
         *before, ready = _receive_until(ws, "ready")
         assert ready["live_capabilities"]["transcriber"] is False
         assert ready["live_capabilities"]["tts"] is False

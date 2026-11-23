@@ -6,6 +6,19 @@ Guía completa para implementar clientes que se conecten a fogar-gateway. Cubre 
 
 ---
 
+## Versión del protocolo y extensión
+
+Este documento describe la **versión 5** del protocolo. El cliente la declara en el handshake (`protocol`, §1) y el gateway la confirma en `ready` (`protocol`, §2). Un handshake sin `protocol`, o con otra versión, se cierra con **4003** antes de mirar nada más (ni siquiera la credencial); el 4003 no se reintenta solo: hay que actualizar el cliente.
+
+Reglas para que el protocolo crezca sin romper a nadie:
+
+- Un cliente **ignora** los campos y los tipos de mensaje que no conoce.
+- El gateway **ignora** los campos del handshake que no conoce.
+- Lo nuevo se **añade** sin romper lo existente.
+- La versión mayor **solo sube** si se quita algo o cambia lo que algo hace.
+
+---
+
 ## Índice
 
 0. [Descubrir el gateway y emparejarse (o iniciar sesión)](#0-descubrir-el-gateway-y-emparejarse)
@@ -127,6 +140,7 @@ El **primer mensaje** que envíes DEBE ser el handshake. Es el único mensaje si
 ```json
 {
   "client_key": "tu-api-key",
+  "protocol": 5,
   "input_mode": "audio",
   "output_mode": ["audio", "text", "status"],
   "agent": "main"
@@ -136,6 +150,7 @@ El **primer mensaje** que envíes DEBE ser el handshake. Es el único mensaje si
 | Campo | Tipo | Requerido | Descripción |
 |-------|------|-----------|-------------|
 | `client_key` | string | ✓ | Clave del dispositivo: la de un dispositivo **emparejado** (`/pair`, del hogar) o el token de uno **con sesión** (`/auth/login`, personal; 4.0). La web entra igual: ya no hay `admin_token` |
+| `protocol` | int | ✓ | Versión del protocolo que implementa el cliente: `5`. Sin él, o con otra versión, el gateway cierra con 4003 |
 | `capabilities` | string[] | — | Lo que sabe hacer el aparato (`screen`, `mic`, `speaker`…; minúsculas, cifras, `_` y `-`, hasta 32 de hasta 32 caracteres). El gateway las guarda y las enseña; aún no decide nada con ellas. Sin el campo se conservan las que tenía |
 | `input_mode` | `"audio"` \| `"text"` | ✓ | Cómo enviará datos este cliente |
 | `output_mode` | array | ✓ | Qué quiere recibir: `"text"` (mensajes `token`), `"audio"` (frames TTS), `"status"` (mensajes `turn_progress`, §5, y `pipeline_event`, §15). Los `status` de servicios, `error`, `transcription*` y el control de turnos llegan siempre |
@@ -158,6 +173,7 @@ El código es el contrato; el `reason` es un texto en inglés para logs y person
 | Situación | Código WS | `reason` |
 |-----------|-----------|----------|
 | JSON inválido (también un número de más de 4300 cifras, que antes cerraba con 1006; solo con `HANDSHAKE_MAX_BYTES` por encima de ~4300: con el valor por defecto cierra antes con 4002), que no es un objeto, o campos incorrectos (también un `agent` que no es un id de agente válido); sin `client_key`, o unas `capabilities` mal formadas | 4000 | `invalid handshake` |
+| Falta `protocol` o no es `5` (se mira antes que cualquier otro campo; un JSON que no es objeto sigue siendo 4000) | 4003 | `protocol version not supported` |
 | El primer mensaje es binario, no texto | 4001 | `handshake must be a text frame` |
 | El handshake supera `HANDSHAKE_MAX_BYTES` (4096 caracteres) | 4002 | `handshake too large` |
 | No se recibe el handshake JSON en los primeros `HANDSHAKE_TIMEOUT_S` (5s por defecto) | 4900 | `handshake timeout` |
@@ -182,6 +198,7 @@ Si el handshake es válido y todos los servicios críticos responden, el gateway
 ```json
 {
   "type": "ready",
+  "protocol": 5,
   "session_id": "hab_sito:1751289600000",
   "agent": "main",
   "conversation": {"id": "0b9d6c1e-5f3a-4c2e-9d8b-2a7c1e4f6a90", "agent": "main"},
@@ -202,6 +219,7 @@ Si el handshake es válido y todos los servicios críticos responden, el gateway
 
 | Campo | Descripción |
 |-------|-------------|
+| `protocol` | Versión del protocolo que habla el gateway (`5`) |
 | `session_id` | Identificador único de esta sesión (`client_id:timestamp_ms`) |
 | `agent` | Agente OpenClaw activo (el solicitado o el por defecto; el de la conversación) |
 | `conversation` | La conversación de la sesión (§14): `id` (guárdalo para retomarla con `conversation` en el handshake) y `agent`. Nuevo en M19. En una sesión sin conversación elegida puede cambiar a mitad de sesión con el día: mira `turn_start.conversation` |
@@ -760,7 +778,7 @@ El cliente escribe; el gateway sintetiza audio con el texto de la respuesta.
 
 | Tipo | Formato | Cuándo |
 |------|---------|--------|
-| `ready` | `{"type":"ready","session_id":"...","agent":"...","conversation":{"id":"...","agent":"..."},"input_mode":"...","output_mode":[...],"requested_capabilities":{...},"live_capabilities":{...}}` | Tras handshake exitoso; puede ir precedido de `status` |
+| `ready` | `{"type":"ready","protocol":5,"session_id":"...","agent":"...","conversation":{"id":"...","agent":"..."},"input_mode":"...","output_mode":[...],"requested_capabilities":{...},"live_capabilities":{...}}` | Tras handshake exitoso; puede ir precedido de `status` |
 | `turn_start` | `{"type":"turn_start","turn_id":"t-N","turn_seq":N mod 65536,"conversation":"..."\|null,"origin":"user"\|"push"}` | Inicio de cada turno |
 | `token` | `{"type":"token","turn_id":"t-N","text":"..."}` | `"text"` en `output_mode` — tokens en streaming |
 | `turn_end` | `{"type":"turn_end","turn_id":"t-N","reason":"done"\|"error"\|"cancelled"\|"interrupted"\|"replaced"\|"timeout"\|"closed"}` | Fin de cada turno (§5) |
@@ -836,6 +854,7 @@ Los códigos estándar se quedan donde el significado es de transporte y el est�
 | 4000 | `invalid handshake` | JSON inválido, campos incorrectos o sin `client_key` | No, hay que arreglar algo (bug del cliente) |
 | 4001 | `handshake must be a text frame` | El primer mensaje es binario | No, hay que arreglar algo (bug del cliente) |
 | 4002 | `handshake too large` | El handshake supera `HANDSHAKE_MAX_BYTES` | No, hay que arreglar algo (bug del cliente) |
+| 4003 | `protocol version not supported` | El handshake no trae `protocol: 5` | No, hay que arreglar algo: actualiza el cliente a la versión 5 |
 | 4010 | `invalid or inactive credential` | `client_key` no válida, o el cliente está desactivado o retirado | No, hay que arreglar algo: vuelve a emparejar (§0) |
 | 4020 | `agent not permitted` | El agente no está en `allowed_agents` del cliente, en el handshake o, con la sesión abierta, porque el administrador lo quitó (`SESSION_REVALIDATE_INTERVAL_S`; antes recibes el `turn_end` (`closed`) del turno abierto). La clave sigue valiendo | No, hay que arreglar algo: otro agente, o que el administrador lo permita |
 | 4021 | `agent not available` | El agente pedido no existe en OpenClaw | No, hay que arreglar algo: otro agente |

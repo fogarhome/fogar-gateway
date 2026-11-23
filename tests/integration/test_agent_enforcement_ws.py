@@ -31,6 +31,7 @@ def test_ws_allowed_agent_passes(client, db_engine):
         ws.send_json(
             {
                 "client_key": VALID_KEY,
+                "protocol": 5,
                 "input_mode": "text",
                 "output_mode": ["text"],
                 "agent": "a",
@@ -48,6 +49,7 @@ def test_ws_disallowed_agent_closes_4020(client, db_engine):
         ws.send_json(
             {
                 "client_key": VALID_KEY,
+                "protocol": 5,
                 "input_mode": "text",
                 "output_mode": ["text"],
                 "agent": "b",
@@ -64,6 +66,7 @@ def test_ws_agent_not_in_roster_closes_4021(client, db_engine):
         ws.send_json(
             {
                 "client_key": VALID_KEY,
+                "protocol": 5,
                 "input_mode": "text",
                 "output_mode": ["text"],
                 "agent": "nonexistent-agent-xyz",
@@ -84,6 +87,7 @@ def test_ws_default_agent_applied_when_handshake_omits_agent(client, db_engine):
         ws.send_json(
             {
                 "client_key": VALID_KEY,
+                "protocol": 5,
                 "input_mode": "text",
                 "output_mode": ["text"],
                 # no "agent" key
@@ -101,6 +105,7 @@ def test_ws_empty_allowed_denies_everything(client, db_engine):
         ws.send_json(
             {
                 "client_key": VALID_KEY,
+                "protocol": 5,
                 "input_mode": "text",
                 "output_mode": ["text"],
             }

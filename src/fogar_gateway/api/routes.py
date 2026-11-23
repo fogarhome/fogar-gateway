@@ -13,7 +13,7 @@ from fogar_gateway.core.logging import fingerprint_key
 from fogar_gateway.core.network import client_ip_for_log
 from fogar_gateway.core.transport import close_or_abort, drop_slow_client
 from fogar_gateway.models.close_codes import Close, CloseFrame, close_sent, send_close
-from fogar_gateway.models.schemas import Client, ClientConfig, Handshake
+from fogar_gateway.models.schemas import PROTOCOL_VERSION, Client, ClientConfig, Handshake
 from fogar_gateway.services.bridge import FogarBridge
 from fogar_gateway.services.conversations import (
     NEW,
@@ -118,6 +118,15 @@ async def gateway_websocket(websocket: WebSocket):
             await send_close(websocket, Close.HANDSHAKE_TOO_LARGE)
             return
         msg_data = json.loads(raw_msg)
+        # Antes de validar: un cliente de otra versión debe ver 4003, no 4000 por un campo que
+        # esa versión no tenía. `type(...) is int`: `true` no es la versión 5.
+        if isinstance(msg_data, dict):
+            protocol = msg_data.get("protocol")
+            if type(protocol) is not int or protocol != PROTOCOL_VERSION:
+                logger.warning(f"Handshake rechazado: protocol={str(protocol)[:40]!r} != {PROTOCOL_VERSION}.")
+                gateway_stats.handshake_rejected("protocol")
+                await send_close(websocket, Close.PROTOCOL_UNSUPPORTED)
+                return
         handshake = Handshake.model_validate(msg_data)  # JSON que no es objeto → ValidationError (D-r4-1)
     except (ValueError, RecursionError) as e:
         # ValueError cubre JSONDecodeError, ValidationError y el límite de 4300 dígitos de un
@@ -326,6 +335,7 @@ async def gateway_websocket(websocket: WebSocket):
             await sender.send_json(
                 {
                     "type": "ready",
+                    "protocol": PROTOCOL_VERSION,
                     "session_id": session_id,
                     "agent": resolved_agent,
                     "conversation": {"id": conversation.id, "agent": resolved_agent},
