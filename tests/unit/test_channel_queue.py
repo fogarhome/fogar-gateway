@@ -399,9 +399,13 @@ async def test_frames_held_before_the_ack_go_to_the_right_sender(make_bridge):
     await hub.aclose(1.0)
 
 
-async def test_a_lost_connection_ends_the_runs_with_a_stable_error(session, openclaw, hub):
+async def test_a_lost_connection_ends_the_runs_with_a_stable_error(session, openclaw, hub, monkeypatch):
     """Every run of the channel still waiting when OpenClaw drops ends for every session with
-    TURN_ERROR `orchestrator_disconnected`: the open one, and a queued one (its own pair)."""
+    TURN_ERROR `orchestrator_disconnected`: the open one at once, and a queued one (its own
+    pair) once no reconnection proved it still queued within RECONNECT_GRACE_S (2b.2)."""
+    from fogar_gateway.services import channel as channel_module
+
+    monkeypatch.setattr(channel_module, "RECONNECT_GRACE_S", 0.2)
     tv, tv_ws = session("tv")
     mac, mac_ws = session("mac")
     await tv.turns.start_user_turn("hold-a")

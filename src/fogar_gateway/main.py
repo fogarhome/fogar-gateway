@@ -166,6 +166,9 @@ async def _lifespan_body(app: FastAPI):
         return _on_state_change
 
     openclaw.on_state_change = _broadcaster("orchestrator")
+    # 5.0 PR 2b.2: tras una reconexión, cada canal relee los mensajes en cola de OpenClaw
+    # (`chat.history` `pendingInputs`) y confirma o da por perdidos los suyos.
+    openclaw.on_connected = channel_hub.reconnected
 
     # Proveedores de voz singleton (STT_PROVIDER / TTS_PROVIDER), inyectados al bridge.
     stt = build_stt_provider(settings)
@@ -204,6 +207,7 @@ async def _lifespan_body(app: FastAPI):
         # 1. Unhook the state-change broadcasts first (G-68): nothing closing below
         #    may schedule a new notification task.
         openclaw.on_state_change = None
+        openclaw.on_connected = None
         stt.on_state_change = None
         tts.on_state_change = None
         # Every step runs even if the lifespan is cancelled; failures go to DEBUG (#221).

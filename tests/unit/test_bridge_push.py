@@ -262,11 +262,29 @@ async def test_orphan_push_end_emits_nothing(make_push_bridge):
 
 @pytest.mark.parametrize("kind", ["chat", "tool"])
 async def test_push_payload_outside_a_push_turn_is_dropped(make_push_bridge, kind):
-    """#109: nothing leaks outside a turn_start/turn_end envelope."""
-    bridge, _ = make_push_bridge(config=ClientConfig(tool_calls_enabled=True))
+    """#109: nothing leaks outside a turn_start/turn_end envelope. Since 5.0 PR 2b.2 a push's
+    first event opens it (no `agent start` needed), so a payload of a run whose push already
+    ended is what must not leak (nor reopen it), and a terminal `chat` never opens one."""
+    bridge, ws = make_push_bridge(config=ClientConfig(tool_calls_enabled=True))
+    channel = bridge.channel
+    channel.enqueue_push("turn_start", SK, "r1")
+    channel.enqueue_push("turn_end", SK, "r1")
     payload = {"deltaText": "Buenos días!"} if kind == "chat" else _TOOL
-    await push(bridge, (kind, payload))
-    assert await sent(bridge) == []
+    channel.enqueue_push(kind, payload, "r1")  # late, of the ended push's run
+    channel.enqueue_push("chat", {"state": "final", "deltaText": "x"}, "r2")
+    await bridge.push_idle()
+    assert [m["type"] for m in await sent(bridge)] == ["turn_start", "turn_end"]
+
+
+@pytest.mark.parametrize("kind", ["chat", "tool"])
+async def test_a_push_s_first_event_opens_it_inside_its_envelope(make_push_bridge, kind):
+    """5.0 PR 2b.2: a run drained from OpenClaw's queue has no `agent start`; its first event
+    opens the push, always inside a turn_start/turn_end pair (#109)."""
+    bridge, ws = make_push_bridge(config=ClientConfig(tool_calls_enabled=True))
+    payload = {"deltaText": "Buenos días!"} if kind == "chat" else _TOOL
+    await push(bridge, (kind, payload), ("turn_end", SK))
+    types = [m["type"] for m in await sent(bridge)]
+    assert types == ["turn_start", "token" if kind == "chat" else "tool_call", "turn_end"]
 
 
 async def test_push_end_bounds_audio_drain(make_push_bridge, monkeypatch):

@@ -1,7 +1,7 @@
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 
 from fogar_gateway.services.openclaw.client import (
     ORCHESTRATOR_ERROR,
@@ -72,6 +72,9 @@ class ReconnectingOpenClawClient:
         self._closed = False  # G-52: tras close() nada vuelve a lanzar la reconexión
         # Register disconnect callback so the inner client notifies us on unexpected drops.
         self._client.on_disconnect = self._handle_disconnect
+        # 5.0 PR 2b.2: called (synchronously, it must not block) after every successful
+        # connect once wired; main.py hooks the channels' `pendingInputs` re-read to it.
+        self.on_connected: Callable[[], None] | None = None
 
     def get_name(self) -> str:
         return self._name
@@ -81,6 +84,7 @@ class ReconnectingOpenClawClient:
             self.gateway_info = await self._client.connect()
             self._health.mark_connected()
             self._wake.set()  # a loop sleeping in its backoff ends instead of lingering
+            self._notify_connected()
         except Exception as e:  # noqa: BLE001 — frontera: el fallo arranca el reintento
             # Type/stable code only (#228): the text can carry OpenClaw-provided content.
             self._last_error = describe_error(e)
@@ -202,7 +206,7 @@ class ReconnectingOpenClawClient:
                 return  # a direct connect() already recovered the service: nothing to do
             self.gateway_info = await self._client.connect()
 
-        await reconnect_with_backoff(
+        reconnected = await reconnect_with_backoff(
             attempt,
             self._health,
             initial_backoff=self._initial_backoff,
@@ -211,3 +215,15 @@ class ReconnectingOpenClawClient:
             label=self._name,
             wake=self._wake,
         )
+        if reconnected:
+            self._notify_connected()
+
+    def _notify_connected(self) -> None:
+        hook = self.on_connected
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception as e:  # noqa: BLE001 — frontera: hook externo; la conexión ya está hecha
+            logger.warning("[%s] on_connected hook failed (%s)", self._name, describe_error(e))
+            logger.debug("[%s] on_connected: %s", self._name, traceback_no_message(e))

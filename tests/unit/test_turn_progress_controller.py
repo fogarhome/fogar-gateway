@@ -202,10 +202,32 @@ def _status(run_id, phase):
     return {"sessionKey": SK, "runId": run_id, "state": "status", "phase": phase}
 
 
+async def test_phases_before_agent_start_open_the_push(make_bridge, interval):
+    """5.0 PR 2b.2: a push opens on its run's first event (a run drained from OpenClaw's queue
+    never gets `agent start`): its startup phases open it and go out in order; the later
+    `start` opens nothing more (#84)."""
+    interval(0)
+    bridge, _ = make_bridge(client_id="hab_sito", output_mode=WITH_PROGRESS)
+    channel = bridge.channel
+    channel.enqueue_push("chat", _status("r1", "preparing_workspace"), "r1")
+    channel.enqueue_push("chat", _status("r1", "starting_model"), "r1")
+    channel.enqueue_push("turn_start", SK, "r1")
+    channel.enqueue_push("chat", {"sessionKey": SK, "runId": "r1", "deltaText": "hola"}, "r1")
+    channel.enqueue_push("turn_end", SK, "r1")
+    await bridge.push_idle()
+    msgs = await sent(bridge)
+    assert kinds(msgs) == ["turn_start", "turn_progress", "turn_progress", "token", "turn_end"]
+    assert progress(msgs) == [("preparing", None), ("thinking", None)]
+
+
 async def _push_with_early_phases(bridge, run_id="r1"):
+    """The phases of `run_id` arrive while another push (`r0`) is open: they wait (#254) for
+    `run_id`'s own push, which opens once `r0` ends."""
     turns_ = bridge.channel  # 5.0: the push (and its early phases) is the channel's
+    turns_.enqueue_push("turn_start", SK, "r0")
     turns_.enqueue_push("chat", _status(run_id, "preparing_workspace"), run_id)
     turns_.enqueue_push("chat", _status(run_id, "starting_model"), run_id)
+    turns_.enqueue_push("turn_end", SK, "r0")
     turns_.enqueue_push("turn_start", SK, run_id)
     turns_.enqueue_push("chat", {"sessionKey": SK, "runId": run_id, "deltaText": "hola"}, run_id)
     turns_.enqueue_push("turn_end", SK, run_id)
@@ -217,7 +239,7 @@ async def test_the_last_early_phase_of_a_push_goes_out_when_it_opens(make_bridge
     bridge, _ = make_bridge(client_id="hab_sito", output_mode=WITH_PROGRESS)
     await _push_with_early_phases(bridge)
     msgs = await sent(bridge)
-    assert kinds(msgs) == ["turn_start", "turn_progress", "token", "turn_end"]
+    assert kinds(msgs) == ["turn_start", "turn_end", "turn_start", "turn_progress", "token", "turn_end"]
     assert progress(msgs) == [("thinking", None)]
 
 

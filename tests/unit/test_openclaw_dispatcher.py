@@ -910,8 +910,8 @@ def _agent_stream(stream, phase, run_id="r1", sk=SK):
         ("tool", "start"),
         ("tool", "result"),
         ("assistant", "end"),
-        ("run_status", "preparing_workspace"),
         ("thinking", "error"),
+        ("error", "seq gap"),
     ],
 )
 async def test_only_the_lifecycle_stream_opens_or_ends_a_push(stream, phase):
@@ -923,6 +923,18 @@ async def test_only_the_lifecycle_stream_opens_or_ends_a_push(stream, phase):
     client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     await dispatcher.dispatch(_agent_stream(stream, phase))
     bridge.enqueue_push.assert_not_called()
+
+
+async def test_a_run_status_or_a_model_phase_opens_a_push():
+    """5.0 PR 2b.2: a run drained from OpenClaw's queue gets no lifecycle `start`; its first
+    event (here a `run_status`, or a lifecycle `model`) opens the push (`open`: unlike `start`,
+    it never reopens a push its run already closed)."""
+    dispatcher, _, client_reg = make_dispatcher()
+    bridge = MagicMock()
+    client_reg.register("client-a", bridge, keyed_conversation("client-a"))
+    await dispatcher.dispatch(_agent_stream("run_status", "queued"))
+    await dispatcher.dispatch(_agent_stream("lifecycle", "model"))
+    assert [c.args for c in bridge.enqueue_push.call_args_list] == [("open", SK), ("open", SK)]
 
 
 @pytest.mark.parametrize(
@@ -968,3 +980,18 @@ async def test_session_message_is_known_not_drift_and_reaches_nobody(caplog):
     drift = [r.getMessage() for r in caplog.records if "unhandled" in r.getMessage()]
     assert drift == ["unhandled OpenClaw event 'brand.new' (first occurrence; further ones are "
                      "logged at DEBUG) — possible protocol drift, see docs/openclaw-protocol.md"]
+
+
+async def test_a_user_session_message_goes_to_its_channel(caplog):
+    """5.0 PR 2b.2: a `user` `session.message` goes to its key's channel
+    (`take_session_message`), never as a push and never logged; other roles go nowhere."""
+    dispatcher, _, client_reg = make_dispatcher()
+    channel = MagicMock()
+    client_reg.register("client-a", channel, keyed_conversation("client-a"))
+    secret = {"role": "user", "content": "SECRETO", "idempotencyKey": "run-b:user"}
+    payload = {"sessionKey": "agent:main:client-a", "message": secret, "messageId": "m-1"}
+    with caplog.at_level(logging.DEBUG):
+        await dispatcher.dispatch({"type": "event", "event": "session.message", "payload": payload})
+    channel.take_session_message.assert_called_once_with(payload)
+    assert not channel.enqueue_push.called
+    assert "SECRETO" not in caplog.text

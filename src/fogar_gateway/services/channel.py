@@ -49,8 +49,15 @@ and since 5.0 PR 2b it uses OpenClaw's own queue (`messages.queue`; docs/opencla
   lifecycle `start`/`model`/`fallback_step` or `run_status`), not only on `start`, which a run
   drained from the queue never gets; it ends on its terminal `chat` (`final`, keeping the
   streamed text when the `final` carries no `message`; `aborted`; `error`, classified #397).
+- Steer (2b.2): a `user` `session.message` (`take_session_message`) links OpenClaw's message id
+  to its `chat.send` run (`idempotencyKey` `"<runId>:user"`); a copy marked
+  `steerTargetRunId` makes that run `absorbed`: its message `delivered`, no turn of its own.
+  A run that never opened ends exactly as decision 4 says (`_run_terminal`).
+- Reconnect (2b.2): a queued run without a turn survives a drop `unconfirmed` until the
+  reconnection re-reads `pendingInputs` (`reconcile_pending`) or `RECONNECT_GRACE_S` passes.
 - Origin before the ack (decision 3): while a `chat.send` waits for its ack, frames of a run
   nobody knows yet are held; the ack says whose they are, and what is still nobody's is a push.
+  A push opens on its run's first event too (`push_route`), not only on lifecycle `start`.
 - One turn open at a time: a run whose first event arrives while another turn is open waits
   (its frames deferred, in order) until that turn ends; so does a push opening while a user
   turn is open.
@@ -84,6 +91,7 @@ from uuid import uuid4
 from fogar_gateway.core.config import settings
 from fogar_gateway.services import orchestration
 from fogar_gateway.services.openclaw.chat_text import ChatTextTracker, extract_message_text
+from fogar_gateway.services.openclaw.dispatcher import push_route
 from fogar_gateway.services.openclaw.failures import classify_failure, fallback_reason
 from fogar_gateway.services.openclaw.models import ToolCallEvent
 from fogar_gateway.services.openclaw.registry import TurnRegistry
@@ -109,9 +117,21 @@ _EARLY_PHASE_TTL_S = 30.0
 # `final`) siguen siendo suyos y se descartan, nunca llegan como push.
 _DONE_RUNS = 64
 _TERMINAL_CHAT = ("final", "aborted", "error")
+# Pushes cerrados por su lifecycle `end`/`error`, recordados: un evento tardío de su run (un
+# `run_status`, una fase) no abre otro push; solo un lifecycle `start` nuevo (#84).
+_ENDED_PUSH_RUNS = 64
+# `session.message` de usuario vistos: id de OpenClaw (`oc_message_id`) → runId de su
+# `chat.send`. La marca de `steer` llega en una copia repetida que puede no traer el enlace.
+_OC_MESSAGES = 64
+# Tras una caída de OpenClaw, lo que un run en cola (sin turno) espera a que la reconexión
+# relea `pendingInputs` y diga si sigue en la cola; si no llega a tiempo, falla
+# (`orchestrator_disconnected`), como un run en marcha.
+RECONNECT_GRACE_S = 15.0
+_DISCONNECTED = "orchestrator_disconnected"
 
 MessageState = Literal["pending", "delivered", "withdrawn"]
-RunState = Literal["queued", "running", "done"]
+# `absorbed`: OpenClaw (`steer`) metió su mensaje en el run activo; no tendrá turno propio.
+RunState = Literal["queued", "running", "absorbed", "done"]
 
 
 def _as_dict(value: object) -> dict:
@@ -128,6 +148,48 @@ def _final_has_text(payload: dict) -> bool:
     return (isinstance(delta, str) and bool(delta)) or bool(
         extract_message_text(payload.get("message"))
     )
+
+
+def _lifecycle_error(event: str, payload: dict) -> bool:
+    return (
+        event == "agent"
+        and payload.get("stream") in (None, "lifecycle")
+        and _as_dict(payload.get("data")).get("phase") == "error"
+    )
+
+
+def _run_of_idempotency(value: object) -> str | None:
+    """`"<runId>:user"` (the `idempotencyKey` of a `chat.send`'s user message) → runId."""
+    if isinstance(value, str) and value.endswith(":user") and len(value) > len(":user"):
+        return value[: -len(":user")]
+    return None
+
+
+def pending_run_ids(history: object) -> set[str] | None:
+    """The runIds `chat.history` says are still waiting or running on the key: every
+    `pendingInputs.items[]` in `state:"queued"` (its `runId` is the `chat.send`'s) and the
+    `inFlightRun`. None when the answer has no readable `pendingInputs` (the shape was seen
+    live once, 2026.11.7; read defensively): then nothing is proven."""
+    if not isinstance(history, dict):
+        return None
+    pending = history.get("pendingInputs")
+    items = pending.get("items") if isinstance(pending, dict) else None
+    if not isinstance(items, list):
+        return None
+    ids: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        state = item.get("state")
+        queued = state == "queued" or (state is None and item.get("queued") is True)
+        run_id = item.get("runId")
+        if queued and isinstance(run_id, str) and run_id:
+            ids.add(run_id)
+    in_flight = history.get("inFlightRun")
+    run_id = in_flight.get("runId") if isinstance(in_flight, dict) else in_flight
+    if isinstance(run_id, str) and run_id:
+        ids.add(run_id)
+    return ids
 
 
 def _opens_run(event: str, payload: dict) -> bool:
@@ -343,6 +405,9 @@ class RunInfo:
     progress_at: float = field(default_factory=time.monotonic)
     fallback_reason: str | None = None  # the last `fallback_step` failure reason (#397)
     tokens: int = 0
+    absorbed_into: str | None = None  # `absorbed`: the run `steer` folded it into
+    # Tras una caída de OpenClaw, en cola sin confirmar: espera a `pendingInputs` (2b.2).
+    unconfirmed: bool = False
     chat_text: ChatTextTracker = field(default_factory=ChatTextTracker, repr=False)
     recorder: _SenderTracker | None = field(default=None, repr=False)
     # Decision 5: only a weak reference to the sender; the live session is resolved on use.
@@ -400,6 +465,12 @@ class ConversationChannel:
         self._defer_push = False
         self._replaying = False
         self._push: ChannelTurn | None = None
+        self._ended_push_runs: OrderedDict[str, None] = OrderedDict()
+        # `session.message` (2b.2): oc_message_id → runId de su `chat.send`.
+        self._oc_messages: OrderedDict[str, str] = OrderedDict()
+        # Tras una caída: hasta cuándo esperan los runs sin confirmar, y con qué código fallan.
+        self._lost_deadline: float | None = None
+        self._lost_code = _DISCONNECTED
         self._push_text = ChatTextTracker()  # #241: texto ya emitido en la respuesta del push
         # #254: runId → (última fase de arranque, cuándo) de runs sin push abierto todavía.
         self._early_phases: OrderedDict[str, tuple[ProgressPhase, float]] = OrderedDict()
@@ -579,6 +650,7 @@ class ConversationChannel:
                     subscription, "on_turn_end",
                     partial(subscription.subscriber.on_turn_end, turn, reason),
                 )
+        self._settle_absorbed(turn.run_id)
         self._touch_head()
         self._replay()
         return True
@@ -836,6 +908,14 @@ class ConversationChannel:
             self._enqueue(("run", (event, payload), run_id))
             return True
         if hold and self._acks > 0:
+            push = self._push
+            if push is not None and not push.ended:
+                # El push abierto no es de nadie que espere su ack: sus frames no se retienen
+                # (retenidos, su tope #286 vencería sin que le faltara progreso; 2b.2).
+                if push.run_id == run_id:
+                    return False
+                if push.run_id is None:
+                    push.progress_at = time.monotonic()
             if len(self._held) >= settings.TURN_QUEUE_MAX:
                 logger.warning(f"[{self._tag}] demasiados frames retenidos: se descarta uno")
             else:
@@ -849,7 +929,12 @@ class ConversationChannel:
         held, self._held = self._held, []
         for event, payload in held:
             run_id = _str_run_id(payload)
-            if run_id is not None and (run_id in self._runs or run_id in self._done_runs):
+            if event == "session.message":
+                if self._acks > 0:
+                    self._held.append((event, payload))
+                else:
+                    self._enqueue(("smsg", payload, None))
+            elif run_id is not None and (run_id in self._runs or run_id in self._done_runs):
                 self._enqueue(("run", (event, payload), run_id))
             elif self._acks > 0:
                 self._held.append((event, payload))
@@ -858,29 +943,28 @@ class ConversationChannel:
 
     def _forward_push(self, event: str, payload: dict) -> None:
         """Un frame que resultó no ser de un run propio: lo que el dispatcher habría hecho con
-        él como push (solo el lifecycle abre o cierra un push), con sus mismos filtros
-        (`TurnRegistry.blocks_push`: #112, #130 S3b). Un push abierto así cuenta su tope
-        (#286) desde ahora, no desde que llegó retenido."""
-        run_id = _str_run_id(payload)
-        data = _as_dict(payload.get("data"))
-        kind: str | None = None
-        arg: Any = None
-        if event == "chat":
-            kind, arg = "chat", payload
-        elif event == "session.tool":
-            if data.get("phase") in ("start", "result"):
-                kind, arg = "tool", data
-        elif event == "agent" and payload.get("stream") in (None, "lifecycle"):
-            phase = data.get("phase")
-            if phase == "fallback_step":
-                kind, arg = "fallback", data
-            elif phase in ("start", "end"):
-                kind, arg = ("turn_start" if phase == "start" else "turn_end"), self.session_key
-            elif phase == "error":
-                kind, arg = "turn_error", data
-        if kind is None or self._turn_registry.blocks_push(self.session_key, kind):
+        él como push (`push_route`), con sus mismos filtros (`TurnRegistry.blocks_push`: #112,
+        #130 S3b). Un push abierto así cuenta su tope (#286) desde ahora, no desde que llegó
+        retenido."""
+        route = push_route(event, payload)
+        if route is None:
             return
-        self.enqueue_push(kind, arg, run_id)
+        kind, arg = route
+        if self._turn_registry.blocks_push(self.session_key, kind):
+            return
+        self.enqueue_push(kind, arg, _str_run_id(payload))
+
+    def take_session_message(self, payload: dict) -> None:
+        """A `user` `session.message` of this key (2b.2), from the dispatcher: to the worker,
+        in order with the runs' frames (a steered run's empty `final` comes after it). It
+        carries user text: never logged."""
+        if self._closed:
+            return
+        if self._acks > 0 and len(self._held) < settings.TURN_QUEUE_MAX:
+            # Puede ser del `chat.send` cuyo ack aún no llegó: espera con lo retenido, en orden.
+            self._held.append(("session.message", payload))
+            return
+        self._enqueue(("smsg", payload, None))
 
     def fail_run(self, run_id: str, code: str, *, crashed: bool = False) -> None:
         """One of the channel's runs failed outside OpenClaw's frames (a stable `code`): its
@@ -889,18 +973,46 @@ class ConversationChannel:
         self._enqueue(("fail", (code, crashed), run_id))
 
     def connection_lost(self, code: str) -> None:
-        """The OpenClaw connection dropped: every run of this channel still unfinished ends
-        with `code` (`orchestrator_disconnected`)."""
+        """The OpenClaw connection dropped: every run of this channel with its turn open (or
+        frames already waiting) ends with `code` (`orchestrator_disconnected`); one still in
+        OpenClaw's queue waits, unconfirmed, for the reconnection to say whether it is still
+        there (`reconcile_pending`), at most `RECONNECT_GRACE_S`."""
         if self._runs or self._held:
             self._enqueue(("lost", code, None))
+
+    @property
+    def needs_reconcile(self) -> bool:
+        """After a reconnection: whether to re-read `pendingInputs` (someone is attached, or
+        runs wait unconfirmed)."""
+        return not self._closed and (
+            bool(self._subscriptions) or any(i.unconfirmed for i in self._runs.values())
+        )
+
+    async def reconcile_pending(self) -> None:
+        """OpenClaw is back (`ReconnectingOpenClawClient.on_connected`): re-read the key's
+        `chat.history` `pendingInputs` (a read method) and keep pending the unconfirmed runs it
+        still lists; the rest end with `orchestrator_disconnected`. Unreadable: nothing is
+        proven, they all end. Only ids and counts are logged."""
+        if self._closed:
+            return
+        alive: set[str] | None
+        try:
+            history = await self.orchestrator.request(
+                "chat.history", {"sessionKey": self.session_key, "limit": 1}
+            )
+            alive = pending_run_ids(history)
+        except Exception as e:  # noqa: BLE001 — frontera: sin lectura, nada demuestra que siga en cola
+            logger.warning(f"[{self._tag}] pendingInputs tras reconectar: {describe_error(e)}")
+            alive = None
+        self._enqueue(("reconcile", alive, None))
 
     # -- the worker --------------------------------------------------------------------
 
     def enqueue_push(self, kind: str, arg: Any, run_id: str | None = None) -> None:
         """Encola un evento de push para el worker (#130 S3a). Síncrono, nunca bloquea: lo
-        llama el bucle de OpenClaw vía FrameDispatcher. `kind`: "turn_start" | "chat" |
-        "tool" | "fallback" | "turn_end" | "turn_error"; `arg`: la session_key (turn_start,
-        turn_end), el payload (chat/tool) o el `data` del `agent` (fallback/turn_error, #397);
+        llama el bucle de OpenClaw vía FrameDispatcher. `kind`: "turn_start" | "open" |
+        "chat" | "tool" | "fallback" | "turn_end" | "turn_error" (`push_route`); `arg`: la
+        session_key (turn_start, open, turn_end), el payload (chat/tool) o el `data` del `agent` (fallback/turn_error, #397);
         `run_id`: el runId del evento, si lo trae. No hace nada una vez cerrado el canal."""
         self._enqueue((kind, arg, run_id))
 
@@ -979,6 +1091,10 @@ class ConversationChannel:
             self._run_fail(run_id, arg[0], arg[1])
         elif kind == "lost":
             self._lost(arg)
+        elif kind == "smsg":
+            self._session_message(arg)
+        elif kind == "reconcile":
+            self._reconcile(arg)
         else:
             self._push_item(kind, arg, run_id)
 
@@ -993,13 +1109,28 @@ class ConversationChannel:
                 return True  # detrás de lo suyo que ya espera
             if info.turn is not None or self.current_turn is None:
                 return False
-            return kind == "fail" or _opens_run(arg[0], arg[1])
-        if kind == "lost":
+            if info.state == "absorbed":
+                return False  # no abrirá turno: su `final` vacío solo lo da por terminado
+            if kind == "fail":
+                return True
+            event, payload = arg
+            return _opens_run(event, payload) or _lifecycle_error(event, payload)
+        if kind in ("lost", "smsg", "reconcile"):
             return False
         if self._defer_push:
             return True
         current = self.current_turn
-        return kind == "turn_start" and current is not None and current.origin == "user"
+        return current is not None and current.origin == "user" and self._push_opens(kind, arg, run_id)
+
+    def _push_opens(self, kind: str, arg: Any, run_id: str | None) -> bool:
+        """Este evento de push abriría un push (no hay ninguno abierto): su primer evento."""
+        if kind == "turn_start":
+            return True
+        if run_id is not None and run_id in self._ended_push_runs:
+            return False
+        if kind in ("open", "tool", "fallback"):
+            return True
+        return kind == "chat" and _as_dict(arg).get("state") not in _TERMINAL_CHAT
 
     def _defer(self, item: tuple[str, Any, str | None]) -> None:
         if len(self._deferred) >= settings.TURN_QUEUE_MAX:
@@ -1050,7 +1181,8 @@ class ConversationChannel:
         """Sin turno abierto, el primer run propio que aún no abrió el suyo (el siguiente)."""
         if self.current_turn is not None:
             return None
-        return next((i for i in self._runs.values() if i.turn is None), None)
+        # Uno absorbido (`steer`) nunca tendrá turno propio: no es el siguiente.
+        return next((i for i in self._runs.values() if i.turn is None and i.state == "queued"), None)
 
     def _active_run(self) -> RunInfo | None:
         """El run cuyo tope de TURN_TIMEOUT_S corre: el del turno abierto, o el siguiente."""
@@ -1059,7 +1191,9 @@ class ConversationChannel:
             if turn.origin != "user" or turn.run_id is None:
                 return None
             return self._runs.get(turn.run_id)
-        return self._head()
+        head = self._head()
+        # Uno sin confirmar tras una caída espera a la reconexión (RECONNECT_GRACE_S), no a su tope.
+        return None if head is None or head.unconfirmed else head
 
     def _touch_head(self) -> None:
         """Nada va delante del siguiente run: su tope empieza ahora."""
@@ -1074,6 +1208,7 @@ class ConversationChannel:
             logger.debug(f"[{self._tag}] frame de un run terminado descartado")
             return
         info.progress_at = time.monotonic()
+        info.unconfirmed = False  # un frame suyo demuestra que sigue vivo
         if event == "chat":
             state = payload.get("state")
             if state in _TERMINAL_CHAT:
@@ -1093,10 +1228,17 @@ class ConversationChannel:
                 self.emit(self._open_run(info), ChannelToolCall(tool_call))
         elif event == "agent":
             data = _as_dict(payload.get("data"))
+            if payload.get("stream") == "error" and data.get("reason") == "seq gap":
+                # 2026.11.7: el aviso de OpenClaw en lugar del `start` de un run sacado de la
+                # cola. No es un fallo: no abre nada.
+                logger.debug(f"[{self._tag}] run {run_id}: aviso seq gap")
+                return
             if payload.get("stream") in (None, "lifecycle") and data.get("phase") == "fallback_step":
                 # #397: la razón del fallo de su run, para clasificar su error después.
                 info.fallback_reason = fallback_reason(data, info.fallback_reason)
-            if _opens_run(event, payload):
+            if _lifecycle_error(event, payload):
+                self._run_lifecycle_error(info, data)
+            elif _opens_run(event, payload):
                 self._open_run(info)
 
     def _open_run(self, info: RunInfo) -> ChannelTurn:
@@ -1132,7 +1274,13 @@ class ConversationChannel:
 
     def _run_terminal(self, info: RunInfo, state: str, payload: dict) -> None:
         """El `chat` terminal del run: `final` (con la cola de texto que falte; sin `message`,
-        el texto ya llegó en los deltas), `aborted` o `error` (#300, #397)."""
+        el texto ya llegó en los deltas), `aborted` o `error` (#300, #397).
+
+        Uno que nunca abrió su turno (decisión 4 de la 2b): un `final` sin texto (absorbido por
+        `steer`, o vacío) no abre nada y su mensaje queda `delivered`; un `final` con texto
+        (p. ej. la respuesta de un comando `/queue …`) abre, emite su texto y cierra en el
+        acto; `aborted` no abre nada (si era un pendiente, `withdrawn`); `error` abre y cierra
+        con su TURN_ERROR, para que un pendiente que falla no desaparezca en silencio."""
         if info.turn is None:
             if state == "final":
                 text = info.chat_text.feed(payload)
@@ -1151,6 +1299,10 @@ class ConversationChannel:
                     self._announce(info, "withdrawn")
                 self._finish(info)
                 return
+            if info.state == "absorbed":
+                # Su mensaje ya llegó dentro de otro turno: nada que abrir.
+                self._finish(info)
+                return
             turn = self._open_run(info)
             self._run_error(info, turn, classify_failure(payload, fallback_reason=info.fallback_reason))
             return
@@ -1164,6 +1316,19 @@ class ConversationChannel:
             self._end_run(info, "cancelled")  # lo abortó otro (no el gateway: lápida)
         else:
             self._run_error(info, turn, classify_failure(payload, fallback_reason=info.fallback_reason))
+
+    def _run_lifecycle_error(self, info: RunInfo, data: dict) -> None:
+        """`agent` lifecycle `error` de un run propio (#300). Con su turno abierto, su `chat`
+        `error` llega detrás y lo cierra (con `errorKind`). Uno que nunca abrió su turno
+        (decisión 4) lo abre y lo cierra ya con su TURN_ERROR; su `chat` `error` tardío se
+        descarta (run terminado)."""
+        if info.turn is not None:
+            return
+        if info.state == "absorbed":
+            self._finish(info)
+            return
+        turn = self._open_run(info)
+        self._run_error(info, turn, classify_failure(data, fallback_reason=info.fallback_reason))
 
     def _run_error(
         self, info: RunInfo, turn: ChannelTurn, code: str, *, crashed: bool = False
@@ -1209,14 +1374,70 @@ class ConversationChannel:
         self._run_error(info, self._open_run(info), code, crashed=crashed)
 
     def _lost(self, code: str) -> None:
+        """La conexión con OpenClaw cayó. Un run con su turno abierto (o con frames ya en
+        espera de turno) falla ya con `code`: lo que traía se perdió. Uno absorbido ya entregó
+        su mensaje: termina sin más. Uno aún en la cola de OpenClaw (sin turno) queda sin
+        confirmar hasta que la reconexión relea `pendingInputs` (`_reconcile`), como mucho
+        RECONNECT_GRACE_S; entonces falla si no sigue en la cola."""
         self._held.clear()
-        for info in list(self._runs.values()):
+        runs = list(self._runs.values())
+        failing = [i for i in runs if i.turn is not None or i.run_id in self._deferred_runs]
+        waiting = [i for i in runs if i not in failing and i.state == "queued"]
+        for info in runs:
+            if info.state == "absorbed" and info not in failing:
+                self._finish(info)
+        for info in waiting:
+            info.unconfirmed = True
+        if waiting:
+            self._lost_code = code
+            if self._lost_deadline is None:
+                self._lost_deadline = time.monotonic() + RECONNECT_GRACE_S
+            logger.info(
+                f"[{self._tag}] OpenClaw caído: {len(waiting)} mensaje(s) en cola sin confirmar"
+            )
+        for info in failing:
             self._handle(("fail", (code, False), info.run_id))
+
+    def _reconcile(self, alive: set[str] | None) -> None:
+        """Tras reconectar (`reconcile_pending`): los runs sin confirmar que `pendingInputs`
+        (o `inFlightRun`) aún lista siguen pendientes; los demás fallan con el código de la
+        caída. `alive` None: la lectura no demostró nada, fallan todos."""
+        unconfirmed = [i for i in self._runs.values() if i.unconfirmed]
+        if not unconfirmed:
+            logger.debug(f"[{self._tag}] pendingInputs releído: nada sin confirmar")
+            return
+        now = time.monotonic()
+        kept = 0
+        for info in unconfirmed:
+            if alive is not None and info.run_id in alive:
+                info.unconfirmed = False
+                info.progress_at = now
+                kept += 1
+        logger.info(
+            f"[{self._tag}] pendingInputs tras reconectar: {kept} sigue(n) en cola, "
+            f"{len(unconfirmed) - kept} falla(n)"
+        )
+        self._fail_unconfirmed()
+        self._touch_head()
+
+    def _fail_unconfirmed(self) -> None:
+        """Los runs aún sin confirmar fallan, cada uno con su par y su TURN_ERROR."""
+        self._lost_deadline = None
+        for info in [i for i in self._runs.values() if i.unconfirmed]:
+            info.unconfirmed = False
+            self._handle(("fail", (self._lost_code, False), info.run_id))
 
     def _on_timeouts(self) -> None:
         left = self._push_budget_left()
         if left is not None and left <= 0:
             self._push_timed_out()
+        deadline = self._lost_deadline
+        if deadline is not None and deadline <= time.monotonic():
+            logger.warning(
+                f"[{self._tag}] sin reconexión en RECONNECT_GRACE_S={RECONNECT_GRACE_S}s: "
+                "fallan los mensajes en cola sin confirmar"
+            )
+            self._fail_unconfirmed()
         info = self._active_run()
         if info is not None and info.progress_at + settings.TURN_TIMEOUT_S <= time.monotonic():
             self._run_timed_out(info)
@@ -1230,6 +1451,8 @@ class ConversationChannel:
         info = self._active_run()
         if info is not None:
             budgets.append(info.progress_at + settings.TURN_TIMEOUT_S - time.monotonic())
+        if self._lost_deadline is not None:
+            budgets.append(self._lost_deadline - time.monotonic())
         return min(budgets) if budgets else None
 
     def _run_timed_out(self, info: RunInfo) -> None:
@@ -1246,6 +1469,67 @@ class ConversationChannel:
             self._run_error(info, self._open_run(info), "turn_timeout")
         self._spawn_abort(info.run_id)
 
+    # -- session.message: steered messages (2b.2) --------------------------------------
+
+    def _session_message(self, payload: dict) -> None:
+        """A `user` `session.message`. Copies of one message share OpenClaw's `messageId`
+        (`oc_message_id`) and are not discarded as duplicates: each updates what is known of
+        it. The link to its `chat.send` (`idempotencyKey` `"<runId>:user"`) may come on one
+        copy and `steer`'s mark (`__openclaw.steerTargetRunId`, the run that absorbed it) on
+        another, so the link is remembered by `oc_message_id`. A mark naming another run
+        makes the message's run `absorbed` (`_absorb`). Text never read, never logged."""
+        message = _as_dict(payload.get("message"))
+        meta = _as_dict(message.get("__openclaw"))
+        oc_message_id = payload.get("messageId", meta.get("id"))
+        run_id = (
+            _run_of_idempotency(message.get("idempotencyKey"))
+            or _run_of_idempotency(meta.get("idempotencyKey"))
+            or _run_of_idempotency(payload.get("idempotencyKey"))
+        )
+        if isinstance(oc_message_id, str) and oc_message_id:
+            known = self._oc_messages
+            if run_id is not None:
+                known.pop(oc_message_id, None)
+                known[oc_message_id] = run_id
+                while len(known) > _OC_MESSAGES:
+                    known.popitem(last=False)
+            else:
+                run_id = known.get(oc_message_id)
+        target = meta.get("steerTargetRunId")
+        if run_id is None or not isinstance(target, str) or not target or target == run_id:
+            return
+        info = self._runs.get(run_id)
+        if info is not None:
+            self._absorb(info, target)
+
+    def _absorb(self, info: RunInfo, target: str) -> None:
+        """`steer` folded this message into run `target`: it is `delivered` for everyone (once)
+        and will never open a turn of its own; its answer goes on inside `target`'s turn,
+        whose sender (and audio) does not change. Its empty `final` only ends it."""
+        if info.turn is not None or info.state != "queued":
+            return  # ya con turno propio, o ya absorbido/terminado
+        info.state = "absorbed"
+        info.absorbed_into = target
+        info.unconfirmed = False
+        logger.debug(f"[{self._tag}] run {info.run_id} absorbido (steer) por {target}")
+        if info.message == "pending":
+            self._announce(info, "delivered")
+        if self.current_turn is None or self.current_turn.run_id != target:
+            # El run que lo absorbió ya no está abierto aquí: nada más que esperar de él.
+            self._settle_absorbed(None)
+        self._touch_head()
+
+    def _settle_absorbed(self, ended_run: str | None) -> None:
+        """Al terminar un turno, los runs absorbidos por él (o por uno que ya no es de nadie
+        aquí) terminan: su `final` vacío ya no hace falta."""
+        for info in list(self._runs.values()):
+            if info.state != "absorbed":
+                continue
+            target = info.absorbed_into
+            open_target = self.current_turn is not None and self.current_turn.run_id == target
+            if target == ended_run or (target not in self._runs and not open_target):
+                self._finish(info)
+
     # -- push --------------------------------------------------------------------------
 
     def _push_item(self, kind: str, arg: Any, run_id: str | None) -> None:
@@ -1254,10 +1538,12 @@ class ConversationChannel:
             logger.debug(f"[{self._tag}] push {kind} de un run abortado descartado")
         elif kind == "turn_start":
             self._push_start(run_id)
+        elif kind == "open":
+            self._push_open(run_id)
         elif kind == "chat":
-            self._push_chat(arg)
+            self._push_chat(arg, run_id)
         elif kind == "tool":
-            self._push_tool(arg)
+            self._push_tool(arg, run_id)
         elif kind == "fallback":
             self._push_fallback(arg, run_id)
         elif kind == "turn_end":
@@ -1291,7 +1577,36 @@ class ConversationChannel:
             if s.subscriber.wants_push and s.subscriber.agent_allowed(key)
         ]
 
+    def _open_push(self, run_id: str | None) -> ChannelTurn | None:
+        """El push abierto, o uno nuevo abierto con este primer evento de su run (2b.2: no
+        solo con lifecycle `start`, que un run sacado de la cola no trae). None si no se abre:
+        su run ya cerró su push (solo un `start` nuevo lo reabre, #84), un turno de /v1 tiene
+        la clave (#112), o el agente no está permitido."""
+        push = self._push
+        if push is not None and not push.ended:
+            return push
+        if run_id is not None and run_id in self._ended_push_runs:
+            logger.debug(f"[{self._tag}] evento tardío de un push ya cerrado: descartado")
+            return None
+        if self._turn_registry.get_queue_by_session(self.session_key) is not None:
+            logger.debug(f"[{self._tag}] push no abierto: un turno de /v1 tiene la clave (#112)")
+            return None
+        self._push_start(run_id)
+        push = self._push
+        return push if push is not None and not push.ended else None
+
+    def _push_open(self, run_id: str | None) -> None:
+        """`run_status` o lifecycle `model`: abre el push de su run si no hay uno abierto; si
+        lo hay, solo cuenta como progreso (#84, #286)."""
+        push = self._push
+        if push is not None and not push.ended:
+            push.progress_at = time.monotonic()
+            return
+        self._open_push(run_id)
+
     def _push_start(self, run_id: str | None = None) -> None:
+        if run_id is not None:
+            self._ended_push_runs.pop(run_id, None)  # un `start` nuevo de su run lo reabre (#84)
         key = self.session_key
         subscribers = [s.subscriber for s in self._subscriptions]
         if subscribers and not any(s.agent_allowed(key) for s in subscribers):
@@ -1325,19 +1640,24 @@ class ConversationChannel:
         if early is not None:  # #254: la fase que su run contó antes de abrirse
             self.emit(turn, ChannelProgress(Progress(early)))
 
-    def _push_chat(self, payload: dict) -> None:
+    def _push_chat(self, payload: dict, run_id: str | None = None) -> None:
         push = self._push
         phase = chat_status_phase(payload)
-        run_id = payload.get("runId")
-        if phase is not None and (
-            push is None or push.ended or _other_run(push.run_id, run_id)
-        ):
-            # #254: fase de arranque de un run cuyo push aún no se abrió (llega antes de su
-            # `agent start`): se guarda para cuando se abra.
+        run_id = run_id if run_id is not None else _str_run_id(payload)
+        if phase is not None and push is not None and not push.ended and _other_run(push.run_id, run_id):
+            # #254: fase de arranque de otro run con un push abierto: se guarda para cuando
+            # se abra el suyo.
             self._note_early_phase(run_id, phase)
             return
         if push is None or push.ended:
-            return  # #109: nada fuera de un turn_start/turn_end
+            if payload.get("state") in _TERMINAL_CHAT:
+                return  # #109: nada fuera de un turn_start/turn_end
+            # 2b.2: el primer evento de su run abre el push (sin esperar a un `start`).
+            push = self._open_push(run_id)
+            if push is None:
+                if phase is not None:
+                    self._note_early_phase(run_id, phase)
+                return
         push.progress_at = time.monotonic()
         if phase is not None:  # #254: una fase de arranque, sin texto
             self.emit(push, ChannelProgress(Progress(phase)))
@@ -1347,9 +1667,9 @@ class ConversationChannel:
         if delta:
             self.emit(push, ChannelToken(delta))
 
-    def _push_tool(self, data: dict) -> None:
-        push = self._push
-        if push is None or push.ended:
+    def _push_tool(self, data: dict, run_id: str | None = None) -> None:
+        push = self._open_push(run_id)
+        if push is None:
             return
         push.progress_at = time.monotonic()
         tool_call = ToolCallEvent.from_session_tool_payload(data)
@@ -1357,9 +1677,11 @@ class ConversationChannel:
             self.emit(push, ChannelToolCall(tool_call))
 
     def _push_fallback(self, data: dict, run_id: str | None) -> None:
-        """#397: un `fallback_step` del run del push abierto: su razón, para clasificar su error."""
-        push = self._push
-        if push is not None and not push.ended and not _other_run(push.run_id, run_id):
+        """#397: un `fallback_step` del run del push (abierto por él si no lo estaba): su
+        razón, para clasificar su error."""
+        push = self._open_push(run_id)
+        if push is not None and not _other_run(push.run_id, run_id):
+            push.progress_at = time.monotonic()
             push.fallback_reason = fallback_reason(data, push.fallback_reason)
 
     def _push_end(self, *, failure: dict | None = None) -> None:
@@ -1377,6 +1699,12 @@ class ConversationChannel:
             gateway_stats.turn_error(code)
             self.emit(push, ChannelError(code))
         self._push = None
+        if push.run_id is not None:
+            # Lo que llegue tarde de su run (un `run_status`, una fase) no abre otro push.
+            self._ended_push_runs.pop(push.run_id, None)
+            self._ended_push_runs[push.run_id] = None
+            while len(self._ended_push_runs) > _ENDED_PUSH_RUNS:
+                self._ended_push_runs.popitem(last=False)
         self.end_turn(push, "done" if failure is None else "error")
 
     def _push_timed_out(self) -> None:
@@ -1539,6 +1867,14 @@ class ChannelHub:
         """The OpenClaw connection dropped: every live channel ends its unfinished runs."""
         for channel in list(self._channels.values()):
             channel.connection_lost(code)
+
+    def reconnected(self) -> None:
+        """OpenClaw is back (`ReconnectingOpenClawClient.on_connected`, 2b.2): every channel
+        with subscribers, or with runs that wait unconfirmed since the drop, re-reads its
+        `pendingInputs` (`ConversationChannel.reconcile_pending`). Never blocks."""
+        for channel in list(self._channels.values()):
+            if channel.needs_reconcile:
+                self.spawn(channel.reconcile_pending(), "pending_inputs")
 
     def drop_if_idle(self, session_key: str, channel: ConversationChannel | None = None) -> bool:
         """Forget the channel if nothing keeps it alive (`ConversationChannel.idle`). With

@@ -321,9 +321,11 @@ Read in the npm package `openclaw@2026.10.5` (`server-chat`, `builtin-openclaw`,
   `item` (or `tool`) `start` with no push open could open one; an `end` also marked the run
   ended for the active-run tracking.
 
-How the gateway reacts now: only `stream:"lifecycle"` opens (`start`) or ends (`end`/`error`) a
-push; an `agent` event of any other stream only records that its run is still active. A frame
-without `stream` (not sent by 2026.10.5) keeps the old reading, as lifecycle.
+How the gateway reacts now: only `stream:"lifecycle"` ends (`end`/`error`) a push; an `item`
+`end` or a `tool` `start` opens or ends nothing. A frame without `stream` (not sent by 2026.10.5)
+keeps the old reading, as lifecycle. Since 5.0 PR 2b.2 a push also opens on its run's first
+`run_status`, lifecycle `model`/`fallback_step`, `chat` status/delta or `session.tool`, not only
+on lifecycle `start` (see "How the gateway reacts (5.0 PR 2b.2)").
 
 ---
 
@@ -619,9 +621,10 @@ Full notes in the team's Obsidian vault (observations of 2026-10 on OpenClaw and
   and later sends its own `final` (OpenClaw appears to fold the message into the running run;
   not verified, no text recorded). Confirmed on 2026.11.7 (it is `steer`, the default queue
   mode): see "C3 queue behaviour and failure fields".
-- Events the gateway ignores today: `agent` streams `run_status`, `assistant`, `thinking`, `item`, `plan`,
-  `usage`; `sessions.changed`, `session.message` (since 4.0.1 deliberately, without the
-  "unhandled … possible protocol drift" log: see "`session.message`" below).
+- Events the gateway ignores today: `agent` streams `assistant`, `thinking`, `item`, `plan`,
+  `usage`; `sessions.changed`; a `session.message` of any role but `user`. Since 5.0 PR 2b.2 a
+  `run_status` opens the turn or push of its run, and a `user` `session.message` goes to its
+  conversation's channel (see "How the gateway reacts (5.0 PR 2b.2)").
 
 ### `session.message` (server 2026.11.7, read in the package source)
 
@@ -630,9 +633,10 @@ Full notes in the team's Obsidian vault (observations of 2026-10 on OpenClaw and
 - Payload fields: `sessionKey`, `agentId`, `message` (an object with `role`: `user`, `assistant`,
   `system`, `developer`, `tool` or `toolResult`, plus its content), `messageId`, `messageSeq`,
   `runId` when it belongs to a run, and a session snapshot. It carries user text: never log it.
-- The gateway ignores it: the turn's text already arrives as `chat`. It is a candidate source for
-  E2 (what OpenClaw does ends up in the conversation's history, including messages from other
-  channels) without a plugin.
+- Until 5.0 PR 2b.1 the gateway ignored it (the turn's text already arrives as `chat`). Since
+  2b.2 it reads only a `user` one, for its ids and `steer`'s mark (see "How the gateway reacts
+  (5.0 PR 2b.2)"), never its content. Still a candidate source for E2 (what OpenClaw does ends
+  up in the conversation's history, including messages from other channels) without a plugin.
 
 **Breaking for fogar-gateway as of v1.21.0:** `stream_response()` ends a turn on the first
 `chat` `final` of its `sessionKey` and its queue receives every `chat` event of that key,
@@ -1203,9 +1207,68 @@ explicitly requested agent, as `resolve_agent` does; the handshake keeps its 402
 - **Not yet (2b.2):** a steered run (`session.message` `steerTargetRunId`) is only recognised by
   its `final` `seq: 1` without `message` and without prior events: the message turns
   `delivered` and no turn opens; `session.message` is still ignored, and `pendingInputs` is not
-  re-read on reconnect.
+  re-read on reconnect. (Done in 2b.2, next section.)
+
+### How the gateway reacts (5.0 PR 2b.2, 2026-11-24)
+
+`services/channel.py`, `services/openclaw/dispatcher.py` (`push_route`),
+`services/openclaw/reconnecting.py` (`on_connected`). No server change; tested against the
+fake's copies of the sequences above (`tests/unit/test_channel_runs.py`), not live.
+
+- **`session.message` is read**, only `role:"user"` and only its ids: it goes to its key's
+  channel, in order with the frames (held with them while a `chat.send` waits for its ack).
+  Copies of one message are not dropped as duplicates: each updates what is known by OpenClaw's
+  `messageId` (`oc_message_id` in the code; `__openclaw.id` when `messageId` is missing). The
+  link to the `chat.send` (`idempotencyKey` `"<runId>:user"`, read from `message`,
+  `message.__openclaw` or the payload) is remembered per `oc_message_id`, because `steer`'s mark
+  (`message.__openclaw.steerTargetRunId`) may come on a copy without it. A mark naming another
+  run makes the message's run **absorbed**: its message turns `delivered` for every session
+  (once), it never opens a turn of its own, and the active turn keeps its sender and audio. Its
+  `final` `seq: 1` without `message` then just ends it; if that `final` never comes, it ends with
+  the turn that absorbed it. The content is never read or logged.
+- **The terminal of a run that never opened its turn** (a queued or absorbed message): a `final`
+  without text opens nothing (its message `delivered` if it was pending: absorbed, or empty); a
+  `final` with text (the reply to a `/queue …` command) opens, emits it and closes at once; an
+  `aborted` opens nothing (`withdrawn` if pending); a `chat` `error` **or an `agent` lifecycle
+  `error`** opens and closes with its `TURN_ERROR` (classified, #397), so a failing pending
+  message does not vanish (a later `chat` `error` of the same run is dropped). With its turn
+  open, a run still waits for its `chat` `error` (with `errorKind`) after a lifecycle `error`.
+  What would open a turn waits while another turn is open (one at a time); what opens nothing
+  happens at once.
+- **A push opens on its run's first event**, not only on lifecycle `start`: a `chat` status or
+  delta, a `session.tool` start/result, an `agent` lifecycle `start`/`model`/`fallback_step` or
+  a `run_status` (`push_route` is the single mapping, also for frames released after an ack). A
+  terminal `chat` never opens one (#109), the `seq gap` `agent` `stream:"error"` opens nothing
+  (DEBUG only), nor do `item`/`tool`/`assistant`… streams. Once lifecycle `end`/`error` closed a
+  push, a late `run_status`/`model`/phase/delta of its run opens nothing; only a new lifecycle
+  `start` of it does (#84). Still: tombstones (#285), #112 (no push opens while a /v1 turn holds
+  the key; for the openers other than `start` it is checked when the channel's worker handles
+  them), #130 S3b, startup phases of a run kept while another push is open (#254). During a user
+  turn a push's opener waits for that turn to end.
+- **Reconnect and `pendingInputs`.** When the connection drops, a run with its turn open (or with
+  frames already waiting for one) ends at once with `orchestrator_disconnected`, as before; an
+  absorbed one just ends; one still in OpenClaw's queue without a turn is kept **unconfirmed**
+  (its message stays `pending`). When `ReconnectingOpenClawClient` connects again it calls
+  `on_connected` → `ChannelHub.reconnected`: every channel with subscribers or unconfirmed runs
+  reads `chat.history` (`{sessionKey, limit: 1}`, a `READ_METHODS` read) and keeps pending the
+  unconfirmed runs whose `runId` is in `pendingInputs.items[]` with `state:"queued"` (or
+  `queued: true` without `state`) or is the `inFlightRun` (`{runId}` or a bare id: **its shape
+  was not seen live**, read defensively). The rest, or all of them when the read fails or has no
+  readable `pendingInputs`, end with `orchestrator_disconnected` (each its own pair: delivered,
+  turn_start, TURN_ERROR, turn_end). Without a reconnection within `RECONNECT_GRACE_S` (15 s,
+  `services/channel.py`) they end the same way. A frame of an unconfirmed run confirms it. Items
+  the channel does not know (another client's, a /v1 one) are ignored. Only counts and ids are
+  logged.
+- **An open push's frames are not held behind a slow ack:** a frame of the open push's run
+  (known not to be the sender's) goes straight to the push, so its #286 clock keeps seeing
+  progress while a `chat.send` waits for its ack.
 
 ## Change log of this file
+
+- **2026-11-24**: "C3 queue behaviour" gains how the gateway reacts in 5.0 PR 2b.2 (#406): a
+  `user` `session.message` is read (ids and `steerTargetRunId`, updated by `messageId`), absorbed
+  runs, the exact terminals of a run that never opened, a push opens on its first event,
+  `pendingInputs` re-read on reconnect (the `inFlightRun` shape is unverified).
 
 - **2026-11-24**: "C3 queue behaviour" gains how the gateway reacts in 5.0 PR 2b.1 (#406): no
   abort before `chat.send`, `chat.abort` by `runId`, a run opens on its first event, frames

@@ -179,8 +179,8 @@ async def test_queue_peaks_in_session_end(make_reason_bridge):
     turns.deliver_by_session(sk, ("token", "b"))
     turns.unregister(sk, "req-1")
     assert q.qsize() == 2
-    for kind in ("chat", "chat", "chat"):  # 3 at once in the worker's queue (no push opens)
-        enqueue_push(bridge, kind, {})
+    for kind in ("chat", "chat", "chat"):  # 3 at once in the worker's queue (no push opens:
+        enqueue_push(bridge, kind, {"state": "final"})  # a terminal is never a first event)
     await asyncio.sleep(0.01)
     await bridge.close_all()
     meta = _end_meta(bridge)

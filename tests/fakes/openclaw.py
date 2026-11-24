@@ -137,6 +137,17 @@ class FakeOpenClawServer:
     SIN `message`. Un texto que empieza por `hold` se para tras su delta hasta `release_run()`
     (o `release`). `queued` = los runIds que esperan, por clave; `running` = el que corre.
 
+    `steer=True` (sin `queue`; el modo por defecto del real, 2026.11.7): un `chat.send` con
+    otro run en marcha en su clave se pliega en él. Como el real: su ack es `started`; después,
+    el `session.message` de su mensaje de usuario (`messageId` M, `idempotencyKey`
+    `"<runId>:user"`) y otra copia del mismo M SIN `idempotencyKey` y con
+    `__openclaw.steerTargetRunId` = el run que lo absorbió; y un `chat` `final` `seq: 1` sin
+    `message` para su run. Ninguna otra cosa de su run.
+
+    En modo `queue`, `chat.history` trae además `pendingInputs` (`{items, total, queuedCount}`,
+    cada item `{id, acceptedAt, state: "queued", message, runId, queued: true}`) y, si corre
+    un run, `inFlightRun` (`{runId}`: su forma no se vio en vivo).
+
     Cada `chat.send` y cada push tienen su `runId` (en el ack y en sus eventos), como el real.
 
     Lectura (M19, forma real de 2026.10.5, docs/openclaw-protocol.md «2026-11-14»): cada
@@ -176,6 +187,9 @@ class FakeOpenClawServer:
         # pliega en él (ver `_chat_send`). Se puede activar en mitad de un test.
         self.steer = False
         self._live: dict[str, int] = {}  # sessionKey -> runs de `chat.send` en marcha
+        self._live_runs: dict[str, list[str]] = {}  # sessionKey -> sus runIds, en orden
+        self._texts: dict[str, str] = {}  # runId -> texto de su `chat.send` (pendingInputs)
+        self._messages = 0  # ids de OpenClaw de los `session.message`
         self.queued: dict[str, list[str]] = {}  # sessionKey -> runIds en cola (modo `queue`)
         self.running: dict[str, str] = {}  # sessionKey -> runId que corre (modo `queue`)
         self._lanes: dict[str, asyncio.Lock] = {}
@@ -340,6 +354,16 @@ class FakeOpenClawServer:
             limit = params.get("limit", 200)
             payload = {"sessionKey": params["sessionKey"], "messages": messages[-limit:],
                        "hasMore": len(messages) > limit, "totalMessages": len(messages)}
+            if self.queue:
+                sk = params["sessionKey"].lower()
+                items = [
+                    {"id": f"pi-{r}", "acceptedAt": 0, "state": "queued", "message": self._texts.get(r, ""),
+                     "runId": r, "queued": True}
+                    for r in self.queued.get(sk, [])
+                ]
+                payload["pendingInputs"] = {"items": items, "total": len(items), "queuedCount": len(items)}
+                if sk in self.running:
+                    payload["inFlightRun"] = {"runId": self.running[sk]}
         await ws.send(self._res(rid, payload))
 
     async def push(self, sk, text, end=True, progress=False):
@@ -596,6 +620,7 @@ class FakeOpenClawServer:
         raw, text = params["sessionKey"], params["message"]
         sk = raw.lower()
         self._record(sk, "user", text)
+        self._texts[run_id] = text
         lane = self._lanes.setdefault(sk, asyncio.Lock())
         drained = lane.locked()
         queued = self.queued.setdefault(sk, [])
@@ -655,10 +680,10 @@ class FakeOpenClawServer:
                 # `steer` (el modo por defecto del real, 2026.11.7): con un run en marcha en la
                 # clave, este se pliega en él; su propio run solo trae un `final` `seq: 1` sin
                 # `message` (la respuesta, si la hay, va bajo el run que lo absorbió).
-                payload = {"sessionKey": sk, "runId": run_id, "state": "final", "seq": 1}
-                await ws.send(json.dumps({"type": "event", "event": "chat", "payload": payload}))
+                await self._steered(ws, sk, run_id, text, self._live_runs[sk][-1])
                 return
             self._live[sk] = self._live.get(sk, 0) + 1
+            self._live_runs.setdefault(sk, []).append(run_id)
             counted = True
             # Un run empieza con su lifecycle `start`, como el real (5.0 PR 2b: el turno se
             # abre con el primer evento de su run).
@@ -721,6 +746,24 @@ class FakeOpenClawServer:
         finally:
             if counted:
                 self._live[sk] -= 1
+                self._live_runs[sk].remove(run_id)
+
+    async def _steered(self, ws, sk, run_id, text, target):
+        """Lo que el real manda de un mensaje absorbido por `steer` (2026.11.7, «C3 queue
+        behaviour»): su `session.message` (dos copias del mismo `messageId`; la marca de
+        `steer` solo en la segunda, que no repite el enlace) y su `final` `seq: 1` vacío."""
+        self._messages += 1
+        message_id = f"m-{self._messages}"
+        first = {"role": "user", "content": text, "idempotencyKey": f"{run_id}:user",
+                 "__openclaw": {"id": message_id, "seq": self._messages}}
+        again = {"role": "user", "content": text,
+                 "__openclaw": {"id": message_id, "seq": self._messages, "steerTargetRunId": target}}
+        for message in (first, again):
+            payload = {"sessionKey": sk, "agentId": sk.split(":")[1], "message": message,
+                       "messageId": message_id, "messageSeq": self._messages}
+            await ws.send(json.dumps({"type": "event", "event": "session.message", "payload": payload}))
+        payload = {"sessionKey": sk, "runId": run_id, "state": "final", "seq": 1}
+        await ws.send(json.dumps({"type": "event", "event": "chat", "payload": payload}))
 
 
 class SendOnlyOpenClawWS:
