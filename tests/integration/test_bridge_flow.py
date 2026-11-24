@@ -1,6 +1,6 @@
 """Tests para el flujo de texto en FogarBridge.
 
-input_mode=text: sin transcriber. El cliente manda texto plano,
+input_mode=text: sin transcriber. El cliente manda el mensaje JSON `send`,
 recibe tokens del orchestrator.
 """
 

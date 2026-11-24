@@ -933,7 +933,7 @@ class OpenClawClient:
                     # OpenClaw's own error text stays out of the client and the logs;
                     # the operator gets only the short code.
                     _finished = True
-                    code = classify_failure(data)
+                    code = ORCHESTRATOR_ERROR  # a rejected res carries no structural field to classify
                     logger.warning(
                         "OpenClaw rejected the turn (code=%s, %s)",
                         _safe_error_code(data.get("error")),

@@ -739,7 +739,7 @@ class FogarBridge:
                         self._last_audio_at = now
                         await self.transcriber.send_audio(message["bytes"])
 
-                # TEXTO → Orchestrator (prompt directo desde un cliente de texto)
+                # Text frames are protocol JSON messages (non-JSON → INVALID_MESSAGE)
                 elif "text" in message:
                     text_data = message["text"]
                     try:
