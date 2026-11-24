@@ -75,7 +75,7 @@ class Teardown:
     def raise_if_cancelled(self) -> None:
         """Relanza solo la cancelación recibida durante este `Teardown`, no una heredada.
 
-        Para esperas fuera de un cierre (p. ej. el barge-in), donde una cancelación
+        Para esperas fuera de un cierre (p. ej. el `chat.abort` de un run), donde una cancelación
         que otro se tragó antes no debe tumbar la tarea que espera.
         """
         if self.cancelled:

@@ -146,8 +146,14 @@ def describe(messages: list[Message]) -> list[str]:
 
 
 def interrupted(messages: list[Message]) -> list[dict]:
-    """Los `turn_end` de un barge-in (M19: `reason: "interrupted"`, sin mensaje aparte)."""
+    """Los `turn_end` de un `send` con `interrupt` (M19: `reason: "interrupted"`, sin mensaje
+    aparte)."""
     return [m for m in of_type(messages, "turn_end") if m.get("reason") == "interrupted"]
+
+
+def cancelled(messages: list[Message]) -> list[dict]:
+    """Los `turn_end` de un `cancel` del cliente (`reason: "cancelled"`)."""
+    return [m for m in of_type(messages, "turn_end") if m.get("reason") == "cancelled"]
 
 
 def turn_ended(messages: list[Message]) -> bool:

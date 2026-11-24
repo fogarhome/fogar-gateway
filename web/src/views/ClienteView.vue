@@ -238,17 +238,15 @@ frenarRecarga(() => rotando.value)
             <p class="fg-meta">Lo dice el aparato al emparejarse. En cada sesión manda lo que pida al conectarse.</p>
           </fieldset>
           <details class="mas">
-            <summary>Conversación y voz: idioma, interrupciones, silencio, mensajes de Fogar y herramientas</summary>
+            <summary>Conversación y voz: idioma, silencio, mensajes de Fogar y herramientas</summary>
             <div class="rejilla">
               <FgCampo v-model="form.stt_language" etiqueta="Idioma al transcribir" pista="Código del idioma: es, en, gl…" :error="err('stt_language')" />
               <FgCampo v-model="form.stt_vad_thold" etiqueta="Umbral de voz" inputmode="decimal" pista="De 0 a 1. 0: el del transcriptor." :error="err('stt_vad_thold')" />
               <FgCampo v-model="form.tts_speed" etiqueta="Velocidad de la voz" inputmode="decimal" pista="1 es la normal." :error="err('tts_speed')" />
               <FgCampo v-model="form.allowed_agents" etiqueta="Agentes permitidos" pista="Separados por comas. Vacío: todos." :error="err('allowed_agents')" />
-              <FgCampo v-model="form.barge_in_min_chars" etiqueta="Letras para interrumpir" inputmode="numeric" pista="Cuánto tiene que decir para cortar a Fogar." :error="err('barge_in_min_chars')" />
               <FgCampo v-model="form.silence_timeout_s" etiqueta="Silencio para cerrar el turno (s)" inputmode="decimal" :error="err('silence_timeout_s')" />
             </div>
             <div class="interruptores">
-              <label class="opcion"><input v-model="form.barge_in_enabled" type="checkbox" />Se le puede interrumpir</label>
               <label class="opcion"><input v-model="form.push_enabled" type="checkbox" />Fogar puede hablarle sin que pregunte</label>
               <label class="opcion"><input v-model="form.tool_calls_enabled" type="checkbox" />Ve las herramientas que usa Fogar</label>
             </div>

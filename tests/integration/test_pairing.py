@@ -131,7 +131,7 @@ def test_admin_pairing_cancel(http):
 def test_pair_creates_client_with_template(http, db_engine):
     item = _open(
         http, name="tele", client_type="screen", default_agent="j-assistant",
-        allowed_agents=["j-assistant"], tts_voice="ef_dora", barge_in_enabled=False,
+        allowed_agents=["j-assistant"], tts_voice="ef_dora", push_enabled=False,
     )
     r = http.post("/pair", json={"code": item["code"]})
     assert r.status_code == 201, r.text
@@ -142,7 +142,7 @@ def test_pair_creates_client_with_template(http, db_engine):
     assert body["gateway"]["name"]  # el nombre solo sale al canjear un código, nunca en el well-known
     [row] = _rows(db_engine)
     assert row.id == body["client_id"] and row.key_hash == hash_key(body["client_key"])
-    assert (row.client_type, row.default_agent, row.tts_voice, row.barge_in_enabled) == (
+    assert (row.client_type, row.default_agent, row.tts_voice, row.push_enabled) == (
         "screen", "j-assistant", "ef_dora", False,
     )
     assert json.loads(row.allowed_agents) == ["j-assistant"]

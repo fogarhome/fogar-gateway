@@ -1,6 +1,6 @@
 """
-Integration test for #108: barge_in_enabled=False must not interrupt
-an in-flight orchestrator response when a partial transcription arrives.
+A partial transcription that arrives mid-response never interrupts it (5.0, #406: the
+barge-in left the gateway; it was #108's `barge_in_enabled=False` case, now the only one).
 """
 
 import asyncio
@@ -56,7 +56,7 @@ def _start_fake_transcriber():
                 {
                     "type": "ready",
                     "protocol_version": 1,
-                    "session_id": "test-barge-in-session",
+                    "session_id": "test-transcription-session",
                 }
             )
         )
@@ -119,12 +119,9 @@ def start_fake_transcriber():
 # ---------------------------------------------------------------------------
 
 
-def test_disabled_barge_in_does_not_interrupt_in_flight_response(
-    mock_services, db_engine, monkeypatch
-):
-    """#108: handshake with barge_in_enabled=False + a slow (long) agent response
-    + a partial transcription mid-response → the response keeps streaming to
-    completion, no {"type": "interrupted"} is ever sent."""
+def test_partial_does_not_interrupt_in_flight_response(mock_services, db_engine, monkeypatch):
+    """A slow (long) agent response + a partial transcription mid-response → the response
+    keeps streaming to completion and ends `done`, one turn_start and one turn_end."""
     with Session(db_engine) as s:
         s.add(
             ClientRecord(
@@ -132,8 +129,6 @@ def test_disabled_barge_in_does_not_interrupt_in_flight_response(
                 name=CLIENT_NAME,
                 key_hash=hash_key(VALID_KEY),
                 is_active=True,
-                barge_in_enabled=False,
-                barge_in_min_chars=5,
             )
         )
         s.commit()
@@ -188,17 +183,15 @@ def test_disabled_barge_in_does_not_interrupt_in_flight_response(
         # The turn completes with a {"type": "turn_end"} wire frame (see
         # bridge.py's pipe_tokens()) — the mock orchestrator's internal
         # OrchestratorEvent(type="status", content="done") is consumed by
-        # call_orchestrator() and never reaches the client verbatim. Also
-        # break on "interrupted": if barge-in wrongly fires, the active
-        # turn is cancelled and turn_end never arrives, so waiting only
-        # for turn_end would hang until the silence watchdog force-closes
-        # the connection instead of failing the assertion below cleanly.
+        # call_orchestrator() and never reaches the client verbatim.
         for _ in range(10):
             msg = ws.receive_json()
             received_types.append(msg.get("type"))
-            if msg.get("type") in ("turn_end", "interrupted"):
+            if msg.get("type") == "turn_end":
                 break
 
-    assert "interrupted" not in received_types
+    assert msg == {"type": "turn_end", "turn_id": "t-1", "reason": "done"}
+    assert received_types.count("turn_end") == 1
+    assert "turn_start" not in received_types  # one pair on this socket
     assert "transcription_partial" in received_types
     assert "token" in received_types  # second token still delivered, response not cut off

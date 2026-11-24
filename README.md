@@ -3,7 +3,7 @@
 La puerta de entrada de Fogar en casa. Un solo servicio que reconoce cada aparato del hogar, lo conecta con el asistente y con la voz, y se administra desde el navegador o la terminal.
 
 - **Aparatos**: Fogar TV, el cliente de voz (Mac y Android), la app de iPhone y Home Assistant. Un aparato nuevo **descubre el gateway y se empareja con un código de 6 cifras**, sin copiar claves.
-- **Asistente**: los turnos de voz y texto van a [OpenClaw](docs/openclaw-protocol.md), que elige el agente y sus herramientas. El gateway lleva el turno de principio a fin: streaming, interrupciones (barge-in) y avisos que llegan sin preguntar (push).
+- **Asistente**: los turnos de voz y texto van a [OpenClaw](docs/openclaw-protocol.md), que elige el agente y sus herramientas. El gateway lleva el turno de principio a fin: streaming, cola de mensajes, «parar» y «enviar ahora», y avisos que llegan sin preguntar (push). Hablar encima no corta nada: pausar o callar la voz lo decide el cliente (5.0).
 - **Voz**: transcripción (STT) y síntesis (TTS) con los servicios propios de Fogar, con ElevenLabs o desactivadas. Sin voz, el texto sigue funcionando.
 - **Personas** (4.0): cada persona de casa entra con su cuenta. Lo que habla desde sus dispositivos es suyo; lo que se habla desde la tele o los altavoces es del hogar. Dueño, administradores y miembros, como en Home Assistant.
 - **Administración**: un panel web en `/` (estado en vivo, conversaciones y chat con Fogar, sesiones, clientes y personas) y la CLI `fogar-gw` (diagnóstico, configuración, servicio, logs, emparejamiento y personas).
@@ -232,7 +232,7 @@ El cliente envía un handshake JSON como primer mensaje. Si es válido, el gatew
 ← {"type":"turn_end","turn_id":"t-1","reason":"done"}
 ```
 
-Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la referencia completa incluyendo barge-in, transcripción, push turns y manejo de errores.
+Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la referencia completa incluyendo interrupciones, transcripción, push turns y manejo de errores.
 
 ---
 
@@ -303,7 +303,7 @@ En vez de crear el cliente y copiar su clave a mano, el cliente puede darse de a
 
 ```bash
 fogar-gw pair --type screen --name tele --agent j-assistant --allowed-agent j-assistant \
-  --set tts_voice=ef_dora --set barge_in_enabled:=false
+  --set tts_voice=ef_dora --set push_enabled:=false
 ```
 
 1. Enseña un código de 6 cifras (`482 913`), el nombre del gateway y a qué hora caduca (10 minutos).

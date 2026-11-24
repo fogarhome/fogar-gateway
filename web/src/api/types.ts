@@ -99,8 +99,6 @@ export interface ClientResponse {
   stt_vad_thold: number
   tts_voice: string
   tts_speed: number
-  barge_in_enabled: boolean
-  barge_in_min_chars: number
   output_mode: OutputMode[] | null
   silence_timeout_s: number
   push_enabled: boolean

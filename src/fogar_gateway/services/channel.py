@@ -1120,18 +1120,16 @@ class ConversationChannel:
             await self.cancel_head("interrupted")
 
     async def cancel(
-        self, reason: EndReason, *, push: bool = True, expected: ChannelTurn | None = None
+        self, reason: EndReason, *, expected: ChannelTurn | None = None
     ) -> ChannelTurn | None:
         """Para el turno abierto (o `expected`, si sigue abierto), lo haya iniciado quien lo
         haya iniciado: su run (solo ese) se aborta en OpenClaw y su turno termina con `reason`
-        para todos. Con `push=False`, un push no. Dos llamadas a la vez lo cancelan una vez
+        para todos (también un push). Dos llamadas a la vez lo cancelan una vez
         (G-08: el cambio de estado es síncrono). Devuelve el turno cancelado."""
         turn = expected if expected is not None else self.current_turn
         if turn is None or turn.ended or turn is not self.current_turn:
             return None
         if turn.origin == "push":
-            if not push:
-                return None
             return await self._cut_push(turn, reason)
         run_id = turn.run_id
         info = self._runs.get(run_id) if run_id is not None else None
@@ -1144,16 +1142,11 @@ class ConversationChannel:
         await self._abort_step(run_id, "chat.abort del turno")
         return turn
 
-    async def cancel_head(
-        self, reason: EndReason, *, sender: ChannelSubscriber | None = None
-    ) -> bool:
+    async def cancel_head(self, reason: EndReason) -> bool:
         """Sin turno abierto: el mensaje entregado cuyo run aún no empezó (nada va delante) se
-        aborta, y su mensaje queda `withdrawn` para todos (no llegó a tener turno). Con
-        `sender`, solo si lo envió esa sesión."""
+        aborta, y su mensaje queda `withdrawn` para todos (no llegó a tener turno)."""
         head = self._head()
         if head is None or head.message != "delivered":
-            return False
-        if sender is not None and head.by_session is not sender:
             return False
         logger.info(f"[{self._tag}] run {head.run_id} sin empezar: chat.abort ({reason})")
         self._abort_run(head.run_id)

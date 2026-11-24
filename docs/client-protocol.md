@@ -28,7 +28,7 @@ Reglas para que el protocolo crezca sin romper a nadie:
 4. [Enviar texto](#4-enviar-texto)
 5. [Recibir tokens de texto](#5-recibir-tokens-de-texto)
 6. [Recibir audio TTS](#6-recibir-audio-tts)
-7. [Barge-in e interrupciones](#7-barge-in-e-interrupciones)
+7. [Hablar encima e interrupciones](#7-hablar-encima-e-interrupciones)
 8. [Estado de servicios](#8-estado-de-servicios)
 9. [Mensajes de error](#9-mensajes-de-error)
 10. [Turns iniciados por el agente (push)](#10-turns-iniciados-por-el-agente-push)
@@ -73,7 +73,7 @@ No escanees redes ni rangos de IP.
 
 ### Emparejarse
 
-El administrador abre un código en el gateway con `fogar-gw pair` (ver el [README](../README.md#emparejar-un-cliente)). El gateway lo enseña: 6 cifras, de un solo uso y válido 10 minutos. En la configuración del código el administrador ya ha fijado cómo se comportará tu cliente: agente, voz, barge-in…
+El administrador abre un código en el gateway con `fogar-gw pair` (ver el [README](../README.md#emparejar-un-cliente)). El gateway lo enseña: 6 cifras, de un solo uso y válido 10 minutos. En la configuración del código el administrador ya ha fijado cómo se comportará tu cliente: agente, voz, avisos…
 
 Tu cliente necesita **una pantalla de emparejamiento donde la persona solo escribe el código**. Todo lo demás lo pone el cliente:
 
@@ -157,6 +157,8 @@ El **primer mensaje** que envíes DEBE ser el handshake. Es el único mensaje si
 | `agent` | string | — | Agente OpenClaw a usar; omitir (o vacío) para usar el agente por defecto (ver "Selección de agente" abajo). Un id de OpenClaw: letra o cifra y luego letras, cifras, `_` o `-`, hasta 64; otro valor (con `:`, espacios…) es 4000. Sin distinguir mayúsculas: el gateway lo pasa a minúsculas, como OpenClaw (`"Main"` es `main`, y así llega en `ready.agent`) |
 | `conversation` | string (1–64) | — | La conversación de la sesión (§14): el id de una conversación **de este cliente** para retomarla, o `"new"` para empezar una. Sin él, la conversación del día. Nuevo en M19 |
 
+El handshake no configura nada de la voz al hablar encima: desde la 5.0 el barge-in es cosa del cliente (§7). Un campo que el gateway no conoce (un `barge_in` de un cliente viejo, por ejemplo) se ignora, como manda la regla de extensión.
+
 ### Selección de agente
 
 El agente efectivo de la sesión no es simplemente "el que pediste o el global": el gateway resuelve una cascada server-side (`agent` del handshake si no está vacío → `default_agent` configurado por el admin para tu `client_key` → el agente que el hogar da a tu persona (dispositivo con sesión) o a lo común (dispositivo del hogar; 4.0) → `DEFAULT_AGENT`, el de la instalación (#245) → default global de OpenClaw → `"main"`) y aplica dos comprobaciones de política antes de aceptar la conexión: si tu cliente tiene una lista `allowed_agents`, el agente resultante debe estar en ella (una lista vacía lo deniega todo); y si pediste el agente explícitamente, debe existir en el roster de OpenClaw (`src/fogar_gateway/core/agent_policy.py`). Como cliente necesitas saber tres cosas:
@@ -205,12 +207,10 @@ Si el handshake es válido y todos los servicios críticos responden, el gateway
   "input_mode": "audio",
   "output_mode": ["audio", "text"],
   "requested_capabilities": {
-    "barge_in": true,
     "tts": true,
     "transcriber": true
   },
   "live_capabilities": {
-    "barge_in": true,
     "tts": true,
     "transcriber": true
   }
@@ -225,16 +225,17 @@ Si el handshake es válido y todos los servicios críticos responden, el gateway
 | `conversation` | La conversación de la sesión (§14): `id` (guárdalo para retomarla con `conversation` en el handshake) y `agent`. Nuevo en M19. En una sesión sin conversación elegida puede cambiar a mitad de sesión con el día: mira `turn_start.conversation` |
 | `input_mode` | Modo de entrada confirmado |
 | `output_mode` | Modos de salida activos |
-| `requested_capabilities.barge_in` | Si el barge-in está habilitado para este cliente |
 | `requested_capabilities.tts` | Si el cliente pidió salida de audio (`"audio"` en `output_mode`) |
 | `requested_capabilities.transcriber` | Si el cliente pidió modo audio (`input_mode == "audio"`) |
-| `live_capabilities.barge_in` | Si el barge-in está operativo (requiere barge-in habilitado, transcriber activo y un proveedor STT con parciales) |
 | `live_capabilities.tts` | Si TTS responde en este momento |
 | `live_capabilities.transcriber` | Si el transcriptor está conectado (`input_mode == "audio"`) |
 
 Espera este mensaje antes de enviar audio o texto. Si no llega, la conexión fue cerrada por un error de handshake.
 
-> **Voz desactivada.** Si el gateway tiene la voz en `off` (`STT_PROVIDER`/`TTS_PROVIDER`), se comporta como con ese servicio caído, y solo para lo que pidió la sesión: antes de `ready` llega `status` con `state: "unavailable"` para `transcriber` si `input_mode` es `"audio"`, y para `tts` si `output_mode` incluye `"audio"`; una sesión solo de texto no recibe ninguno. `live_capabilities.transcriber`/`tts` (y `barge_in`) valen `false`. La sesión sigue abierta en texto: `send` funciona, el audio que mandes se descarta y no hay avisos de recuperación.
+> **Voz desactivada.** Si el gateway tiene la voz en `off` (`STT_PROVIDER`/`TTS_PROVIDER`), se comporta como con ese servicio caído, y solo para lo que pidió la sesión: antes de `ready` llega `status` con `state: "unavailable"` para `transcriber` si `input_mode` es `"audio"`, y para `tts` si `output_mode` incluye `"audio"`; una sesión solo de texto no recibe ninguno. `live_capabilities.transcriber`/`tts` valen `false`. La sesión sigue abierta en texto: `send` funciona, el audio que mandes se descarta y no hay avisos de recuperación.
+
+> **Incompatibilidad de protocolo — 5.0**
+> `requested_capabilities.barge_in` y `live_capabilities.barge_in` ya no existen: el gateway no corta un turno porque hables encima (§7). Un cliente que los leía para decidir si podía interrumpir hablando debe decidirlo él: pausar o callar su voz en local, y cortar con `cancel` o con un `send` con `interrupt`.
 
 > **Incompatibilidad de protocolo — #114 (v1.15.0)**
 > `ready.capabilities` fue reemplazado por `ready.requested_capabilities` + `ready.live_capabilities`.
@@ -380,7 +381,7 @@ Los tokens llegan en orden; concaténalos para reconstruir la respuesta completa
 { "type": "turn_end", "turn_id": "t-1", "reason": "done" }
 ```
 
-Señala que el turno terminó. **Todo turno con `turn_start` recibe exactamente un `turn_end`** en tu socket — también si falla (tras un `error`), si se cancela (`cancel`, barge-in, transcripción final, un `send` que interrumpe) o si el cierre de sesión lo corta. Desde 5.0 un `send` aceptado produce su `message` (abajo) y su par `turn_start`/`turn_end` cuando su run empieza: dos `send` seguidos dan dos pares, uno detrás del otro (los dos `done`); un mensaje quitado (`withdraw`) o parado antes de empezar no tiene par. Un `send` que OpenClaw no acepta (sin conexión, rechazado) recibe su par con su `error` `TURN_ERROR`, solo en tu sesión. Después del `turn_end` no se envía más audio de ese turno; lo que sigue es la reproducción del audio que ya recibiste (como mucho `AUDIO_LEAD_S`, unos 2 s, por delante del tiempo real).
+Señala que el turno terminó. **Todo turno con `turn_start` recibe exactamente un `turn_end`** en tu socket — también si falla (tras un `error`), si se cancela (`cancel`, un `send` que interrumpe) o si el cierre de sesión lo corta. Desde 5.0 un `send` aceptado produce su `message` (abajo) y su par `turn_start`/`turn_end` cuando su run empieza: dos `send` seguidos dan dos pares, uno detrás del otro (los dos `done`); un mensaje quitado (`withdraw`) o parado antes de empezar no tiene par. Un `send` que OpenClaw no acepta (sin conexión, rechazado) recibe su par con su `error` `TURN_ERROR`, solo en tu sesión. Después del `turn_end` no se envía más audio de ese turno; lo que sigue es la reproducción del audio que ya recibiste (como mucho `AUDIO_LEAD_S`, unos 2 s, por delante del tiempo real).
 
 `reason` (nuevo en M19) dice por qué terminó:
 
@@ -389,7 +390,7 @@ Señala que el turno terminó. **Todo turno con `turn_start` recibe exactamente 
 | `done` | Terminó solo: la respuesta completa (o el push, con su fin) |
 | `error` | Falló: va precedido de su `error` `TURN_ERROR` (§9), también un push cuyo agente falla (desde 5.0, #397) |
 | `cancelled` | Un `cancel` de cualquier sesión de la conversación (§4), o OpenClaw abortó el run por su cuenta. Un mensaje parado antes de que empiece su run no tiene par: su `message` queda `withdrawn` (5.0) |
-| `interrupted` | Un `send` con `interrupt` lo cortó («enviar ahora», también un push), o hablaste encima: un barge-in (§7) o una transcripción final con el turno en curso. Sustituye al antiguo mensaje `interrupted` |
+| `interrupted` | Un `send` con `interrupt` lo cortó («enviar ahora», también un push; §7). Hablar encima ya no lo produce (5.0). Sustituye al antiguo mensaje `interrupted` |
 | `replaced` | Tu sesión pasó a la conversación del día nuevo (§14), o un `send` tuyo que no llegó a la conversación dejó atrás el turno que mostrabas. Desde 5.0 un `send` ya no sustituye el turno en curso |
 | `timeout` | `TURN_TIMEOUT_S` sin progreso del orquestador (§13), tras su `error` `turn_timeout` |
 | `closed` | La sesión se cierra (o te fuiste) con el turno abierto |
@@ -458,7 +459,7 @@ Solo con `"status"` en `output_mode`. Mientras el agente prepara la respuesta o 
 
 Reglas:
 
-- **Solo dentro de su turno:** llega después de su `turn_start` y antes de su `turn_end`, en el orden total de la sesión, nunca después del `turn_end`. Nada de una ejecución abortada (barge-in, `cancel`, un `send` que la sustituye) llega como progreso, ni nada del turno desde que se interrumpe aunque su `turn_end` tarde un momento. Vale igual para un push (§10): si el orquestador contó en qué estaba antes de abrirlo, ese último estado llega justo después de su `turn_start`.
+- **Solo dentro de su turno:** llega después de su `turn_start` y antes de su `turn_end`, en el orden total de la sesión, nunca después del `turn_end`. Nada de una ejecución abortada (`cancel`, un `send` con `interrupt`) llega como progreso, ni nada del turno desde que se interrumpe aunque su `turn_end` tarde un momento. Vale igual para un push (§10): si el orquestador contó en qué estaba antes de abrirlo, ese último estado llega justo después de su `turn_start`.
 - **Es el estado actual, no un registro:** cada uno sustituye al anterior. Un `token` lo deja obsoleto (el texto ya está llegando; bórralo); puede volver a llegar después de un `token` si el agente usa otra herramienta a media respuesta. Sin un `token` entre medias nunca llega el mismo estado dos veces seguidas, y llega como mucho uno cada 250 ms: si el orquestador encadena herramientas más deprisa, el gateway se salta los intermedios y manda el más reciente (y lo que quedara aplazado al salir un `token` ya no sale).
 - **No es una garantía:** un turno puede no traer ninguno (una respuesta inmediata, o un orquestador que no lo cuenta), y no hay uno de cierre: el fin es el `turn_end`.
 - **Independiente de `tool_calls_enabled`:** ese flag sigue gobernando el mensaje `tool_call` completo (con `args` y `result`); `turn_progress` solo lleva el nombre, así que llega con el flag desactivado.
@@ -572,7 +573,7 @@ def parse_audio_frame(data: bytes):
     return turn_seq, pcm16
 ```
 
-### Pseudocódigo con barge-in por turn_seq
+### Pseudocódigo: descartar el audio por turn_seq
 
 ```python
 current_turn_seq = 0
@@ -593,7 +594,7 @@ async for msg in ws:
         if data["type"] == "turn_start":
             current_turn_seq = data["turn_seq"]
             audio_player.prepare_for_new_turn()
-        elif data["type"] == "turn_end" and data["reason"] == "interrupted":
+        elif data["type"] == "turn_end" and data["reason"] in ("interrupted", "cancelled"):
             audio_player.stop()
 ```
 
@@ -601,26 +602,34 @@ async for msg in ws:
 
 ---
 
-## 7. Barge-in e interrupciones
+## 7. Hablar encima e interrupciones
 
-El barge-in ocurre cuando el usuario empieza a hablar mientras el orquestador aún está respondiendo.
+**El barge-in es cosa del cliente (5.0).** Que el usuario hable mientras el orquestador responde no corta nada en el gateway: ni la transcripción parcial ni la final cierran el turno ni un push, en ninguna sesión. Te llegan como siempre (`transcription_partial`, `transcription`) y la final espera a que tú la envíes con `send`, que entra en la cola de la conversación como cualquier mensaje (§4): con un turno en curso queda `pending` hasta que OpenClaw la recoge.
 
-El gateway detecta la parcial de transcripción y cancela el turno activo si el barge-in está habilitado (`requested_capabilities.barge_in`; `live_capabilities.barge_in` indica si está operativo) y la parcial supera el umbral mínimo de caracteres. El cliente recibe el `turn_end` del turno cancelado con su motivo:
+Qué hace la voz mientras el usuario habla lo decides tú, en local: pausarla, bajarla o callarla al detectar voz (con tu VAD o con las parciales), y seguir o no después. El gateway no lo sabe ni lo necesita: el turno sigue en marcha y su audio sigue llegando; descártalo o guárdalo como quieras.
+
+**Cortar es siempre explícito:**
+
+- **Parar:** `{"type":"cancel"}` (§4) cierra el turno en curso de la conversación para todas las sesiones, con `turn_end` `cancelled`.
+- **Enviar ahora:** `send` con `"interrupt": true` (§4) corta el turno en curso (su `turn_end` llega con `reason: "interrupted"`) y envía tu mensaje:
 
 ```json
 { "type": "turn_end", "turn_id": "t-1", "reason": "interrupted" }
 ```
 
-El orden es `turn_end` (t-1, `interrupted`) → `turn_start` (t-2). Desde 5.0, un mensaje tuyo cortado así antes de que empiece su run no tiene par: su `message` queda `withdrawn` (§5).
+El orden es `turn_end` (t-1, `interrupted`) → `turn_start` (t-2). Desde 5.0, un mensaje tuyo parado antes de que empiece su run no tiene par: su `message` queda `withdrawn` (§5).
+
+> **Incompatibilidad de protocolo — 5.0**
+> El gateway ya no hace barge-in: una parcial que pasaba del umbral (`barge_in_min_chars`) cerraba el turno con `turn_end` `interrupted`, y una transcripción final con un turno en curso también lo cortaba; ya no. `barge_in_enabled`/`barge_in_min_chars` desaparecen de la configuración del cliente (API, web y CLI) y `barge_in` de `ready` (§2) y de las etapas de `pipeline_event` (§15). Un cliente de voz que contaba con ese corte debe pausar o callar su voz en local y, si quiere cortar el turno, enviar `cancel` o un `send` con `interrupt`.
 
 > **Incompatibilidad de protocolo — M19**
 > El mensaje `{"type":"interrupted","turn_id":...}` **ya no existe**: lo sustituye `turn_end.reason: "interrupted"` del mismo turno. Un cliente que esperaba `interrupted` para parar el audio o limpiar la respuesta debe mirar `reason` en el `turn_end`.
 
-**Un push que está sonando también se corta** (§10): el barge-in, un `send` con `interrupt` y un `cancel` lo cierran igual que a un turno normal. Recibes su `turn_end` (exactamente uno) antes de cualquier otra cosa del turno nuevo, con `reason` `interrupted` o `cancelled`. Un `send` sin `interrupt` no lo corta (5.0): espera a que termine. Su audio deja de llegar. La transcripción final por sí sola no lo corta: lo corta el `send` que la sigue.
+**Un push que está sonando también se corta** (§10): un `send` con `interrupt` y un `cancel` lo cierran igual que a un turno normal. Recibes su `turn_end` (exactamente uno) antes de cualquier otra cosa del turno nuevo, con `reason` `interrupted` o `cancelled`. Un `send` sin `interrupt` no lo corta (5.0): espera a que termine. Su audio deja de llegar. Hablar encima no lo corta: ni la parcial ni la final.
 
 El audio del turno cancelado deja de salir en cuanto el gateway procesa la cancelación, sin esperar a que se libere su TTS, y su `turn_end` tampoco espera a que se cierre la conexión con el servidor de voz; lo que ya estaba en camino (como mucho `AUDIO_LEAD_S` por delante) puede llegar antes del `turn_end`. Nada del turno cancelado llega después de su `turn_end`: ni tokens ni audio, tampoco la respuesta que OpenClaw ya tuviera en camino al abortarlo, que no cierra tu turno siguiente ni vuelve como un push (#285).
 
-Tras un `turn_end` con `reason: "interrupted"`:
+Tras un `turn_end` con `reason` `interrupted` o `cancelled`:
 - Limpia la UI de la respuesta en curso
 - Descarta audio con `turn_seq` del turno cancelado (ya no llegará más)
 - El flujo reinicia normalmente — sigue enviando audio
@@ -763,7 +772,7 @@ Un push que llega mientras suena una respuesta tuya se entrega después del `tur
 
 Nunca hay dos push abiertos a la vez: si mientras uno está abierto llega otro de una conversación distinta (un recordatorio de ayer mientras habla uno de hoy), el segundo se descarta entero y no te llega; el abierto sigue intacto hasta su `turn_end`. Los push que lleguen después de ese `turn_end` se abren normalmente.
 
-Al revés, hablar corta el push: si el usuario hace barge-in, envía un `send` o un `cancel` mientras un push está abierto, el gateway para su audio, te envía su `turn_end` y, si el push es de tu misma sesión de agente, lo aborta en OpenClaw. Solo después arranca el turno del usuario, así que nunca hay dos turnos abiertos a la vez (#202). Lo que quedara de ese push no llega.
+Al revés, cortar el push es explícito: si el cliente envía un `cancel` o un `send` con `interrupt` mientras un push está abierto (hablar encima no lo corta, §7; un `send` sin `interrupt` espera a que termine), el gateway para su audio, te envía su `turn_end` y, si el push es de tu misma sesión de agente, lo aborta en OpenClaw. Solo después arranca el turno del usuario, así que nunca hay dos turnos abiertos a la vez (#202). Lo que quedara de ese push no llega.
 
 Un push tiene el mismo tope que un turno normal: si OpenClaw lo abre y deja de mandar nada durante `TURN_TIMEOUT_S` (sin su fin), el gateway lo cierra con `{"type":"error","code":"TURN_ERROR","message":"turn_timeout","fatal":false,"turn_id":...}` y su `turn_end`, y lo aborta en OpenClaw si es de tu sesión de agente (#286). El siguiente push abre su propio `turn_start`.
 
@@ -982,7 +991,7 @@ Las reglas son las mismas para todos los clientes; el gateway no mira el tipo de
 
 - **Sin `conversation` en el handshake**, la sesión cae en la **conversación del día**: una por cliente, agente y día. El día empieza a las `CONVERSATION_DAY_START_HOUR` (5:00 por defecto, hora local del gateway). Se evalúa **al empezar cada turno tuyo**: una sesión que sigue abierta al pasar el corte (una tele con el socket abierto días) pasa a la conversación del día nuevo en su primer turno después, y lo verás en `turn_start.conversation`. `ready.conversation` es la del momento de conectar. Un push no cambia la conversación de la sesión.
 - **Con `"conversation": "new"`**, el gateway crea una conversación nueva para tu cliente (solo si la sesión llega a `ready`: un handshake que acaba en 1011 no deja una conversación vacía); **con el `id` de una de tus conversaciones** (el que te dio `ready.conversation.id`), la retomas: OpenClaw sigue el hilo. Una sesión que eligió conversación **no cambia nunca de día** por sí sola. Solo puedes pedir conversaciones de tu propio cliente: cualquier otro id cierra con 4100 (`conversation not found`). Una conversación fija su agente (§1).
-- **Varias sesiones en una conversación (5.0).** Una conversación puede estar abierta en varias sesiones a la vez (la misma del día en dos aparatos, el mismo id en dos pestañas, una reconexión antes de que caiga el socket viejo): ninguna cierra a otra (el 4102 se retiró, §9). Cada turno de la conversación, lo envíe quien lo envíe, llega a cada sesión con su propio `turn_start`/`turn_end` (su `turn_id`, su `turn_seq`); el audio, solo a la sesión que lo envió. Una sesión que entra con un turno en marcha recibe su `turn_start` y el texto acumulado en un `token` (§5). Una sesión que se va no corta el turno para las demás. Un `cancel` («Parar») desde cualquiera de las sesiones para el turno de la conversación para todas (todas reciben su `turn_end` `cancelled`). La voz no: un barge-in o una transcripción final solo cortan un turno que envió esa misma sesión, y de un push, solo su copia en esa sesión (el push sigue en las demás); un cliente de voz que oye la tele no le corta su turno. Un `send` durante un turno no lo corta: espera en la cola de OpenClaw y todas las sesiones ven su `message` `pending` (§4, §5); con `interrupt` corta el turno en curso (todas reciben su `turn_end` `interrupted`); `withdraw` quita un pendiente, sea de quien sea. Una sesión que entra recibe también los mensajes pendientes. Solo te adjuntas a conversaciones que puedes ver (abajo).
+- **Varias sesiones en una conversación (5.0).** Una conversación puede estar abierta en varias sesiones a la vez (la misma del día en dos aparatos, el mismo id en dos pestañas, una reconexión antes de que caiga el socket viejo): ninguna cierra a otra (el 4102 se retiró, §9). Cada turno de la conversación, lo envíe quien lo envíe, llega a cada sesión con su propio `turn_start`/`turn_end` (su `turn_id`, su `turn_seq`); el audio, solo a la sesión que lo envió. Una sesión que entra con un turno en marcha recibe su `turn_start` y el texto acumulado en un `token` (§5). Una sesión que se va no corta el turno para las demás. Un `cancel` («Parar») desde cualquiera de las sesiones para el turno de la conversación para todas (todas reciben su `turn_end` `cancelled`). La voz no corta nada (5.0, §7): ni una parcial ni una final cortan el turno, ni el de esa sesión ni el de otra, ni un push; un cliente de voz que oye la tele no le corta su turno. Un `send` durante un turno no lo corta: espera en la cola de OpenClaw y todas las sesiones ven su `message` `pending` (§4, §5); con `interrupt` corta el turno en curso (todas reciben su `turn_end` `interrupted`); `withdraw` quita un pendiente, sea de quien sea. Una sesión que entra recibe también los mensajes pendientes. Solo te adjuntas a conversaciones que puedes ver (abajo).
 - **Push:** llega a todas las sesiones que tienen abierta su conversación (cada una con su par; el audio, en una sola). Temporal hasta la 5.0 PR 2c: un push de una conversación que ninguna sesión tiene abierta no llega a nadie (lo recogerá el dispositivo de avisos, §10).
 - **Home Assistant (`/v1`)** sigue la misma regla del día para su cliente (con `Authorization: Bearer`).
 
@@ -1016,7 +1025,6 @@ No lleva texto (ni del usuario ni de la respuesta) ni los detalles que el gatewa
 |---|---|
 | `session_start` | Al empezar la sesión, justo después de `ready` |
 | `transcription_partial` | Cada parcial de transcripción (`input_mode: "audio"`), después de su `transcription_partial` |
-| `barge_in` | Un parcial cortó el turno en curso (§7), después de su `turn_end` |
 | `transcription_final` | La transcripción final, antes de su `transcription` |
 | `transcription_incomplete` | El transcriptor cortó una final por saturación (`complete: false`, `reason` del transcriptor) o una reconexión cortó la frase en curso o la frase entera cayó mientras se reabría tras la anterior (`reason: "phrase_interrupted"`, la final no se entrega) |
 | `llm_start` | Un turno del usuario sale hacia el orquestador (después de su `turn_start`) |

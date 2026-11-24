@@ -126,7 +126,6 @@ export const STAGE: Record<string, string> = {
   tts_start: 'Empieza la voz',
   tts_first_chunk: 'Primer audio',
   tts_done: 'Voz terminada',
-  barge_in: 'Interrupción',
   client_slow: 'Cliente lento',
   session_revoked: 'Acceso retirado',
   agent_revoked: 'Agente retirado',

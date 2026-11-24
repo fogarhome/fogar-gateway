@@ -75,9 +75,9 @@ logger = logging.getLogger(__name__)
 
 TurnOrigin = Literal["user", "push"]
 # done: terminó solo · error: falló (TURN_ERROR o fallo del agente) · cancelled: `cancel` de
-# un cliente · interrupted: un `send` que interrumpe, o el usuario habló encima (barge-in o
-# transcripción final) · replaced: la sesión pasó a otra conversación (cambio de día), o un
-# `send` que no llegó al canal dejó atrás el turno de este socket · timeout: TURN_TIMEOUT_S
+# un cliente · interrupted: un `send` con `interrupt` (enviar ahora) · replaced: la sesión
+# pasó a otra conversación (cambio de día), o un `send` que no llegó al canal dejó atrás el
+# turno de este socket · timeout: TURN_TIMEOUT_S
 # sin progreso · closed: la sesión se cierra o el cliente se fue.
 EndReason = Literal["done", "error", "cancelled", "interrupted", "replaced", "timeout", "closed"]
 
@@ -267,8 +267,8 @@ class TurnTts:
         """Espera a que salga todo su audio, acotada por INACTIVIDAD.
 
         La ventana empieza al empezar a esperar (7e: tras una pausa larga del agente el sello
-        de progreso es viejo). asyncio.wait, no wait_for: una cancelación ajena (barge-in,
-        close_all) se propaga en vez de confundirse con la del audio.
+        de progreso es viejo). asyncio.wait, no wait_for: una cancelación ajena (un
+        `cancel`, close_all) se propaga en vez de confundirse con la del audio.
         """
         audio = self._audio
         if not self.live or audio is None:
@@ -315,9 +315,9 @@ class TurnTts:
 
     async def _shutdown(self) -> None:
         """Para el audio y cierra el stream. Los dos pasos terminan aunque cancelen a quien
-        libera (#221): una segunda cancelación (un barge-in y después close_all) no deja el
-        stream abierto; esa cancelación se relanza al final. Una heredada no (como en el
-        barge-in, `raise_if_cancelled`). Cada paso, acotado por PUSH_TTS_DRAIN_TIMEOUT_S
+        libera (#221): una segunda cancelación (un `cancel` y después close_all) no deja el
+        stream abierto; esa cancelación se relanza al final. Una heredada no
+        (`raise_if_cancelled`). Cada paso, acotado por PUSH_TTS_DRAIN_TIMEOUT_S
         (#204: un audio que ignora la cancelación no cuelga a nadie)."""
         if self._shut:
             return
@@ -856,19 +856,15 @@ class TurnController:
             await self._send_turn_error(turn, code)
         await self._end(turn, "error")
 
-    async def cancel(
-        self, reason: EndReason, *, push: bool = True, own_only: bool = False
-    ) -> tuple[bool, str | None]:
+    async def cancel(self, reason: EndReason) -> tuple[bool, str | None]:
         """Cancela lo que la sesión muestra ahora: el turno abierto en este socket (el del
-        usuario y, con `push`, también un push). Si es una copia de un turno que ya terminó en
+        usuario o un push). Si es una copia de un turno que ya terminó en
         el canal (su audio aún suena), se corta solo aquí y el turno abierto del canal sigue
         (se abrirá después, como antes); si es la copia del turno abierto del canal (o el
         socket aún no muestra nada), se cancela en el canal: el `cancel` del cliente para el
-        turno para todos (C3). Con `own_only` (la voz: barge-in y transcripción final, hasta
-        que la 2b quite el barge-in) solo corta un turno que esta sesión envió; de un push,
-        solo su copia aquí (el canal sigue), y el turno de otra sesión, nada: un cliente de
-        voz que oye la tele no le corta su turno. Devuelve (cancelado, su turn_id en esta
-        sesión)."""
+        turno para todos (C3). La voz nunca llama aquí (5.0: hablar no corta nada; cortar
+        es siempre explícito, `cancel` o `send` con `interrupt`). Devuelve (cancelado, su
+        turn_id en esta sesión)."""
         channel = self._channel
         current = channel.current_turn if channel is not None else None
         mine = self._by_channel.get(current.id) if current is not None else None
@@ -876,30 +872,15 @@ class TurnController:
         if shown is not None and shown is not mine:
             if shown.cancel_reason is not None:
                 return False, None  # ya se está cortando aquí (su turn_end va en camino)
-            if shown.origin == "push" and not push:
-                return False, None
-            source = shown.channel
-            if own_only and shown.origin == "user" and source is not None and source.by_session is not self:
-                return False, None  # el turno de otra sesión: la voz de aquí no lo corta
             shown.cancel_reason = shown.cancel_reason or reason
             await self._end(shown, reason)
             return True, shown.turn_id
         if channel is None or current is None or mine is None:
             if channel is not None and current is None:
-                # Un mensaje entregado cuyo run aún no abrió su turno: «Parar» lo aborta (la
-                # voz, solo si es de esta sesión).
-                await channel.cancel_head(reason, sender=self if own_only else None)
+                # Un mensaje entregado cuyo run aún no abrió su turno: «Parar» lo aborta.
+                await channel.cancel_head(reason)
             return False, None
-        if current.origin == "push" and not push:
-            return False, None
-        if own_only and current.by_session is not self:
-            if current.origin != "push" or not mine.opened:
-                return False, None
-            # Solo su copia: el push sigue en el canal para las demás sesiones.
-            mine.cancel_reason = mine.cancel_reason or reason
-            await self._end(mine, reason)
-            return True, mine.turn_id
-        if await channel.cancel(reason, push=push, expected=current) is None:
+        if await channel.cancel(reason, expected=current) is None:
             return False, None
         if mine.opened:
             # Su fin ya está en la cola; aquí sale ya (A-r2-2), sin esperar a que el worker
@@ -1151,8 +1132,8 @@ class TurnController:
 
     async def _send_progress(self, turn: Turn, progress: Progress) -> None:
         # Sin await entre mirar `halted` y encolar: `_end` lo marca antes de encolar turn_end,
-        # así que este turn_progress nunca sale detrás de él. Un turno ya cancelado (barge-in,
-        # `cancel`, un `send` que lo sustituye) tampoco cuenta nada mientras se limpia.
+        # así que este turn_progress nunca sale detrás de él. Un turno ya cancelado (`cancel`,
+        # un `send` con `interrupt`) tampoco cuenta nada mientras se limpia.
         if turn.halted:
             return
         try:

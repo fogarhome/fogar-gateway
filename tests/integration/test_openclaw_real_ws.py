@@ -552,7 +552,7 @@ async def test_abort_absorbs_its_aborted_frame(server):
 
 
 async def test_aborted_turn_frames_never_reach_the_next_turn(server):
-    """A turn cancelled mid-run (barge-in) is aborted; the reply of its run that was
+    """A turn cancelled mid-run (`cancel`) is aborted; the reply of its run that was
     already on its way is dropped instead of closing the next turn (G-14)."""
     client, turns = make_client(server.port)
     await client.connect()

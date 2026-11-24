@@ -63,7 +63,7 @@ def test_create_client_full(http):
         "allowed_agents": ["home", "kitchen"],
         "tts_voice": "en_heart",
         "stt_language": "en",
-        "barge_in_min_chars": 10,
+        "silence_timeout_s": 3.5,
     }
     r = http.post("/admin/clients", json=body, headers=HEADERS)
     assert r.status_code == 201
@@ -72,6 +72,7 @@ def test_create_client_full(http):
     assert data["default_agent"] == "home"
     assert data["allowed_agents"] == ["home", "kitchen"]
     assert data["tts_voice"] == "en_heart"
+    assert data["silence_timeout_s"] == 3.5
 
 
 def test_create_client_with_empty_allowed_agents_denies_all(http):
@@ -160,12 +161,12 @@ def test_patch_client_config(http):
     created = http.post("/admin/clients", json={"name": "C"}, headers=HEADERS).json()
     r = http.patch(
         f"/admin/clients/{created['id']}",
-        json={"tts_voice": "en_heart", "barge_in_enabled": False},
+        json={"tts_voice": "en_heart", "push_enabled": False},
         headers=HEADERS,
     )
     assert r.status_code == 200
     assert r.json()["tts_voice"] == "en_heart"
-    assert r.json()["barge_in_enabled"] is False
+    assert r.json()["push_enabled"] is False
 
 
 def test_patch_deactivate(http):

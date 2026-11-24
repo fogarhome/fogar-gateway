@@ -400,9 +400,9 @@ async def test_a_home_device_never_attaches_to_a_private_conversation(make_bridg
 # ── Who may cut a turn (2a.3, L2) ─────────────────────────────────────────
 
 
-async def test_a_voice_client_s_barge_in_never_cuts_another_session_s_turn(session, hub):
-    """A voice client hearing the TV: its barge-in and its final transcription only cut a turn
-    it sent; the TV's turn goes on for everyone, not aborted."""
+async def test_speech_never_cuts_a_turn_of_any_session(session, hub):
+    """5.0 (#406): a voice client hearing the TV, and the TV itself: neither a partial nor a
+    final transcription cuts the turn; it goes on for everyone, not aborted."""
     tv, tv_ws = session("tv")
     voice, voice_ws = session("voice")
     started = asyncio.Event()
@@ -410,31 +410,37 @@ async def test_a_voice_client_s_barge_in_never_cuts_another_session_s_turn(sessi
     await tv.turns.start_user_turn("hola")
     await asyncio.wait_for(started.wait(), 2)
 
-    await voice._on_transcription("una frase larga", False)  # barge-in partial
+    await voice._on_transcription("una frase larga", False)  # partial
     await voice._on_transcription("una frase larga", True)  # final
-    await sent(voice)
+    await tv._on_transcription("otra frase larga", False)  # nor the sender's own speech
+    await tv._on_transcription("otra frase larga", True)
+    await sent(tv), await sent(voice)
     assert not tv.turns.user_task.done()
     assert hub.get(SK).current_turn is not None
     assert pairs(voice_ws) == [("turn_start", "t-1", "user")]
+    assert pairs(tv_ws) == [("turn_start", "t-1", "user")]
+    hub.orchestrator.abort_run.assert_not_called()
 
-    await tv._on_transcription("otra frase larga", False)  # its own barge-in does cut it
+    assert (await tv.turns.cancel("cancelled"))[0]  # cutting is explicit
     await sent(tv), await sent(voice)
-    assert pairs(tv_ws)[-1] == ("turn_end", "t-1", "interrupted")
-    assert pairs(voice_ws)[-1] == ("turn_end", "t-1", "interrupted")
+    for ws in (tv_ws, voice_ws):
+        assert pairs(ws) == [("turn_start", "t-1", "user"), ("turn_end", "t-1", "cancelled")]
 
 
-async def test_a_barge_in_on_a_push_cuts_only_this_session_s_copy(session, hub):
+async def test_speech_during_a_push_cuts_no_session_s_copy(session, hub):
+    """5.0 (#406; it used to cut this session's copy): every session gets the whole push."""
     tv, tv_ws = session("tv")
     voice, voice_ws = session("voice")
     await push(tv.channel, ("turn_start", SK), ("chat", {"deltaText": "aviso"}))
     await sent(tv), await sent(voice)
 
     await voice._on_transcription("una frase larga", False)
+    await voice._on_transcription("una frase larga", True)
     await push(tv.channel, ("chat", {"deltaText": " y más"}), ("turn_end", SK))
     await sent(tv), await sent(voice)
 
-    assert pairs(voice_ws) == [("turn_start", "t-1", "push"), ("turn_end", "t-1", "interrupted")]
-    assert texts(voice_ws) == ["aviso"]
+    assert pairs(voice_ws) == [("turn_start", "t-1", "push"), ("turn_end", "t-1", "done")]
+    assert texts(voice_ws) == ["aviso", " y más"]
     assert pairs(tv_ws) == [("turn_start", "t-1", "push"), ("turn_end", "t-1", "done")]
     assert texts(tv_ws) == ["aviso", " y más"]
 

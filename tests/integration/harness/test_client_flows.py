@@ -12,7 +12,7 @@ from tests.integration.conftest import VALID_KEY
 from tests.integration.harness.conftest import (
     assert_turns_paired,
     audio,
-    interrupted,
+    cancelled,
     of_type,
     turn_ended,
 )
@@ -89,21 +89,28 @@ async def _until(cond, timeout: float = 5.0) -> None:
             await asyncio.sleep(0.01)
 
 
-async def test_speaking_over_a_running_turn_interrupts_it(harness):
-    harness.transcriber.on_audio = [("espera un momento", False)]
+async def test_speaking_over_a_running_turn_never_interrupts_it(harness):
+    """5.0 (#406): el barge-in sale del gateway. Hablar encima solo trae la transcripción; el
+    turno sigue hasta que el cliente lo corta de forma explícita (`cancel`)."""
+    harness.transcriber.on_audio = [("espera un momento", False), ("espera un momento", True)]
     client = await harness.connect(input_mode="audio", output_mode=("text",))
-    assert client.ready["live_capabilities"]["barge_in"] is True
+    assert "barge_in" not in client.ready["live_capabilities"]
+    assert "barge_in" not in client.ready["requested_capabilities"]
 
     await client.send({"type": "send", "text": "hold"})  # el orquestador se queda esperando
     await client.collect(lambda m: bool(of_type(m, "turn_start")))
     await client.send_audio(AUDIO_FRAME)
-    msgs = await client.collect(lambda m: bool(interrupted(m)))
-
-    (start,) = of_type(msgs, "turn_start")
+    msgs = await client.collect(lambda m: bool(of_type(m, "transcription")))
+    msgs = await client.collect(timeout=0.3)
     assert of_type(msgs, "transcription_partial")[0]["text"] == "espera un momento"
+    assert of_type(msgs, "transcription")[0]["text"] == "espera un momento"
+    assert of_type(msgs, "turn_end") == []  # ni la parcial ni la final cortan nada
+
+    await client.send({"type": "cancel"})
+    msgs = await client.collect(lambda m: bool(cancelled(m)))
+    (start,) = of_type(msgs, "turn_start")
     (end,) = of_type(msgs, "turn_end")
-    assert end == {"type": "turn_end", "turn_id": start["turn_id"], "reason": "interrupted"}
-    assert of_type(msgs, "interrupted") == []  # M19: sustituido por turn_end.reason
+    assert end == {"type": "turn_end", "turn_id": start["turn_id"], "reason": "cancelled"}
     assert_turns_paired(msgs)
 
 

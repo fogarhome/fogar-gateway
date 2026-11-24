@@ -138,7 +138,7 @@ async def _cancel_turn_during(make_tts_bridge, monkeypatch, *, tokens_block):
         await asyncio.wait_for(entered.wait(), 2.0)
     else:
         await asyncio.sleep(0.2)  # tokens done, now waiting for audio
-    assert (await bridge.turns.cancel("interrupted"))[0]  # barge-in
+    assert (await bridge.turns.cancel("cancelled"))[0]
     await asyncio.wait_for(bridge.turns.idle(), 2.0)
     tts_client.close.assert_awaited()
     await asyncio.sleep(0)
@@ -151,9 +151,9 @@ async def _cancel_turn_during(make_tts_bridge, monkeypatch, *, tokens_block):
     assert leftover == []
 
 
-async def test_barge_in_cancel_during_tokens_closes_tts_no_orphans(make_tts_bridge, monkeypatch):
+async def test_cancel_during_tokens_closes_tts_no_orphans(make_tts_bridge, monkeypatch):
     await _cancel_turn_during(make_tts_bridge, monkeypatch, tokens_block=True)
 
 
-async def test_barge_in_cancel_during_audio_wait_closes_tts_no_orphans(make_tts_bridge, monkeypatch):
+async def test_cancel_during_audio_wait_closes_tts_no_orphans(make_tts_bridge, monkeypatch):
     await _cancel_turn_during(make_tts_bridge, monkeypatch, tokens_block=False)

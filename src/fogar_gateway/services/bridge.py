@@ -360,9 +360,6 @@ class FogarBridge:
             tts_live = False
 
         return {
-            "barge_in": bool(self.config.barge_in_enabled)
-            and transcriber_live
-            and self._stt.capabilities.partials,
             "tts": tts_live,
             "transcriber": transcriber_live,
         }
@@ -869,8 +866,10 @@ class FogarBridge:
     async def _on_transcription(self, text: str, is_final: bool):
         """Callback dispatched by TranscriberClient on every transcription event.
 
-        Partials: trigger barge-in if text is substantial and a turn is active.
-        Finals: cancel any running turn, notify the client, start a new turn.
+        Neither a partial nor a final cuts anything (5.0, #406: speaking never cuts; pausing
+        or silencing the voice is the client's local decision, and cutting is always explicit,
+        `cancel` or a `send` with `interrupt`). Both go to the client; the final waits for
+        the client's `send`, which joins the conversation's queue like any message.
         All client_ws sends are guarded — the client may disconnect at any time.
         """
         if not is_final:
@@ -881,25 +880,9 @@ class FogarBridge:
                 self._log_send_failed("transcription_partial", e)
                 return
             await self.tracker.record("transcription_partial", text_len=len(text))
-
-            # Barge-in: interrupt active turn if enabled and partial is substantial enough
-            if self.config.barge_in_enabled and len(text) >= self.config.barge_in_min_chars:
-                # The turn or the push open now: one the worker opens after the cancel stays.
-                # Su turn_end lleva `reason: "interrupted"` (M19: ya no hay mensaje aparte).
-                # Solo lo suyo (own_only): un cliente de voz no corta el turno de otra sesión.
-                cancelled, _ = await self.turns.cancel("interrupted", own_only=True)
-                if cancelled:
-                    logger.info(
-                        f"[{self.client_id}] Barge-in: turno cancelado por parcial len={len(text)}"
-                    )
-                    await self.tracker.record("barge_in")
             return  # partials never reach the orchestrator
 
         await self.tracker.record("transcription_final", text_len=len(text))
-
-        # Final: cancel any running turn (not a push: the `send` that follows cuts it),
-        # notify client. El orquestador se llama cuando el cliente envíe {"type": "send"}.
-        await self.turns.cancel("interrupted", push=False, own_only=True)
         logger.debug(f"[{self.client_id}] Transcripción final: '{text[:40]}'")
         try:
             await self._sender.send_json({"type": "transcription", "text": text})

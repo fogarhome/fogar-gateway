@@ -54,9 +54,9 @@ def _slow_feed_stream(feeding: asyncio.Event):
     return stream
 
 
-async def test_barge_in_during_the_reply_s_audio_spares_the_push_not_yet_shown(make_bridge):
+async def test_cancel_during_the_reply_s_audio_spares_the_push_not_yet_shown(make_bridge):
     """The reply ended in the channel and its audio still plays here; a push opened in the
-    channel, its turn_start still queued on this socket. A barge-in cuts the reply only: the
+    channel, its turn_start still queued on this socket. A `cancel` cuts the reply only: the
     push is neither cancelled nor aborted, and opens after (as before 5.0)."""
     playing = asyncio.Event()
     stream = AsyncMock()
@@ -78,13 +78,13 @@ async def test_barge_in_during_the_reply_s_audio_spares_the_push_not_yet_shown(m
         and bridge.channel.current_turn.origin == "push"
     )
 
-    assert await bridge.turns.cancel("interrupted") == (True, "t-1")  # barge-in
+    assert await bridge.turns.cancel("cancelled") == (True, "t-1")
     await wait_until(lambda: len(ws.of("turn_start")) == 2)
     await bridge._sender.flush()
 
     assert bridge.channel.current_turn is not None  # the push goes on
     assert _marks(ws) == [
-        ("turn_start", "t-1", "user"), ("turn_end", "t-1", "interrupted"),
+        ("turn_start", "t-1", "user"), ("turn_end", "t-1", "cancelled"),
         ("turn_start", "t-2", "push"),
     ]  # fmt: skip
     await bridge.close_all()

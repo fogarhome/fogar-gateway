@@ -14,13 +14,12 @@ from fogar_gateway.core.config import settings
 from tests.integration.harness.conftest import (
     assert_turns_paired,
     audio,
-    interrupted,
+    cancelled,
     of_type,
     turn_ended,
 )
 
 LEAD = 0.2
-AUDIO_FRAME = b"\x00" * 3200  # 50 ms de micrófono: dispara el parcial del barge-in
 CHUNKS = 12
 BYTES_PER_S = 48000
 
@@ -199,41 +198,41 @@ async def test_slow_reader_with_keepalive_gets_the_whole_reply(paced):
 
 
 async def _audio_client(paced):
-    paced.transcriber.on_audio = [("espera un momento", False)]
-    return await paced.connect(input_mode="audio", output_mode=("text", "audio"))
+    return await paced.connect(output_mode=("text", "audio"))
 
 
-async def test_barge_in_during_paced_audio_stops_it_soon(paced):
-    """Criterio 5: tras el barge-in llega como mucho el adelanto ya en camino."""
+async def test_cancel_during_paced_audio_stops_it_soon(paced):
+    """Criterio 5: tras un corte (`cancel`; 5.0, #406: hablar ya no corta) llega como mucho
+    el adelanto ya en camino."""
     client = await _audio_client(paced)
     await client.send({"type": "send", "text": "hola"})
     await client.collect(lambda m: len(audio(m)) >= 1)
     before = len(client.messages)
-    await client.send_audio(AUDIO_FRAME)
-    msgs = await client.collect(lambda m: bool(interrupted(m)))
+    await client.send({"type": "cancel"})
+    msgs = await client.collect(lambda m: bool(cancelled(m)))
     await client.collect(timeout=0.3)
 
     (turn,) = of_type(msgs, "turn_start")
     late = _seq_audio(msgs[before:], turn["turn_seq"])
     assert sum(len(f) - 3 for f in late) <= (LEAD + 0.1 + 0.3) * BYTES_PER_S
     ends = of_type(msgs, "turn_end")
-    assert ends == [{"type": "turn_end", "turn_id": turn["turn_id"], "reason": "interrupted"}]
+    assert ends == [{"type": "turn_end", "turn_id": turn["turn_id"], "reason": "cancelled"}]
     assert of_type(msgs, "interrupted") == []  # M19: ya no existe
 
 
-async def test_barge_in_cuts_a_push_being_spoken(paced):
-    """Criterio 9: un barge-in corta el push que suena: un turn_end `interrupted` con su id."""
+async def test_cancel_cuts_a_push_being_spoken(paced):
+    """Criterio 9: un `cancel` corta el push que suena: un turn_end `cancelled` con su id."""
     client = await _audio_client(paced)
     await paced.push("aviso largo")
     await client.collect(lambda m: len(audio(m)) >= 1)
-    await client.send_audio(AUDIO_FRAME)
-    msgs = await client.collect(lambda m: bool(interrupted(m)))
+    await client.send({"type": "cancel"})
+    msgs = await client.collect(lambda m: bool(cancelled(m)))
     await client.collect(timeout=0.3)
 
     (push,) = of_type(msgs, "turn_start")
     assert push["origin"] == "push"
     ends = of_type(msgs, "turn_end")
-    assert ends == [{"type": "turn_end", "turn_id": push["turn_id"], "reason": "interrupted"}]
+    assert ends == [{"type": "turn_end", "turn_id": push["turn_id"], "reason": "cancelled"}]
     end_at = msgs.index(ends[0])
     assert not _seq_audio(msgs[end_at:], push["turn_seq"])
     assert_turns_paired(msgs)

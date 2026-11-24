@@ -396,7 +396,7 @@ async def test_cut_while_push_tts_connects_closes_that_tts(make_push_bridge):
 
 
 async def test_cancel_cuts_only_the_push_open_when_it_arrived(make_push_bridge):
-    """Barge-in/cancel only cut the push that was open when they arrived (I-1): with no
+    """A cancel only cuts the push that was open when it arrived (I-1): with no
     push open, nothing is aborted and the next push opens normally."""
     bridge, _ = make_push_bridge(output_mode=("text",))
     assert await bridge.turns.cancel("cancelled") == (False, None)

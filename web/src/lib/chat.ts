@@ -201,7 +201,7 @@ export class ChatLog {
 
 const REASON: Record<string, string> = {
   cancelled: 'La paraste aquí.',
-  interrupted: 'Se interrumpió: hablaste encima.',
+  interrupted: 'Se interrumpió: se envió otro mensaje ya.',
   replaced: 'Se cortó: la sustituyó tu siguiente mensaje.',
   timeout: 'Se cortó: OpenClaw dejó de responder.',
   closed: 'Se cortó: se cerró la conexión.',

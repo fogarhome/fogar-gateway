@@ -15,13 +15,12 @@ from fogar_gateway.services import turn_progress
 from tests.integration.conftest import CLIENT_ID
 from tests.integration.harness.conftest import (
     assert_turns_paired,
-    interrupted,
+    cancelled,
     of_type,
     turn_ended,
 )
 
 WITH_PROGRESS = ("text", "status")
-AUDIO_FRAME = b"\x00" * 3200  # 50 ms de PCM Float32 a 16 kHz
 
 
 @pytest.fixture
@@ -190,17 +189,16 @@ async def test_a_flood_is_rate_capped_and_the_latest_state_still_arrives(harness
     assert_turns_paired(msgs)
 
 
-async def test_no_progress_after_a_barge_in_with_a_tool_deferred(harness):
-    """La fase sale ya y la herramienta queda aplazada por el ritmo; el usuario habla encima
-    antes de que salga: no llega ningún `turn_progress` tras la interrupción."""
-    harness.transcriber.on_audio = [("espera un momento", False)]
-    client = await harness.connect(input_mode="audio", output_mode=WITH_PROGRESS)
+async def test_no_progress_after_a_cancel_with_a_tool_deferred(harness):
+    """La fase sale ya y la herramienta queda aplazada por el ritmo; el usuario corta el turno
+    (`cancel`) antes de que salga: no llega ningún `turn_progress` tras el corte."""
+    client = await harness.connect(output_mode=WITH_PROGRESS)
     await client.send({"type": "send", "text": "progress_hold"})
     await client.collect(lambda m: bool(of_type(m, "turn_progress")))
-    await client.send_audio(AUDIO_FRAME)
-    await client.collect(lambda m: bool(interrupted(m)))
+    await client.send({"type": "cancel"})
+    await client.collect(lambda m: bool(cancelled(m)))
     msgs = await client.collect(timeout=turn_progress.PROGRESS_MIN_INTERVAL_S + 0.4)
-    end_at = msgs.index(interrupted(msgs)[0])
+    end_at = msgs.index(cancelled(msgs)[0])
     assert not of_type(msgs[end_at:], "turn_progress")
     assert ("tool", "slow_tool") not in progress(msgs)
     assert_progress_inside_turns(msgs)

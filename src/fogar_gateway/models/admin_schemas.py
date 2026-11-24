@@ -38,7 +38,6 @@ AgentName = Annotated[
 _VadThold = Annotated[float, Field(ge=0.0, le=1.0)]
 _Speed = Annotated[float, Field(gt=0.0, le=10.0)]
 _Seconds = Annotated[float, Field(gt=0.0, le=86_400.0)]
-_MinChars = Annotated[int, Field(ge=1, le=10_000)]
 
 # Campos de PATCH que mapean a columnas NOT NULL: `null` explícito -> 422.
 _NOT_NULL_UPDATE_FIELDS = (
@@ -48,8 +47,6 @@ _NOT_NULL_UPDATE_FIELDS = (
     "stt_vad_thold",
     "tts_voice",
     "tts_speed",
-    "barge_in_enabled",
-    "barge_in_min_chars",
     "silence_timeout_s",
     "push_enabled",
     "tool_calls_enabled",
@@ -69,8 +66,6 @@ class ClientCreate(BaseModel):
     stt_vad_thold: _VadThold = 0.0
     tts_voice: _Text = "af_heart"
     tts_speed: _Speed = 1.0
-    barge_in_enabled: bool = True
-    barge_in_min_chars: _MinChars = 5
     output_mode: list[OutputMode] | None = None
     silence_timeout_s: _Seconds = 2.0
     push_enabled: bool = True
@@ -95,8 +90,6 @@ class ClientUpdate(BaseModel):
     stt_vad_thold: _VadThold | None = None
     tts_voice: _Text | None = None
     tts_speed: _Speed | None = None
-    barge_in_enabled: bool | None = None
-    barge_in_min_chars: _MinChars | None = None
     output_mode: list[OutputMode] | None = None
     silence_timeout_s: _Seconds | None = None
     push_enabled: bool | None = None
@@ -130,8 +123,6 @@ class ClientResponse(BaseModel):
     stt_vad_thold: float
     tts_voice: str
     tts_speed: float
-    barge_in_enabled: bool
-    barge_in_min_chars: int
     output_mode: list[str] | None
     silence_timeout_s: float
     push_enabled: bool
@@ -157,8 +148,6 @@ class ClientResponse(BaseModel):
             stt_vad_thold=r.stt_vad_thold,
             tts_voice=r.tts_voice,
             tts_speed=r.tts_speed,
-            barge_in_enabled=r.barge_in_enabled,
-            barge_in_min_chars=r.barge_in_min_chars,
             output_mode=json.loads(r.output_mode) if r.output_mode else None,
             silence_timeout_s=r.silence_timeout_s,
             push_enabled=r.push_enabled,

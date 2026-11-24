@@ -4,7 +4,8 @@ G-08 (#201) cancel race, G-09 turn created during close_all, G-10 one turn_end p
 turn on every path, G-11 turn_seq wraparound, G-18 a gone client stops receiving (5.0: it no longer aborts
 the channel's turn, decision 2).
 The M6 exit-gate mutants live with their topic: the `_closed` guard of close_all in
-test_bridge_close_all.py, the `>=` boundary of barge_in_min_chars in test_bridge_barge_in.py.
+test_bridge_close_all.py. (The barge-in left the gateway in 5.0, #406: a transcription ends
+no turn, test_bridge_transcription.py.)
 """
 
 import asyncio
@@ -214,36 +215,6 @@ async def test_send_that_interrupts_a_turn_closes_it_with_one_turn_end_each(make
     order = [(m["type"], m.get("turn_id")) for m in ws.sent if isinstance(m, dict)
              if m["type"] in ("turn_start", "turn_end")]
     assert order == [("turn_start", "t-1"), ("turn_end", "t-1"), ("turn_start", "t-2"), ("turn_end", "t-2")]
-
-
-async def test_final_transcription_cancelling_a_turn_sends_turn_end(make_bridge):
-    bridge, ws = make_bridge()
-    started = asyncio.Event()
-    bridge.orchestrator.stream_response = blocking(started)
-    await start_turn(bridge)
-    await asyncio.wait_for(started.wait(), 2)
-
-    await bridge._on_transcription("hola que tal", True)
-
-    await sent(bridge)
-    assert ws.types().count("turn_end") == 1
-    assert bridge.turns.last_ended.end_reason == "interrupted"
-
-
-async def test_barge_in_ends_the_turn_with_reason_interrupted(make_bridge):
-    bridge, ws = make_bridge()
-    started = asyncio.Event()
-    bridge.orchestrator.stream_response = blocking(started)
-    await start_turn(bridge)
-    await asyncio.wait_for(started.wait(), 2)
-
-    await bridge._on_transcription("hola que tal", False)
-    assert bridge.turns.last_ended.end_reason == "interrupted"
-
-    await sent(bridge)
-    # M19: no `interrupted` message any more; the turn_end says why.
-    assert ws.of("interrupted") == []
-    assert ws.of("turn_end") == [{"type": "turn_end", "turn_id": "t-1", "reason": "interrupted"}]
 
 
 # ── G-11 ─────────────────────────────────────────────────────────────────────
@@ -560,7 +531,7 @@ async def test_a_send_during_the_push_timeout_cut_waits_for_its_abort(make_bridg
 
 
 async def test_a_second_cancellation_during_tts_release_still_closes_the_stream(make_bridge):
-    """#221: a barge-in cuts the turn; close_all cancels the session's worker while that
+    """#221: a `cancel` cuts the turn; close_all cancels the session's worker while that
     turn's TTS is being released. The stream is still closed, and one turn_end goes out.
     (5.0: the release is the session's, not the channel task's: decision 1.)"""
     cancelling = asyncio.Event()
@@ -582,11 +553,11 @@ async def test_a_second_cancellation_during_tts_release_still_closes_the_stream(
     task = await start_turn(bridge)
     await asyncio.wait_for(started.wait(), 2)
 
-    assert (await bridge.turns.cancel("interrupted"))[0]  # barge-in
+    assert (await bridge.turns.cancel("cancelled"))[0]
     await asyncio.wait_for(cancelling.wait(), 2)  # the release waits for the audio
     await asyncio.wait_for(bridge.close_all(), 2)  # close_all
 
-    assert task.cancelled()  # the barge-in cut its run
+    assert task.cancelled()  # the cancel cut its run
     stream.close.assert_awaited_once()
     assert [m["turn_id"] for m in ws.of("turn_end")] == ["t-1"]
 

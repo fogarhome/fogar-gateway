@@ -84,10 +84,9 @@ def _insert_client(c, client_id: str, home: str = "home", user: str | None = Non
 
     c.execute(text(
         "INSERT INTO clients (id, home_id, user_id, name, key_hash, is_active, created_at, "
-        "stt_language, stt_vad_thold, tts_voice, tts_speed, barge_in_enabled, "
-        "barge_in_min_chars, silence_timeout_s, push_enabled, "
+        "stt_language, stt_vad_thold, tts_voice, tts_speed, silence_timeout_s, push_enabled, "
         "tool_calls_enabled) VALUES (:id, :home, :user, 'X', :id, 1, '2026-11-21', 'es', 0, "
-        "'v', 1, 1, 5, 2, 1, 0)"
+        "'v', 1, 2, 1, 0)"
     ), {"id": client_id, "home": home, "user": user})
 
 
@@ -167,6 +166,49 @@ def test_migration_drops_max_silence_turns(tmp_path, monkeypatch):
     finally:
         database.dispose_engine()
 
+
+
+def test_migration_drops_barge_in(tmp_path, monkeypatch):
+    """#406: el barge-in sale del gateway. Una base con `barge_in_enabled`/`barge_in_min_chars`
+    los pierde sin perder clientes ni sus conversaciones; bajar de versión los devuelve con sus
+    valores por defecto de antes (True, 5)."""
+    from alembic import command
+    from sqlalchemy import text
+
+    barge = {"barge_in_enabled", "barge_in_min_chars"}
+    _point_at(monkeypatch, tmp_path / "barge.db")
+    command.upgrade(database._alembic_config(), "50a0e1f00002")
+    engine = database.get_engine()
+    try:
+        with engine.begin() as c:
+            assert barge <= {col["name"] for col in inspect(c).get_columns("clients")}
+            c.execute(text(
+                "INSERT INTO clients (id, home_id, name, key_hash, is_active, created_at, "
+                "stt_language, stt_vad_thold, tts_voice, tts_speed, barge_in_enabled, "
+                "barge_in_min_chars, silence_timeout_s, push_enabled, "
+                "tool_calls_enabled) VALUES ('tv', 'home', 'TV', 'k', 1, '2026-11-21', 'es', 0, "
+                "'v', 1, 0, 9, 7, 1, 0)"
+            ))
+            _insert_conversation(c, "c-tv", "tv")
+        database.run_migrations()
+        with engine.connect() as c:
+            assert not barge & {col["name"] for col in inspect(c).get_columns("clients")}
+            row = c.execute(text("SELECT id, silence_timeout_s FROM clients")).one()
+            assert tuple(row) == ("tv", 7.0)
+            assert c.execute(text("SELECT id FROM conversations")).scalars().all() == ["c-tv"]
+            assert c.execute(text("PRAGMA foreign_key_check")).all() == []
+        engine.dispose()
+        command.downgrade(database._alembic_config(), "50a0e1f00002")
+        with engine.connect() as c:
+            assert barge <= {col["name"] for col in inspect(c).get_columns("clients")}
+            row = c.execute(text(
+                "SELECT id, barge_in_enabled, barge_in_min_chars, silence_timeout_s FROM clients"
+            )).one()
+            assert tuple(row) == ("tv", 1, 5, 7.0)
+            assert c.execute(text("SELECT id FROM conversations")).scalars().all() == ["c-tv"]
+            assert c.execute(text("PRAGMA foreign_key_check")).all() == []
+    finally:
+        database.dispose_engine()
 
 def test_a_3x_database_is_refused_untouched(tmp_path, monkeypatch):
     """La 4.0 no convierte una BD 3.x (M20): error claro y el fichero sin tocar."""

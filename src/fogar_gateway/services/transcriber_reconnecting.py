@@ -181,7 +181,7 @@ class ReconnectingTranscriberClient:
         if self._lost:
             if is_final:
                 await self._phrase_lost()
-            return  # partials of a cut phrase could trigger a barge-in
+            return  # partials of a cut phrase are dropped with it
         if is_final:
             self._phrase_open = False
         await self._callbacks.on_transcription(text, is_final)

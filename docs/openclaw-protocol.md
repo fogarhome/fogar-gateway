@@ -224,7 +224,7 @@ package (read on the server by the maintainer; summarized here):
 
 **Deliberate gateway decision:** the gateway emits a text tail only for `final`. On
 `aborted` and `error` it does **not** emit any tail from `message`: after an `aborted` the
-client has already cut the reply (barge-in or cancel), and speaking more text after the user
+client has already cut the reply (`cancel` or a `send` with `interrupt`), and speaking more text after the user
 interrupted would be wrong; an `error` may omit `message` on purpose. Pinned by a test.
 
 How the gateway responds (`src/fogar_gateway/services/openclaw/chat_text.py`, used by
@@ -659,8 +659,8 @@ No server change; this records how the gateway reacts. Frames are still routed b
   without `runId` are delivered as they come. `chat.abort`'s own short registration takes
   every frame of the key (its answer is caught by id, not through the dispatcher).
 - **Aborted runs are tombstoned** (`RUN_ABORT_TOMBSTONE_S`, 300 s; run ids are never reused)
-  on every abort path: a turn that ends without its terminal `chat` (barge-in, a replacing
-  `send`, `cancel`, the client gone, `turn_timeout`, `turn_overflow`) tombstones its run;
+  on every abort path: a turn that ends without its terminal `chat` (a `send` with
+  `interrupt`, `cancel`, the client gone, `turn_timeout`, `turn_overflow`) tombstones its run;
   if its ack had not arrived yet, the late ack does it. The answer to `chat.abort`
   (`{ok, aborted: true, runIds}`) tombstones the runs it names, and a push the gateway cuts
   or times out has the `runId` of its `agent start` tombstoned too, before its `chat.abort`

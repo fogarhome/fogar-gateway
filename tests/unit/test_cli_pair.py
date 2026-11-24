@@ -116,8 +116,8 @@ def test_pair_template_body(use_api):
     fake = use_api(PollingApi([]))
     r = run("pair", "--no-wait", "--name", "tele", "--type", "screen", "--agent", "j-assistant",
             "--allowed-agent", "j-assistant", "--set", "tts_voice=ef_dora",
-            "--set", "barge_in_enabled:=false")
+            "--set", "push_enabled:=false")
     assert r.exit_code == 0, r.output
     assert fake.calls[0] == ("POST", "/admin/pairing", {
         "name": "tele", "client_type": "screen", "default_agent": "j-assistant",
-        "allowed_agents": ["j-assistant"], "tts_voice": "ef_dora", "barge_in_enabled": False})
+        "allowed_agents": ["j-assistant"], "tts_voice": "ef_dora", "push_enabled": False})
