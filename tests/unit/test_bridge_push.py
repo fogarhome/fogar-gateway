@@ -13,7 +13,15 @@ import pytest
 
 from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
-from tests.fakes.bridge import enqueue_push, fixed_conversation, push, push_reply, sent, wait_until
+from tests.fakes.bridge import (
+    enqueue_push,
+    fixed_conversation,
+    push,
+    push_reply,
+    sent,
+    tokens,
+    wait_until,
+)
 
 SK = "agent:main:hab_sito"
 
@@ -501,6 +509,7 @@ async def test_a_push_whose_turn_start_fails_leaves_no_turn_and_the_next_send_ab
     assert bridge.turns.snapshot(0.0)["turn"]["kind"] == "idle"
     bridge.orchestrator.abort.assert_not_awaited()
 
+    bridge.orchestrator.stream_response = tokens("ok")
     await bridge.turns.start_user_turn("hola")
     bridge.orchestrator.abort.assert_awaited_with(SK)
     assert turns.is_run_aborted("run-p")

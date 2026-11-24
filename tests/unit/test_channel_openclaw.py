@@ -395,3 +395,86 @@ async def test_a_home_device_never_attaches_to_a_private_conversation(make_bridg
         assert bridge.channel is None
         assert hub.get(conversation.session_key) is None
         await bridge.close_all()
+
+
+# ── Who may cut a turn (2a.3, L2) ─────────────────────────────────────────
+
+
+async def test_a_voice_client_s_barge_in_never_cuts_another_session_s_turn(session, hub):
+    """A voice client hearing the TV: its barge-in and its final transcription only cut a turn
+    it sent; the TV's turn goes on for everyone, not aborted."""
+    tv, tv_ws = session("tv")
+    voice, voice_ws = session("voice")
+    started = asyncio.Event()
+    hub.orchestrator.stream_response = blocking(started)
+    await tv.turns.start_user_turn("hola")
+    await asyncio.wait_for(started.wait(), 2)
+
+    await voice._on_transcription("una frase larga", False)  # barge-in partial
+    await voice._on_transcription("una frase larga", True)  # final
+    await sent(voice)
+    assert not tv.turns.user_task.done()
+    assert hub.get(SK).current_turn is not None
+    hub.orchestrator.abort.assert_not_awaited()
+    assert pairs(voice_ws) == [("turn_start", "t-1", "user")]
+
+    await tv._on_transcription("otra frase larga", False)  # its own barge-in does cut it
+    await sent(tv), await sent(voice)
+    assert pairs(tv_ws)[-1] == ("turn_end", "t-1", "interrupted")
+    assert pairs(voice_ws)[-1] == ("turn_end", "t-1", "interrupted")
+
+
+async def test_a_barge_in_on_a_push_cuts_only_this_session_s_copy(session, hub):
+    tv, tv_ws = session("tv")
+    voice, voice_ws = session("voice")
+    await push(tv.channel, ("turn_start", SK), ("chat", {"deltaText": "aviso"}))
+    await sent(tv), await sent(voice)
+
+    await voice._on_transcription("una frase larga", False)
+    await push(tv.channel, ("chat", {"deltaText": " y más"}), ("turn_end", SK))
+    await sent(tv), await sent(voice)
+
+    assert pairs(voice_ws) == [("turn_start", "t-1", "push"), ("turn_end", "t-1", "interrupted")]
+    assert texts(voice_ws) == ["aviso"]
+    assert pairs(tv_ws) == [("turn_start", "t-1", "push"), ("turn_end", "t-1", "done")]
+    assert texts(tv_ws) == ["aviso", " y más"]
+    hub.orchestrator.abort.assert_not_awaited()
+
+
+async def test_a_client_cancel_stops_the_turn_for_everyone(session, hub):
+    """C3: «Parar» from any session stops the conversation's turn (the client `cancel`)."""
+    tv, tv_ws = session("tv")
+    mac, mac_ws = session("mac")
+    started = asyncio.Event()
+    hub.orchestrator.stream_response = blocking(started)
+    await tv.turns.start_user_turn("hola")
+    await asyncio.wait_for(started.wait(), 2)
+    assert (await mac.turns.cancel("cancelled"))[0]
+    await sent(tv), await sent(mac)
+    for ws in (tv_ws, mac_ws):
+        assert pairs(ws) == [("turn_start", "t-1", "user"), ("turn_end", "t-1", "cancelled")]
+
+
+async def test_another_person_s_device_never_attaches_to_a_private_conversation(make_bridge, hub):
+    """M20: Ana's private conversation is not opened from Bea's personal device."""
+    from fogar_gateway.models.schemas import Client
+
+    private = keyed_conversation("ana-web", id="conv-ana")
+    object.__setattr__(private, "owner_user_id", "ana")
+    hub.index.add(private)
+    bea, _ = make_bridge(
+        client=Client(id="bea-web", key_hash="k", is_active=True, user_id="bea"),
+        client_id="bea-web", orchestrator=hub.orchestrator, turn_registry=hub.turn_registry,
+        channel_hub=hub, client_registry=ClientRegistry(hub.index),
+        conversation=SessionConversation(private, explicit=True),
+    )  # fmt: skip
+    ana, _ = make_bridge(
+        client=Client(id="ana-web", key_hash="k", is_active=True, user_id="ana"),
+        client_id="ana-web", orchestrator=hub.orchestrator, turn_registry=hub.turn_registry,
+        channel_hub=hub, client_registry=ClientRegistry(hub.index),
+        conversation=SessionConversation(private, explicit=True),
+    )  # fmt: skip
+    assert bea.channel is None
+    assert ana.channel is not None and ana.channel.subscribers() == [ana.turns]
+    await bea.close_all()
+    await ana.close_all()

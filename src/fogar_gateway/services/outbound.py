@@ -120,7 +120,7 @@ class QueuedSender:
 
     def restrict(self, allowed: frozenset[str]) -> None:
         """Desde ya solo salen mensajes JSON de estos tipos: ni audio ni ningún otro, tampoco
-        lo que ya estaba en la cola (una sesión revocada o desplazada, G-18)."""
+        lo que ya estaba en la cola (una sesión revocada o con el agente retirado, G-18)."""
         self._allowed = allowed
 
     def _passes(self, kind: str, item) -> bool:

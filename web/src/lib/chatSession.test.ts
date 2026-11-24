@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createChatSession, MAX_CONSECUTIVE_FAILURES } from './chatSession'
+import { backoffMs } from './chat'
+import { createChatSession, GIVE_UP_AFTER_MS } from './chatSession'
 
 // Un WebSocket de mentira: guarda lo enviado y deja simular lo que manda el gateway.
 class FakeSocket {
@@ -133,42 +134,51 @@ describe('createChatSession', () => {
     expect(s.state.connection).toBe('ready')
   })
 
-  it(`tras ${MAX_CONSECUTIVE_FAILURES} caídas seguidas deja de reintentar solo y espera a «Reintentar» (#344)`, () => {
+  it('reintenta solo mientras las caídas seguidas duran menos de dos minutos; después espera a «Reintentar» (#344)', () => {
     const s = session()
     s.send('¿Llegas?')
-    for (let i = 1; i < MAX_CONSECUTIVE_FAILURES; i++) {
-      last().serverClose([1006, 1011, 1012][i % 3]!)
-      expect(s.state.connection).toBe('reconnecting')
-      vi.advanceTimersByTime(30_000)
-      expect(FakeSocket.all).toHaveLength(i + 1)
-      last().open() // abre, pero no llega a `ready`
-    }
+    let sockets = 1
+    const t0 = Date.now()
+    // Un reinicio del gateway que tarda: 1006, 1011, 1012… cada reintento tras su espera (1 s, 2 s, 4 s… hasta 30 s).
     last().serverClose(1006)
+    while (s.state.connection === 'reconnecting') {
+      expect(Date.now() - t0).toBeLessThan(GIVE_UP_AFTER_MS)
+      vi.advanceTimersByTime(backoffMs(s.state.failures))
+      sockets += 1
+      expect(FakeSocket.all).toHaveLength(sockets)
+      last().open() // abre, pero no llega a `ready`
+      last().serverClose([1006, 1011, 1012][sockets % 3]!)
+    }
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(GIVE_UP_AFTER_MS)
+    expect(sockets).toBeGreaterThan(5) // no se rinde tras unos pocos intentos rápidos
     expect(s.state.connection).toBe('stopped')
     expect(s.state.notice).toMatch(/tras varios intentos/)
-    expect(s.state.failures).toBe(MAX_CONSECUTIVE_FAILURES)
     vi.advanceTimersByTime(600_000)
-    expect(FakeSocket.all).toHaveLength(MAX_CONSECUTIVE_FAILURES) // nada más, solo
+    expect(FakeSocket.all).toHaveLength(sockets) // nada más, solo
     expect(s.send('hola')).toBe(false)
 
     s.reconnect()
     expect(s.state.failures).toBe(0)
-    expect(FakeSocket.all).toHaveLength(MAX_CONSECUTIVE_FAILURES + 1)
+    expect(FakeSocket.all).toHaveLength(sockets + 1)
     last().open()
     last().receive(READY)
     expect(s.state.connection).toBe('ready')
+    // «Reintentar» volvió a contar: otra caída reintenta solo.
+    last().serverClose(1006)
+    expect(s.state.connection).toBe('reconnecting')
   })
 
-  it('un `ready` vuelve a contar las caídas desde cero', () => {
+  it('un `ready` vuelve a contar el tiempo desde cero', () => {
     const s = session()
     for (let round = 0; round < 3; round++) {
-      for (let i = 1; i < MAX_CONSECUTIVE_FAILURES; i++) {
+      // 1 + 2 + 4 + 8 + 16 + 30 + 30 + 30 s ≈ 2 min menos un poco, sin `ready`…
+      for (const wait of [1000, 2000, 4000, 8000, 16_000, 30_000, 30_000]) {
         last().serverClose(1006)
         expect(s.state.connection).toBe('reconnecting')
-        vi.advanceTimersByTime(30_000)
+        vi.advanceTimersByTime(wait)
       }
       last().open()
-      last().receive(READY)
+      last().receive(READY) // …y entra: la cuenta empieza de nuevo
       expect(s.state.connection).toBe('ready')
       expect(s.state.failures).toBe(0)
     }

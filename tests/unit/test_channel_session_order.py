@@ -254,7 +254,9 @@ async def test_close_does_not_leave_a_cut_s_turn_end_running(make_bridge, monkey
     t0 = time.monotonic()
     await bridge.close_all()
     assert time.monotonic() - t0 < 0.45  # within the teardown bound, not the TTS one
-    assert all(t.done() or t.cancelling() for t in cuts)
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert all(t.done() for t in cuts), "a cut's turn_end task outlived the close"
     assert ws.of("turn_end")[0] == {"type": "turn_end", "turn_id": "t-1", "reason": "replaced"}
 
 

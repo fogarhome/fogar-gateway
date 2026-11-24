@@ -875,7 +875,8 @@ class FogarBridge:
             if self.config.barge_in_enabled and len(text) >= self.config.barge_in_min_chars:
                 # The turn or the push open now: one the worker opens after the cancel stays.
                 # Su turn_end lleva `reason: "interrupted"` (M19: ya no hay mensaje aparte).
-                cancelled, _ = await self.turns.cancel("interrupted")
+                # Solo lo suyo (own_only): un cliente de voz no corta el turno de otra sesión.
+                cancelled, _ = await self.turns.cancel("interrupted", own_only=True)
                 if cancelled:
                     logger.info(
                         f"[{self.client_id}] Barge-in: turno cancelado por parcial len={len(text)}"
@@ -887,7 +888,7 @@ class FogarBridge:
 
         # Final: cancel any running turn (not a push: the `send` that follows cuts it),
         # notify client. El orquestador se llama cuando el cliente envíe {"type": "send"}.
-        await self.turns.cancel("interrupted", push=False)
+        await self.turns.cancel("interrupted", push=False, own_only=True)
         logger.debug(f"[{self.client_id}] Transcripción final: '{text[:40]}'")
         try:
             await self._sender.send_json({"type": "transcription", "text": text})

@@ -153,7 +153,11 @@ async def test_closing_sender_keeps_turn_for_other(harness, clock):
     assert [t["text"] for t in of_type(other.messages, "token")] == ["reply-partial ", "fin"]
     assert [e["reason"] for e in of_type(other.messages, "turn_end")] == ["done"]
     assert_turns_paired(other.messages)
-    assert len(of_type(sender.messages, "turn_end")) <= 1
+    # El que se fue: su turn_start y, como mucho, el turn_end de ese mismo turno (el socket lo
+    # cerró él: el `closed` puede no llegarle), nunca dos.
+    (start,) = of_type(sender.messages, "turn_start")
+    ends = of_type(sender.messages, "turn_end")
+    assert len(ends) <= 1 and all(e["turn_id"] == start["turn_id"] for e in ends)
     key = harness.session_key(other)
     assert [m for m, sk in harness.openclaw.calls if sk == key] == ["chat.send"]  # sin chat.abort
 

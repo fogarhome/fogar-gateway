@@ -13,10 +13,11 @@ export type Connection =
   | 'stopped' // parada: no tiene arreglo reconectando, o se agotaron los reintentos (ver `notice`)
 
 /**
- * Caídas seguidas sin llegar a `ready` (1006, 1011, 1012…) tras las que se deja de reintentar solo
- * (#344): la conversación se para con «Reintentar» a mano. Un `ready` vuelve a contar desde cero.
+ * Cuánto se reintenta solo (#344): si las caídas seguidas sin llegar a `ready` (1006, 1011, 1012…)
+ * duran ya esto, se deja de reintentar y la conversación se para con «Reintentar» a mano. Cubre un
+ * reinicio del gateway o de OpenClaw, o un portátil que despierta; un `ready` vuelve a contar.
  */
-export const MAX_CONSECUTIVE_FAILURES = 5
+export const GIVE_UP_AFTER_MS = 120_000
 const GIVE_UP_TEXT = 'No llego al gateway tras varios intentos. Comprueba la conexión y reintenta.'
 
 export interface ChatSessionOptions {
@@ -59,6 +60,8 @@ export function createChatSession(options: ChatSessionOptions) {
   // Escrito con la conversación dormida: sale al llegar `ready` (su línea, por si no sale).
   let pending: { text: string; key: string } | null = null
   let disposed = false
+  // Desde cuándo falla sin llegar a `ready` (null: no está fallando).
+  let failingSince: number | null = null
 
   function connect(): void {
     if (disposed) return
@@ -102,6 +105,7 @@ export function createChatSession(options: ChatSessionOptions) {
       const m = msg as Extract<ServerMessage, { type: 'ready' }>
       state.connection = 'ready'
       state.failures = 0
+      failingSince = null
       // Un `restored` solo llega a quien estaba conectado al volver OpenClaw: al entrar, se parte de cero.
       state.orchestratorDown = false
       state.agent = m.conversation?.agent ?? m.agent
@@ -125,7 +129,9 @@ export function createChatSession(options: ChatSessionOptions) {
     const action = closeAction(code)
     if (action === 'retry') {
       state.failures += 1
-      if (state.failures < MAX_CONSECUTIVE_FAILURES) {
+      const now = Date.now()
+      failingSince ??= now
+      if (now - failingSince < GIVE_UP_AFTER_MS) {
         state.connection = 'reconnecting'
         retry = setTimeout(connect, backoffMs(state.failures))
         return
@@ -181,6 +187,7 @@ export function createChatSession(options: ChatSessionOptions) {
     if (ws || disposed) return
     state.log = new ChatLog(options.conversationId)
     state.failures = 0
+    failingSince = null
     state.connection = 'connecting'
     connect()
   }

@@ -524,7 +524,7 @@ class TurnController:
             # sale ya (A-r2-2), sin esperar detrás de un worker ocupado con su TTS; lo que venga
             # después sigue en la cola, detrás de él. Su fin encolado ya no hará nada.
             local.cancel_reason = local.cancel_reason or reason
-            task = asyncio.create_task(self._end(local, reason), name="turn_cut")
+            task = asyncio.create_task(self._cut(local, reason), name="turn_cut")
             self._cuts.add(task)
             task.add_done_callback(self._cuts.discard)
             self._supervise(task)
@@ -723,13 +723,19 @@ class TurnController:
             await self._send_turn_error(turn, "internal_error")
         await self._end(turn, "error")
 
-    async def cancel(self, reason: EndReason, *, push: bool = True) -> tuple[bool, str | None]:
+    async def cancel(
+        self, reason: EndReason, *, push: bool = True, own_only: bool = False
+    ) -> tuple[bool, str | None]:
         """Cancela lo que la sesión muestra ahora: el turno abierto en este socket (el del
         usuario y, con `push`, también un push). Si es una copia de un turno que ya terminó en
         el canal (su audio aún suena), se corta solo aquí y el turno abierto del canal sigue
         (se abrirá después, como antes); si es la copia del turno abierto del canal (o el
-        socket aún no muestra nada), se cancela en el canal. Devuelve (cancelado, su turn_id
-        en esta sesión)."""
+        socket aún no muestra nada), se cancela en el canal: el `cancel` del cliente para el
+        turno para todos (C3). Con `own_only` (la voz: barge-in y transcripción final, hasta
+        que la 2b quite el barge-in) solo corta un turno que esta sesión envió; de un push,
+        solo su copia aquí (el canal sigue), y el turno de otra sesión, nada: un cliente de
+        voz que oye la tele no le corta su turno. Devuelve (cancelado, su turn_id en esta
+        sesión)."""
         channel = self._channel
         current = channel.current_turn if channel is not None else None
         mine = self._by_channel.get(current.id) if current is not None else None
@@ -744,6 +750,13 @@ class TurnController:
             return False, None
         if current.origin == "push" and not push:
             return False, None
+        if own_only and current.by_session is not self:
+            if current.origin != "push" or not mine.opened:
+                return False, None
+            # Solo su copia: el push sigue en el canal para las demás sesiones.
+            mine.cancel_reason = mine.cancel_reason or reason
+            await self._end(mine, reason)
+            return True, mine.turn_id
         if await channel.cancel(reason, push=push, expected=current) is None:
             return False, None
         if mine.opened:
@@ -1070,6 +1083,20 @@ class TurnController:
             td.raise_if_cancelled()
         return True
 
+    async def _cut(self, turn: Turn, reason: EndReason) -> None:
+        """El turn_end de un corte, en su propia tarea (A-r2-2), y después su TTS. Si el cierre
+        de la sesión la cancela (`_close_turns`), termina ya: la liberación del TTS sigue sola,
+        supervisada y acotada por PUSH_TTS_DRAIN_TIMEOUT_S, y nunca la retiene."""
+        if not await self._end(turn, reason, release=False):
+            return
+        release = asyncio.create_task(self._release_turn_tts(turn, reason), name="turn_cut_tts")
+        self._supervise(release)  # su fallo, al log por tipo (#221)
+        try:
+            await asyncio.wait({release})
+        except asyncio.CancelledError:
+            release.cancel()
+            raise
+
     async def _release_turn_tts(self, turn: Turn, reason: EndReason) -> None:
         if turn.tts is not None:
             if reason not in _DRAINED:
@@ -1142,8 +1169,11 @@ class TurnController:
                         await self._close_one(td, turn, item[2], limit)
             elif kind in ("turn_start", "refused") and not item[1].ended:
                 turn = item[1]
-                if turn.origin != "user":
-                    self._forget(turn)  # un push que este socket nunca mostró
+                source = turn.channel
+                if turn.origin != "user" or (source is not None and source.by_session is not self):
+                    # Un push, o el turno de otra sesión, que este socket nunca mostró: nada.
+                    # Un `send` aceptado de esta sesión sí recibe su par (G-r2-1, A-r3-1).
+                    self._forget(turn)
                     continue
                 for earlier in list(self._live):
                     if earlier is not turn and earlier.opened:

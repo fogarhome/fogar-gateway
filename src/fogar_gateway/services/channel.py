@@ -316,7 +316,8 @@ class ConversationChannel:
             self.conversation.id, subscriber.client.id, len(self._subscriptions),
         )
         turn = self.current_turn
-        if turn is not None:
+        if turn is not None and turn.cancel_reason is None:
+            # Uno que se está sustituyendo o cortando no se le enseña a quien llega.
             self._start(turn, subscription)
         return True
 
