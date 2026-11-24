@@ -55,7 +55,7 @@ def _cli(port, *args, json_out=False):
 
 async def _open(port, key):
     ws = await websockets.connect(f"ws://127.0.0.1:{port}/ws/stream")
-    await ws.send(json.dumps({"client_key": key, "input_mode": "text", "output_mode": ["text"]}))
+    await ws.send(json.dumps({"client_key": key, "protocol": 5, "input_mode": "text", "output_mode": ["text"]}))
     ready = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
     assert ready["type"] == "ready"
     return ws

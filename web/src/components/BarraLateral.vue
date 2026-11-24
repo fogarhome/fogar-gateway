@@ -94,7 +94,7 @@ async function salir(): Promise<void> {
     </div>
     <div class="pie">
       <span v-if="session.user" class="fg-meta">{{ session.user.display_name }}</span>
-      <span v-if="props.nombre" class="fg-meta">{{ props.nombre }}<template v-if="props.version"> · v{{ props.version }}</template></span>
+      <span v-if="props.nombre || props.version" class="fg-meta">{{ props.nombre }}<template v-if="props.nombre && props.version"> · </template><template v-if="props.version">v{{ props.version }}</template></span>
       <button type="button" class="salir" @click="salir">Salir</button>
     </div>
   </nav>
@@ -109,7 +109,7 @@ async function salir(): Promise<void> {
     <RouterLink v-for="s in enMenu" :key="s.to" :to="s.to" class="menu-enlace" :aria-current="s.activa ? 'page' : undefined">
       <FgIcono :nombre="s.icono" />{{ s.texto }}
     </RouterLink>
-    <span v-if="props.nombre" class="fg-meta">{{ props.nombre }}<template v-if="props.version"> · v{{ props.version }}</template></span>
+    <span v-if="props.nombre || props.version" class="fg-meta">{{ props.nombre }}<template v-if="props.nombre && props.version"> · </template><template v-if="props.version">v{{ props.version }}</template></span>
     <button type="button" class="salir" @click="salir">Salir</button>
   </div>
   <nav class="inferior" aria-label="Secciones">

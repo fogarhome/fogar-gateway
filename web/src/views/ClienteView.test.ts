@@ -36,7 +36,6 @@ const cliente: ClientResponse = {
   barge_in_min_chars: 3,
   output_mode: null,
   silence_timeout_s: 10,
-  max_silence_turns: 2,
   push_enabled: false,
   tool_calls_enabled: false,
 }

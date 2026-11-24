@@ -19,7 +19,6 @@ const cliente: ClientResponse = {
   barge_in_min_chars: 5,
   output_mode: ['audio', 'text'],
   silence_timeout_s: 2,
-  max_silence_turns: 3,
   push_enabled: true,
   tool_calls_enabled: false,
 }

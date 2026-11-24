@@ -1,7 +1,7 @@
 import logging
 
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from fogar_gateway.core.config import Settings
 from fogar_gateway.core.startup_checks import SpeechConfigError, check_speech_settings
@@ -77,7 +77,7 @@ def test_rejects_v3_model_for_ws(model):
     assert "ELEVENLABS_TTS_MODEL" in str(e.value) and model not in str(e.value)
 
 
-def test_legacy_auto_audio_gate_means_energy(monkeypatch):
-    # "auto" was the documented default before #264; a production .env carrying it must still boot.
+def test_stt_audio_gate_auto_is_rejected(monkeypatch):
     monkeypatch.setenv("STT_AUDIO_GATE", "auto")
-    assert Settings().STT_AUDIO_GATE == "energy"
+    with pytest.raises(ValidationError, match="STT_AUDIO_GATE"):
+        Settings()

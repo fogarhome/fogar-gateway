@@ -12,6 +12,7 @@ from tests.integration.conftest import CLIENT_ID, VALID_KEY
 
 HANDSHAKE = {
     "client_key": VALID_KEY,
+    "protocol": 5,
     "input_mode": "text",
     "output_mode": ["text", "status"],
 }
@@ -54,7 +55,7 @@ def test_slow_client_policy_records_the_event_and_calls_drop_slow_client(client,
 
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_json(HANDSHAKE)
-        ws.send_text("hola")
+        ws.send_json({"type": "send", "text": "hola"})
         assert _wait_for(lambda: len(dropped) == 1), "on_slow no se invocó"
 
     assert recorded == [("client_slow", {"timeout_s": 0.05})]
@@ -67,7 +68,7 @@ def test_slow_client_without_transport_is_closed_with_1013(client, monkeypatch):
 
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_json(HANDSHAKE)
-        ws.send_text("hola")
+        ws.send_json({"type": "send", "text": "hola"})
         with pytest.raises(WebSocketDisconnect) as exc:
             for _ in range(60):
                 ws.receive_json()

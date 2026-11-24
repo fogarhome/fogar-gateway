@@ -18,7 +18,7 @@ async def bridge(make_bridge, mock_tracker):
     transcriber.last_transcript_at = None
     b, _ = make_bridge(
         client_id="c1",
-        config=ClientConfig(silence_timeout_s=1, max_silence_turns=2),
+        config=ClientConfig(silence_timeout_s=1),
         tracker=mock_tracker,
         input_mode="audio",
         transcriber=transcriber,

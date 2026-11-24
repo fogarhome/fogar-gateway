@@ -86,7 +86,6 @@ class ClientRecord(SQLModel, table=True):
     barge_in_min_chars: int = Field(default=5)
     output_mode: str | None = Field(default=None)  # JSON list, e.g. '["audio","text"]'
     silence_timeout_s: float = Field(default=2.0)
-    max_silence_turns: int = Field(default=3)
     push_enabled: bool = Field(default=True)
     tool_calls_enabled: bool = Field(default=False)
 

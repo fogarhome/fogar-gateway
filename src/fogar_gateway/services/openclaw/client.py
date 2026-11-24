@@ -23,6 +23,11 @@ from fogar_gateway.services.openclaw.device import (
     build_auth_payload_v3,
 )
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
+from fogar_gateway.services.openclaw.failures import (
+    ORCHESTRATOR_ERROR,
+    classify_failure,
+    fallback_reason,
+)
 from fogar_gateway.services.openclaw.models import (
     AuthMethod,
     GatewayInfo,
@@ -56,7 +61,8 @@ ORCHESTRATOR_DISCONNECTED_ERROR = "orchestrator_disconnected"
 # text. They reach WS clients as `TURN_ERROR.message` and /v1 callers as the error body.
 ORCHESTRATOR_SEND_FAILED_ERROR = "orchestrator_send_failed"  # chat.send could not be written
 ORCHESTRATOR_UNAVAILABLE_ERROR = "orchestrator_unavailable"  # not connected / reconnecting
-ORCHESTRATOR_ERROR = "orchestrator_error"  # OpenClaw rejected the turn, or an internal failure
+# ORCHESTRATOR_ERROR and the specific failure codes (#397) live in services/openclaw/failures.py
+# (stdlib, imported here: defining them here would be a circular import).
 ORCHESTRATOR_HANDSHAKE_FAILED_ERROR = "orchestrator_handshake_failed"  # connect() handshake
 # OpenClaw accepted the token but waits for the operator to approve this device (`last_error`).
 ORCHESTRATOR_PAIRING_REQUIRED_ERROR = "orchestrator_pairing_required"
@@ -855,6 +861,7 @@ class OpenClawClient:
         _sent = False
         _finished = False
         text_tracker = ChatTextTracker()
+        run_fallback: str | None = None  # #397: last fallback_step failure reason of this run
 
         try:
             try:
@@ -905,11 +912,16 @@ class OpenClawClient:
                         break
                     if data.get("state") == "error":
                         # #300: the agent failed after accepting the turn (no `final`
-                        # follows). errorMessage stays out of the client and the logs.
+                        # follows). #397: classified from structural fields only;
+                        # errorMessage stays out of the client and the logs.
                         _finished = True
-                        logger.warning("OpenClaw agent failed mid-turn (chat state=error)")
-                        yield OrchestratorEvent(type="error", content=ORCHESTRATOR_ERROR)
+                        code = classify_failure(data, fallback_reason=run_fallback)
+                        logger.warning("OpenClaw agent failed mid-turn (chat state=error, %s)", code)
+                        yield OrchestratorEvent(type="error", content=code)
                         break
+                elif kind == "agent":
+                    # #397: a lifecycle `fallback_step` of this run (dispatcher).
+                    run_fallback = fallback_reason(data, run_fallback)
                 elif kind == "accepted":
                     yield OrchestratorEvent(type="status", content=ACCEPTED)
                 elif kind == "tool":
@@ -921,11 +933,13 @@ class OpenClawClient:
                     # OpenClaw's own error text stays out of the client and the logs;
                     # the operator gets only the short code.
                     _finished = True
+                    code = ORCHESTRATOR_ERROR  # a rejected res carries no structural field to classify
                     logger.warning(
-                        "OpenClaw rejected the turn (code=%s)",
+                        "OpenClaw rejected the turn (code=%s, %s)",
                         _safe_error_code(data.get("error")),
+                        code,
                     )
-                    yield OrchestratorEvent(type="error", content=ORCHESTRATOR_ERROR)
+                    yield OrchestratorEvent(type="error", content=code)
                     break
                 elif kind == "overflow":
                     # Consumer fell behind the bounded queue (#130 S3b). _finished

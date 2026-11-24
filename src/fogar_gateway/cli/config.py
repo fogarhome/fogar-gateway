@@ -39,7 +39,7 @@ def _config_module() -> Any:
 
     `fogar_gateway.core.config` construye un `Settings()` global al importarse: un valor inválido
     (entorno o config.env) lo rompe. Entonces se ejecuta el módulo aparte, sin registrarlo, y se
-    toman la clase y RETIRED_KEYS, definidas antes de esa línea: la CLI sigue pudiendo validar
+    toma la clase, definida antes de esa línea: la CLI sigue pudiendo validar
     y corregir el valor (`config set`/`unset`, #359) sin traceback.
     """
     import importlib
@@ -63,7 +63,14 @@ def _config_module() -> Any:
 
 def _errors(exc: Any) -> list[str]:
     # Campo y tipo de error, nunca el valor (podría ser un secreto).
-    return [f"{'.'.join(str(p) for p in e['loc'])}: {e['type']}" for e in exc.errors()]
+    out = []
+    for e in exc.errors():
+        loc = ".".join(str(p) for p in e["loc"])
+        if e["type"] == "extra_forbidden":  # las claves de config.env llegan en minúsculas
+            out.append(f"{loc.upper()}: {e['type']} (ajuste retirado o desconocido: bórralo de config.env)")
+        else:
+            out.append(f"{loc}: {e['type']}")
+    return out
 
 
 def _settings_error(exc: Exception) -> list[str]:
@@ -133,7 +140,6 @@ def validation_checks(settings: Any) -> list[dict[str, str]]:
         ADMIN_TOKEN_MIN_LEN,
         SpeechConfigError,
         check_speech_settings,
-        deprecated_settings,
         insecure_tokens,
     )
 
@@ -166,8 +172,6 @@ def validation_checks(settings: Any) -> list[dict[str, str]]:
         if hosts := _host_bit_entries(csv):
             checks.append(_check("warn", name, f"{hosts}. El gateway usa la red indicada; "
                                  "escríbela así."))
-    for name in deprecated_settings(settings):
-        checks.append(_check("warn", name, "Obsoleto e ignorado; bórralo de la configuración."))
     return checks
 
 
@@ -372,8 +376,10 @@ def _resolve_name(name: str, *, retired: bool = False) -> str:
     module = _config_module()
     fields = module.Settings.model_fields
     key = name.upper()
-    if retired and key in module.RETIRED_KEYS:  # `unset` las quita, como pide el log (F-r8-4)
-        return key
+    if retired and key not in fields and paths.config_file().is_file() and any(
+        _line_re(key).match(line) for line in paths.config_file().read_text().splitlines()
+    ):
+        return key  # `unset` quita un ajuste retirado que sigue en config.env
     if key not in fields:
         close = difflib.get_close_matches(key, list(fields), n=1)
         hint = f" ¿Querías decir {close[0]}?" if close else ""

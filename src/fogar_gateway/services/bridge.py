@@ -38,9 +38,8 @@ from fogar_gateway.services.turns import TurnController
 
 logger = logging.getLogger(__name__)
 
-# Silence-watchdog poll interval (issue #129). Each tick with no transcription for
-# longer than `silence_timeout_s` is one strike (and one `degraded` notice), so
-# `max_silence_turns` counts ticks, not whole `silence_timeout_s` windows.
+# Silence-watchdog poll interval (issue #129). A tick with no transcription for longer than
+# `silence_timeout_s` warns the client (`degraded`), once per stretch of silence (#394).
 _WATCHDOG_POLL_S = 2
 # Tests swap this name for a virtual clock; patching asyncio.sleep would change it process-wide.
 _sleep = asyncio.sleep
@@ -363,14 +362,14 @@ class FogarBridge:
         }
 
     async def _transcription_watchdog(self):
-        """Notifica al cliente si hay silencio prolongado; cierra tras max_silence_turns consecutivos."""
+        """Avisa al cliente (`degraded`) de un silencio prolongado, una vez por tramo; nunca cierra la sesión (#394)."""
         # Esperar a que el cliente empiece a enviar audio antes de vigilar
         while self._last_audio_at is None:
             await _sleep(0.5)
             if not self.transcriber or self.transcriber.state == ConnectionState.DEGRADED:
                 return
 
-        silence_count = 0
+        warned = False
         last_seen_transcription_at = self.transcriber.last_transcript_at
         was_connected = True
         recovery_baseline: float | None = None
@@ -391,7 +390,7 @@ class FogarBridge:
 
             current_transcription_at = self.transcriber.last_transcript_at
             if current_transcription_at != last_seen_transcription_at:
-                silence_count = 0
+                warned = False
                 last_seen_transcription_at = current_transcription_at
                 recovery_baseline = None
             elif not was_connected:
@@ -400,16 +399,16 @@ class FogarBridge:
                 # so it still predates the outage — restart the silence clock from
                 # the recovery moment instead of blaming the client for however
                 # long the reconnect took (issue #149).
-                silence_count = 0
+                warned = False
                 recovery_baseline = time.monotonic()
             was_connected = True
 
             now = time.monotonic()
             if self.turns.in_flight():
                 # Decision of Sito (#215): a turn in progress is activity, not silence.
-                # Strikes reset and the window restarts from now, so the first window
-                # after the turn is a fresh one (no strike on the first tick after it).
-                silence_count = 0
+                # The warning resets and the window restarts from now, so the first window
+                # after the turn is a fresh one (no warning on the first tick after it).
+                warned = False
                 recovery_baseline = now
                 continue
 
@@ -417,8 +416,8 @@ class FogarBridge:
             if now - last_audio > self._audio_gap_s():
                 # #227: the client is not sending audio (wake-word client idle between
                 # turns, keepalive only). Silence is only counted while audio flows:
-                # no strikes, no `degraded`, accumulated strikes are forgotten.
-                silence_count = 0
+                # no `degraded`, and the warning state is forgotten.
+                warned = False
                 continue
 
             burst_start = self._audio_burst_start
@@ -430,7 +429,7 @@ class FogarBridge:
             if last_audio <= last:
                 # No audio since the window's reference point (the last transcription):
                 # the client already said its piece and went quiet. Nothing to blame it for.
-                silence_count = 0
+                warned = False
                 continue
             elapsed = now - last
             timeout = self.config.silence_timeout_s
@@ -439,17 +438,10 @@ class FogarBridge:
                 # return its first result (`warmup_s`; fogar = 0) isn't blamed for it.
                 timeout += self._stt.capabilities.warmup_s
 
-            if elapsed > timeout:
-                silence_count += 1
-                logger.warning(
-                    f"[{self.client_id}] Watchdog: {elapsed:.1f}s sin transcripción "
-                    f"({silence_count}/{self.config.max_silence_turns})"
-                )
+            if elapsed > timeout and not warned:
+                warned = True
+                logger.warning(f"[{self.client_id}] Watchdog: {elapsed:.1f}s sin transcripción")
                 await self.notify_service_status("transcriber", "degraded")
-                if silence_count >= self.config.max_silence_turns:
-                    self.note_close_reason("silence_timeout")
-                    await self.close_all()
-                    return
 
     async def _idle_watchdog(self):
         """Cierra la sesión si el cliente no manda ningún mensaje (audio o texto) durante
@@ -747,7 +739,7 @@ class FogarBridge:
                         self._last_audio_at = now
                         await self.transcriber.send_audio(message["bytes"])
 
-                # TEXTO → Orchestrator (prompt directo desde un cliente de texto)
+                # Text frames are protocol JSON messages (non-JSON → INVALID_MESSAGE)
                 elif "text" in message:
                     text_data = message["text"]
                     try:
@@ -759,9 +751,8 @@ class FogarBridge:
                         parsed = False
 
                     if not parsed:
-                        if self.handshake.input_mode == "text":
-                            # Texto plano en modo texto — compatibilidad con clientes de texto puro
-                            await self.turns.start_user_turn(text_data)
+                        # 5.0: a non-JSON frame is never a prompt, in any input_mode.
+                        await self._send_invalid_message()
                     elif not isinstance(json_msg, dict):
                         # G-20: a JSON scalar/list (`42`, `[1]`, `"s"`, `true`, `null`)
                         # is not a protocol message. Non-fatal error, session goes on.

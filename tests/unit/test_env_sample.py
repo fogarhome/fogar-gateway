@@ -47,19 +47,9 @@ def test_env_sample_defaults_match_settings_defaults():
     assert mismatches == [], mismatches
 
 
-def test_retired_key_in_config_env_is_ignored_with_one_warning(caplog):
-    """#272: an old config.env still carrying ORCHESTRATOR_RECONNECT_MAX_DURATION must load."""
-    import logging
-
+def test_retired_orchestrator_reconnect_key_is_rejected():
     import pytest
     from pydantic import ValidationError
 
-    caplog.set_level(logging.WARNING, logger="fogar_gateway.core.config")
-    s = Settings(ORCHESTRATOR_RECONNECT_MAX_DURATION="300.0", OPENCLAW_PORT=1234)  # type: ignore[call-arg]
-    assert s.OPENCLAW_PORT == 1234
-    assert not hasattr(s, "ORCHESTRATOR_RECONNECT_MAX_DURATION")
-    warnings = [r for r in caplog.records if "obsolete" in r.getMessage()]
-    assert len(warnings) == 1
-
-    with pytest.raises(ValidationError):  # extra='forbid' stays for everything else
-        Settings(SOME_UNKNOWN_KEY="x")  # type: ignore[call-arg]
+    with pytest.raises(ValidationError, match="ORCHESTRATOR_RECONNECT_MAX_DURATION"):
+        Settings(ORCHESTRATOR_RECONNECT_MAX_DURATION="300.0")  # type: ignore[call-arg]

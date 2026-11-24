@@ -92,6 +92,13 @@ def test_paths_are_reported(base):
     assert str(base / "data" / "gateway.db") in found["rutas"]["detail"]
 
 
+def test_doctor_reports_retired_key(base):
+    (base / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nSHUTDOWN_DRAIN_S=10\n")
+    detail = checks(run("--json", "doctor"))["configuración"]
+    assert detail["level"] == "fail"
+    assert "SHUTDOWN_DRAIN_S" in detail["detail"] and "bórralo" in detail["detail"]
+
+
 def test_invalid_config_is_a_failure_naming_the_field_only(base):
     (base / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nSTT_PROVIDER=valor-raro-xyz\n")
     r = run("--json", "doctor")

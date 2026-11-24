@@ -85,9 +85,9 @@ def _insert_client(c, client_id: str, home: str = "home", user: str | None = Non
     c.execute(text(
         "INSERT INTO clients (id, home_id, user_id, name, key_hash, is_active, created_at, "
         "stt_language, stt_vad_thold, tts_voice, tts_speed, barge_in_enabled, "
-        "barge_in_min_chars, silence_timeout_s, max_silence_turns, push_enabled, "
+        "barge_in_min_chars, silence_timeout_s, push_enabled, "
         "tool_calls_enabled) VALUES (:id, :home, :user, 'X', :id, 1, '2026-11-21', 'es', 0, "
-        "'v', 1, 1, 5, 2, 3, 1, 0)"
+        "'v', 1, 1, 5, 2, 1, 0)"
     ), {"id": client_id, "home": home, "user": user})
 
 
@@ -133,6 +133,37 @@ def test_4_0_schema_keeps_every_conversation_with_its_home_and_device(tmp_path, 
         with engine.connect() as c:
             assert c.execute(text("SELECT id FROM conversations")).scalars().all() == ["c-tv"]
             assert c.execute(text("SELECT id FROM clients")).scalars().all() == ["tv"]
+    finally:
+        database.dispose_engine()
+
+
+def test_migration_drops_max_silence_turns(tmp_path, monkeypatch):
+    """#394: una base 4.0.1 (con `max_silence_turns`) arranca la 5.0 sin perder clientes ni las
+    conversaciones que cuelgan de ellos (la copia por lotes de `clients` no las borra en cascada)."""
+    from alembic import command
+    from sqlalchemy import text
+
+    _point_at(monkeypatch, tmp_path / "old.db")
+    command.upgrade(database._alembic_config(), "40a0e1f00001")
+    engine = database.get_engine()
+    try:
+        with engine.begin() as c:
+            assert "max_silence_turns" in {col["name"] for col in inspect(c).get_columns("clients")}
+            c.execute(text(
+                "INSERT INTO clients (id, home_id, name, key_hash, is_active, created_at, "
+                "stt_language, stt_vad_thold, tts_voice, tts_speed, barge_in_enabled, "
+                "barge_in_min_chars, silence_timeout_s, max_silence_turns, push_enabled, "
+                "tool_calls_enabled) VALUES ('tv', 'home', 'TV', 'k', 1, '2026-11-21', 'es', 0, "
+                "'v', 1, 1, 5, 7, 3, 1, 0)"
+            ))
+            _insert_conversation(c, "c-tv", "tv")
+        database.run_migrations()
+        with engine.connect() as c:
+            assert "max_silence_turns" not in {col["name"] for col in inspect(c).get_columns("clients")}
+            row = c.execute(text("SELECT id, silence_timeout_s FROM clients")).one()
+            assert tuple(row) == ("tv", 7.0)
+            assert c.execute(text("SELECT id FROM conversations")).scalars().all() == ["c-tv"]
+            assert c.execute(text("PRAGMA foreign_key_check")).all() == []
     finally:
         database.dispose_engine()
 

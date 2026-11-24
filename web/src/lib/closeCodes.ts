@@ -18,6 +18,7 @@ export const CLOSE_CODES = {
   4000: 'fix', // handshake inválido
   4001: 'fix', // handshake no es texto
   4002: 'fix', // handshake demasiado grande
+  4003: 'fix', // versión de protocolo no admitida
   4010: 'fix', // credencial inválida o inactiva
   4020: 'fix', // agente no permitido
   4021: 'fix', // agente no disponible

@@ -53,7 +53,6 @@ export function ownText(texts: Record<string, string>, value: string): string | 
 export const CLOSE_REASON: Record<string, string> = {
   client_disconnect: 'Se fue el cliente',
   idle_timeout: 'Inactividad (5 min)',
-  silence_timeout: 'Silencio al hablar',
   slow_client: 'Cliente lento',
   revoked: 'Acceso retirado',
   agent_revoked: 'Agente retirado',
@@ -77,6 +76,11 @@ export const TURN_ERROR: Record<string, string> = {
   orchestrator_unavailable: 'OpenClaw no está disponible',
   orchestrator_send_failed: 'No se pudo enviar a OpenClaw',
   orchestrator_error: 'OpenClaw rechazó la pregunta',
+  orchestrator_auth_failed: 'OpenClaw no puede usar el modelo: revisa su clave',
+  orchestrator_model_unavailable: 'El modelo del agente no está disponible',
+  orchestrator_rate_limited: 'El modelo está saturado o sin cuota: prueba más tarde',
+  orchestrator_timeout: 'El modelo tardó demasiado en responder',
+  orchestrator_agent_unavailable: 'Este agente ya no está disponible aquí',
   orchestrator_disconnected: 'OpenClaw se desconectó a mitad',
   turn_timeout: 'OpenClaw dejó de responder',
   turn_overflow: 'El gateway no pudo seguir el ritmo de la respuesta',
@@ -85,7 +89,11 @@ export const TURN_ERROR: Record<string, string> = {
 }
 
 /** Errores de turno con los que la pregunta no llegó a OpenClaw: no vendrá al releer lo dicho. */
-export const NOT_IN_OPENCLAW: ReadonlySet<string> = new Set(['orchestrator_unavailable', 'orchestrator_send_failed'])
+export const NOT_IN_OPENCLAW: ReadonlySet<string> = new Set([
+  'orchestrator_unavailable',
+  'orchestrator_send_failed',
+  'orchestrator_agent_unavailable',
+])
 
 /** En qué está un turno (`turn_progress`, docs/client-protocol.md §5); la herramienta va aparte. */
 export const TURN_PROGRESS: Record<string, string> = {

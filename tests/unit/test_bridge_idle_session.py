@@ -87,7 +87,7 @@ async def test_idle_persistent_client_is_not_closed_nor_degraded(make_idle_bridg
     """One turn of audio, then only keepalive for many silence windows (wake-word client)."""
     monkeypatch.setattr(bridge_module, "_WATCHDOG_POLL_S", 0.05)
     clock = VClock(monkeypatch)
-    bridge, ws = make_idle_bridge(ClientConfig(silence_timeout_s=timeout_s, max_silence_turns=strikes))
+    bridge, ws = make_idle_bridge(ClientConfig(silence_timeout_s=timeout_s))
     bridge.close_all = AsyncMock()
     loop_task = asyncio.create_task(bridge._client_input_loop())
     wd = asyncio.create_task(bridge._transcription_watchdog())
@@ -106,9 +106,8 @@ async def test_idle_persistent_client_is_not_closed_nor_degraded(make_idle_bridg
 async def test_audio_resuming_after_idle_starts_a_fresh_silence_window(make_idle_bridge, monkeypatch):
     monkeypatch.setattr(bridge_module, "_WATCHDOG_POLL_S", 0.05)
     clock = VClock(monkeypatch)
-    bridge, ws = make_idle_bridge(ClientConfig(silence_timeout_s=0.2, max_silence_turns=2))
-    closed_at: list[float] = []
-    bridge.close_all = AsyncMock(side_effect=lambda *a, **k: closed_at.append(clock.t))
+    bridge, ws = make_idle_bridge(ClientConfig(silence_timeout_s=0.2))
+    bridge.close_all = AsyncMock()
     loop_task = asyncio.create_task(bridge._client_input_loop())
     wd = asyncio.create_task(bridge._transcription_watchdog())
     try:
@@ -116,8 +115,7 @@ async def test_audio_resuming_after_idle_starts_a_fresh_silence_window(make_idle
         bridge.transcriber.last_transcript_at = clock.t
         await _feed(clock, ws, keepalive_for=0.6)  # idle phase
         await sent(bridge)
-        assert not ws.of("status") and not closed_at
-        resumed = clock.t
+        assert not ws.of("status")
         await _feed(clock, ws, audio_for=1.0)  # wake word again, then silence in the audio
     finally:
         wd.cancel()
@@ -125,9 +123,8 @@ async def test_audio_resuming_after_idle_starts_a_fresh_silence_window(make_idle
     await sent(bridge)
     degraded = ws.of("status")
     assert degraded, "continuous audio with no transcription must still be reported"
-    assert closed_at, "...and still close the session"
-    # the stale pre-idle transcription time must not count: nothing within one window
-    assert closed_at[0] - resumed >= 0.2
+    bridge.close_all.assert_not_awaited()  # ...but only reported, never closed (#394)
+    assert len(degraded) == 1
 
 
 async def test_watchdog_exits_if_transcriber_degrades_before_any_audio(make_idle_bridge, monkeypatch):
@@ -141,25 +138,23 @@ async def test_watchdog_exits_if_transcriber_degrades_before_any_audio(make_idle
     assert wd.done() and not wd.cancelled()
 
 
-async def test_streaming_client_with_no_transcriptions_behaves_as_before(make_idle_bridge, monkeypatch):
-    """Regression guard: an always-streaming client (ESP32) gets one strike and one
-    degraded notice per poll tick and is closed after max_silence_turns ticks."""
+async def test_streaming_client_with_no_transcriptions_is_warned_once_and_kept(make_idle_bridge, monkeypatch):
+    """An always-streaming client (ESP32) with no transcriptions gets one degraded notice per
+    stretch of silence, however many ticks it lasts, and the session stays open (#394)."""
     monkeypatch.setattr(bridge_module, "_WATCHDOG_POLL_S", 0.1)
     clock = VClock(monkeypatch)
-    bridge, ws = make_idle_bridge(ClientConfig(silence_timeout_s=0.05, max_silence_turns=3))
+    bridge, ws = make_idle_bridge(ClientConfig(silence_timeout_s=0.05))
     bridge.close_all = AsyncMock()
     loop_task = asyncio.create_task(bridge._client_input_loop())
     wd = asyncio.create_task(bridge._transcription_watchdog())
     try:
-        for _ in range(300):  # up to 3 virtual seconds of continuous audio
-            if wd.done():
-                break
+        for _ in range(300):  # 3 virtual seconds of continuous audio: ~30 ticks
             ws.inbox.put_nowait(_audio())
             await clock.advance(clock.t + 0.01)
+        assert not wd.done()
     finally:
         wd.cancel()
         loop_task.cancel()
-    assert wd.done() and not wd.cancelled()
     await sent(bridge)
-    assert len(ws.of("status")) == 3
-    bridge.close_all.assert_awaited_once()
+    assert len(ws.of("status")) == 1
+    bridge.close_all.assert_not_awaited()

@@ -9,6 +9,7 @@ from tests.integration.conftest import VALID_KEY
 
 HANDSHAKE = {
     "client_key": VALID_KEY,
+    "protocol": 5,
     "input_mode": "text",
     "output_mode": ["text", "status"],
 }
@@ -27,7 +28,7 @@ def _drain_until_turn_end(ws, limit=40):
 def test_ready_precedes_turn_and_turn_start_precedes_tokens(client):
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_json(HANDSHAKE)
-        ws.send_text("hola")
+        ws.send_json({"type": "send", "text": "hola"})
         msgs = _drain_until_turn_end(ws)
 
     types = [m["type"] for m in msgs]
@@ -65,7 +66,7 @@ def test_rejected_handshake_creates_no_writer_task(client, monkeypatch):
 
     monkeypatch.setattr(routes, "QueuedSender", spy)
     with client.websocket_connect("/ws/stream") as ws:
-        ws.send_json({"client_key": "no-existe", "input_mode": "text", "output_mode": ["text"]})
+        ws.send_json({"client_key": "no-existe", "protocol": 5, "input_mode": "text", "output_mode": ["text"]})
         with pytest.raises(WebSocketDisconnect) as exc:
             ws.receive_json()
     assert (exc.value.code, exc.value.reason) == (4010, "invalid or inactive credential")

@@ -126,8 +126,17 @@ class FrameDispatcher:
             # show the run is alive. A frame without `stream` keeps the old reading.
             self._turns.note_run_activity(sk, _run_id(payload), ended=False)
             return
-        phase = _as_dict(payload.get("data")).get("phase")
+        data = _as_dict(payload.get("data"))
+        phase = data.get("phase")
         self._turns.note_run_activity(sk, _run_id(payload), ended=phase in ("end", "error"))
+        if phase == "fallback_step":
+            # #397: the run's failure reason, for classifying its error later (failures.py).
+            # Only its structural fields are read; it opens or ends nothing.
+            if self._turns.deliver_by_session(sk, ("agent", data), _run_id(payload)):
+                return
+            if (bridge := self._clients.route(sk)) is not None:
+                bridge.enqueue_push("fallback", data, run_id=_run_id(payload))
+            return
         bridge = self._clients.route(sk)
         if bridge is None:
             return
@@ -161,8 +170,10 @@ class FrameDispatcher:
             # the push open forever, its TTS connection never closed,
             # and the push path permanently dead for the rest of the session
             # (caught in final review, 2026-08-04).
-            kind = "turn_error" if phase == "error" else "turn_end"
-            bridge.enqueue_push(kind, sk, run_id=_run_id(payload))
+            if phase == "error":  # #397: its `data`, which the push classifies
+                bridge.enqueue_push("turn_error", data, run_id=_run_id(payload))
+            else:
+                bridge.enqueue_push("turn_end", sk, run_id=_run_id(payload))
 
     async def _handle_session_tool(self, payload: dict) -> None:
         sk = payload.get("sessionKey")

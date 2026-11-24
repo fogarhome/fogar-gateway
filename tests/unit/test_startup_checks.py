@@ -6,16 +6,15 @@ import sys
 import textwrap
 
 import pytest
+from pydantic import ValidationError
 
 from fogar_gateway.core.config import Settings
 from fogar_gateway.core.startup_checks import (
     LOCK_FILENAME,
     SingleProcessLockError,
     acquire_single_process_lock,
-    deprecated_settings,
     insecure_tokens,
     release_single_process_lock,
-    warn_deprecated_settings,
     warn_insecure_tokens,
 )
 
@@ -28,21 +27,12 @@ def _settings(**kw) -> Settings:
     return Settings(_env_file=None, **base)
 
 
-def test_obsolete_shutdown_drain_s_is_accepted_and_warned(tmp_path, caplog):
-    """#221: SHUTDOWN_DRAIN_S is ignored, but an old .env that still sets it must not
-    stop the gateway from starting (pydantic-settings rejects unknown .env keys)."""
+def test_shutdown_drain_s_in_config_env_is_rejected(tmp_path):
+    """5.0: a retired key is an extra key; startup fails and names it."""
     env = tmp_path / ".env"
-    env.write_text("SHUTDOWN_DRAIN_S=30.0\n", encoding="utf-8")
-    caplog.set_level(logging.WARNING)
-
-    assert warn_deprecated_settings(Settings(_env_file=env)) == ["SHUTDOWN_DRAIN_S"]
-    assert any("SHUTDOWN_DRAIN_S" in r.getMessage() for r in caplog.records)
-
-
-def test_no_deprecation_warning_by_default(caplog):
-    caplog.set_level(logging.WARNING)
-    assert warn_deprecated_settings(_settings()) == []
-    assert caplog.records == []
+    env.write_text("SHUTDOWN_DRAIN_S=10\n", encoding="utf-8")
+    with pytest.raises(ValidationError, match=r"(?i)SHUTDOWN_DRAIN_S"):
+        Settings(_env_file=env)
 
 
 def test_no_warning_when_tokens_are_set(caplog):
@@ -213,11 +203,4 @@ def test_insecure_tokens_lists_names_without_logging(caplog):
     caplog.set_level(logging.DEBUG)
     s = Settings(_env_file=None, ADMIN_TOKEN="", OPENCLAW_TOKEN="changeme", TTS_TOKEN="changeme")
     assert insecure_tokens(s) == ["ADMIN_TOKEN", "OPENCLAW_TOKEN", "TTS_TOKEN"]
-    assert caplog.records == []
-
-
-def test_deprecated_settings_lists_names_without_logging(caplog):
-    caplog.set_level(logging.DEBUG)
-    s = Settings(_env_file=None, SHUTDOWN_DRAIN_S=3.0)
-    assert deprecated_settings(s) == ["SHUTDOWN_DRAIN_S"]
     assert caplog.records == []

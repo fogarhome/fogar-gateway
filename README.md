@@ -69,7 +69,7 @@ Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la guía completa 
 
 | Endpoint | Método | Auth | Descripción |
 |----------|--------|------|-------------|
-| `/.well-known/fogar-gateway` | GET | ninguna | Identifica al gateway: `{"service": "fogar-gateway", "version", "name", "instance_id"}` (`name` = `GATEWAY_NAME` o el nombre del equipo; `instance_id` = identificador aleatorio por arranque del proceso) |
+| `/.well-known/fogar-gateway` | GET | ninguna | Identifica al gateway: `{"service": "fogar-gateway", "version", "instance_id"}` (sin nombre: privacidad; `instance_id` = identificador aleatorio por arranque del proceso). El nombre (`GATEWAY_NAME`) llega al canjear un código en `POST /pair`, en `gateway.name` |
 | `/pair` | POST | un código de `fogar-gw pair` | El cliente canjea el código y recibe su `client_key`, la única vez que se ve. Ver [Emparejar un cliente](#emparejar-un-cliente) |
 
 Los dos son públicos: detrás de un proxy o un túnel también llegan desde internet. `/pair` solo acepta un código abierto por el administrador, y 5 códigos erróneos seguidos anulan todos los abiertos. El protocolo para clientes está en [`docs/client-protocol.md` §0](docs/client-protocol.md#0-descubrir-el-gateway-y-emparejarse).
@@ -480,7 +480,7 @@ Variables de entorno o, si no, de `<base>/config.env` (instalación nativa). En 
 |----------|---------|-------------|
 | `DATABASE_URL` | `sqlite:///data/gateway.db` | Base de datos SQLite local (identidad y configuración de clientes). Una ruta relativa cuelga de `<base>` |
 | `GATEWAY_HOST` | `0.0.0.0` | Host de escucha de `fogar-gw serve` (`127.0.0.1` detrás de un proxy en el mismo host) |
-| `GATEWAY_NAME` | — | Nombre con el que se anuncia a los clientes (`/.well-known/fogar-gateway`). Vacío = nombre del equipo; en Docker conviene fijarlo |
+| `GATEWAY_NAME` | — | Nombre con el que se presenta a los clientes al emparejarse (`gateway.name` de `POST /pair`; no se publica en `/.well-known/fogar-gateway`). Vacío = nombre del equipo; en Docker conviene fijarlo |
 | `PUBLIC_URLS` | — | URLs `https://` propias por las que se llega al gateway (CSV, sin ruta, parámetros ni usuario), p. ej. `https://fogar.example.com`. Vacío = ninguna |
 | `TRANSCRIBER_WS_URL` | `localhost:9000` | fogar-transcriber |
 | `TTS_WS_URL` | `localhost:8005` | fogar-speaker |
@@ -517,7 +517,7 @@ El STT y el TTS pasan por una capa de proveedores (`src/fogar_gateway/services/s
 
 `ELEVENLABS_BASE_URL` y `ELEVENLABS_TTS_MODEL` están en `.env.sample`; el resto de ajustes de ElevenLabs son constantes del adaptador (`src/fogar_gateway/services/speech/elevenlabs/`). El proveedor se elige con `STT_PROVIDER`/`TTS_PROVIDER` al arrancar; cambiarlo exige reiniciar. Con el plan Creator, ElevenLabs conserva el audio y las transcripciones (la retención cero es solo enterprise).
 
-`silence_timeout_s` y `max_silence_turns` (umbral del watchdog de silencio) son campos de configuración **por cliente** en la base de datos, no variables de entorno globales — ver `ClientRecord` en `src/fogar_gateway/db/models.py`.
+`silence_timeout_s` (umbral del aviso de silencio, que nunca cierra la sesión) es un campo de configuración **por cliente** en la base de datos, no una variable de entorno global — ver `ClientRecord` en `src/fogar_gateway/db/models.py`.
 
 ---
 

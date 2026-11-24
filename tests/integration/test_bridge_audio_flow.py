@@ -29,6 +29,7 @@ from tests.integration.conftest import (
 
 HANDSHAKE_AUDIO = {
     "client_key": VALID_KEY,
+    "protocol": 5,
     "input_mode": "audio",
     "output_mode": ["text"],
 }
@@ -247,11 +248,12 @@ def test_tts_connect_uses_voice_and_speed_from_config(mock_services, db_engine, 
                 ws.send_json(
                     {
                         "client_key": VALID_KEY,
+                        "protocol": 5,
                         "input_mode": "text",
                         "output_mode": ["audio", "text"],
                     }
                 )
-                ws.send_text("test")
+                ws.send_json({"type": "send", "text": "test"})
                 try:
                     ws.receive_json()
                 except Exception:

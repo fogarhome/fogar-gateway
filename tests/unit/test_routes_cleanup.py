@@ -26,6 +26,7 @@ CLIENT_ID = "hab_sito"
 
 HANDSHAKE_TEXT = {
     "client_key": CLIENT_KEY,
+    "protocol": 5,
     "input_mode": "text",
     "output_mode": ["text"],
 }

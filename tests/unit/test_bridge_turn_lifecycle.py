@@ -434,9 +434,11 @@ async def test_push_events_reset_the_push_budget(make_bridge, monkeypatch):
 
 async def test_failed_push_ends_with_reason_error(make_bridge):
     bridge, ws = make_bridge()
-    await push(bridge, ("turn_start", "sk"), ("turn_error", "sk"))
+    await push(bridge, ("turn_start", "sk"), ("turn_error", {"phase": "error"}))
     await sent(bridge)
-    assert ws.types() == ["turn_start", "turn_end"]
+    # #397: su TURN_ERROR (sin señal estructural, el genérico) y luego su turn_end.
+    assert ws.types() == ["turn_start", "error", "turn_end"]
+    assert ws.of("error")[0]["message"] == "orchestrator_error"
     assert bridge.turns.last_ended.origin == "push"
     assert bridge.turns.last_ended.end_reason == "error"
     await bridge.close_all()

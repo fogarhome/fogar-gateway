@@ -57,6 +57,7 @@ class Close:
     HANDSHAKE_INVALID = CloseFrame(4000, "invalid handshake", "fix")
     HANDSHAKE_NOT_TEXT = CloseFrame(4001, "handshake must be a text frame", "fix")
     HANDSHAKE_TOO_LARGE = CloseFrame(4002, "handshake too large", "fix")
+    PROTOCOL_UNSUPPORTED = CloseFrame(4003, "protocol version not supported", "fix")
     INVALID_CREDENTIAL = CloseFrame(4010, "invalid or inactive credential", "fix")
     AGENT_NOT_PERMITTED = CloseFrame(4020, "agent not permitted", "fix")
     AGENT_NOT_AVAILABLE = CloseFrame(4021, "agent not available", "fix")

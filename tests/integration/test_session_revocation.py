@@ -25,7 +25,7 @@ from tests.integration.conftest import (
     _configure_app_mocks,
 )
 
-HANDSHAKE = {"client_key": VALID_KEY, "input_mode": "text", "output_mode": ["text"]}
+HANDSHAKE = {"client_key": VALID_KEY, "protocol": 5, "input_mode": "text", "output_mode": ["text"]}
 INTERVAL_S = 0.2
 # La puerta de salida de la issue es ≤ 15 s; con intervalos cortos debe cerrar mucho antes.
 CLOSE_DEADLINE_S = 5.0

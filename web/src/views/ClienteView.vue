@@ -246,7 +246,6 @@ frenarRecarga(() => rotando.value)
               <FgCampo v-model="form.allowed_agents" etiqueta="Agentes permitidos" pista="Separados por comas. Vacío: todos." :error="err('allowed_agents')" />
               <FgCampo v-model="form.barge_in_min_chars" etiqueta="Letras para interrumpir" inputmode="numeric" pista="Cuánto tiene que decir para cortar a Fogar." :error="err('barge_in_min_chars')" />
               <FgCampo v-model="form.silence_timeout_s" etiqueta="Silencio para cerrar el turno (s)" inputmode="decimal" :error="err('silence_timeout_s')" />
-              <FgCampo v-model="form.max_silence_turns" etiqueta="Turnos en silencio antes de colgar" inputmode="numeric" :error="err('max_silence_turns')" />
             </div>
             <div class="interruptores">
               <label class="opcion"><input v-model="form.barge_in_enabled" type="checkbox" />Se le puede interrumpir</label>

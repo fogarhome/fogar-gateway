@@ -3,7 +3,7 @@
 Descubrimiento y emparejamiento de clientes (#317).
 
 Público, sin autenticación:
-  GET    /.well-known/fogar-gateway  — «soy un Fogar»: servicio, versión, nombre e instance_id
+  GET    /.well-known/fogar-gateway  — «soy un Fogar»: servicio, versión e instance_id (sin nombre)
   POST   /pair                      — el cliente canjea un código y recibe su client_key (una sola vez)
 
 Administración (X-Admin-Token):
@@ -68,7 +68,6 @@ def well_known() -> dict[str, Any]:
     return {
         "service": "fogar-gateway",
         "version": __version__,
-        "name": gateway_name(),
         "instance_id": INSTANCE_ID,
     }
 

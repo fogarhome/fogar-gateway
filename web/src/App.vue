@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import BarraLateral from './components/BarraLateral.vue'
 import FgAvisos from './components/FgAvisos.vue'
@@ -15,6 +15,7 @@ const live = useLiveStore()
 const clients = useClientsStore()
 
 const isPublic = computed(() => Boolean(route.meta.public))
+// El nombre de la casa (de /auth/me, con cualquier rol): para saber en cuál estás.
 const nombre = ref<string>()
 
 // El estado vivo y los clientes, solo para quien cuida del hogar (dueño o administrador).
@@ -36,8 +37,9 @@ watch(
   async (token) => {
     if (!token) return
     try {
-      const me = await api<{ user: SessionUser }>('/auth/me')
+      const me = await api<{ user: SessionUser; home?: { name: string } | null }>('/auth/me')
       session.setUser(me.user)
+      nombre.value = me.home?.name
       if (route.meta.admin && !session.isAdmin) await router.replace('/conversaciones')
     } catch (e) {
       if (e instanceof ApiError && e.kind === 'unauthorized') {
@@ -49,15 +51,6 @@ watch(
   { immediate: true },
 )
 
-// Nombre del gateway (público, sin token): para saber en qué casa estás.
-onMounted(async () => {
-  try {
-    const r = await fetch('/.well-known/fogar-gateway')
-    if (r.ok) nombre.value = ((await r.json()) as { name?: string }).name
-  } catch {
-    // sin nombre: la barra no lo enseña
-  }
-})
 </script>
 
 <template>

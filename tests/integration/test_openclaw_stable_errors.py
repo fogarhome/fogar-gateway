@@ -132,6 +132,60 @@ async def test_res_ok_false_gives_stable_error_not_openclaw_text(caplog):
     assert_clean(caplog, events)
 
 
+# ── fallos del agente con campos estructurales (#397) ─────────────────────────
+
+
+def _event(event, payload):
+    return json.dumps({"type": "event", "event": event, "payload": {"sessionKey": SK, "runId": "r1", **payload}})
+
+
+async def test_chat_error_with_an_auth_signal_gives_orchestrator_auth_failed(caplog):
+    caplog.set_level(logging.DEBUG, logger="fogar_gateway")
+
+    async def on_chat(ws, rid):
+        await ws.send(_res(rid, {"runId": "r1", "status": "started"}))
+        detail = {"failoverReason": "auth", "httpStatus": 401, "providerErrorMessagePreview": MARK}
+        await ws.send(_event("chat", {"seq": 1, "state": "error", "errorMessage": MARK, "errorDetail": detail}))
+
+    async with Server(on_chat=on_chat) as srv:
+        client = make_client(srv.port)
+        await client.connect()
+        try:
+            events = await asyncio.wait_for(run_turn(client), 5)
+        finally:
+            await client.close()
+    assert [e.content for e in events if e.type == "error"] == ["orchestrator_auth_failed"]
+    assert_clean(caplog, events)
+
+
+async def test_an_earlier_fallback_step_classifies_a_bare_chat_error(caplog):
+    """2026-11-01: sin credenciales, la única señal estructural fue el `fallback_step`."""
+    caplog.set_level(logging.DEBUG, logger="fogar_gateway")
+
+    async def on_chat(ws, rid):
+        await ws.send(_res(rid, {"runId": "r1", "status": "started"}))
+        step = {
+            "phase": "fallback_step",
+            "fallbackStepFromModel": "m",
+            "fallbackStepFromFailureReason": "auth",
+            "fallbackStepFromFailureDetail": MARK,
+            "fallbackStepFinalOutcome": "chain_exhausted",
+        }
+        await ws.send(_event("agent", {"stream": "lifecycle", "data": step}))
+        await ws.send(_event("agent", {"stream": "lifecycle", "data": {"phase": "error", "error": MARK}}))
+        await ws.send(_event("chat", {"seq": 2, "state": "error", "errorMessage": MARK}))
+
+    async with Server(on_chat=on_chat) as srv:
+        client = make_client(srv.port)
+        await client.connect()
+        try:
+            events = await asyncio.wait_for(run_turn(client), 5)
+        finally:
+            await client.close()
+    assert [e.content for e in events if e.type == "error"] == ["orchestrator_auth_failed"]
+    assert_clean(caplog, events)
+
+
 # ── fallo de send: la excepción de websockets lleva el motivo del cierre ──────
 
 

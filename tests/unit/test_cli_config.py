@@ -561,16 +561,12 @@ def test_set_validates_its_field_ignoring_other_bad_environment(home, monkeypatc
     assert os.environ["TTS_VOICE_MAP"] == "bad"  # el entorno queda como estaba
 
 
-@pytest.mark.parametrize("extra", ["", "TURN_TIMEOUT_S=0\n"])
-def test_retired_key_warning_once_per_command(home, extra):
-    """F-r7-3: el WARNING de la clave obsoleta sale una vez, también con la configuración
-    inválida (la CLI ejecuta entonces el módulo otra vez). En un proceso nuevo."""
-    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nORCHESTRATOR_RECONNECT_MAX_DURATION=5\n{extra}")
-    r = subprocess.run([sys.executable, "-m", "fogar_gateway.cli", "config", "set",
-                        "TURN_TIMEOUT_S", "10"], cwd=ROOT, capture_output=True, text=True,
-                       env=os.environ)
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert (r.stdout + r.stderr).count("is obsolete and ignored") == 1
+def test_config_validate_reports_retired_key(home):
+    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nSHUTDOWN_DRAIN_S=10\n")
+    r = run("config", "validate")
+    assert r.exit_code == 1
+    assert "SHUTDOWN_DRAIN_S" in r.output and "bórralo" in r.output
+    assert "Traceback" not in r.output
 
 
 @pytest.mark.parametrize("value", ["0", "inf", "nan"])
@@ -645,7 +641,7 @@ def test_set_non_fatal_problem_restarts_and_warns_before(home, systemd, monkeypa
 
 
 def test_unset_accepts_retired_key(home):
-    """F-r8-4: el log pide quitar ORCHESTRATOR_RECONNECT_MAX_DURATION; `unset` lo hace."""
+    """`unset` quita un ajuste retirado que sigue en config.env, aunque ya no sea un campo."""
     _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nORCHESTRATOR_RECONNECT_MAX_DURATION=5\n")
     r = run("config", "unset", "orchestrator_reconnect_max_duration")
     assert r.exit_code == 0, r.output

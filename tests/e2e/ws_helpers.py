@@ -18,6 +18,7 @@ async def ws_handshake(
         json.dumps(
             {
                 "client_key": client_key,
+                "protocol": 5,
                 "input_mode": input_mode,
                 "output_mode": ["text"],
                 "agent": agent,

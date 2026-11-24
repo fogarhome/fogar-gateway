@@ -117,22 +117,6 @@ def warn_insecure_tokens(settings) -> list[str]:
     return flagged
 
 
-def deprecated_settings(settings) -> list[str]:
-    """Ajustes obsoletos que aún vienen definidos, sin escribir en el log."""
-    return ["SHUTDOWN_DRAIN_S"] if settings.SHUTDOWN_DRAIN_S is not None else []
-
-
-def warn_deprecated_settings(settings) -> list[str]:
-    """WARNING por cada ajuste obsoleto que aún venga definido. Devuelve sus nombres."""
-    flagged = deprecated_settings(settings)
-    if flagged:
-        logger.warning(
-            "SHUTDOWN_DRAIN_S está obsoleto y se ignora: el cierre de una sesión cancela el "
-            "turno en curso y cada paso lo acota SESSION_TEARDOWN_S. Bórralo del .env."
-        )
-    return flagged
-
-
 def _lock_path(database_url: str) -> Path | None:
     url = make_url(database_url)
     if url.get_backend_name() != "sqlite" or not url.database or url.database == ":memory:":
