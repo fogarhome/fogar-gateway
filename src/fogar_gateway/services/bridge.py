@@ -205,6 +205,9 @@ class FogarBridge:
         cambio de canal lo hace `TurnController` en ese mismo `send` (decisión 6: deja el de
         ayer, donde su turno sigue para los demás, y se adjunta al de hoy)."""
         self._client_registry.index.add(new)
+        # El máximo de la cola de turno es por clave (#219), así que lo es del canal, no de esta
+        # sesión: con varias sesiones en una conversación, la primera que lo lee se lo lleva.
+        # Solo es una métrica de session_end; se deja así.
         self._turn_queue_peak = max(
             self._turn_queue_peak, self._turn_registry.pop_peak(old.session_key)
         )

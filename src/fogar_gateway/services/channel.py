@@ -58,11 +58,7 @@ from uuid import uuid4
 from fogar_gateway.core.config import settings
 from fogar_gateway.services import orchestration
 from fogar_gateway.services.openclaw.chat_text import ChatTextTracker
-from fogar_gateway.services.openclaw.failures import (
-    ORCHESTRATOR_AGENT_UNAVAILABLE_ERROR,
-    classify_failure,
-    fallback_reason,
-)
+from fogar_gateway.services.openclaw.failures import classify_failure, fallback_reason
 from fogar_gateway.services.openclaw.models import ToolCallEvent
 from fogar_gateway.services.openclaw.registry import TurnRegistry
 from fogar_gateway.services.reconnection import describe_error, traceback_no_message
@@ -475,11 +471,14 @@ class ConversationChannel:
         (`replaced`), the open push is cut, any other run active on the key is aborted, and
         only then the new turn opens (every subscriber gets its `on_turn_start`) and its task
         starts. `interrupt` is not used yet (5.0 PR 2b). None if nothing started: the channel
-        is closing, or `sender` left while waiting (G-09)."""
+        is closing, `sender` left while waiting (G-09), or `sender` may not use this agent: the
+        channel is left untouched (no replace, no cut, no abort) and the session answers its
+        `send` alone (#397, `TurnController.start_user_turn`)."""
         del interrupt  # 2b
         if self._closed:
             return None
-        allowed = sender.agent_allowed(self.session_key)
+        if not sender.agent_allowed(self.session_key):
+            return None
         tracker = sender.tracker
         async with self._lock:
             if self._closed:
@@ -494,7 +493,7 @@ class ConversationChannel:
             self._user_turn = turn
             recorder = _SenderTracker(self, sender, tracker) if tracker is not None else None
             task = asyncio.create_task(
-                self._run_user_turn(turn, text, tracker, recorder, allowed), name="turn"
+                self._run_user_turn(turn, text, tracker, recorder), name="turn"
             )
             self._hub.supervise(task)
             task.add_done_callback(self._after_user_task)
@@ -570,7 +569,6 @@ class ConversationChannel:
         text: str,
         tracker: PipelineTracker | None,
         recorder: _SenderTracker | None,
-        allowed: bool,
     ) -> None:
         # Sus suscriptores vieron (o verán) su turn_start: le sigue su fin (G-10), pase lo que
         # pase desde aquí.
@@ -580,15 +578,6 @@ class ConversationChannel:
                 tracker.start_turn()
             self._note_turn()
             gateway_stats.turn_started("normal")
-            if not allowed:
-                # #397 (decisión a): la política del gateway, antes del chat.send. Solo el
-                # gateway sabe qué agentes puede usar cada dispositivo; OpenClaw solo diría
-                # INVALID_REQUEST.
-                code = ORCHESTRATOR_AGENT_UNAVAILABLE_ERROR
-                logger.warning(f"[{self._tag}] Turno sin agente disponible: {code}")
-                gateway_stats.turn_error(code)
-                self.emit(turn, ChannelError(code))
-                return
             reason = await self._stream(turn, text, recorder)
         except asyncio.CancelledError:
             reason = turn.cancel_reason or "cancelled"

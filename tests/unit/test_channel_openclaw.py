@@ -478,3 +478,32 @@ async def test_another_person_s_device_never_attaches_to_a_private_conversation(
     assert ana.channel is not None and ana.channel.subscribers() == [ana.turns]
     await bea.close_all()
     await ana.close_all()
+
+
+async def test_a_send_with_an_agent_not_allowed_leaves_the_channel_alone(session, hub):
+    """#397 in a shared conversation: a session whose `allowed_agents` no longer has this agent
+    gets its own pair with TURN_ERROR orchestrator_agent_unavailable; the open turn is not
+    replaced, nothing is aborted, and the other session sees nothing of it."""
+    tv, tv_ws = session("tv")
+    mac, mac_ws = session("mac")
+    started = asyncio.Event()
+    hub.orchestrator.stream_response = blocking(started)
+    await tv.turns.start_user_turn("hola")
+    task = tv.turns.user_task
+    await asyncio.wait_for(started.wait(), 2)
+
+    mac.turns.allowed_agents = ["otro"]
+    await mac.turns.start_user_turn("prohibido")
+    await sent(mac), await sent(tv)
+
+    assert not task.done()
+    hub.orchestrator.abort.assert_not_awaited()
+    assert pairs(tv_ws) == [("turn_start", "t-1", "user")]
+    assert tv_ws.of("error") == []
+    # On its own socket the refused send leaves the turn it showed behind (one open turn per
+    # socket, #202), as any `send` does; in the channel that turn goes on.
+    assert pairs(mac_ws) == [
+        ("turn_start", "t-1", "user"), ("turn_end", "t-1", "replaced"),
+        ("turn_start", "t-2", "user"), ("turn_end", "t-2", "error"),
+    ]  # fmt: skip
+    assert [e["message"] for e in mac_ws.of("error")] == ["orchestrator_agent_unavailable"]

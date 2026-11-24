@@ -430,13 +430,13 @@ def test_push_goes_to_the_channel_of_its_conversation():
     assert hub.channel_for(session_key_for("main", "c2")).conversation.id == "c2"
 
 
-def test_push_of_a_conversation_nobody_has_open_reaches_nobody():
-    """Decisión 7 (regresión conocida hasta la 2c): la conversación de ayer de la tele, cuya
-    sesión ya está en la de hoy: su push va a su canal, sin nadie adjunto; ya no a la última
-    sesión del cliente."""
+def test_push_of_a_conversation_resolves_its_own_channel_through_the_index():
+    """El push de la conversación de ayer va al canal de esa conversación (resuelto por el
+    índice, aunque ninguna sesión lo tenga abierto), no al de hoy."""
     hub = _hub(_conv("yesterday"), _conv("today"))
     channel = hub.channel_for(session_key_for("main", "yesterday"))
-    assert channel is not None and channel.subscribers() == []
+    assert channel is not None and channel.conversation.id == "yesterday"
+    assert channel is not hub.channel_for(session_key_for("main", "today"))
 
 
 def test_push_of_a_key_without_a_conversation_goes_nowhere():

@@ -203,12 +203,24 @@ async def test_day_cutoff_moves_a_long_lived_session_at_its_next_turn(harness, c
     assert said(harness, session_key_for("main", today)) == ["dos"]
     assert_turns_paired(client.messages)
 
-    # 5.0 (decisión 7, regresión conocida hasta la 2c): un recordatorio de la conversación de
-    # ayer va a su canal, en el que la tele ya no está (está en la de hoy): no le llega.
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="push to an unattached conversation: notification device, 5.0 PR 2c (decisión 7)",
+)
+async def test_yesterdays_reminder_reaches_the_tv_in_todays_conversation(harness, clock):
+    """Lo que debe pasar: un recordatorio de la conversación de ayer llega a la tele aunque ya
+    esté en la de hoy (con `turn_start.conversation` = la de ayer)."""
+    client = await harness.connect()
+    yesterday = client.ready["conversation"]["id"]
+    await run_turn(client, "uno")
+    clock.now = datetime(2026, 11, 15, 5, 30)  # pasado el corte de las 5:00
+    await run_turn(client, "dos")
+
     await harness.push("se te olvidó algo", session_key=session_key_for("main", yesterday))
-    await client.collect(timeout=0.5)
-    assert len(of_type(client.messages, "turn_start")) == 2
-    assert_turns_paired(client.messages)
+    await client.collect(lambda m: len(of_type(m, "turn_start")) >= 3, timeout=1.0)
+    push_start = of_type(client.messages, "turn_start")[2]
+    assert (push_start["origin"], push_start["conversation"]) == ("push", yesterday)
 
 
 async def test_push_of_a_conversation_reaches_the_session_that_has_it_open(harness, clock):

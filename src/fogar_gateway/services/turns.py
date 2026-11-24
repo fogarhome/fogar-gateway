@@ -50,12 +50,14 @@ from fogar_gateway.services.channel import (
     ConversationChannel,
 )
 from fogar_gateway.services.conversations import SessionConversation
+from fogar_gateway.services.openclaw.failures import ORCHESTRATOR_AGENT_UNAVAILABLE_ERROR
 from fogar_gateway.services.openclaw.models import ToolCallEvent
 from fogar_gateway.services.outbound import ClientGone, OutboundSender, log_send_failed
 from fogar_gateway.services.pacing import AudioPacer
 from fogar_gateway.services.pipeline_tracker import PipelineTracker
 from fogar_gateway.services.reconnection import describe_error
 from fogar_gateway.services.speech.ports import TextToSpeechProvider, TtsStream
+from fogar_gateway.services.stats import gateway_stats
 from fogar_gateway.services.teardown import Teardown
 from fogar_gateway.services.turn_progress import Progress, TurnProgress
 
@@ -699,19 +701,29 @@ class TurnController:
             if channel is None:
                 await self._refuse_send()
                 return
+            if not self.agent_allowed(channel.session_key):
+                # #397 (decisión a): la política del gateway, antes del chat.send (OpenClaw solo
+                # diría INVALID_REQUEST). Solo esta sesión recibe su par con el error: el turno
+                # del canal, sus push y sus runs no se tocan (las demás sesiones no lo ven).
+                code = ORCHESTRATOR_AGENT_UNAVAILABLE_ERROR
+                logger.warning(f"[{self._client_id}] Turno sin agente disponible: {code}")
+                gateway_stats.turn_started("normal")
+                gateway_stats.turn_error(code)
+                await self._refuse_send(code)
+                return
             self._sent_on = channel
             await channel.send_user_message(self, text)
 
-    async def _refuse_send(self) -> None:
-        """Sin canal (no pudo adjuntarse): el `send` recibe su par con un TURN_ERROR estable.
-        Por la cola de la sesión, como cualquier turno (#202): su turn_start sale detrás del
-        turn_end de los anteriores."""
+    async def _refuse_send(self, code: str = "internal_error") -> None:
+        """Un `send` que no llega al canal (sin canal, o un agente no permitido) recibe su par
+        con un TURN_ERROR estable (`code`). Por la cola de la sesión, como cualquier turno
+        (#202): su turn_start sale detrás del turn_end de los anteriores."""
         turn = self._new_turn("user")
         turn.conversation_id = self._conversation.id
         self._live.append(turn)
-        self._enqueue(("refused", turn))
+        self._enqueue(("refused", turn, code))
 
-    async def _paint_refused(self, turn: Turn) -> None:
+    async def _paint_refused(self, turn: Turn, code: str) -> None:
         if turn.ended:
             return
         for earlier in list(self._live):
@@ -720,7 +732,7 @@ class TurnController:
                 earlier.cancel_reason = earlier.cancel_reason or "replaced"
                 await self._end(earlier, "replaced")
         if await self._open(turn):
-            await self._send_turn_error(turn, "internal_error")
+            await self._send_turn_error(turn, code)
         await self._end(turn, "error")
 
     async def cancel(
@@ -743,6 +755,9 @@ class TurnController:
         if shown is not None and shown is not mine:
             if shown.origin == "push" and not push:
                 return False, None
+            source = shown.channel
+            if own_only and shown.origin == "user" and source is not None and source.by_session is not self:
+                return False, None  # el turno de otra sesión: la voz de aquí no lo corta
             shown.cancel_reason = shown.cancel_reason or reason
             await self._end(shown, reason)
             return True, shown.turn_id
@@ -818,7 +833,7 @@ class TurnController:
                 elif kind == "turn_end":
                     await self._paint_end(item[1], item[2])
                 elif kind == "refused":
-                    await self._paint_refused(item[1])
+                    await self._paint_refused(item[1], item[2])
                 elif kind == "leave":
                     _, conversation_id, reason = item
                     for turn in list(self._live):

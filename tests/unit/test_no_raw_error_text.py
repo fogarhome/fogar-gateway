@@ -102,9 +102,10 @@ async def test_agent_unavailable_is_a_turn_error_before_chat_send(make_bridge):
         yield OrchestratorEvent(type="status", content="done")
 
     bridge.orchestrator.stream_response = s
-    await run_turn(bridge, "x")
+    await bridge.turns.start_user_turn("x")
     await sent(bridge)
 
+    assert ws.types() == ["turn_start", "error", "turn_end"]
     assert ws.of("error")[0]["message"] == "orchestrator_agent_unavailable"
     assert ws.of("turn_end")[0]["reason"] == "error"
     assert called == []
