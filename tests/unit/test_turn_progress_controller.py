@@ -14,8 +14,8 @@ import pytest
 from fogar_gateway.services import channel as channel_module
 from fogar_gateway.services import turn_progress
 from fogar_gateway.services.openclaw.models import ToolCallEvent
-from fogar_gateway.services.protocol import OrchestratorEvent
 from tests.fakes.bridge import run_turn, sent, start_turn
+from tests.fakes.orchestrator import OrchestratorEvent
 
 SK = "agent:main:hab_sito"
 WITH_PROGRESS = ("text", "status")

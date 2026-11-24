@@ -95,8 +95,6 @@ class FogarBridge:
         self._stt: SpeechToTextProvider = speech.stt
         self.tracker: PipelineTracker = tracker
         self._client_registry = client_registry
-        # Máximo de la cola de turno (#219) y runs de OpenClaw: lápidas y activos (#285).
-        self._turn_registry = turn_registry
         # La conversación de la sesión (M19): su sessionKey y su cambio de día.
         self.conversation = conversation
         conversation.bind(self._spawn_background)
@@ -105,7 +103,6 @@ class FogarBridge:
         # ilegible): uno por sesión.
         self._policy_close: asyncio.Task | None = None
         # Máximo de la cola de turno de las conversaciones que la sesión ya dejó (#219).
-        self._turn_queue_peak = 0
         self.transcriber: SttSession | None = None
 
         self.tasks: list[asyncio.Task] = []
@@ -205,12 +202,6 @@ class FogarBridge:
         cambio de canal lo hace `TurnController` en ese mismo `send` (decisión 6: deja el de
         ayer, donde su turno sigue para los demás, y se adjunta al de hoy)."""
         self._client_registry.index.add(new)
-        # El máximo de la cola de turno es por clave (#219), así que lo es del canal, no de esta
-        # sesión: con varias sesiones en una conversación, la primera que lo lee se lo lleva.
-        # Solo es una métrica de session_end; se deja así.
-        self._turn_queue_peak = max(
-            self._turn_queue_peak, self._turn_registry.pop_peak(old.session_key)
-        )
 
     def snapshot(self) -> dict[str, Any]:
         """Estado vivo de la sesión para /admin/state (#219): solo números, estados e
@@ -218,7 +209,6 @@ class FogarBridge:
         desde el SessionRecord (aquí van a None)."""
         now = time.monotonic()
         turns = self.turns.snapshot(now)
-        depth, peak = self._turn_registry.depth(self._session_key())
         return {
             "session_id": self.tracker.session_id,
             "client_id": self.client_id,
@@ -231,7 +221,9 @@ class FogarBridge:
             "turn": turns["turn"],
             "turn_count": self.tracker.turn_count,
             "sender": self._sender.queue_stats(),
-            "turn_queue": {"depth": depth, "peak": peak},
+            # #219: la cola por clave de un turno se fue con la 5.0 (todo run es de su canal,
+            # 2b.3); el campo se queda a 0 hasta que /admin/state lo retire.
+            "turn_queue": {"depth": 0, "peak": 0},
             "push_backlog": turns["push_backlog"],
             "last_activity_s": (
                 round(now - self._last_client_activity, 3) if self._last_client_activity else None
@@ -258,7 +250,7 @@ class FogarBridge:
             "turn_in_flight": bool(self._turn_in_flight_at_close),
             "sender_peak_msgs": 0,
             "sender_peak_bytes": 0,
-            "turn_queue_peak": 0,
+            "turn_queue_peak": 0,  # #219: sin cola por clave desde la 5.0 (2b.3)
             "push_backlog_peak": self.turns.push_backlog_peak,
         }
         # Una métrica nunca debe impedir el cierre.
@@ -268,12 +260,6 @@ class FogarBridge:
             meta["sender_peak_bytes"] = int(q["peak_bytes"])
         except Exception as e:  # noqa: BLE001 — una métrica nunca impide el cierre
             logger.debug(f"[{self.client_id}] sender_peak no disponible: {type(e).__name__}")
-        try:
-            meta["turn_queue_peak"] = max(
-                self._turn_queue_peak, self._turn_registry.pop_peak(self._session_key())
-            )
-        except Exception as e:  # noqa: BLE001 — una métrica nunca impide el cierre
-            logger.debug(f"[{self.client_id}] turn_queue_peak no disponible: {type(e).__name__}")
         return meta
 
     async def close_all(

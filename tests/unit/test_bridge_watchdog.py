@@ -10,10 +10,10 @@ import pytest
 import fogar_gateway.services.bridge as bridge_module
 from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.pipeline_tracker import PipelineTracker
-from fogar_gateway.services.protocol import OrchestratorEvent
 from fogar_gateway.services.reconnection import ConnectionState
 from fogar_gateway.services.teardown import Teardown
 from tests.fakes.bridge import enqueue_push, push, sent
+from tests.fakes.orchestrator import OrchestratorEvent
 
 _CONFIG = ClientConfig(silence_timeout_s=1)
 

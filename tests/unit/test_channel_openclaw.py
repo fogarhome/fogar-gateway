@@ -15,8 +15,8 @@ from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.conversations import ConversationIndex, SessionConversation
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
-from fogar_gateway.services.protocol import OrchestratorEvent
 from tests.fakes.bridge import blocking, keyed_conversation, sent, tokens, wait_until
+from tests.fakes.orchestrator import OrchestratorEvent
 
 CONVERSATION = keyed_conversation("shared", id="conv-s")
 SK = CONVERSATION.session_key
@@ -110,7 +110,6 @@ async def test_user_turn_reaches_two_subscribers(session, hub):
         assert pairs(ws) == [("turn_start", "t-1", "user"), ("turn_end", "t-1", "done")]
         assert texts(ws) == ["ho", "la"]
         assert ws.of("turn_start")[0]["conversation"] == "conv-s"
-    hub.orchestrator.abort.assert_not_awaited()
 
 
 async def test_each_subscriber_numbers_its_own_turns(session, hub):
@@ -301,7 +300,6 @@ async def test_a_subscriber_leaving_mid_turn_does_not_abort_the_run(session, hub
     assert pairs(tv_ws) == [("turn_start", "t-1", "user"), ("turn_end", "t-1", "closed")]
     assert pairs(mac_ws) == [("turn_start", "t-1", "user"), ("turn_end", "t-1", "done")]
     assert texts(mac_ws) == ["uno ", "dos"]
-    hub.orchestrator.abort.assert_not_awaited()
     assert mac.channel.subscribers() == [mac.turns]
 
 
@@ -417,7 +415,6 @@ async def test_a_voice_client_s_barge_in_never_cuts_another_session_s_turn(sessi
     await sent(voice)
     assert not tv.turns.user_task.done()
     assert hub.get(SK).current_turn is not None
-    hub.orchestrator.abort.assert_not_awaited()
     assert pairs(voice_ws) == [("turn_start", "t-1", "user")]
 
     await tv._on_transcription("otra frase larga", False)  # its own barge-in does cut it
@@ -440,7 +437,6 @@ async def test_a_barge_in_on_a_push_cuts_only_this_session_s_copy(session, hub):
     assert texts(voice_ws) == ["aviso"]
     assert pairs(tv_ws) == [("turn_start", "t-1", "push"), ("turn_end", "t-1", "done")]
     assert texts(tv_ws) == ["aviso", " y más"]
-    hub.orchestrator.abort.assert_not_awaited()
 
 
 async def test_a_client_cancel_stops_the_turn_for_everyone(session, hub):
@@ -499,7 +495,6 @@ async def test_a_send_with_an_agent_not_allowed_leaves_the_channel_alone(session
     await sent(mac), await sent(tv)
 
     assert not task.done()
-    hub.orchestrator.abort.assert_not_awaited()
     assert pairs(tv_ws) == [("turn_start", "t-1", "user")]
     assert tv_ws.of("error") == []
     # On its own socket the refused send leaves the turn it showed behind (one open turn per

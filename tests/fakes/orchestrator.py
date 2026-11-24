@@ -1,8 +1,8 @@
 """A mock orchestrator's `stream_response` played as OpenClaw runs (5.0 PR 2b, #406).
 
-Since 2b the channel no longer reads `stream_response` for a WebSocket turn: it sends
-(`orchestrator.send` → the ack's runId) and reads the run's frames from the dispatcher
-(`ConversationChannel.take_frame`). Most session tests still describe the reply as a
+Since 2b the channel no longer reads `stream_response` (since 2b.3 the gateway has none, /v1
+included): it sends (`orchestrator.send` → the ack's runId) and reads the run's frames from
+the dispatcher (`ConversationChannel.take_frame`). Most session tests still describe the reply as a
 `stream_response` (`tests/fakes/bridge.py`: `tokens`, `blocking`, …); `wire_stream_orchestrator`
 gives such a mock a `send` and an `abort_run` that play it as OpenClaw would:
 
@@ -16,15 +16,32 @@ gives such a mock a `send` and an `abort_run` that play it as OpenClaw would:
 - `abort_run(sk, run_id)` cancels that run's task (queued or running); nothing more of it
   arrives (the channel tombstoned it already).
 
-The mock keeps its own `abort`, `stream_response` and assertions; `send`/`abort_run` are
-AsyncMocks too (`send.await_args_list`, `abort_run.assert_awaited_once_with(...)`).
+The mock keeps its own `stream_response` (the reply, as `OrchestratorEvent`s) and assertions;
+`send`/`abort_run` are AsyncMocks too (`send.await_args_list`,
+`abort_run.assert_awaited_once_with(...)`).
 """
 
 import asyncio
 import itertools
+from dataclasses import dataclass
+from typing import Literal
 from unittest.mock import AsyncMock, NonCallableMock
 
+from fogar_gateway.services.openclaw.models import ToolCallEvent
 from fogar_gateway.services.orchestration import OrchestratorError
+from fogar_gateway.services.turn_progress import ProgressPhase
+
+
+@dataclass
+class OrchestratorEvent:
+    """One event of a mock's `stream_response`: how a test describes a reply. Until 5.0 PR
+    2b.3 it was the gateway's own (`OpenClawClient.stream_response`); since every turn goes
+    through its channel it only lives here, played as OpenClaw frames (module docstring)."""
+
+    type: Literal["token", "status", "error", "tool_call", "progress"]
+    content: str = ""
+    tool_call: ToolCallEvent | None = None
+    phase: ProgressPhase | None = None  # `progress`: in the gateway's vocabulary (#254)
 
 _RUNS = itertools.count(1)
 

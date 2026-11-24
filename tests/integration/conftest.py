@@ -21,9 +21,9 @@ from fogar_gateway.main import app
 from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.openclaw.models import GatewayInfo
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
-from fogar_gateway.services.protocol import OrchestratorEvent, OrchestratorProtocol
+from fogar_gateway.services.protocol import OrchestratorProtocol
 from fogar_gateway.services.reconnection import ConnectionState, ServiceStatus
-from tests.fakes.orchestrator import wire_stream_orchestrator
+from tests.fakes.orchestrator import OrchestratorEvent, wire_stream_orchestrator
 
 # ---------------------------------------------------------------------------
 # Datos de test estándar
@@ -162,7 +162,6 @@ def make_mock_orchestrator(tokens: list[str] = None) -> OrchestratorProtocol:
     mock.connect = AsyncMock()
     mock.close = AsyncMock()
     mock.ping = AsyncMock(return_value=True)
-    mock.abort = AsyncMock()
     # Lecturas de OpenClaw (M19): sin sesiones.
     mock.request = AsyncMock(return_value={"sessions": [], "hasMore": False})
     mock.trigger_reconnect = MagicMock(return_value=True)

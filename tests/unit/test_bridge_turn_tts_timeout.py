@@ -9,9 +9,9 @@ import pytest
 import websockets
 
 from fogar_gateway.core.config import settings
-from fogar_gateway.services.protocol import OrchestratorEvent
 from fogar_gateway.services.tts_client import TTSClient
 from tests.fakes.bridge import sent, start_turn, tokens
+from tests.fakes.orchestrator import OrchestratorEvent
 
 
 @pytest.fixture

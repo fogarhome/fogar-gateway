@@ -16,8 +16,7 @@ from fogar_gateway.services.bridge import FogarBridge
 from fogar_gateway.services.conversations import Conversation, SessionConversation
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
 from fogar_gateway.services.outbound import ClientGone, QueuedSender
-from fogar_gateway.services.protocol import OrchestratorEvent
-from tests.fakes.orchestrator import wire_stream_orchestrator
+from tests.fakes.orchestrator import OrchestratorEvent, wire_stream_orchestrator
 from tests.fakes.speech import speech_providers
 
 

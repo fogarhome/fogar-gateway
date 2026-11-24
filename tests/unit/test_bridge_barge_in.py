@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from fogar_gateway.models.schemas import ClientConfig
-from fogar_gateway.services.protocol import OrchestratorEvent
 from tests.fakes.bridge import GoneSender, blocking, sent, start_turn
+from tests.fakes.orchestrator import OrchestratorEvent
 
 _AUDIO = dict(input_mode="audio", output_mode=("audio", "text", "status"))
 

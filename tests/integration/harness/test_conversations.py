@@ -239,32 +239,31 @@ async def test_push_of_a_conversation_reaches_the_session_that_has_it_open(harne
     assert of_type(a.messages, "turn_start")[0]["conversation"] == a.ready["conversation"]["id"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Decisión 8 de la 5.0 PR 2: hasta la 2b.3, /v1 sigue en stream_response y manda su "
-    "chat.send en el acto; con OpenClaw en `steer` (su modo por defecto, que el falso imita aquí) "
-    "el mensaje de /v1 se pliega en el turno vivo del canal y /v1 no recibe su respuesta. La 2b.3 "
-    "lo manda por el canal esperando su turno.",
-)
 async def test_v1_talks_in_a_conversation_with_a_live_channel(harness, clock):
+    """Decisión 8 de la 5.0 PR 2 (resuelta en la 2b.3): /v1 habla en la conversación de su
+    cliente aunque tenga un turno vivo en otra sesión. Con OpenClaw en `steer` (su modo por
+    defecto, que el falso imita aquí) su mensaje no se pliega en ese turno: espera a que
+    termine y recibe su propia respuesta."""
     harness.openclaw.steer = True  # OpenClaw's default queue mode (2026.11.7)
     client = await harness.connect()
     await client.send({"type": "send", "text": "partial_hold"})
     await client.collect(lambda m: bool(of_type(m, "token")))
     body = {"model": "fogar-gateway", "messages": [{"role": "user", "content": "hola"}]}
-    try:
-        async with httpx.AsyncClient(
-            base_url=f"http://127.0.0.1:{harness.port}",
-            headers={"authorization": f"Bearer {VALID_KEY}"},
-            timeout=5,
-        ) as http:
-            res = await http.post("/v1/chat/completions", json=body)
-        assert res.status_code == 200, res.text
-        assert res.json()["choices"][0]["message"]["content"] == "reply-hola"
-    finally:
+    async with httpx.AsyncClient(
+        base_url=f"http://127.0.0.1:{harness.port}",
+        headers={"authorization": f"Bearer {VALID_KEY}"},
+        timeout=5,
+    ) as http:
+        request = asyncio.create_task(http.post("/v1/chat/completions", json=body))
+        await asyncio.sleep(0.2)
+        assert not request.done()  # espera al turno vivo
         harness.openclaw.release.set()
-    await client.collect(lambda m: bool(of_type(m, "turn_end")))
-    assert [e["reason"] for e in of_type(client.messages, "turn_end")] == ["done"]
+        res = await request
+    assert res.status_code == 200, res.text
+    assert res.json()["choices"][0]["message"]["content"] == "reply-hola"
+    await client.collect(lambda m: len(of_type(m, "turn_end")) >= 2)
+    assert [e["reason"] for e in of_type(client.messages, "turn_end")] == ["done", "done"]
+    assert_turns_paired(client.messages)
 
 
 async def test_a_new_session_that_fails_its_health_check_leaves_the_live_one_alone(harness):

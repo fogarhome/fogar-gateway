@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock
 
 from fogar_gateway.core.config import settings
 from fogar_gateway.services.outbound import QueuedSender
-from fogar_gateway.services.protocol import OrchestratorEvent
 from tests.fakes.bridge import (
     RecWS,
     blocking,
@@ -27,6 +26,7 @@ from tests.fakes.bridge import (
     tokens,
     wait_until,
 )
+from tests.fakes.orchestrator import OrchestratorEvent
 
 # ── G-08 (#201) ──────────────────────────────────────────────────────────────
 
@@ -424,7 +424,6 @@ async def test_a_push_without_progress_is_closed_with_turn_timeout(make_bridge, 
     assert bridge.turns.last_ended.end_reason == "timeout"
     await wait_until(lambda: bridge.orchestrator.abort_run.await_count == 1)
     bridge.orchestrator.abort_run.assert_awaited_once_with(sk, "run-p")  # only its run
-    bridge.orchestrator.abort.assert_not_awaited()
 
     # the next push opens its own turn
     await push(bridge, *push_reply("segundo", sk=sk))
@@ -482,7 +481,6 @@ async def test_an_interrupting_send_over_a_push_ends_it_with_reason_interrupted(
     assert order == [("turn_start", "t-1"), ("turn_end", "t-1"), ("turn_start", "t-2"), ("turn_end", "t-2")]
     assert (replaced.origin, replaced.end_reason) == ("push", "interrupted")
     bridge.orchestrator.abort_run.assert_awaited_once_with(sk, "run-p")
-    bridge.orchestrator.abort.assert_not_awaited()  # never the whole key: the queue stays
     await bridge.close_all()
 
 
@@ -495,7 +493,6 @@ async def test_cutting_a_push_without_run_id_aborts_nothing(make_bridge, caplog)
     assert await bridge.turns.cancel("cancelled") == (True, "t-1")
     await sent(bridge)
     assert ws.of("turn_end")[0]["reason"] == "cancelled"
-    bridge.orchestrator.abort.assert_not_awaited()
     bridge.orchestrator.abort_run.assert_not_awaited()
     assert "sin runId" in caplog.text
     await bridge.close_all()

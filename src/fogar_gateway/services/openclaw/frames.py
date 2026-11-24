@@ -80,12 +80,10 @@ def chat_send(
     return _req("chat.send", req_id, params)
 
 
-def chat_abort(req_id: str, session_key: str, run_id: str | None = None) -> dict:
-    """Without `run_id`, every run of the key; with it, only that run (a queued one too)."""
-    params = {"sessionKey": session_key}
-    if run_id is not None:
-        params["runId"] = run_id
-    return _req("chat.abort", req_id, params)
+def chat_abort(req_id: str, session_key: str, run_id: str) -> dict:
+    """Only that run (a queued one too). The gateway never aborts a whole key (5.0, #406):
+    that would also take the messages waiting in OpenClaw's queue."""
+    return _req("chat.abort", req_id, {"sessionKey": session_key, "runId": run_id})
 
 
 # ── Lectura (sessions.list, chat.history; M19) ────────────────────

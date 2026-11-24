@@ -76,25 +76,22 @@ class Channels(Protocol):
 class FrameDispatcher:
     """Routes incoming OpenClaw frames to the correct queue or channel.
 
-    Knows about TurnRegistry and the conversation channels (5.0, #406). Does not touch
-    WebSocket or TTS. A frame of a run a channel sent (`ConversationChannel.take_frame`) goes
-    to that channel first; the run of a /v1 turn (`stream_response`, until 5.0 PR 2b.3)
-    reaches it by `deliver_by_session`; a frame of a run no one knows yet while its channel
-    waits for a `chat.send` ack is held by the channel (decision 3 of the 5.0 PR 2 plan);
-    everything else is a push of the key's conversation's channel (`channel_for`: the
-    conversation from the index, the channel created if none is live), opened by its run's
-    first event (`push_route`, 2b.2). A `user` `session.message` goes to the channel too
-    (`take_session_message`: ids and `steer`'s mark). A key no conversation has goes nowhere.
-
-    Turn queues are bounded and fed with non-blocking puts (issue #130 S3b).
+    Knows about TurnRegistry (the tombstones) and the conversation channels (5.0, #406).
+    Does not touch WebSocket or TTS. A frame of a run a channel sent
+    (`ConversationChannel.take_frame`; a WebSocket message or, since 5.0 PR 2b.3, a /v1 one)
+    goes to that channel; a frame of a run no one knows yet while its channel waits for a
+    `chat.send` ack is held by the channel (decision 3 of the 5.0 PR 2 plan); everything else
+    is a push of the key's conversation's channel (`channel_for`: the conversation from the
+    index, or the live channel of the key, created if none is live), opened by its run's first
+    event (`push_route`, 2b.2). A `user` `session.message` goes to the channel too
+    (`take_session_message`: ids and `steer`'s mark). A key no channel has goes nowhere.
 
     Frames of a run the gateway aborted (`runId` tombstoned in TurnRegistry, #285) are
     dropped before any routing: they never reach the next turn nor come back as a push.
 
-    Push handlers are never awaited here: this runs inside OpenClaw's _listen loop,
-    so anything slow would stall every session sharing the connection (issue #130
-    S3a). The routing decision (including the #112 normal-turn check) is still taken
-    synchronously, and only the resulting work is queued on the channel's push worker.
+    Nothing is awaited here: this runs inside OpenClaw's _listen loop, so anything slow
+    would stall every session sharing the connection (issue #130 S3a). The routing decision
+    is taken synchronously, and only the resulting work is queued on the channel's worker.
     """
 
     def __init__(self, turn_registry: TurnRegistry, channels: Channels) -> None:
@@ -127,17 +124,12 @@ class FrameDispatcher:
         )
 
     async def _handle_res(self, frame: dict) -> None:
-        # A res ends the turn only when it is a failure (ok:false). An ok:true ack
-        # ("started", ...) is not a turn end (G-47); the real completion is the chat
-        # event with state "final" (server 2026.6.11+, the minimum supported).
+        # Every request the gateway sends (`chat.send`, `chat.abort`, a read, a ping) gets its
+        # `res` by id in OpenClawClient; one that reaches the dispatcher came after its caller
+        # stopped waiting. A late `chat.abort` answer still names the runs it aborted (#285).
         if frame.get("ok") is False:
-            self._turns.deliver_by_req(frame.get("id", ""), ("done", frame))
             return
-        # #285: the `chat.send` ack names the run of the turn; a `chat.abort` answer, the
-        # runs it aborted. Both feed the runId tombstones.
-        payload = _as_dict(frame.get("payload"))
-        self._turns.note_run(str(frame.get("id", "")), _run_id(payload))
-        self._turns.note_abort_result(payload)
+        self._turns.note_abort_result(_as_dict(frame.get("payload")))
 
     def _of_aborted_run(self, payload: dict) -> bool:
         if self._turns.is_run_aborted(payload.get("runId")):
@@ -164,51 +156,38 @@ class FrameDispatcher:
         if sk is None or self._of_aborted_run(payload):
             return
         channel = self._channels.channel_for(sk)
-        if _taken(channel, "chat", payload):
-            return
-        if self._turns.deliver_by_session(sk, ("chat", payload), _run_id(payload)):
-            return
         if channel is None or _taken(channel, "chat", payload, hold=True):
             return
-        self._push(channel, sk, "chat", payload)
+        self._push(channel, "chat", payload)
 
     async def _handle_agent_lifecycle(self, payload: dict) -> None:
         sk = payload.get("sessionKey")
         if sk is None or self._of_aborted_run(payload):
             return
-        stream = payload.get("stream")
         channel = self._channels.channel_for(sk)
-        if _taken(channel, "agent", payload):
+        if channel is None or _taken(channel, "agent", payload, hold=True):
             # A run the channel sent: every stream of it is the channel's (it opens its turn
-            # on the run's first event, not on `start`: docs/openclaw-protocol.md, C3).
+            # on the run's first event, not on `start`: docs/openclaw-protocol.md, C3; a
+            # `fallback_step` is kept for classifying its error, #397). Or held while a
+            # `chat.send` of the channel waits for its ack (any stream: a `run_status` or a
+            # lifecycle `model` may be its run's first event).
             return
         data = _as_dict(payload.get("data"))
-        if stream == "error" and data.get("reason") == "seq gap":
+        if payload.get("stream") == "error" and data.get("reason") == "seq gap":
             # OpenClaw's own notice where a drained run's lifecycle `start` should be
             # (2026.11.7): not a failure, it opens and closes nothing.
             logger.debug("agent seq gap notice (sk=%s)", sk)
-        if data.get("phase") == "fallback_step" and stream in (None, "lifecycle"):
-            # #397: the run's failure reason, for classifying its error later (failures.py).
-            # Only its structural fields are read; it opens or ends nothing.
-            if self._turns.deliver_by_session(sk, ("agent", data), _run_id(payload)):
-                return
-        if channel is None or _taken(channel, "agent", payload, hold=True):
-            # Held while a `chat.send` of the channel waits for its ack (any stream: a
-            # `run_status` or a lifecycle `model` may be its run's first event).
-            return
-        self._push(channel, sk, "agent", payload)
+        self._push(channel, "agent", payload)
 
-    def _push(self, channel: "ConversationChannel", sk: str, event: str, payload: dict) -> None:
-        """A frame nobody owns: the push of its key (`push_route`), unless #112/#130 S3b
-        (`TurnRegistry.blocks_push`: a /v1 turn holds the key, or its overflow) stop it. An
-        `end`/`error` is always forwarded, never suppressed: the push end no-ops when no push
-        is open (#84), and suppressing it could orphan a push opened before a /v1 turn."""
+    def _push(self, channel: "ConversationChannel", event: str, payload: dict) -> None:
+        """A frame nobody owns: the push of its key (`push_route`). An `end`/`error` is always
+        forwarded: the push end no-ops when no push is open (#84). While a turn of the channel
+        is open (a /v1 one too, #112) a push's opener waits in the channel's worker."""
         route = push_route(event, payload)
         if route is None:
             return
         kind, arg = route
-        if not self._turns.blocks_push(sk, kind):
-            channel.enqueue_push(kind, arg, run_id=_run_id(payload))
+        channel.enqueue_push(kind, arg, run_id=_run_id(payload))
 
     def _handle_session_message(self, payload: dict) -> None:
         """`session.message` (2026.11.7): a transcript append. Only a `user` one matters: it
@@ -234,13 +213,9 @@ class FrameDispatcher:
         if data.get("phase") not in ("start", "result"):
             return
         channel = self._channels.channel_for(sk)
-        if _taken(channel, "session.tool", payload):
-            return
-        if self._turns.deliver_by_session(sk, ("tool", data), _run_id(payload)):
-            return
         if channel is None or _taken(channel, "session.tool", payload, hold=True):
             return
-        self._push(channel, sk, "session.tool", payload)
+        self._push(channel, "session.tool", payload)
 
     def connection_lost(self, code: str) -> None:
         """The OpenClaw connection dropped (`OpenClawClient._listen`): every channel ends the

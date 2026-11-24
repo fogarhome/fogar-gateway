@@ -117,7 +117,7 @@ def test_audio_chunk_transcribed_and_forwarded_to_orchestrator(
 ):
     """PCM → transcriber fake emite is_final → cliente recibe transcripción
     → cliente envía {"type":"send"} → orchestrator llamado con el texto."""
-    from fogar_gateway.services.protocol import OrchestratorEvent
+    from tests.fakes.orchestrator import OrchestratorEvent
 
     called_with_text = {}
     mock_orch = make_mock_orchestrator()

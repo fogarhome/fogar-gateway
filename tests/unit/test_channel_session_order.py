@@ -12,7 +12,6 @@ from fogar_gateway.core.config import settings
 from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.conversations import SessionConversation
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
-from fogar_gateway.services.protocol import OrchestratorEvent
 from tests.fakes.bridge import (
     enqueue_push,
     keyed_conversation,
@@ -21,6 +20,7 @@ from tests.fakes.bridge import (
     tokens,
     wait_until,
 )
+from tests.fakes.orchestrator import OrchestratorEvent
 
 
 def _provider(stream):
@@ -82,7 +82,6 @@ async def test_barge_in_during_the_reply_s_audio_spares_the_push_not_yet_shown(m
     await wait_until(lambda: len(ws.of("turn_start")) == 2)
     await bridge._sender.flush()
 
-    bridge.orchestrator.abort.assert_not_awaited()
     assert bridge.channel.current_turn is not None  # the push goes on
     assert _marks(ws) == [
         ("turn_start", "t-1", "user"), ("turn_end", "t-1", "interrupted"),

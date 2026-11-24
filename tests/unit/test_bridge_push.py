@@ -142,7 +142,6 @@ async def test_push_of_a_retired_agent_is_dropped_and_aborted(make_push_bridge):
     # 5.0 PR 2b: only its run, never the whole key.
     await wait_until(lambda: bridge.orchestrator.abort_run.await_count == 1)
     bridge.orchestrator.abort_run.assert_awaited_with(sk, "run-x")
-    bridge.orchestrator.abort.assert_not_awaited()
 
 
 async def test_an_open_push_of_a_retired_agent_is_cut_at_its_next_start(make_push_bridge):
@@ -164,7 +163,6 @@ async def test_an_open_push_of_a_retired_agent_is_cut_at_its_next_start(make_pus
     ]
     await wait_until(lambda: bridge.orchestrator.abort_run.await_count >= 1)
     bridge.orchestrator.abort_run.assert_awaited_with(sk, "run-x")
-    bridge.orchestrator.abort.assert_not_awaited()
 
 
 async def test_revalidation_refreshes_allowed_agents_for_pushes(make_push_bridge, monkeypatch):
@@ -371,7 +369,6 @@ async def test_cut_while_the_push_drains_its_audio_sends_one_turn_end(make_push_
     ]
     # 5.0 (decision 1): OpenClaw already ended that run and the channel closed its push;
     # only this session's audio was left, so nothing is aborted.
-    bridge.orchestrator.abort.assert_not_awaited()
     assert bridge.turns.last_ended.end_reason == "cancelled"
     assert bridge.turns.snapshot(0.0)["turn"]["kind"] == "idle"
 
@@ -405,7 +402,6 @@ async def test_cancel_cuts_only_the_push_open_when_it_arrived(make_push_bridge):
     assert await bridge.turns.cancel("cancelled") == (False, None)
     await push(bridge, ("turn_start", SK))
     assert bridge.turns.snapshot(0.0)["turn"]["kind"] == "push"
-    bridge.orchestrator.abort.assert_not_awaited()
     await bridge.close_all()
 
 
@@ -556,7 +552,6 @@ async def test_a_push_whose_turn_start_fails_leaves_no_turn_and_the_next_send_ab
     enqueue_push(bridge, "turn_start", SK, run_id="run-p")
     await bridge.push_idle()
     assert bridge.turns.snapshot(0.0)["turn"]["kind"] == "idle"
-    bridge.orchestrator.abort.assert_not_awaited()
 
     bridge.orchestrator.stream_response = tokens("ok")
     await bridge.turns.start_user_turn("hola")
@@ -564,7 +559,6 @@ async def test_a_push_whose_turn_start_fails_leaves_no_turn_and_the_next_send_ab
     assert not bridge.turns.user_task.done()  # its run waits behind the push
     enqueue_push(bridge, "turn_end", SK, run_id="run-p")
     await asyncio.wait_for(bridge.turns.user_task, 2)
-    bridge.orchestrator.abort.assert_not_awaited()
     bridge.orchestrator.abort_run.assert_not_awaited()
     assert not turns.is_run_aborted("run-p")
     await bridge.close_all()

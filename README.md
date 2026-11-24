@@ -211,11 +211,12 @@ Auth (4.0): `X-Admin-Token` = `ADMIN_TOKEN` (la CLI, en la máquina del gateway)
 - `HANDSHAKE_MAX_BYTES` mide **caracteres**, no bytes (con caracteres multibyte el tope real puede ser hasta 4x mayor). El tope de 1 MiB por mensaje WebSocket lo pone `fogar-gw serve`: con `uvicorn` a mano rige el de uvicorn (16 MiB).
 - Con Bearer válido, `model` selecciona el agente (sin distinguir mayúsculas) y se aplican `default_agent`/`allowed_agents` del cliente (violación → `403`; un `model` que no es un id de agente válido, con `:` o espacios, es `403 agent_not_available` aunque OpenClaw no esté conectado). Sin `model`, la cascada: `default_agent` del cliente, `DEFAULT_AGENT`, el agente por defecto de OpenClaw y `main`.
 - Con Bearer, cada petición va a la **conversación por defecto del día** del cliente para ese agente (M19), como un cliente WebSocket que no elige conversación. El origen de confianza sin Bearer no tiene ficha de cliente: conserva su sesión `agent:{agente}:ha` y no sale en `/admin/conversations`.
+- **Desde 5.0, `/v1` pasa por el canal de su conversación** (como un mensaje del WebSocket): las sesiones que tengan abierta esa conversación ven su mensaje y su turno (con Home Assistant como origen, sin audio). Su respuesta es siempre la de su propio run: si hay un turno en marcha en la conversación, la petición espera a que termine (y lo que llegue mientras corre el suyo espera detrás), así que dos peticiones a la vez ya no reciben `409 turn_in_progress`: la segunda espera a la primera. Si otro aparato para su turno, `502 turn_cancelled`.
 
 | Endpoint | Método | Descripción |
 |----------|--------|-------------|
 | `/v1/models` | GET | Devuelve el alias `fogar-gateway` y los agentes del roster de OpenClaw (filtrados por `allowed_agents`) para un llamante con Bearer; un origen confiable sin Bearer (el chat ignora `model` y usa el agente por defecto) y un gateway sin roster, solo el alias |
-| `/v1/chat/completions` | POST | Chat completion; soporta `stream: true/false`. Si el último mensaje `user` falta o solo tiene espacios → `400 empty_message`, sin llamar a OpenClaw. Si el cliente corta antes de la respuesta (con o sin stream), el turno se aborta en OpenClaw |
+| `/v1/chat/completions` | POST | Chat completion; soporta `stream: true/false`. Si el último mensaje `user` falta o solo tiene espacios → `400 empty_message`, sin llamar a OpenClaw. Si el cliente corta antes de la respuesta (con o sin stream), su run (solo ese) se aborta en OpenClaw |
 
 ---
 
@@ -643,7 +644,7 @@ src/fogar_gateway/
     ├── transcriber_reconnecting.py ReconnectingTranscriberClient — uno por sesión de audio, backoff en background
     ├── tts_client.py                WebSocket → fogar-speaker, protocolo puro, creado por turno
     ├── tts_reconnecting.py          ReconnectingTTSClient — singleton, backoff perezoso por turno
-    ├── orchestration.py     call_orchestrator() — helper compartido WS+HTTP
+    ├── orchestration.py     OrchestratorError (códigos estables)
     ├── pipeline_tracker.py  PipelineTracker — latencias por turno
     ├── session_registry.py  SessionRegistry — observabilidad de sesiones
     ├── speech/              Proveedores STT/TTS: ports.py, factory.py, fogar.py, elevenlabs/, off.py (voz desactivada)

@@ -1,7 +1,6 @@
 import asyncio
-import contextlib
 import logging
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import Callable
 
 from fogar_gateway.services.openclaw.client import (
     ORCHESTRATOR_ERROR,
@@ -11,7 +10,6 @@ from fogar_gateway.services.openclaw.client import (
 )
 from fogar_gateway.services.openclaw.models import GatewayInfo
 from fogar_gateway.services.orchestration import OrchestratorError
-from fogar_gateway.services.protocol import OrchestratorEvent
 from fogar_gateway.services.reconnection import (
     ConnectionState,
     ServiceHealth,
@@ -110,10 +108,6 @@ class ReconnectingOpenClawClient:
             return False
         return await self._client.ping()
 
-    async def abort(self, session_key: str) -> None:
-        if self.state == ConnectionState.CONNECTED:
-            await self._client.abort(session_key)
-
     async def send(self, text: str, session_key: str, *, queue_mode: str | None = None) -> str:
         """`OpenClawClient.send`; sin conexión, `orchestrator_unavailable`. Raises
         OrchestratorError (a stable code), never anything else."""
@@ -138,36 +132,6 @@ class ReconnectingOpenClawClient:
         if self.state != ConnectionState.CONNECTED:
             raise OrchestratorRequestError(ORCHESTRATOR_UNAVAILABLE_ERROR)
         return await self._client.request(method, params, timeout)
-
-    async def stream_response(
-        self,
-        text: str,
-        session_key: str,
-    ) -> AsyncGenerator[OrchestratorEvent, None]:
-        if self.state != ConnectionState.CONNECTED:
-            self._ensure_loop()
-            yield OrchestratorEvent(type="error", content=ORCHESTRATOR_UNAVAILABLE_ERROR)
-            return
-        try:
-            # aclosing() here (not just around the outer generator in
-            # call_orchestrator) guarantees the inner OpenClawClient.stream_response()
-            # generator — which holds `finally: self._turn_registry.unregister(...)` —
-            # gets a synchronous GeneratorExit when this generator is closed early,
-            # instead of being abandoned for the asyncgen GC finalizer to eventually
-            # close (issue #150, one layer removed from the #99/#147 fix).
-            async with contextlib.aclosing(
-                self._client.stream_response(text=text, session_key=session_key)
-            ) as inner:
-                async for event in inner:
-                    yield event
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 — frontera: el turno cede orchestrator_error
-            logger.warning("[%s] stream_response error (%s)", self._name, type(e).__name__)
-            logger.debug(
-                "[%s] stream_response traceback (no message): %s", self._name, traceback_no_message(e)
-            )
-            yield OrchestratorEvent(type="error", content=ORCHESTRATOR_ERROR)
 
     def status(self) -> ServiceStatus:
         return self._health.status()

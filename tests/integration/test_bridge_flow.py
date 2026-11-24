@@ -7,7 +7,7 @@ recibe tokens del orchestrator.
 import pytest
 
 from fogar_gateway.core.config import settings
-from fogar_gateway.services.protocol import OrchestratorEvent
+from tests.fakes.orchestrator import OrchestratorEvent
 from tests.integration.conftest import VALID_KEY
 
 HANDSHAKE_TEXT = {

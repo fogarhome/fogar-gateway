@@ -574,7 +574,7 @@ them to a log. What it does instead:
 | `chat` `state:"error"`, or a push's `agent` `phase:"error"` | the code classified from structural fields (#397, below), else `orchestrator_error` | WARNING with that code only |
 | Not connected / reconnecting | `orchestrator_unavailable` | — |
 | Connection ends mid-turn | `orchestrator_disconnected` (#213) | type / close codes only |
-| `turn_timeout`, `turn_overflow`, `turn_in_progress` | same literals (unchanged) | — |
+| `turn_timeout`, `turn_overflow`, `turn_in_progress` | same literals (unchanged; since 5.0 PR 2b.3 only `turn_timeout` is still sent, and `/v1` adds `turn_cancelled`) | — |
 | Unexpected exception wrapping the stream | `orchestrator_error` | type only; traceback without message at DEBUG |
 
 Handshake (`connect()`): a rejected `hello`, a first frame that is not `connect.challenge`, or
@@ -1193,6 +1193,7 @@ explicitly requested agent, as `resolve_agent` does; the handshake keeps its 402
   whole key: a push without `runId` is only cut on the gateway's side (WARNING, nothing sent),
   because `chat.abort` of the key would also take the queued messages. `/v1`
   (`stream_response`, until 2b.3) still sends a whole-key `chat.abort` when it gives up.
+  (Since 2b.3 nothing does: see "5.0 PR 2b.3".)
 - **A run opens its turn on its first event**, not on lifecycle `start`: `chat` status, delta,
   tool or an `error`, a `final` that carries text, `agent` lifecycle `start`/`model`/
   `fallback_step` or a `run_status`. The `seq gap` `agent` `stream:"error"` opens nothing (it
@@ -1272,12 +1273,53 @@ fake's copies of the sequences above (`tests/unit/test_channel_runs.py`), not li
 - **#112 is now partly checked in the channel's worker:** for push openers other than
   lifecycle `start`, "a /v1 turn holds the key" is read when the worker handles the frame, so
   a frame of a /v1 run handled after /v1 unregistered may open a push. 2b.3 moves /v1 into the
-  channel and reworks this.
+  channel and reworks this (next section).
 - **Withdraw vs. steer race (inherent):** OpenClaw tells that it absorbed B only afterwards (its
   `session.message`). A `withdraw` of B in between finds it pending, aborts it (OpenClaw has
   nothing left to abort) and announces `withdrawn`, while B's answer arrives inside A's turn.
 
+### How the gateway reacts (5.0 PR 2b.3, 2026-11-24)
+
+`src/fogar_gateway/api/openai_routes.py`, `services/channel.py` (`send_exclusive`). No server
+change; tested against the fake in `steer` mode (`tests/integration/harness/test_v1_channel.py`),
+not live.
+
+- **`/v1` goes through its conversation's channel.** Its run is one of the channel's runs (a
+  `RunInfo` like a WebSocket message's), so its frames reach the channel by `runId`
+  (`take_frame`); `stream_response`, the per-key turn registration in `TurnRegistry`
+  (`register`/`deliver_by_session`/`blocks_push`) and the dispatcher's `/v1` paths (including
+  the separate `fallback_step` path, #397) are gone. `TurnRegistry` keeps only the tombstones
+  (#285).
+- **`queueMode` untested live; the gateway waits instead.** `/v1` (Home Assistant) must get the
+  answer of its own run, never a reply folded by `steer` into someone else's run, nor someone
+  else's message folded into its own. The per-message `queueMode: "followup"` would say that to
+  OpenClaw, but it was only read in the source, never tried: `chat.send` still carries no
+  `queueMode`. The channel guarantees it instead: a `/v1` message takes the channel's send lock,
+  waits until the channel is calm (no open turn, no unfinished run of the channel's own —
+  queued, running or absorbed —, no `chat.send` waiting for its ack, nothing deferred or still
+  queued for the channel's worker), sends, and keeps the lock until its run ends. WebSocket
+  sends and other `/v1` messages that arrive meanwhile wait behind it in arrival order (their
+  `message` goes out once they are sent): a WebSocket message sent during `/v1`'s run would be
+  steered into it and change `/v1`'s answer. Residual risk: a push (a run nobody sent) that
+  starts after `/v1`'s `chat.send` is OpenClaw's to order; the gateway cannot hold it back.
+- **Subscribers see it like any message:** its `message` (`from.source: "device"`, the caller's
+  client id and name; the trusted-origin caller without a client row uses `device_id: "ha"`,
+  name `Home Assistant`, on a channel of its own key `agent:{agent}:ha` that no session can
+  attach to) and its turn (`turn_start.by` = that device), with no audio for anyone. The turn
+  counts in its conversation on the `chat.send` ack, as before.
+- **Ending:** the run's terminal ends it as for any channel run (`final`, `error` classified
+  #397, `turn_timeout` after `TURN_TIMEOUT_S` without progress, `orchestrator_disconnected`).
+  A Home Assistant client that leaves (or a timeout) aborts only its run, `chat.abort
+  {sessionKey, runId}` (tombstoned first); the whole-key `chat.abort` is gone from the
+  gateway. A client `cancel` from a WebSocket session stops `/v1`'s turn like any other:
+  `/v1` answers 502 `turn_cancelled`. Two `/v1` requests on one conversation no longer get
+  409 `turn_in_progress`: the second waits for the first.
+
 ## Change log of this file
+
+- **2026-11-24**: "C3 queue behaviour" gains how the gateway reacts in 5.0 PR 2b.3 (#406): `/v1`
+  goes through the conversation's channel and waits for calm instead of sending `queueMode`
+  (untested live); no whole-key `chat.abort` left; `turn_in_progress` no longer sent.
 
 - **2026-11-24**: "C3 queue behaviour" gains how the gateway reacts in 5.0 PR 2b.2 (#406): a
   `user` `session.message` is read (ids and `steerTargetRunId`, updated by `messageId`), absorbed

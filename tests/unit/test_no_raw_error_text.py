@@ -18,13 +18,13 @@ from fogar_gateway.services import tts_client as tts_mod
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.reconnecting import ReconnectingOpenClawClient
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
-from fogar_gateway.services.protocol import OrchestratorEvent
 from fogar_gateway.services.reconnection import ConnectionState, describe_error
 from fogar_gateway.services.speech.ports import SttCallbacks, SttParams
 from fogar_gateway.services.transcriber_client import TranscriberClient
 from fogar_gateway.services.transcriber_reconnecting import ReconnectingTranscriberClient
 from fogar_gateway.services.tts_client import TTSClient
 from tests.fakes.bridge import push, run_turn, sent
+from tests.fakes.orchestrator import OrchestratorEvent
 
 SECRET = "SECRET-INTERNAL"
 

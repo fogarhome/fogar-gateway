@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 from unittest.mock import AsyncMock
 
 import pytest
@@ -8,7 +7,7 @@ from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.models import GatewayInfo
 from fogar_gateway.services.openclaw.reconnecting import ReconnectingOpenClawClient
-from fogar_gateway.services.protocol import OrchestratorEvent
+from fogar_gateway.services.orchestration import OrchestratorError
 from fogar_gateway.services.reconnection import ConnectionState
 
 
@@ -23,12 +22,7 @@ def make_mock_client(gateway_info=None):
         return gateway_info
 
     client.connect.side_effect = fake_connect
-
-    async def fake_stream(*args, **kwargs):
-        yield OrchestratorEvent(type="token", content="hi")
-        yield OrchestratorEvent(type="status", content="done")
-
-    client.stream_response = fake_stream
+    client.send.return_value = "run-1"
     return client
 
 
@@ -49,26 +43,22 @@ async def test_connect_sets_connected_state():
 
 
 @pytest.mark.asyncio
-async def test_stream_response_delegates():
+async def test_send_delegates():
     inner = make_mock_client(GATEWAY_INFO)
     roc = ReconnectingOpenClawClient(inner, "test")
     await roc.connect()
-    events = []
-    async for e in roc.stream_response("hello", session_key="agent:main:u"):
-        events.append(e)
-    assert any(e.type == "token" for e in events)
+    assert await roc.send("hello", "agent:main:u") == "run-1"
+    inner.send.assert_awaited_once_with("hello", "agent:main:u", queue_mode=None)
 
 
 @pytest.mark.asyncio
-async def test_stream_response_when_not_connected_yields_error():
+async def test_send_when_not_connected_raises_unavailable():
     inner = make_mock_client(GATEWAY_INFO)
     roc = ReconnectingOpenClawClient(inner, "test")
     # NOT calling connect() first
-    events = []
-    async for e in roc.stream_response("hello", session_key="agent:main:u"):
-        events.append(e)
-    assert events[0].type == "error"
-    assert "unavailable" in events[0].content
+    with pytest.raises(OrchestratorError, match=r"^orchestrator_unavailable$"):
+        await roc.send("hello", "agent:main:u")
+    inner.send.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -145,8 +135,8 @@ async def test_probes_while_reconnecting_do_not_add_attempts_or_tasks():
 
     for _ in range(100):
         await roc.ping()
-        async for _event in roc.stream_response("x", session_key="agent:main:u"):
-            pass
+        with pytest.raises(OrchestratorError):
+            await roc.send("x", "agent:main:u")
     await asyncio.sleep(0.01)
 
     assert inner.connect.call_count == calls
@@ -362,44 +352,6 @@ async def test_trigger_reconnect_coalesces_with_in_flight_attempt():
     assert inner.connect.call_count == 1
 
 
-@pytest.mark.asyncio
-async def test_stream_response_closes_inner_generator_on_early_exit():
-    """Issue #150: in production, `call_orchestrator()` (src/fogar_gateway/services/orchestration.py)
-    wraps `ReconnectingOpenClawClient.stream_response()` in `contextlib.aclosing()`
-    and raises on an `error` event, closing the OUTER generator early. The INNER
-    generator — the real `OpenClawClient.stream_response()`, which holds
-    `finally: self._turn_registry.unregister(...)` — must be closed synchronously
-    at that same moment, not abandoned for the asyncgen GC finalizer to eventually
-    get around to (which would leave the session_key locked with `TurnInProgress`)."""
-    inner_finally_ran = []
-
-    async def fake_stream(*args, **kwargs):
-        try:
-            yield OrchestratorEvent(type="error", content="boom")
-            yield OrchestratorEvent(type="token", content="never reached")
-        finally:
-            inner_finally_ran.append(True)
-
-    inner = make_mock_client(GATEWAY_INFO)
-    inner.stream_response = fake_stream
-    roc = ReconnectingOpenClawClient(inner, "test")
-    await roc.connect()
-
-    with pytest.raises(RuntimeError):
-        async with contextlib.aclosing(
-            roc.stream_response("hi", session_key="agent:main:u")
-        ) as stream:
-            async for event in stream:
-                if event.type == "error":
-                    # Mirrors call_orchestrator() raising on an error event.
-                    raise RuntimeError(event.content)
-
-    assert inner_finally_ran, (
-        "inner OpenClawClient generator's finally (TurnRegistry.unregister) "
-        "never ran synchronously — it was abandoned instead of closed"
-    )
-
-
 class _SlowToStopWS:
     """Socket del que el listener tarda en soltar al cancelarlo (cierre en curso)."""
 
@@ -449,19 +401,19 @@ async def test_close_does_not_hang_when_cancel_lands_inside_connect(monkeypatch)
 
 
 async def test_after_close_nothing_starts_a_reconnect():
-    """G-52 (#221): tras close(), ni ping(), ni stream_response(), ni una caída avisada
-    por el cliente interno vuelven a crear la tarea de reconexión."""
+    """G-52 (#221): tras close(), ni ping(), ni send(), ni una caída avisada por el cliente
+    interno vuelven a crear la tarea de reconexión."""
     inner = make_mock_client(GATEWAY_INFO)
     roc = ReconnectingOpenClawClient(inner, "test")  # sin connect(): DEGRADED
     await roc.close()
 
     assert await roc.ping() is False
-    events = [e async for e in roc.stream_response("hola", session_key="agent:main:u")]
+    with pytest.raises(OrchestratorError, match=r"^orchestrator_unavailable$"):
+        await roc.send("hola", "agent:main:u")
     inner.on_disconnect()
     roc.trigger_reconnect()
     await asyncio.sleep(0.01)
 
-    assert events[0].content == "orchestrator_unavailable"
     assert roc._reconnect_task is None
     inner.connect.assert_not_called()
 

@@ -1,8 +1,8 @@
 """Hallazgo 6 de la auditoría: la session key usa el agente ya resuelto y normalizado."""
 
 from fogar_gateway.models.schemas import Handshake
-from fogar_gateway.services.protocol import OrchestratorEvent
 from tests.fakes.bridge import run_turn
+from tests.fakes.orchestrator import OrchestratorEvent
 
 
 async def test_session_key_uses_stripped_resolved_agent(make_bridge):

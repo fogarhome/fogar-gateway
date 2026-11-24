@@ -15,8 +15,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from fogar_gateway.services.openclaw.registry import ClientRegistry
-from fogar_gateway.services.protocol import OrchestratorEvent
 from tests.fakes.bridge import push, sent, start_turn
+from tests.fakes.orchestrator import OrchestratorEvent
 
 
 @pytest.fixture

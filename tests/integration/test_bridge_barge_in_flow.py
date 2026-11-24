@@ -16,8 +16,7 @@ from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.main import app
 from fogar_gateway.services.auth import hash_key
-from fogar_gateway.services.protocol import OrchestratorEvent
-from tests.fakes.orchestrator import wire_stream_orchestrator
+from tests.fakes.orchestrator import OrchestratorEvent, wire_stream_orchestrator
 from tests.integration.conftest import (
     CLIENT_ID,
     CLIENT_NAME,

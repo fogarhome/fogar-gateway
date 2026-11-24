@@ -373,16 +373,6 @@ async def test_without_db_the_turn_stays_in_its_conversation(service, clock, cap
 # ── Sesiones vivas y reparto del push ─────────────────────────────────────
 
 
-async def test_a_day_move_frees_the_old_keys_queue_peak_and_keeps_its_value(make_bridge):
-    bridge, _ = make_bridge()
-    old = bridge.conversation.current
-    new = Conversation("d2", old.client_id, "main", session_key_for("main", "d2"), "default", None)
-    bridge._turn_registry._peak[old.session_key] = 3
-    await bridge._on_conversation_move(old, new)
-    assert old.session_key not in bridge._turn_registry._peak
-    assert bridge._session_end_meta("completed")["turn_queue_peak"] == 3
-
-
 async def test_a_session_that_left_its_channel_never_aborts_on_that_key(make_bridge):
     """5.0 (#406): una sesión que se va (aquí, revocada) deja el canal; después, ni corta nada en
     él ni aborta en su clave (solo el canal aborta)."""
@@ -392,7 +382,6 @@ async def test_a_session_that_left_its_channel_never_aborts_on_that_key(make_bri
     await push(bridge, ("turn_start", bridge.conversation.session_key))
     await asyncio.wait_for(bridge.revoke(), 2)
     assert await bridge.turns.cancel("cancelled") == (False, None)
-    bridge.orchestrator.abort.assert_not_awaited()
     await bridge.close_all()
 
 
