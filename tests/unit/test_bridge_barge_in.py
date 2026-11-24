@@ -131,6 +131,7 @@ async def test_cancel_after_the_turn_ended_returns_false(bridge):
     bridge.orchestrator.stream_response = done
     task = await start_turn(bridge)
     await asyncio.wait({task})
+    await bridge.turns.idle()  # 5.0: the session's turn ends after the channel's (its audio)
 
     assert await bridge.turns.cancel("cancelled") == (False, None)
 

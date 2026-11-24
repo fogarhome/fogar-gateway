@@ -2,15 +2,16 @@
 
 import pytest
 
+from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
-from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+from fogar_gateway.services.openclaw.registry import TurnRegistry
 
 SK = "agent:main:client-a"
 
 
 def make():
     turns = TurnRegistry()
-    return FrameDispatcher(turns, ClientRegistry()), turns
+    return FrameDispatcher(turns, ChannelHub()), turns
 
 
 async def test_res_ok_false_ends_turn_with_error_frame():

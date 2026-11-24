@@ -7,8 +7,10 @@ import pytest
 
 import fogar_gateway.services.openclaw.registry as registry_mod
 from fogar_gateway.core.config import settings
+from fogar_gateway.services.channel import ChannelHub
+from fogar_gateway.services.conversations import ConversationIndex
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
-from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+from fogar_gateway.services.openclaw.registry import TurnRegistry
 from tests.fakes.bridge import keyed_conversation
 
 SK = "agent:main:client-a"
@@ -107,11 +109,15 @@ def _chat_frame(text="x"):
 
 
 def _make():
+    """The dispatcher and the channel of `SK` (5.0): its `enqueue_push` records the pushes."""
     turns = TurnRegistry(max_queue_size=2)
-    clients = ClientRegistry()
-    bridge = MagicMock()
-    clients.register("client-a", bridge, keyed_conversation("client-a"))
-    return FrameDispatcher(turns, clients), turns, bridge
+    index = ConversationIndex()
+    conversation = keyed_conversation("client-a")
+    index.add(conversation)
+    hub = ChannelHub(index=index, turn_registry=turns)
+    channel = hub.get_or_create(conversation)
+    channel.enqueue_push = MagicMock()
+    return FrameDispatcher(turns, hub), turns, channel
 
 
 @pytest.mark.asyncio

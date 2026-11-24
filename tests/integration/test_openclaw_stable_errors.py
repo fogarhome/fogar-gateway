@@ -17,10 +17,11 @@ from unittest.mock import AsyncMock
 import pytest
 import websockets
 
+from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.reconnecting import ReconnectingOpenClawClient
-from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+from fogar_gateway.services.openclaw.registry import TurnRegistry
 from fogar_gateway.services.protocol import OrchestratorEvent
 from fogar_gateway.services.reconnection import ConnectionState
 
@@ -95,7 +96,7 @@ class Server:
 
 def make_client(port):
     turns = TurnRegistry()
-    client = OpenClawClient("127.0.0.1", port, "tok", turns, FrameDispatcher(turns, ClientRegistry()))
+    client = OpenClawClient("127.0.0.1", port, "tok", turns, FrameDispatcher(turns, ChannelHub()))
     return client
 
 

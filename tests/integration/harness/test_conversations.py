@@ -110,11 +110,11 @@ async def test_day_cutoff_moves_a_long_lived_session_at_its_next_turn(harness, c
     assert said(harness, session_key_for("main", today)) == ["dos"]
     assert_turns_paired(client.messages)
 
-    # Un recordatorio de la conversación de ayer sigue llegando a la tele, que ya está en la de hoy.
+    # 5.0 (decisión 7, regresión conocida hasta la 2c): un recordatorio de la conversación de
+    # ayer va a su canal, en el que la tele ya no está (está en la de hoy): no le llega.
     await harness.push("se te olvidó algo", session_key=session_key_for("main", yesterday))
-    await client.collect(lambda m: len(of_type(m, "turn_end")) == 3)
-    push = of_type(client.messages, "turn_start")[-1]
-    assert (push["conversation"], push["origin"]) == (yesterday, "push")
+    await client.collect(timeout=0.5)
+    assert len(of_type(client.messages, "turn_start")) == 2
     assert_turns_paired(client.messages)
 
 
@@ -135,8 +135,9 @@ async def test_push_of_a_conversation_reaches_the_session_that_has_it_open(harne
 
 
 async def test_a_displaced_session_ends_its_turn_and_lets_go_before_the_new_one_talks(harness):
-    """La vieja recibe el turn_end (`closed`) de su turno abierto antes del 4102, y su
-    chat.abort sale antes del primer chat.send de la nueva, que llega entero."""
+    """La vieja recibe el turn_end (`closed`) de su turno abierto antes del 4102, y el
+    chat.abort de ese turno (5.0: lo manda el canal al sustituirlo) sale antes del primer
+    chat.send de la nueva, que llega entero."""
     old = await harness.connect()
     await old.send({"type": "send", "text": "wait-old"})  # el orquestador se queda esperando
     await harness.openclaw.wait_held(1)
@@ -148,7 +149,10 @@ async def test_a_displaced_session_ends_its_turn_and_lets_go_before_the_new_one_
     assert [e["reason"] for e in of_type(old.messages, "turn_end")] == ["closed"]
     assert_turns_paired(old.messages)
 
-    msgs = await run_turn(new, "hola")
+    # 5.0 (2a.2): la vieja dejó el canal sin abortar nada (decisión 2) y la nueva, al
+    # adjuntarse, ve el turno abierto de la vieja; su `send` lo sustituye (`replaced`).
+    msgs = await run_turn(new, "hola", ends=2)
+    assert [e["reason"] for e in of_type(msgs, "turn_end")] == ["replaced", "done"]
     assert [t["text"] for t in of_type(msgs, "token")] == ["reply-hola"]
     key = harness.session_key(new)
     assert [m for m, sk in harness.openclaw.calls if sk == key] == [

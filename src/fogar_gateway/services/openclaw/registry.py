@@ -362,14 +362,14 @@ def _prune(deadlines: dict[str, float]) -> None:
 
 
 class ClientRegistry:
-    """Sesiones vivas (#113, M19): quién recibe un push y qué conversación está abierta dónde.
+    """Sesiones vivas (#113, M19): las de cada cliente (avisos de estado, revocación) y qué
+    conversación está abierta dónde.
 
     Cada sesión se registra con su cliente y su conversación (un cliente puede tener varias
     sesiones, cada una en una conversación). Una conversación está abierta en una sola sesión:
     abrirla en otra devuelve la anterior, que el llamador cierra (4102 «conversation opened
-    elsewhere»). El push se enruta por su `sessionKey`: conversación (`index`) → la sesión que
-    la tiene abierta o, si ninguna, la sesión más reciente de su cliente (p. ej. un recordatorio
-    en la conversación de ayer de la tele, que ya está en la de hoy).
+    elsewhere»; 5.0 PR 2a.3 lo quita). El push ya no pasa por aquí: va al canal de su
+    conversación (services/channel.py, #406), que lo reparte a las sesiones adjuntas.
 
     Las identidades se comparan con `is` (#113): el cierre tardío de una sesión vieja nunca
     quita a la nueva.
@@ -418,19 +418,6 @@ class ClientRegistry:
     def holder(self, conversation_id: str) -> Any | None:
         """La sesión que tiene abierta la conversación, si hay una."""
         return self._open.get(conversation_id)
-
-    def route(self, session_key: str) -> Any | None:
-        """La sesión que recibe un push de `session_key`, o None."""
-        conversation = self.index.get(session_key)
-        if conversation is not None:
-            target = self._open.get(conversation.id) or self.get(conversation.client_id)
-            # M20: lo privado nunca a un dispositivo del hogar ni a uno de otra persona. Su
-            # dispositivo es de su dueño (`_stamp`): esto es la red de seguridad.
-            owner = conversation.owner_user_id
-            if target is not None and owner is not None and target.client.user_id != owner:
-                return None
-            return target
-        return None
 
     def for_client(self, client_id: str) -> list[Any]:
         """Las sesiones vivas de un cliente (una copia)."""

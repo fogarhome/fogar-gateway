@@ -17,6 +17,7 @@ import pytest
 
 from fogar_gateway.api import routes
 from fogar_gateway.models.schemas import Client, ClientConfig
+from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.conversations import Conversation, ConversationIndex, conversation_day
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
 from fogar_gateway.services.session_registry import SessionRegistry
@@ -75,6 +76,7 @@ def _make_app_state(orchestrator_ping_result=True):
         speech=SimpleNamespace(tts=AsyncMock(), stt=AsyncMock()),
         client_registry=ClientRegistry(),
         turn_registry=TurnRegistry(),
+        channel_hub=ChannelHub(orchestrator=orchestrator),
         session_registry=SessionRegistry(),
         conversations=_FakeConversations(),
     ), orchestrator

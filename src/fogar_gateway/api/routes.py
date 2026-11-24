@@ -258,6 +258,7 @@ async def gateway_websocket(websocket: WebSocket):
             conversation=conversation,
             sender=sender,
             turn_registry=app_state.turn_registry,
+            channel_hub=app_state.channel_hub,
         )
     except Exception as e:  # noqa: BLE001 — frontera: sesión a medio construir
         logger.error(f"[{client.id}] Fallo al construir la sesión: {describe_error(e)}")

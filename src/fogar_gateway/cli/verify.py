@@ -186,6 +186,7 @@ async def verify_openclaw(host: str, port: int, token: str) -> Verdict:
     if (bad := _config_problem()) is not None:
         return bad
     from fogar_gateway.cli.openclaw_access import describe, identity_required_text, pending_text
+    from fogar_gateway.services.channel import ChannelHub
     from fogar_gateway.services.openclaw.client import (
         OpenClawClient,
         OrchestratorDeviceIdentityRequired,
@@ -195,7 +196,7 @@ async def verify_openclaw(host: str, port: int, token: str) -> Verdict:
         OrchestratorStartingError,
     )
     from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
-    from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+    from fogar_gateway.services.openclaw.registry import TurnRegistry
 
     turn_registry = TurnRegistry()
     # use_device_token=False: aunque haya un token de dispositivo guardado para este OpenClaw, se
@@ -206,7 +207,7 @@ async def verify_openclaw(host: str, port: int, token: str) -> Verdict:
         port=port,
         token=token,
         turn_registry=turn_registry,
-        dispatcher=FrameDispatcher(turn_registry, ClientRegistry()),
+        dispatcher=FrameDispatcher(turn_registry, ChannelHub(turn_registry=turn_registry)),
         use_device_token=False,
     )
     granted: dict = {}

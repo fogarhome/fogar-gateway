@@ -10,6 +10,7 @@ from fogar_gateway.core.config import settings
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
 from fogar_gateway.models.close_codes import Close, CloseFrame, send_close
 from fogar_gateway.models.schemas import Client, ClientConfig, Handshake
+from fogar_gateway.services.channel import ChannelHub, ConversationChannel
 from fogar_gateway.services.conversations import Conversation, SessionConversation
 from fogar_gateway.services.db_client import db_client
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
@@ -85,6 +86,7 @@ class FogarBridge:
         conversation: SessionConversation,
         sender: OutboundSender,
         turn_registry: TurnRegistry,
+        channel_hub: ChannelHub | None = None,
     ):
         # Contada al crearse: toda sesión que luego cierra close_all() cuenta como abierta,
         # también la que falla antes de run() (1011, ready fallido…).
@@ -140,18 +142,28 @@ class FogarBridge:
         # first frame of the current burst (a frame after an idle gap starts a new one).
         self._last_audio_at: float | None = None
         self._audio_burst_start: float | None = None
+        # Los canales de las conversaciones (5.0, #406): el de la app. Sin él (tests), uno
+        # propio, que se cierra con la sesión (su turno no le sobrevive).
+        self._own_hub = channel_hub is None
+        if channel_hub is None:
+            channel_hub = ChannelHub(
+                index=client_registry.index,
+                orchestrator=orchestrator,
+                turn_registry=turn_registry,
+                note_turn=lambda conversation_id: self.conversation.note_turn(conversation_id),
+            )
+        self.channel_hub = channel_hub
         self.turns = TurnController(
-            client_id=self.client_id,
+            client=client,
             config=config,
             handshake=handshake,
-            orchestrator=orchestrator,
             tts=self.tts,
             tracker=tracker,
             sender=sender,
             conversation=conversation,
+            channels=channel_hub,
             spawn=self._spawn,
             supervise=self._supervise,
-            turn_registry=turn_registry,
         )
 
     async def connect_internal_services(self):
@@ -181,9 +193,16 @@ class FogarBridge:
         self._client_registry.register(self.client_id, self)
 
     async def claim_conversation(self) -> None:
-        """Abre la conversación de la sesión (M19). Tras el health check y antes de `ready`:
-        una sesión que no llega a abrirse nunca cierra la que la tenía."""
+        """Abre la conversación de la sesión (M19) y se adjunta a su canal (5.0). Tras el
+        health check y antes de `ready`: una sesión que no llega a abrirse nunca cierra la que
+        la tenía, ni recibe un turno antes de `ready`."""
         await _take_over(self._client_registry.open(self.conversation.current, self))
+        self.turns.attach()
+
+    @property
+    def channel(self) -> ConversationChannel | None:
+        """El canal de la conversación al que está adjunta la sesión, si lo está."""
+        return self.turns.channel
 
     def _session_key(self) -> str:
         return self.conversation.session_key
@@ -293,9 +312,13 @@ class FogarBridge:
             self._client_registry.unregister(self.client_id, self)
             limit = settings.SESSION_TEARDOWN_S
             async with Teardown(f"[{self.client_id}] close_all") as td:
-                # The turns first: the one in flight is cancelled (never drained) and every
-                # open turn gets its turn_end while the socket is still open (G-10, G-23).
+                # The turns first: the session leaves its channel (the turn in flight goes on
+                # there, decision 2) and every open turn gets its turn_end while the socket is
+                # still open (G-10, G-23).
                 await self.turns.close(td, limit)
+                if self._own_hub:
+                    # A hub of its own (tests): nobody else is on it, its turn ends with it.
+                    await td.step(self.channel_hub.aclose(limit), "canales propios", limit)
 
                 # Never the calling task: the watchdogs call close_all() on themselves.
                 # Cancel them all first, then wait them under one shared limit.
@@ -536,8 +559,9 @@ class FogarBridge:
     async def displace(self) -> None:
         """Otra sesión abrió la conversación de esta (M19): se cierra con
         `Close.CONVERSATION_OPENED_ELSEWHERE` (4102). El cierre corre en una tarea propia de esta sesión; quien la desplaza
-        espera solo a su primer paso, los chat.abort en la clave (`turns.let_go`), acotado; desde
-        ahí esta sesión ya no aborta nada en esa clave."""
+        espera solo a su primer paso, dejar el canal de la conversación (`turns.let_go`),
+        acotado. Desde la 5.0 el canal es el único que aborta en esa clave (5.0 PR 2a.3 quita
+        el desplazamiento)."""
         if self._policy_close is None:
             logger.info(
                 f"[{self.client_id}] Conversación {self.conversation.id} abierta en otra sesión."
@@ -587,7 +611,8 @@ class FogarBridge:
 
         1. Desde ya no sale nada más que turn_start/turn_end (G-18: ni audio, ni tokens, ni
            avisos); el par entero, nunca un turn_end sin su turn_start (A-r2-1).
-        2. Antes que nada, que nada suyo siga corriendo en OpenClaw en su clave (`let_go`): lo
+        2. Antes que nada, deja el canal de su conversación (`let_go`): sus turnos se cierran
+           aquí y el del canal sigue para los demás (decisión 2 de la 5.0: nada se aborta). Lo
            espera quien la desplaza (`_released`), pase lo que pase.
         3. Exactamente un turn_end por turn_start (G-10): el turno abierto y el push se cierran
            con `closed` y su turn_end sale, acotado, antes del cierre. Después, el cierre de siempre.
@@ -906,10 +931,6 @@ class FogarBridge:
             logger.warning(
                 f"[{self.client_id}] send_json(transcription) falló: {describe_error(e)}"
             )
-
-    def enqueue_push(self, kind: str, arg: Any, run_id: str | None = None) -> None:
-        """Entry point of FrameDispatcher for push events (synchronous, never blocks)."""
-        self.turns.enqueue_push(kind, arg, run_id)
 
     async def push_idle(self) -> None:
         """Wait until every queued push event has been handled (for tests)."""

@@ -4,7 +4,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 from fogar_gateway.core.config import settings
-from tests.fakes.bridge import RecWS, blocking, sent, start_turn, tokens, wait_until
+from tests.fakes.bridge import RecWS, blocking, enqueue_push, sent, start_turn, tokens, wait_until
 
 
 class ClosingWS(RecWS):
@@ -57,7 +57,7 @@ async def test_turn_end_of_a_finished_push_precedes_the_next_turn_start(make_bri
     bridge, ws = make_bridge(output_mode=("text", "audio"), tts=tts_provider(stream))
     bridge.orchestrator.stream_response = tokens("hola")
     for kind, arg in (("turn_start", "agent:main:u"), ("turn_end", "agent:main:u")):
-        bridge.enqueue_push(kind, arg)
+        enqueue_push(bridge, kind, arg)
     await asyncio.wait_for(closing.wait(), 2)
     send = asyncio.create_task(bridge.turns.start_user_turn("x"))
     await asyncio.sleep(0.05)
@@ -109,7 +109,7 @@ async def test_a_displaced_session_never_sends_a_lone_turn_end(make_bridge):
     bridge.orchestrator.stream_response = blocking(started)
     await start_turn(bridge)
     await asyncio.wait_for(started.wait(), 2)
-    bridge.enqueue_push("turn_start", "agent:main:u")
+    enqueue_push(bridge, "turn_start", "agent:main:u")
     await asyncio.sleep(0.02)  # el worker queda esperando al turno del usuario
     await bridge.displace()
     await asyncio.wait_for(bridge._policy_close, 2)

@@ -103,7 +103,7 @@ class _Requester(Protocol):
 
 class ConversationIndex:
     """`session_key` → conversación, en memoria: cargado de la BD al arrancar y al día con cada
-    alta. Lo usa el reparto de push (`ClientRegistry.route`). Solo se toca desde el hilo del
+    alta. Lo usa el reparto de push (`ChannelHub.channel_for`). Solo se toca desde el hilo del
     loop (los métodos async de ConversationService lo actualizan al volver del hilo de la BD)."""
 
     def __init__(self) -> None:

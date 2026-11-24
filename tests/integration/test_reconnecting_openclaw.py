@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.models import GatewayInfo
 from fogar_gateway.services.openclaw.reconnecting import ReconnectingOpenClawClient
@@ -421,10 +422,10 @@ async def test_close_does_not_hang_when_cancel_lands_inside_connect(monkeypatch)
     (mientras desmonta el listener anterior), no se pierde. Antes el listener se tragaba
     su cancelación, el bucle seguía reintentando y close() esperaba hasta max_duration."""
     from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
-    from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+    from fogar_gateway.services.openclaw.registry import TurnRegistry
 
     turns = TurnRegistry()
-    inner = OpenClawClient("127.0.0.1", 1, "t", turns, FrameDispatcher(turns, ClientRegistry()))
+    inner = OpenClawClient("127.0.0.1", 1, "t", turns, FrameDispatcher(turns, ChannelHub()))
     inner._ws = _SlowToStopWS()
     inner._listener_task = asyncio.create_task(inner._listen())
     await asyncio.sleep(0)

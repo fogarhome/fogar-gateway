@@ -1,6 +1,10 @@
 import logging
+from typing import TYPE_CHECKING, Protocol
 
-from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+from fogar_gateway.services.openclaw.registry import TurnRegistry
+
+if TYPE_CHECKING:
+    from fogar_gateway.services.channel import ConversationChannel
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +23,20 @@ def _run_id(payload: dict) -> str | None:
     return run_id if isinstance(run_id, str) else None
 
 
-class FrameDispatcher:
-    """Routes incoming OpenClaw frames to the correct queue or bridge.
+class Channels(Protocol):
+    """Where a push goes: `ChannelHub` (services/channel.py)."""
 
-    Knows about TurnRegistry and ClientRegistry. Does not touch WebSocket or TTS.
+    def channel_for(self, session_key: str) -> "ConversationChannel | None": ...
+
+
+class FrameDispatcher:
+    """Routes incoming OpenClaw frames to the correct queue or channel.
+
+    Knows about TurnRegistry and the conversation channels (5.0, #406). Does not touch
+    WebSocket or TTS. The run of a user turn still reaches its turn by `deliver_by_session`;
+    every other frame of a key goes to its conversation's channel (`channel_for`: the
+    conversation from the index, the channel created if none is live). A key no
+    conversation has goes nowhere.
 
     Turn queues are bounded and fed with non-blocking puts (issue #130 S3b).
 
@@ -32,12 +46,12 @@ class FrameDispatcher:
     Push handlers are never awaited here: this runs inside OpenClaw's _listen loop,
     so anything slow would stall every session sharing the connection (issue #130
     S3a). The routing decision (including the #112 normal-turn check) is still taken
-    synchronously, and only the resulting work is queued on the bridge's push worker.
+    synchronously, and only the resulting work is queued on the channel's push worker.
     """
 
-    def __init__(self, turn_registry: TurnRegistry, client_registry: ClientRegistry) -> None:
+    def __init__(self, turn_registry: TurnRegistry, channels: Channels) -> None:
         self._turns = turn_registry
-        self._clients = client_registry
+        self._channels = channels
         # Frame/event kinds already reported as unhandled — each is logged at INFO
         # once (issue #136), so protocol drift is visible without a per-frame flood.
         self._unknown_seen: set[str] = set()
@@ -109,9 +123,9 @@ class FrameDispatcher:
             return
         if self._turns.is_aborted(sk):
             return  # late frame of a turn aborted for overflow (#130 S3b)
-        bridge = self._clients.route(sk)
-        if bridge is not None:
-            bridge.enqueue_push("chat", payload, run_id=_run_id(payload))
+        channel = self._channels.channel_for(sk)
+        if channel is not None:
+            channel.enqueue_push("chat", payload, run_id=_run_id(payload))
 
     async def _handle_agent_lifecycle(self, payload: dict) -> None:
         sk = payload.get("sessionKey")
@@ -134,11 +148,11 @@ class FrameDispatcher:
             # Only its structural fields are read; it opens or ends nothing.
             if self._turns.deliver_by_session(sk, ("agent", data), _run_id(payload)):
                 return
-            if (bridge := self._clients.route(sk)) is not None:
-                bridge.enqueue_push("fallback", data, run_id=_run_id(payload))
+            if (channel := self._channels.channel_for(sk)) is not None:
+                channel.enqueue_push("fallback", data, run_id=_run_id(payload))
             return
-        bridge = self._clients.route(sk)
-        if bridge is None:
+        channel = self._channels.channel_for(sk)
+        if channel is None:
             return
         if phase == "start":
             if self._turns.get_queue_by_session(sk) is not None:
@@ -157,7 +171,7 @@ class FrameDispatcher:
             if self._turns.is_aborted(sk):
                 logger.debug("agent start suppressed: turn aborted for overflow sk=%s", sk)
                 return
-            bridge.enqueue_push("turn_start", sk, run_id=_run_id(payload))
+            channel.enqueue_push("turn_start", sk, run_id=_run_id(payload))
         elif phase in ("end", "error"):
             # "error" (#300): a failed run ends with it instead of "end".
             # Always forwarded, never suppressed: the push end already
@@ -171,9 +185,9 @@ class FrameDispatcher:
             # and the push path permanently dead for the rest of the session
             # (caught in final review, 2026-08-04).
             if phase == "error":  # #397: its `data`, which the push classifies
-                bridge.enqueue_push("turn_error", data, run_id=_run_id(payload))
+                channel.enqueue_push("turn_error", data, run_id=_run_id(payload))
             else:
-                bridge.enqueue_push("turn_end", sk, run_id=_run_id(payload))
+                channel.enqueue_push("turn_end", sk, run_id=_run_id(payload))
 
     async def _handle_session_tool(self, payload: dict) -> None:
         sk = payload.get("sessionKey")
@@ -187,6 +201,6 @@ class FrameDispatcher:
             return
         if self._turns.is_aborted(sk):
             return  # late frame of a turn aborted for overflow (#130 S3b)
-        bridge = self._clients.route(sk)
-        if bridge is not None:
-            bridge.enqueue_push("tool", data, run_id=_run_id(payload))
+        channel = self._channels.channel_for(sk)
+        if channel is not None:
+            channel.enqueue_push("tool", data, run_id=_run_id(payload))

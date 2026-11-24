@@ -6,8 +6,10 @@ import pytest
 
 from fogar_gateway.core.config import settings
 from fogar_gateway.models.schemas import ClientConfig
+from fogar_gateway.services.bridge import FogarBridge
+from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
-from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+from fogar_gateway.services.openclaw.registry import TurnRegistry
 from fogar_gateway.services.reconnection import ConnectionState, ServiceStatus
 from tests.fakes.bridge import keyed_conversation, push, sent
 from tests.fakes.openclaw import SendOnlyOpenClawWS
@@ -17,9 +19,27 @@ def push_open(bridge) -> bool:
     return bridge.turns.snapshot(0.0)["turn"]["kind"] == "push"
 
 
+class FakeChannels:
+    """What the dispatcher asks of `ChannelHub` (5.0, #406): the channel of a push's
+    `sessionKey`, only for an indexed conversation. `register` stands for a session attached
+    to its conversation's channel: a real bridge maps to its channel, a mock to itself (its
+    `enqueue_push` is what a channel's would get)."""
+
+    def __init__(self):
+        self._by_key = {}
+
+    def register(self, client_id, target, conversation):
+        self._by_key[conversation.session_key] = (
+            target.channel if isinstance(target, FogarBridge) else target
+        )
+
+    def channel_for(self, session_key):
+        return self._by_key.get(session_key)
+
+
 def make_dispatcher():
     turn_reg = TurnRegistry()
-    client_reg = ClientRegistry()
+    client_reg = FakeChannels()
     dispatcher = FrameDispatcher(turn_reg, client_reg)
     return dispatcher, turn_reg, client_reg
 
@@ -785,7 +805,7 @@ async def test_an_ack_without_run_id_delivers_what_was_held():
 
 async def test_held_frames_are_bounded_like_the_queue():
     turn_reg = TurnRegistry(max_queue_size=2)
-    dispatcher = FrameDispatcher(turn_reg, ClientRegistry())
+    dispatcher = FrameDispatcher(turn_reg, ChannelHub())
     q = turn_reg.register("req-1", SK)
     for i in range(3):
         await dispatcher.dispatch(_chat("run-1", text=str(i)))
@@ -810,7 +830,7 @@ async def test_late_terminal_of_an_aborted_turn_before_both_acks_does_not_close_
     from fogar_gateway.services.openclaw.client import OpenClawClient
 
     turns = TurnRegistry()
-    dispatcher = FrameDispatcher(turns, ClientRegistry())
+    dispatcher = FrameDispatcher(turns, ChannelHub())
     client = OpenClawClient("127.0.0.1", 1, "tok", turns, dispatcher)
     client._ws = ws = SendOnlyOpenClawWS()  # no connect: the test is the server
 
@@ -857,7 +877,7 @@ async def test_frames_without_run_id_wait_behind_held_ones():
 async def test_held_frames_overflow_once(caplog):
     """Review 7: after the overflow the turn takes nothing more (one warning, one item)."""
     turn_reg = TurnRegistry(max_queue_size=2)
-    dispatcher = FrameDispatcher(turn_reg, ClientRegistry())
+    dispatcher = FrameDispatcher(turn_reg, ChannelHub())
     q = turn_reg.register("req-1", SK)
     for i in range(6):
         await dispatcher.dispatch(_chat("run-1", text=str(i)))
