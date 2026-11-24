@@ -151,7 +151,8 @@ def _seq_audio(msgs, seq):
 async def test_a_queued_push_survives_a_new_send(paced):
     """I-1: un push en cola tras la respuesta que suena sobrevive a un `send` nuevo. 5.0
     (decisión 1): el canal ya cerró el push cuando llega el `send`, así que la sesión lo pinta
-    en el orden del canal, entero y detrás de su respuesta cortada, antes de la siguiente."""
+    en el orden del canal, entero y detrás de su respuesta cortada, antes de la siguiente. El
+    `send` deja atrás el audio de todo turno anterior: el push llega con su texto, sin voz."""
     client = await paced.connect(output_mode=("text", "audio"))
     await client.send({"type": "send", "text": "hola"})
     await client.collect(lambda m: len(audio(m)) >= 1)
@@ -170,6 +171,10 @@ async def test_a_queued_push_survives_a_new_send(paced):
     pos = {id(m): i for i, m in enumerate(msgs)}
     push_end = next(m for m in of_type(msgs, "turn_end") if m["turn_id"] == push["turn_id"])
     assert pos[id(push_end)] < pos[id(second)]
+    first_end = next(m for m in of_type(msgs, "turn_end") if m["turn_id"] == first["turn_id"])
+    assert first_end["reason"] == "replaced"
+    assert not _seq_audio(msgs, push["turn_seq"])  # sin voz: el `send` lo dejó atrás
+    assert _seq_audio(msgs, second["turn_seq"])  # la respuesta nueva sí suena
     assert_turns_paired(msgs)
 
 

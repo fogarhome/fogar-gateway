@@ -200,6 +200,25 @@ class ChannelTurn:
         return "".join(self._text)
 
 
+class _SenderTracker:
+    """The sender's pipeline tracker, only while the sender is still subscribed: a session
+    that left gets no `llm_*` events (nothing logged after its session_end, nothing sent to
+    its closed socket)."""
+
+    def __init__(
+        self, channel: ConversationChannel, sender: ChannelSubscriber, tracker: PipelineTracker
+    ) -> None:
+        self._channel = channel
+        self._sender = weakref.ref(sender)
+        self._tracker = tracker
+
+    async def record(self, stage: str, **meta: Any) -> Any:
+        sender = self._sender()
+        if sender is None or not self._channel.is_subscribed(sender):
+            return None
+        return await self._tracker.record(stage, **meta)
+
+
 class ChannelBusy(RuntimeError):
     """`open_turn` with a turn still open: a conversation has one open turn at a time."""
 
@@ -471,7 +490,10 @@ class ConversationChannel:
                 return None  # close_all() pudo empezar durante la espera
             turn = self.open_turn("user", sender=sender)
             self._user_turn = turn
-            task = asyncio.create_task(self._run_user_turn(turn, text, tracker, allowed), name="turn")
+            recorder = _SenderTracker(self, sender, tracker) if tracker is not None else None
+            task = asyncio.create_task(
+                self._run_user_turn(turn, text, tracker, recorder, allowed), name="turn"
+            )
             self._hub.supervise(task)
             task.add_done_callback(self._after_user_task)
             self._user_task = task
@@ -541,15 +563,21 @@ class ConversationChannel:
         await self.orchestrator.abort(self.session_key)
 
     async def _run_user_turn(
-        self, turn: ChannelTurn, text: str, tracker: PipelineTracker | None, allowed: bool
+        self,
+        turn: ChannelTurn,
+        text: str,
+        tracker: PipelineTracker | None,
+        recorder: _SenderTracker | None,
+        allowed: bool,
     ) -> None:
-        if tracker is not None:
-            tracker.start_turn()
-        self._note_turn()
-        gateway_stats.turn_started("normal")
-        # Desde aquí sus suscriptores vieron (o verán) su turn_start: le sigue su fin (G-10).
+        # Sus suscriptores vieron (o verán) su turn_start: le sigue su fin (G-10), pase lo que
+        # pase desde aquí.
         reason: EndReason = "error"
         try:
+            if tracker is not None:
+                tracker.start_turn()
+            self._note_turn()
+            gateway_stats.turn_started("normal")
             if not allowed:
                 # #397 (decisión a): la política del gateway, antes del chat.send. Solo el
                 # gateway sabe qué agentes puede usar cada dispositivo; OpenClaw solo diría
@@ -559,7 +587,7 @@ class ConversationChannel:
                 gateway_stats.turn_error(code)
                 self.emit(turn, ChannelError(code))
                 return
-            reason = await self._stream(turn, text, tracker)
+            reason = await self._stream(turn, text, recorder)
         except asyncio.CancelledError:
             reason = turn.cancel_reason or "cancelled"
             raise
@@ -573,7 +601,7 @@ class ConversationChannel:
             self.end_turn(turn, reason)
 
     async def _stream(
-        self, turn: ChannelTurn, text: str, tracker: PipelineTracker | None
+        self, turn: ChannelTurn, text: str, tracker: _SenderTracker | None
     ) -> EndReason:
         # Los suscriptores solo encolan (decisión 1): nadie frena el stream de los demás, y uno
         # que se va no lo aborta (decisión 2: G-18 se invierte).
@@ -649,6 +677,8 @@ class ConversationChannel:
                     kind, arg, run_id = await asyncio.wait_for(queue.get(), timeout=budget)
                 except TimeoutError:
                     await self._run_push_step("timeout", self._push_timed_out())
+                    if self._backlog.pending == 0:
+                        self._hub.drop_if_idle(self.session_key, self)
                     continue
             else:
                 kind, arg, run_id = await queue.get()
@@ -995,9 +1025,23 @@ class ChannelHub:
 
     async def aclose(self, limit: float | None = None) -> None:
         """Close every channel (gateway shutdown): their turns are cancelled, never drained."""
+        # Todos a la vez, bajo un mismo tope: el apagado cabe en el de uvicorn.
+        loop = asyncio.get_running_loop()
+        deadline = None if limit is None else loop.time() + limit
+
+        def left() -> float | None:
+            return None if deadline is None else max(0.0, deadline - loop.time())
+
         async with Teardown("cierre de los canales") as td:
-            for channel in list(self._channels.values()):
-                await td.step(channel.aclose(limit), f"canal {channel.conversation.id}")
+            closing = [
+                asyncio.ensure_future(channel.aclose(limit)) for channel in self._channels.values()
+            ]
             self._channels.clear()
+            for task in closing:
+                await td.wait(task, "cierre de un canal", left())
+                if not task.done():
+                    task.cancel()
             for task in list(self._tasks):
-                await td.cancel(task, f"tarea {task.get_name()}", limit)
+                task.cancel()
+            for task in list(self._tasks):
+                await td.wait(task, f"tarea {task.get_name()}", left())

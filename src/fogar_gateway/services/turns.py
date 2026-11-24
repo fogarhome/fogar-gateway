@@ -91,7 +91,7 @@ class Turn:
     ended: bool = False  # su turn_end ya está en la cola (o se abandonó al cerrar)
     end_reason: EndReason | None = None
     cancel_reason: EndReason | None = None  # quien lo corta en esta sesión dice por qué
-    detached: bool = False  # la sesión dejó su canal: ya no abre TTS
+    silent: bool = False  # sin audio en esta sesión: dejó su canal, o un `send` lo dejó atrás
     tts: "TurnTts | None" = None  # push: su TTS
     pending: "_PendingTts | None" = None  # user: su TTS mientras conecta (E-2)
     progress: TurnProgress = field(default_factory=TurnProgress)  # su `turn_progress` (#254)
@@ -438,6 +438,7 @@ class TurnController:
         self._worker: asyncio.Task | None = None
         self._inbox = _Inbox()
         self._backlog_peak = 0  # máximo de la cola de push de los canales que ya dejó
+        self._cuts: set[asyncio.Task] = set()  # turn_end de cortes en curso (on_turn_end)
         # Una vez puesto no vuelve atrás: ni turnos nuevos (G-09) ni turnos del canal.
         self._closing = False
         # El cliente se fue (desconexión o ClientGone): deja de enviar y de sonar (G-18).
@@ -502,8 +503,18 @@ class TurnController:
 
     def on_turn_end(self, turn: ChannelTurn, reason: EndReason) -> None:
         local = self._by_channel.get(turn.id)
-        if local is not None and not local.ended:
-            self._put(("turn_end", local, reason))
+        if local is None or local.ended:
+            return
+        self._put(("turn_end", local, reason))
+        if local.opened and not _drains(local, reason):
+            # Un corte (un `send` que lo sustituye, su timeout, un agente retirado): su turn_end
+            # sale ya (A-r2-2), sin esperar detrás de un worker ocupado con su TTS; lo que venga
+            # después sigue en la cola, detrás de él. Su fin encolado ya no hará nada.
+            local.cancel_reason = local.cancel_reason or reason
+            task = asyncio.create_task(self._end(local, reason), name="turn_cut")
+            self._cuts.add(task)
+            task.add_done_callback(self._cuts.discard)
+            self._supervise(task)
 
     # ── Canal ─────────────────────────────────────────────────────────────
 
@@ -514,13 +525,23 @@ class TurnController:
 
     def attach(self) -> None:
         """Se adjunta al canal de la conversación de la sesión (tras el health check, antes de
-        `ready`: claim_conversation). Con un turno abierto, recibe su turn_start ya."""
+        `ready`: claim_conversation). Con un turno abierto, recibe su turn_start ya.
+
+        Síncrono a propósito: claim_conversation lo llama justo antes de encolar `ready`, y un
+        await aquí dejaría que un turn_start del canal saliera antes que `ready`."""
         if self._closing or self._channel is not None:
             return
         channel = self._channels.get_or_create(self._conversation.current)
         self._channel = channel  # antes de subscribe: su on_turn_start lo mira
         if not channel.subscribe(self):
+            # No debería pasar (el handshake ya miró `visible_to`): sin canal, cada `send`
+            # recibe un TURN_ERROR estable en vez de silencio.
             self._channel = None
+            self._channels.drop_if_idle(channel.session_key, channel)
+            logger.warning(
+                f"[{self._client_id}] La sesión no pudo adjuntarse al canal de su conversación "
+                f"{self._conversation.id}."
+            )
 
     async def _follow_conversation(self) -> None:
         """Decisión 6 (cambio de día): la sesión cierra su turno del canal de ayer (`replaced`,
@@ -542,7 +563,7 @@ class TurnController:
         conversation_id = channel.conversation.id
         for turn in self._live:
             if turn.conversation_id == conversation_id:
-                turn.detached = True
+                turn.silent = True
         for turn in list(self._live):
             if turn.conversation_id == conversation_id and turn.opened:
                 turn.cancel_reason = turn.cancel_reason or reason
@@ -639,37 +660,62 @@ class TurnController:
         async with self._send_lock:
             if self._closing:
                 return
-            # 7e: lo que aún suena de un turno que ya terminó en su canal se corta.
+            # 7e: un `send` deja atrás el audio de todo turno anterior en esta sesión: lo que
+            # aún suena de uno que ya terminó en su canal se corta, y los que aún esperan su
+            # turn_start en la cola reciben su par y su texto, pero sin voz.
+            for turn in self._live:
+                turn.silent = True
             await self._cut_finishing("replaced")
             # El cambio de día se evalúa al empezar cada turno (services/conversations.py).
             await self._conversation.refresh()
             await self._follow_conversation()
             channel = self._channel
-            if self._closing or channel is None:
+            if self._closing:
+                return
+            if channel is None:
+                await self._refuse_send()
                 return
             self._sent_on = channel
             await channel.send_user_message(self, text)
 
+    async def _refuse_send(self) -> None:
+        """Sin canal (no pudo adjuntarse): el `send` recibe su par con un TURN_ERROR estable."""
+        turn = self._new_turn("user")
+        turn.conversation_id = self._conversation.id
+        self._live.append(turn)
+        if await self._open(turn):
+            await self._send_turn_error(turn, "internal_error")
+        await self._end(turn, "error")
+
     async def cancel(self, reason: EndReason, *, push: bool = True) -> tuple[bool, str | None]:
-        """Cancela el turno que la sesión ve abierto ahora en su canal (el del usuario y, con
-        `push`, también un push; uno que se abra después sigue) y corta lo que de un turno ya
-        terminado aún suena aquí. Devuelve (cancelado, su turn_id en esta sesión)."""
+        """Cancela lo que la sesión muestra ahora: el turno abierto en este socket (el del
+        usuario y, con `push`, también un push). Si es una copia de un turno que ya terminó en
+        el canal (su audio aún suena), se corta solo aquí y el turno abierto del canal sigue
+        (se abrirá después, como antes); si es la copia del turno abierto del canal (o el
+        socket aún no muestra nada), se cancela en el canal. Devuelve (cancelado, su turn_id
+        en esta sesión)."""
         channel = self._channel
-        cut: Turn | None = None
-        if channel is not None:
-            current = channel.current_turn
-            mine = self._by_channel.get(current.id) if current is not None else None
-            if current is not None and mine is not None and (push or current.origin == "user"):
-                if await channel.cancel(reason, push=push, expected=current) is not None:
-                    cut = mine
-                    if mine.opened:
-                        # Su fin ya está en la cola; aquí sale ya (A-r2-2), sin esperar a que
-                        # el worker termine lo que esté haciendo con su TTS.
-                        mine.cancel_reason = mine.cancel_reason or reason
-                        await self._end(mine, reason)
-        finishing = await self._cut_finishing(reason, push=push)
-        cut = cut or finishing
-        return (True, cut.turn_id) if cut is not None else (False, None)
+        current = channel.current_turn if channel is not None else None
+        mine = self._by_channel.get(current.id) if current is not None else None
+        shown = next((t for t in self._live if t.opened and not t.ended), None)
+        if shown is not None and shown is not mine:
+            if shown.origin == "push" and not push:
+                return False, None
+            shown.cancel_reason = shown.cancel_reason or reason
+            await self._end(shown, reason)
+            return True, shown.turn_id
+        if channel is None or current is None or mine is None:
+            return False, None
+        if current.origin == "push" and not push:
+            return False, None
+        if await channel.cancel(reason, push=push, expected=current) is None:
+            return False, None
+        if mine.opened:
+            # Su fin ya está en la cola; aquí sale ya (A-r2-2), sin esperar a que el worker
+            # termine lo que esté haciendo con su TTS.
+            mine.cancel_reason = mine.cancel_reason or reason
+            await self._end(mine, reason)
+        return True, mine.turn_id
 
     async def _cut_finishing(self, reason: EndReason, *, push: bool = True) -> Turn | None:
         """Corta los turnos de la sesión cuyo turno del canal ya terminó solo y que siguen
@@ -748,8 +794,9 @@ class TurnController:
         source = turn.channel
         if (
             not self._wants_audio
+            or turn.halted
             or self._closing
-            or turn.detached
+            or turn.silent
             or source is None
             or source.audio_session is not self
         ):
@@ -1045,21 +1092,45 @@ class TurnController:
             self._channels.drop_if_idle(channel.session_key, channel)
         # El worker antes que el TTS o el audio que pueda estar moviendo.
         await td.cancel(self._worker, "worker de turnos", limit)
-        # Lo que quedaba en su cola se descarta, salvo el turn_start de un `send` aceptado:
-        # recibe su par (G-r2-1, A-r3-1).
+        # Lo que quedaba en su cola, en orden (#202: nunca dos turnos abiertos a la vez): un fin
+        # encolado sale con su motivo; el turn_start de un `send` aceptado sale (G-r2-1, A-r3-1)
+        # solo después de cerrar los anteriores; lo demás (eventos, pushes sin abrir) se descarta.
         inbox = self._inbox
+        items = []
         while not inbox.queue.empty():
-            item = inbox.queue.get_nowait()
+            items.append(inbox.queue.get_nowait())
             inbox.queue.task_done()
-            if item[0] == "turn_start" and item[1].origin == "user" and not item[1].ended:
-                await self._open(item[1])
         inbox.pending = 0
         inbox.since = None
+        for item in items:
+            kind = item[0]
+            if kind == "turn_end" and item[1].opened:
+                await self._close_one(td, item[1], item[2], limit)
+            elif kind == "leave":
+                for turn in list(self._live):
+                    if turn.conversation_id == item[1] and turn.opened:
+                        await self._close_one(td, turn, item[2], limit)
+            elif kind == "turn_start" and not item[1].ended:
+                turn = item[1]
+                if turn.origin != "user":
+                    self._forget(turn)  # un push que este socket nunca mostró
+                    continue
+                for earlier in list(self._live):
+                    if earlier is not turn and earlier.opened:
+                        await self._close_one(td, earlier, "closed", limit)
+                await self._open(turn)
         for turn in list(self._live):
             # Su turn_end, tras soltar su TTS (su audio ya no sale); uno que nunca abrió no
             # recibe nada (nunca un turn_end solo).
-            if turn.tts is not None:
-                await td.step(turn.tts.release(), "cierre del TTS del push", limit)
-            if turn.pending is not None:
-                await td.step(turn.pending.release(), "cierre del TTS del turno", limit)
-            await self._end(turn, "closed", release=False)
+            await self._close_one(td, turn, "closed", limit)
+        for task in list(self._cuts):
+            await td.wait(task, "turn_end de un corte", limit)
+
+    async def _close_one(self, td: Teardown, turn: Turn, reason: EndReason, limit: float) -> None:
+        if turn.ended:
+            return
+        if turn.tts is not None:
+            await td.step(turn.tts.release(), "cierre del TTS del push", limit)
+        if turn.pending is not None:
+            await td.step(turn.pending.release(), "cierre del TTS del turno", limit)
+        await self._end(turn, reason, release=False)
