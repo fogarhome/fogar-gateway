@@ -90,18 +90,11 @@ async def test_failed_push_gets_a_classified_turn_error_without_text(make_bridge
     await bridge.close_all()
 
 
-@pytest.mark.parametrize(
-    ("allowed", "roster"), [(["otro"], None), (None, ["otro"])]
-)
-async def test_agent_unavailable_is_a_turn_error_before_chat_send(make_bridge, allowed, roster):
-    """#397 (decisión a): el agente de la sesión ya no está en `allowed_agents` o en el roster de
-    OpenClaw: el turno acaba con orchestrator_agent_unavailable sin llegar a chat.send."""
-    from fogar_gateway.services.openclaw.models import GatewayInfo
-
+async def test_agent_unavailable_is_a_turn_error_before_chat_send(make_bridge):
+    """#397 (decisión a): el agente de la sesión ya no está en `allowed_agents`: el turno acaba
+    con orchestrator_agent_unavailable sin llegar a chat.send."""
     bridge, ws = make_bridge()
-    bridge.turns.allowed_agents = allowed
-    if roster is not None:
-        bridge.orchestrator.gateway_info = GatewayInfo("otro", 1000, 1 << 20, agents=roster)
+    bridge.turns.allowed_agents = ["otro"]
     called = []
 
     async def s(*a, **k):

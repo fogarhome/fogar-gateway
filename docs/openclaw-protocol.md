@@ -1172,7 +1172,8 @@ the open push). Codes: `auth`/`auth_permanent`/`session_expired`, `auth_invalid_
 `unknown`, a new value, a wrong type, nothing) → `orchestrator_error`. A bare `res`
 `INVALID_REQUEST` stays `orchestrator_error`: the agent case is decided by the gateway before
 `chat.send` (`orchestrator_agent_unavailable` when the session's agent left the device's
-`allowed_agents` or the roster of the last connect; the handshake keeps its 4020/4021 closes and
+`allowed_agents`, checked per turn; the roster is checked only at the handshake, for an
+explicitly requested agent, as `resolve_agent` does; the handshake keeps its 4020/4021 closes and
 `/v1` its 403).
 
 ## Change log of this file

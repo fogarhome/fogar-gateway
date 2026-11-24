@@ -2,7 +2,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
-from fogar_gateway.services.openclaw.models import GatewayInfo, ToolCallEvent
+from fogar_gateway.services.openclaw.models import ToolCallEvent
 from fogar_gateway.services.turn_progress import ProgressPhase
 
 # `status` event content: OpenClaw accepted the turn's chat.send (its ack), before any token.
@@ -21,10 +21,6 @@ class OrchestratorEvent:
 
 @runtime_checkable
 class OrchestratorProtocol(Protocol):
-    # The roster and defaults of the last connect; None until connected (#397: the turn's
-    # agent is checked against it before chat.send).
-    gateway_info: GatewayInfo | None
-
     async def connect(self) -> None: ...
     async def close(self) -> None: ...
     async def ping(self) -> bool: ...

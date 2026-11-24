@@ -83,8 +83,6 @@ def make_bridge(
     kwargs.update(overrides)
     if "sender" not in kwargs:  # not setdefault: it would start a writer task nobody closes
         kwargs["sender"] = QueuedSender(ws)
-    if isinstance(kwargs["orchestrator"], AsyncMock):
-        kwargs["orchestrator"].gateway_info = None  # roster unknown: no roster check (#397)
     bridge = FogarBridge(**kwargs)
     bridge.transcriber = transcriber
     if register:

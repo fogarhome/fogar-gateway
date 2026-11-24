@@ -661,7 +661,7 @@ El `message` de un `TURN_ERROR` es siempre uno de estos códigos fijos, nunca el
 | `orchestrator_model_unavailable` | El modelo del agente no existe o no está disponible, y no quedó ningún modelo de respaldo |
 | `orchestrator_rate_limited` | El proveedor del modelo limitó las peticiones, está sobrecargado o sin saldo/cuota. Puede funcionar más tarde |
 | `orchestrator_timeout` | El modelo o el agente tardó demasiado y OpenClaw cortó el turno (distinto de `turn_timeout`, que corta el gateway) |
-| `orchestrator_agent_unavailable` | El agente de la conversación ya no está disponible para este dispositivo (fuera de su lista de agentes permitidos o del roster de OpenClaw). El gateway lo decide antes de enviar nada a OpenClaw |
+| `orchestrator_agent_unavailable` | El agente de la conversación ya no está disponible para este dispositivo (lo sacaron de su lista de agentes permitidos). El gateway lo decide antes de enviar nada a OpenClaw |
 | `orchestrator_disconnected` | La conexión con el orquestador se cerró con el turno en vuelo |
 | `turn_timeout` | El orquestador no mandó nada durante `TURN_TIMEOUT_S` (§13); también en un push (§10) |
 | `turn_overflow` | El gateway no pudo procesar los eventos del turno al ritmo de llegada (§13) |

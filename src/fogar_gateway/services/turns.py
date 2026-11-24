@@ -637,8 +637,7 @@ class TurnController:
 
         El TTS se conecta a la vez (auditoría 3.0, E-2): un fogar-speaker colgado no retrasa el
         texto; solo el `turn_end`, que espera a la voz como antes."""
-        session_key = self._session_key()
-        if not self._agent_available(session_key):
+        if not self._agent_allowed(self._session_key()):
             # #397 (decisión a): la política del gateway, antes del chat.send. Solo el gateway
             # sabe qué agentes puede usar cada dispositivo; OpenClaw solo diría INVALID_REQUEST.
             code = ORCHESTRATOR_AGENT_UNAVAILABLE_ERROR
@@ -825,17 +824,6 @@ class TurnController:
     def _abort_run(self, run_id: str | None) -> None:
         if run_id is not None:
             self._turn_registry.abort_run(run_id)
-
-    def _agent_available(self, session_key: str) -> bool:
-        """#397: el agente de la clave sigue en `allowed_agents` y, si se conoce el roster de
-        OpenClaw, en él (un roster stale se refresca al reconectar)."""
-        if not self._agent_allowed(session_key):
-            return False
-        info = self._orchestrator.gateway_info
-        parts = session_key.split(":")
-        if info is None or not info.agents or len(parts) < 3 or parts[0] != "agent":
-            return True
-        return parts[1].lower() in info.agents
 
     def _agent_allowed(self, session_key: str) -> bool:
         allowed = self.allowed_agents
