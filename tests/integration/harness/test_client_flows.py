@@ -195,7 +195,7 @@ async def test_failing_push_still_ends_its_turn(harness):
 
 async def test_v1_without_stream_aborts_the_turn_when_the_client_leaves(harness):
     """D-r6-1: HA corta (timeout) un /v1 sin stream: el turno se aborta en OpenClaw y la
-    siguiente petición no choca con un `turn_in_progress` hasta TURN_TIMEOUT_S."""
+    siguiente petición no espera a ese turno hasta TURN_TIMEOUT_S."""
     body = {"model": "fogar-gateway", "messages": [{"role": "user", "content": "wait"}]}
     async with httpx.AsyncClient(
         base_url=f"http://127.0.0.1:{harness.port}",

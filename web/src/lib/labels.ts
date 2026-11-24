@@ -83,8 +83,6 @@ export const TURN_ERROR: Record<string, string> = {
   orchestrator_agent_unavailable: 'Este agente ya no está disponible aquí',
   orchestrator_disconnected: 'OpenClaw se desconectó a mitad',
   turn_timeout: 'OpenClaw dejó de responder',
-  turn_overflow: 'El gateway no pudo seguir el ritmo de la respuesta',
-  turn_in_progress: 'Ya había un turno en marcha',
   internal_error: 'Error interno del gateway',
 }
 

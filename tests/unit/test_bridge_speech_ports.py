@@ -42,8 +42,8 @@ class FakeStt:
     state = ConnectionState.CONNECTED
     on_state_change = None
 
-    def __init__(self, partials=True, emit_in_start=None):
-        self.capabilities = SttCapabilities(partials=partials, warmup_s=0.0)
+    def __init__(self, emit_in_start=None):
+        self.capabilities = SttCapabilities(warmup_s=0.0)
         self.emit_in_start = emit_in_start
         self.opened = []
         self.session = None

@@ -16,7 +16,6 @@ from fogar_gateway.services.reconnection import ConnectionState, ServiceStatus
 
 @dataclass(frozen=True)
 class SttCapabilities:
-    partials: bool  # emite parciales (`transcription_partial` al cliente)
     warmup_s: float  # retraso típico del primer resultado tras abrir upstream
 
 

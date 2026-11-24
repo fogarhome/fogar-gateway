@@ -55,6 +55,16 @@ def test_create_client_minimal(http):
     assert data["stt_language"] == "es"
 
 
+def test_create_client_ignores_legacy_barge_in_fields(http):
+    """#406: the barge-in left the gateway; an older CLI or web still sending its fields gets
+    201 (the fields ignored), not 422."""
+    body = {"name": "Old CLI", "barge_in_enabled": False, "barge_in_min_chars": 9}
+    r = http.post("/admin/clients", json=body, headers=HEADERS)
+    assert r.status_code == 201, r.text
+    data = r.json()
+    assert "barge_in_enabled" not in data and "barge_in_min_chars" not in data
+
+
 def test_create_client_full(http):
     body = {
         "name": "HA Bridge",

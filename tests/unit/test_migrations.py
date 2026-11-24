@@ -167,7 +167,6 @@ def test_migration_drops_max_silence_turns(tmp_path, monkeypatch):
         database.dispose_engine()
 
 
-
 def test_migration_drops_barge_in(tmp_path, monkeypatch):
     """#406: el barge-in sale del gateway. Una base con `barge_in_enabled`/`barge_in_min_chars`
     los pierde sin perder clientes ni sus conversaciones; bajar de versión los devuelve con sus
@@ -209,6 +208,7 @@ def test_migration_drops_barge_in(tmp_path, monkeypatch):
             assert c.execute(text("PRAGMA foreign_key_check")).all() == []
     finally:
         database.dispose_engine()
+
 
 def test_a_3x_database_is_refused_untouched(tmp_path, monkeypatch):
     """La 4.0 no convierte una BD 3.x (M20): error claro y el fichero sin tocar."""

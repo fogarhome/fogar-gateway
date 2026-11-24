@@ -28,7 +28,6 @@ export interface LiveSession {
   turn: { kind: 'idle' | 'normal' | 'push'; since_s: number | null }
   turn_count: number
   sender: { pending_msgs: number; pending_bytes: number; peak_msgs: number; peak_bytes: number }
-  turn_queue: { depth: number; peak: number }
   push_backlog: { pending: number; peak: number }
   last_activity_s: number | null
   stt_state: ServiceState | null

@@ -176,7 +176,7 @@ async def test_queue_peaks_in_session_end(make_reason_bridge):
     await asyncio.sleep(0.01)
     await bridge.close_all()
     meta = _end_meta(bridge)
-    assert meta["turn_queue_peak"] == 0  # 5.0 PR 2b.3: no per-key turn queue any more
+    assert "turn_queue_peak" not in meta  # 5.0 PR 2b.3: no per-key turn queue any more
     assert meta["push_backlog_peak"] == 3
     assert meta["sender_peak_msgs"] == 0 and meta["sender_peak_bytes"] == 0
 
@@ -184,7 +184,7 @@ async def test_queue_peaks_in_session_end(make_reason_bridge):
 async def test_queue_peaks_default_to_zero_without_a_turn(make_reason_bridge):
     bridge = make_reason_bridge()
     await bridge.close_all()
-    assert _end_meta(bridge)["turn_queue_peak"] == 0
+    assert _end_meta(bridge)["push_backlog_peak"] == 0
 
 
 async def test_server_shutdown_disconnect_1012_records_shutdown(make_reason_bridge):

@@ -23,7 +23,6 @@ SNAPSHOT_KEYS = {
     "turn",
     "turn_count",
     "sender",
-    "turn_queue",
     "push_backlog",
     "last_activity_s",
     "stt_state",
@@ -76,7 +75,6 @@ def test_state_shape_with_active_session(client, admin_headers):
     assert row["input_mode"] == "text"
     assert row["stt_state"] is None
     assert set(row["sender"]) == {"pending_msgs", "pending_bytes", "peak_msgs", "peak_bytes"}
-    assert set(row["turn_queue"]) == {"depth", "peak"}
     assert set(row["push_backlog"]) == {"pending", "peak"}
     assert row["started_at"] is not None
 

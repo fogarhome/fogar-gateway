@@ -221,9 +221,6 @@ class FogarBridge:
             "turn": turns["turn"],
             "turn_count": self.tracker.turn_count,
             "sender": self._sender.queue_stats(),
-            # #219: la cola por clave de un turno se fue con la 5.0 (todo run es de su canal,
-            # 2b.3); el campo se queda a 0 hasta que /admin/state lo retire.
-            "turn_queue": {"depth": 0, "peak": 0},
             "push_backlog": turns["push_backlog"],
             "last_activity_s": (
                 round(now - self._last_client_activity, 3) if self._last_client_activity else None
@@ -250,7 +247,6 @@ class FogarBridge:
             "turn_in_flight": bool(self._turn_in_flight_at_close),
             "sender_peak_msgs": 0,
             "sender_peak_bytes": 0,
-            "turn_queue_peak": 0,  # #219: sin cola por clave desde la 5.0 (2b.3)
             "push_backlog_peak": self.turns.push_backlog_peak,
         }
         # Una métrica nunca debe impedir el cierre.

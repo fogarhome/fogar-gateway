@@ -110,6 +110,12 @@ def test_admin_pairing_open_returns_code_once(http):
     assert item["code"] not in json.dumps(listed) + json.dumps(one)
 
 
+def test_admin_pairing_ignores_legacy_barge_in_fields(http):
+    """#406: a template with the old barge-in fields is accepted (201) and they are dropped."""
+    item = _open(http, name="tele", barge_in_enabled=False, barge_in_min_chars=9)
+    assert item["template"] == {"name": "tele"}
+
+
 def test_admin_pairing_limit(http):
     for _ in range(pairing.MAX_OPEN):
         _open(http)

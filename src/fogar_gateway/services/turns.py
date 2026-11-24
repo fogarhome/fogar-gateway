@@ -889,7 +889,7 @@ class TurnController:
             await self._end(mine, reason)
         return True, mine.turn_id
 
-    async def _cut_finishing(self, reason: EndReason, *, push: bool = True) -> Turn | None:
+    async def _cut_finishing(self, reason: EndReason) -> Turn | None:
         """Corta los turnos de la sesión cuyo turno del canal ya terminó solo y que siguen
         abiertos aquí porque su audio suena (7e, A-r2-2): su turn_end sale ya, sin esperar a
         cerrar su TTS. Devuelve el primero cortado."""
@@ -902,8 +902,6 @@ class TurnController:
                 continue  # su fin (un corte) ya está en la cola y no espera a nada
             if turn.tts is None and turn.pending is None:
                 continue  # sin audio que esperar: su fin ya sale tal cual (`done`)
-            if turn.origin == "push" and not push:
-                continue
             turn.cancel_reason = reason
             await self._end(turn, reason)
             first = first or turn
