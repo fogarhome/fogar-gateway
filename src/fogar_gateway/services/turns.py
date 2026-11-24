@@ -40,6 +40,7 @@ sesión como `message` (por su cola ordenada, con su estado: `pending`, `deliver
 import asyncio
 import logging
 import time
+from collections import deque
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -63,7 +64,7 @@ from fogar_gateway.services.openclaw.models import ToolCallEvent
 from fogar_gateway.services.outbound import ClientGone, OutboundSender, log_send_failed
 from fogar_gateway.services.pacing import AudioPacer
 from fogar_gateway.services.pipeline_tracker import PipelineTracker
-from fogar_gateway.services.reconnection import describe_error
+from fogar_gateway.services.reconnection import describe_error, traceback_no_message
 from fogar_gateway.services.speech.ports import TextToSpeechProvider, TtsStream
 from fogar_gateway.services.stats import gateway_stats
 from fogar_gateway.services.teardown import Teardown
@@ -450,6 +451,11 @@ class TurnController:
         self._live: list[Turn] = []  # sus turnos sin turn_end, en orden
         # Serializa los `send` de la sesión (su cambio de día y su envío al canal).
         self._send_lock = asyncio.Lock()
+        # 2b.3: los `send` del cliente esperan aquí, en su orden, a que su tarea los envíe
+        # (`submit_send`): el bucle de entrada nunca se para detrás de un envío (uno que
+        # espera a que termine el turno de /v1 puede tardar).
+        self._sends: deque[tuple[str, bool]] = deque()
+        self._send_task: asyncio.Task | None = None
         # Worker de la sesión: un solo worker conserva el orden start → eventos → fin de
         # cada turno, y el turn_start del siguiente detrás del turn_end del anterior.
         self._worker: asyncio.Task | None = None
@@ -626,6 +632,8 @@ class TurnController:
         channel = self._channel
         if channel is not None and channel.user_turn_running():
             return True
+        if self.sends_waiting:
+            return True  # acotado: el turno que espera (/v1, TURN_TIMEOUT_S) o el ack
         for turn in self._live:
             if turn.origin == "user":
                 return True
@@ -677,6 +685,15 @@ class TurnController:
         last = self._last_sent
         return None if last is None or last.cancelled() else last
 
+    async def sends_idle(self) -> None:
+        """Espera a que salgan los `send` que esperan en la cola de la sesión (para tests)."""
+        while self.sends_waiting:
+            task = self._send_task
+            if task is not None and not task.done():
+                await asyncio.wait({task})
+            else:
+                await asyncio.sleep(0)
+
     async def idle(self) -> None:
         """Espera a que la cola de la sesión esté vacía (para tests)."""
         await self._inbox.queue.join()
@@ -689,6 +706,47 @@ class TurnController:
         await self.idle()
 
     # ── Turno del usuario ─────────────────────────────────────────────────
+
+    def submit_send(self, text: str, *, interrupt: bool = False) -> None:
+        """Un `send` del cliente (el bucle de entrada, 2b.3): a la cola de envíos de la sesión,
+        sin esperar. Una sola tarea los envía en su orden de llegada (`start_user_turn`); uno
+        que espera (detrás del turno de /v1) no tiene id ni sale nada al cable hasta que se
+        envía, y el bucle de entrada sigue leyendo (audio, `cancel`, `withdraw`)."""
+        if self._closing:
+            logger.info(f"[{self._client_id}] send ignorado: la sesión se está cerrando.")
+            return
+        self._sends.append((text, interrupt))
+        if self._send_task is None or self._send_task.done():
+            self._send_task = self._spawn(self._send_loop(), "turn_sends")
+
+    async def _send_loop(self) -> None:
+        while self._sends and not self._closing:
+            text, interrupt = self._sends.popleft()
+            try:
+                await self.start_user_turn(text, interrupt=interrupt)
+            except Exception as e:  # noqa: BLE001 — frontera: un envío roto no para los siguientes
+                # Solo el tipo: el mensaje puede llevar texto del usuario.
+                logger.error(f"[{self._client_id}] send falló: {describe_error(e)}")
+                logger.debug(f"[{self._client_id}] send: {traceback_no_message(e)}")
+
+    @property
+    def sends_waiting(self) -> bool:
+        """Hay `send` de la sesión aún sin enviar (esperan en su cola o en el canal)."""
+        task = self._send_task
+        return bool(self._sends) or (task is not None and not task.done())
+
+    async def interrupt_now(self) -> None:
+        """`send` con `interrupt` (2b.3): el corte, ya, en el bucle de entrada; el envío va
+        después por la cola, en su orden. Corta lo que suena aquí y el turno abierto del canal
+        (lo iniciara quien lo iniciara, /v1 incluido); los envíos de la sesión que aún esperan
+        no se tocan."""
+        channel = self._channel
+        if self._closing or channel is None or not self.agent_allowed(channel.session_key):
+            return
+        for turn in self._live:
+            turn.silent = True
+        await self._cut_finishing("interrupted")
+        await channel.interrupt_now()
 
     async def start_user_turn(self, text: str, *, interrupt: bool = False) -> None:
         """Envía `text` al canal de la conversación (C3, 2b): entra en la cola de OpenClaw;
@@ -1236,6 +1294,11 @@ class TurnController:
 
     async def _close_turns(self, td: Teardown, limit: float) -> None:
         self._closing = True
+        # Los envíos que aún esperan se descartan: sin id, nada salió de ellos al cable (ni su
+        # par); uno ya en `chat.send` deja su run al canal, que lo aborta cuando llegue su ack.
+        self._sends.clear()
+        if self._send_task is not asyncio.current_task():
+            await td.cancel(self._send_task, "envíos en espera", limit)
         channel, self._channel = self._channel, None
         if channel is not None:
             channel.unsubscribe(self)

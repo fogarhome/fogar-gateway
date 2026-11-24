@@ -52,6 +52,7 @@ async def test_send_message_is_not_logged_at_info(bridge, caplog):
 
     with caplog.at_level(logging.INFO):
         await bridge._client_input_loop()
+        await asyncio.wait_for(bridge.turns.sends_idle(), 2)  # 2b.3: sent from its own task
     await asyncio.wait({bridge.turns.user_task}, timeout=2)
 
     assert not any(_SECRET in m for m in _info_messages(caplog))

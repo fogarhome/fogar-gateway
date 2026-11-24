@@ -234,7 +234,7 @@ async def chat_completions(
         conversation_id = None
     # 5.0 PR 2b.3: the turn goes through the conversation's channel, like a WebSocket message,
     # but alone: it waits until the channel is calm and its answer is its own run's.
-    channel: ConversationChannel = request.app.state.channel_hub.get_or_create(conversation)
+    hub = request.app.state.channel_hub
 
     async def _count_turn() -> None:
         """El turno cuenta en su conversación en cuanto OpenClaw acepta su chat.send (aunque
@@ -252,6 +252,10 @@ async def chat_completions(
             if isinstance(event, ChannelToken):
                 on_token(event.text)
 
+        # Resolved right before the call, with no await in between: a channel fetched earlier
+        # could have been dropped as idle by another request meanwhile (2b.3 review M2);
+        # `send_exclusive` pins it before its first await.
+        channel: ConversationChannel = hub.get_or_create(conversation)
         outcome = await channel.send_exclusive(
             text,
             by_client_id=client_id,

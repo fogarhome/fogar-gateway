@@ -760,7 +760,11 @@ class FogarBridge:
                                     f"[{self.client_id}] send recibido: len={len(text)}"
                                     f"{' interrupt' if interrupt else ''}"
                                 )
-                                await self.turns.start_user_turn(text, interrupt=interrupt)
+                                # 2b.3: el bucle no espera al envío (puede esperar detrás
+                                # del turno de /v1); un `interrupt` corta ya.
+                                if interrupt:
+                                    await self.turns.interrupt_now()
+                                self.turns.submit_send(text, interrupt=interrupt)
 
                     elif json_msg.get("type") == "withdraw":
                         # Quita un mensaje pendiente de la conversación (2b): si ya no lo está,

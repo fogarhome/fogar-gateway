@@ -135,6 +135,9 @@ _OC_MESSAGES = 64
 RECONNECT_GRACE_S = 15.0
 _DISCONNECTED = "orchestrator_disconnected"
 _UNAVAILABLE = "orchestrator_unavailable"
+TURN_TIMEOUT = "turn_timeout"
+# Solo /v1 (2b.3): su run terminó sin abrir turno propio (`steer` lo plegó en otro run).
+TURN_ABSORBED = "turn_absorbed"
 
 MessageState = Literal["pending", "delivered", "withdrawn"]
 # `absorbed`: OpenClaw (`steer`) metió su mensaje en el run activo; no tendrá turno propio.
@@ -840,11 +843,28 @@ class ConversationChannel:
         answer). `on_accepted` runs once OpenClaw acked it (/v1 counts its turn there).
 
         Cancelling the caller (the HTTP client left) cuts only its own run: its turn ends
-        `cancelled` for every subscriber and `chat.abort` goes by its `runId`, never the key."""
+        `cancelled` for every subscriber and `chat.abort` goes by its `runId`, never the key;
+        so does a failing `on_accepted`. If it cannot be sent within `TURN_TIMEOUT_S` (the lock
+        and the calm), it gives up with `turn_timeout`. A run that ends without ever opening
+        its own turn (`steer` folded it into a run that started after its `chat.send`, e.g. a
+        push) is `turn_absorbed`: its answer went to someone else's turn."""
         self._senders += 1
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + settings.TURN_TIMEOUT_S
         try:
-            async with self._lock:
-                await self._until_quiet()
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await self._lock.acquire()
+            except TimeoutError:
+                logger.warning(f"[{self._tag}] /v1 sin turno en TURN_TIMEOUT_S: no se envía")
+                return ExclusiveOutcome(error=TURN_TIMEOUT)
+            try:
+                try:
+                    async with asyncio.timeout_at(deadline):
+                        await self._until_quiet()
+                except TimeoutError:
+                    logger.warning(f"[{self._tag}] /v1 sin calma en TURN_TIMEOUT_S: no se envía")
+                    return ExclusiveOutcome(error=TURN_TIMEOUT)
                 if self._closed:
                     return ExclusiveOutcome(error=_UNAVAILABLE)
                 result = await self._chat_send(
@@ -865,18 +885,47 @@ class ConversationChannel:
                     if on_accepted is not None:
                         await on_accepted()
                     await asyncio.wait({info.finished})
-                except asyncio.CancelledError:
+                except BaseException:
+                    # Quien espera se va (o su `on_accepted` falló): su run no sigue solo.
                     await self._cut_own(info)
                     raise
                 if info.recorder is not None:
                     await info.recorder.flush()
                 if info.finished.cancelled():
                     return ExclusiveOutcome(error=info.error_code, cut=info.error_code is None)
+                if info.error_code is None and info.turn is None:
+                    logger.warning(f"[{self._tag}] run {info.run_id} de /v1 absorbido: sin respuesta propia")
+                    return ExclusiveOutcome(error=TURN_ABSORBED)
                 return ExclusiveOutcome(error=info.error_code)
+            finally:
+                self._lock.release()
         finally:
             self._senders -= 1
             # Nadie más lo va a mirar si no tiene suscriptores (el de un origen de confianza).
             self._hub.drop_if_idle(self.session_key, self)
+
+    async def interrupt_now(self) -> None:
+        """«Enviar ahora» de una sesión cuyo envío aún espera su turno (detrás de /v1, p. ej.):
+        el turno abierto del canal (o el mensaje entregado que aún no empezó) se corta ya,
+        sin esperar al lock de envío (2b.3); el envío sale después, en su orden."""
+        if not self._closed:
+            await self._interrupt()
+
+    def _orphan_ack(self, sending: asyncio.Future[str]) -> None:
+        """The ack of a `chat.send` whose sender left (I3): its run is tombstoned and
+        aborted by its runId, and what was held for it is dropped; the rest is released."""
+        self._acks -= 1
+        run_id: str | None = None
+        if not sending.cancelled() and sending.exception() is None:
+            run_id = sending.result()
+        if run_id is not None:
+            logger.info(f"[{self._tag}] ack de un envío abandonado: chat.abort de su run {run_id}")
+            self._abort_run(run_id)
+            self._held = [(e, p) for e, p in self._held if _str_run_id(p) != run_id]
+            self._hub.spawn(self._abort(run_id), "chat_abort")
+        self._release_held()
+        self._wake_quiet()
+        self._hub.drop_if_idle(self.session_key, self)
 
     def _quiet(self) -> bool:
         """Nothing in the channel could steer a new message into another run, or be steered
@@ -915,6 +964,11 @@ class ConversationChannel:
         message is `withdrawn`."""
         if info.state == "done":
             return
+        if info.state == "absorbed":
+            # Su mensaje ya se entregó dentro de otro turno: ni `withdrawn` ni abort (ese run
+            # es de otro); solo deja de esperarse.
+            self._finish(info, cut=True)
+            return
         turn = info.turn
         if turn is not None and turn is self.current_turn:
             await self.cancel("cancelled", expected=turn)
@@ -946,9 +1000,18 @@ class ConversationChannel:
         run_id = ""
         accepted = False
         self._acks += 1
+        orphaned = False
+        sending = asyncio.ensure_future(self.orchestrator.send(text, self.session_key))
         try:
-            run_id = await self.orchestrator.send(text, self.session_key)
+            run_id = await asyncio.shield(sending)
             accepted = True
+        except asyncio.CancelledError:
+            # Quien envía se va antes del ack (/v1 que se desconecta, un close_all): el
+            # `chat.send` ya salió. Su ack, cuando llegue, entierra y aborta ese run; hasta
+            # entonces lo retenido sigue retenido (sus frames no son un push).
+            orphaned = True
+            sending.add_done_callback(self._orphan_ack)
+            raise
         except orchestration.OrchestratorError as e:
             code = str(e)  # siempre un código estable (#228)
         except Exception as e:  # noqa: BLE001 — frontera: un envío roto no cierra el canal
@@ -957,11 +1020,12 @@ class ConversationChannel:
             logger.debug(f"[{self._tag}] chat.send: {traceback_no_message(e)}")
             code = "internal_error"
         finally:
-            self._acks -= 1
-            if not accepted:
-                # Sin run propio (fallo o cancelación de quien envía, p. ej. close_all): lo
-                # retenido no espera más; lo que no es de nadie va al push.
-                self._release_held()
+            if not orphaned:
+                self._acks -= 1
+                if not accepted:
+                    # Sin run propio (un fallo): lo retenido no espera más; lo que no es de
+                    # nadie va al push.
+                    self._release_held()
         if code is not None:
             logger.error(f"[{self._tag}] Orchestrator error: {code}")
             if tracker is not None:

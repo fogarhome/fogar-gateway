@@ -88,7 +88,13 @@ class _StreamRuns:
     async def _run(self, text, session_key, run_id, previous) -> None:
         if previous is not None and not previous.done():
             await asyncio.wait({previous})
-        await asyncio.sleep(0)  # the ack (the caller's `send`) registers the run first
+        # The ack (the caller's `send`) registers the run first, as OpenClaw's ack comes before
+        # the run's events (a few loop turns: the channel shields its `send`, 2b.3).
+        for _ in range(20):
+            await asyncio.sleep(0)
+            channel = self._hub.channel_for(session_key)
+            if channel is None or run_id in channel._runs or run_id in channel._done_runs:
+                break
         frame = {"runId": run_id}
         await self._deliver(session_key, "agent", {**frame, "stream": "lifecycle", "data": {"phase": "start"}})
         try:

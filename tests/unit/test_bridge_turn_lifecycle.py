@@ -203,6 +203,7 @@ async def test_send_that_interrupts_a_turn_closes_it_with_one_turn_end_each(make
 
     await bridge._client_input_loop()
     replaced = bridge.turns.last_ended
+    await asyncio.wait_for(bridge.turns.sends_idle(), 2)  # 2b.3: the send goes from its own task
     await asyncio.wait_for(bridge.turns.user_task, 2)
     assert (replaced.turn_id, replaced.end_reason) == ("t-1", "interrupted")
 

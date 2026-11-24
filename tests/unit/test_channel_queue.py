@@ -491,10 +491,13 @@ def _event(name, payload):
     return {"type": "event", "event": name, "payload": {"sessionKey": SK, **payload}}
 
 
-async def test_held_frames_go_to_the_push_when_the_send_is_cancelled_before_its_ack():
-    """A `chat.send` cancelled while it waits for its ack (close_all cancels the input loop):
-    what was held is released (here, a push), never stranded."""
-    hub, channel, subscriber, dispatcher = _channel(_Orchestrator(acked=False))
+async def test_held_frames_wait_for_the_ack_of_a_send_cancelled_before_it():
+    """A `chat.send` cancelled while it waits for its ack (close_all cancels the session's
+    sends; 2b.3 review I3): what was held keeps waiting for the ack, which says whose it is.
+    Another run's frames (here, a push) are then released; the sender's own run is
+    tombstoned and aborted by its runId, never left running unowned."""
+    orchestrator = _Orchestrator(acked=False)
+    hub, channel, subscriber, dispatcher = _channel(orchestrator)
     sending = asyncio.create_task(channel.send_user_message(subscriber, "hola"))
     await wait_until(lambda: channel._acks == 1)
     await dispatcher.dispatch(_event("agent", {"runId": "run-x", "stream": "lifecycle", "data": {"phase": "start"}}))
@@ -502,12 +505,44 @@ async def test_held_frames_go_to_the_push_when_the_send_is_cancelled_before_its_
     assert len(channel._held) == 2
     sending.cancel()
     await asyncio.gather(sending, return_exceptions=True)
-    assert channel._acks == 0 and channel._held == []
+    assert channel._acks == 1 and len(channel._held) == 2  # still waiting for the ack
 
+    orchestrator.ack.set()  # the ack names r1: run-x was a push
+    await wait_until(lambda: channel._acks == 0)
     await dispatcher.dispatch(_event("agent", {"runId": "run-x", "stream": "lifecycle", "data": {"phase": "end"}}))
     await channel.push_idle()
+    await wait_until(lambda: orchestrator.aborted == ["r1"])
     assert subscriber.got == [("start", "push", "run-x"), ("event", "token"), ("end", "done")]
+    assert hub.turn_registry.is_run_aborted("r1")
     assert channel.idle is False  # still subscribed
+    await hub.aclose(1.0)
+
+
+@pytest.mark.parametrize("exclusive", [False, True], ids=["ws", "v1"])
+async def test_a_send_cancelled_before_its_ack_leaves_no_orphan_run(exclusive):
+    """2b.3 review I3, WebSocket and /v1: the sender leaves before the ack; when the ack
+    arrives its run is tombstoned and aborted by its runId, and its frames (held before the
+    ack, or after it) reach nobody, not even as a push."""
+    orchestrator = _Orchestrator(acked=False)
+    hub, channel, subscriber, dispatcher = _channel(orchestrator)
+    if exclusive:
+        sending = asyncio.create_task(
+            channel.send_exclusive("hola", by_client_id="ha", by_name="HA", sink=lambda e: None)
+        )
+    else:
+        sending = asyncio.create_task(channel.send_user_message(subscriber, "hola"))
+    await wait_until(lambda: channel._acks == 1)
+    await dispatcher.dispatch(_event("agent", {"runId": "r1", "stream": "lifecycle", "data": {"phase": "start"}}))
+    sending.cancel()
+    await asyncio.gather(sending, return_exceptions=True)
+
+    orchestrator.ack.set()
+    await wait_until(lambda: orchestrator.aborted == ["r1"])
+    await dispatcher.dispatch(_event("chat", {"runId": "r1", "state": "delta", "deltaText": "huérfano"}))
+    await dispatcher.dispatch(_event("chat", {"runId": "r1", "state": "final"}))
+    await channel.push_idle()
+    assert subscriber.got == []
+    assert channel._acks == 0 and channel._held == [] and not channel._runs
     await hub.aclose(1.0)
 
 

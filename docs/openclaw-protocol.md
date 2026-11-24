@@ -574,7 +574,7 @@ them to a log. What it does instead:
 | `chat` `state:"error"`, or a push's `agent` `phase:"error"` | the code classified from structural fields (#397, below), else `orchestrator_error` | WARNING with that code only |
 | Not connected / reconnecting | `orchestrator_unavailable` | — |
 | Connection ends mid-turn | `orchestrator_disconnected` (#213) | type / close codes only |
-| `turn_timeout`, `turn_overflow`, `turn_in_progress` | same literals (unchanged; since 5.0 PR 2b.3 only `turn_timeout` is still sent, and `/v1` adds `turn_cancelled`) | — |
+| `turn_timeout`, `turn_overflow`, `turn_in_progress` | same literals (unchanged; since 5.0 PR 2b.3 only `turn_timeout` is still sent, and `/v1` adds `turn_cancelled` and `turn_absorbed`) | — |
 | Unexpected exception wrapping the stream | `orchestrator_error` | type only; traceback without message at DEBUG |
 
 Handshake (`connect()`): a rejected `hello`, a first frame that is not `connect.challenge`, or
@@ -1314,12 +1314,26 @@ not live.
   gateway. A client `cancel` from a WebSocket session stops `/v1`'s turn like any other:
   `/v1` answers 502 `turn_cancelled`. Two `/v1` requests on one conversation no longer get
   409 `turn_in_progress`: the second waits for the first.
+- **Review fixes (2026-11-24):** a WebSocket session never stops reading while its `send`
+  waits behind `/v1` (its sends go out from a per-session task, in order), so its `cancel`
+  stops `/v1`'s turn at once and a `send` with `interrupt` cuts it at once (`chat.abort` by
+  `runId`) before going out. The wait for calm (lock included) is capped at `TURN_TIMEOUT_S`
+  → `turn_timeout`, nothing sent. A `/v1` run that ends without ever opening its own turn —
+  `steer` folded it into a run that started after its `chat.send`, e.g. a push; OpenClaw only
+  says so afterwards (`steerTargetRunId`, or the `final` `seq: 1` without `message`) — is
+  answered 502 `turn_absorbed`, never an empty 200; cutting such an absorbed run neither
+  announces `withdrawn` nor aborts anything. `chat.send` is shielded: a sender that leaves
+  before the ack (a `/v1` client gone, a WebSocket session closing) leaves the ack to the
+  channel, which tombstones and `chat.abort`s that run by its `runId` when it arrives; frames
+  held for it until then are dropped, never handed to a push.
 
 ## Change log of this file
 
 - **2026-11-24**: "C3 queue behaviour" gains how the gateway reacts in 5.0 PR 2b.3 (#406): `/v1`
   goes through the conversation's channel and waits for calm instead of sending `queueMode`
-  (untested live); no whole-key `chat.abort` left; `turn_in_progress` no longer sent.
+  (untested live); no whole-key `chat.abort` left; `turn_in_progress` no longer sent. Review
+  fixes: `turn_absorbed`, the calm wait capped at `TURN_TIMEOUT_S`, a `chat.send` whose sender
+  left is aborted by `runId` once acked.
 
 - **2026-11-24**: "C3 queue behaviour" gains how the gateway reacts in 5.0 PR 2b.2 (#406): a
   `user` `session.message` is read (ids and `steerTargetRunId`, updated by `messageId`), absorbed

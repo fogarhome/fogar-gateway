@@ -237,3 +237,117 @@ async def test_v1_stream_through_the_channel(harness, ha_client, db_engine):
     assert '"content": "reply-hola"' in res.text and res.text.rstrip().endswith("data: [DONE]")
     await tv.collect(lambda m: bool(of_type(m, "turn_end")))
     assert_socket_invariants(tv.messages)
+
+
+# ── 2b.3 review: the input loop never waits behind /v1 (I1), a push during /v1 (M5) ──
+
+
+async def test_cancel_after_a_send_during_v1_stops_v1_and_keeps_the_send(harness, ha_client, db_engine):
+    """Review I1 (the reviewer's repro): during HA's turn the TV sends «dos» (it waits behind
+    /v1) and then presses stop. The `cancel` is read at once: it stops HA's turn (502
+    `turn_cancelled`), not the TV's own message, which then goes and is answered."""
+    harness.openclaw.steer = True
+    conversation = await _ha_conversation(harness, db_engine)
+    tv = await _watcher(harness, conversation)
+    ha = asyncio.create_task(_ask(harness, "hold"))
+    await tv.collect(lambda m: bool(of_type(m, "turn_start")))
+    await tv.send({"type": "send", "text": "dos"})
+    await tv.send({"type": "cancel"})
+
+    res = await asyncio.wait_for(ha, 3)  # without `release`: the cancel cut it
+    assert (res.status_code, res.json()) == (502, {"error": "turn_cancelled"})
+    await tv.collect(lambda m: len(of_type(m, "turn_end")) >= 2)
+    assert [e["reason"] for e in of_type(tv.messages, "turn_end")] == ["cancelled", "done"]
+    assert [(m["text"], m["state"]) for m in of_type(tv.messages, "message")] == [
+        ("hold", "delivered"),
+        ("dos", "delivered"),
+    ]
+    assert [t["text"] for t in of_type(tv.messages, "token")] == ["reply-dos"]
+    assert_socket_invariants(tv.messages)
+
+
+async def test_an_interrupting_send_during_v1_cuts_it_at_once(harness, ha_client, db_engine):
+    """Review I1: `send` with `interrupt` during HA's turn cuts it right away (502
+    `turn_cancelled` for HA, `interrupted` for the sessions) and then goes, in order."""
+    harness.openclaw.steer = True
+    conversation = await _ha_conversation(harness, db_engine)
+    key = session_key_for("main", conversation)
+    tv = await _watcher(harness, conversation)
+    ha = asyncio.create_task(_ask(harness, "hold"))
+    await tv.collect(lambda m: bool(of_type(m, "turn_start")))
+    await tv.send({"type": "send", "text": "tres", "interrupt": True})
+
+    res = await asyncio.wait_for(ha, 3)
+    assert (res.status_code, res.json()) == (502, {"error": "turn_cancelled"})
+    await tv.collect(lambda m: len(of_type(m, "turn_end")) >= 2)
+    assert [e["reason"] for e in of_type(tv.messages, "turn_end")] == ["interrupted", "done"]
+    assert [t["text"] for t in of_type(tv.messages, "token")] == ["reply-tres"]
+    assert all(a.get("runId") for a in harness.openclaw.aborts if a["sessionKey"] == key)
+    assert_socket_invariants(tv.messages)
+
+
+async def test_the_input_loop_keeps_reading_while_a_send_waits(harness, ha_client, db_engine):
+    """Review I1: while the TV's send waits behind HA's turn, what it sends next is read at
+    once (an invalid frame gets its INVALID_MESSAGE, a withdraw is handled), and the waiting
+    send shows nothing on the wire until it goes."""
+    harness.openclaw.steer = True
+    conversation = await _ha_conversation(harness, db_engine)
+    tv = await _watcher(harness, conversation)
+    ha = asyncio.create_task(_ask(harness, "hold"))
+    await tv.collect(lambda m: bool(of_type(m, "turn_start")))
+    await tv.send({"type": "send", "text": "dos"})
+    await tv.send({"type": "withdraw", "message_id": "no-such-message"})
+    await tv.ws.send("42")
+    await tv.collect(lambda m: bool(of_type(m, "error")))
+    (error,) = of_type(tv.messages, "error")
+    assert error["code"] == "INVALID_MESSAGE"
+    assert [m["text"] for m in of_type(tv.messages, "message")] == ["hold"]  # «dos» still waits
+    assert not ha.done()
+
+    harness.openclaw.release.set()
+    assert _reply(await ha) == "reply-hold"
+    await tv.collect(lambda m: len(of_type(m, "turn_end")) >= 2)
+    assert [m["text"] for m in of_type(tv.messages, "message")] == ["hold", "dos"]
+    assert_socket_invariants(tv.messages)
+
+
+async def test_a_push_during_v1_waits_and_ha_gets_only_its_answer(harness, ha_client, db_engine):
+    """Review M5 (#112 since 2b.3): a push that starts while HA's turn is open waits for it
+    to end; HA's answer has nothing of the push, and the sessions see both turns in order."""
+    conversation = await _ha_conversation(harness, db_engine)
+    key = session_key_for("main", conversation)
+    tv = await _watcher(harness, conversation)
+    ha = asyncio.create_task(_ask(harness, "hold"))
+    await tv.collect(lambda m: bool(of_type(m, "turn_start")))
+    await harness.push("aviso", session_key=key)
+    await asyncio.sleep(0.2)
+    assert len(of_type(tv.messages, "turn_start")) == 1  # the push waits
+
+    harness.openclaw.release.set()
+    assert _reply(await ha) == "reply-hold"
+    await tv.collect(lambda m: len(of_type(m, "turn_end")) >= 2)
+    starts = of_type(tv.messages, "turn_start")
+    assert [s["origin"] for s in starts] == ["user", "push"]
+    assert [t["text"] for t in of_type(tv.messages, "token")] == ["reply-hold", "aviso"]
+    assert_socket_invariants(tv.messages)
+
+
+async def test_a_session_closing_with_a_waiting_send_drops_it(harness, ha_client, db_engine):
+    """Review I1: a session that closes while its send waits behind HA's turn drops that send
+    (it never reaches OpenClaw, nothing of it on the wire) and HA's turn goes on."""
+    harness.openclaw.steer = True
+    conversation = await _ha_conversation(harness, db_engine)
+    key = session_key_for("main", conversation)
+    tv = await _watcher(harness, conversation)
+    ha = asyncio.create_task(_ask(harness, "hold"))
+    await tv.collect(lambda m: bool(of_type(m, "turn_start")))
+    await tv.send({"type": "send", "text": "dos"})
+    await asyncio.sleep(0.1)
+    await tv.ws.close()
+    await asyncio.sleep(0.3)  # the gateway closes the session
+
+    harness.openclaw.release.set()
+    assert _reply(await ha) == "reply-hold"
+    await asyncio.sleep(0.2)
+    assert _sends(harness, key) == 2  # «uno» and HA's: «dos» never went
+    assert [m["text"] for m in of_type(tv.messages, "message")] == ["hold"]
