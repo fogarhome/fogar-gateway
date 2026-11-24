@@ -418,3 +418,142 @@ async def test_a_lost_connection_ends_the_runs_with_a_stable_error(session, open
         assert [e["message"] for e in ws.of("error")] == ["orchestrator_disconnected"] * 2
         assert [r for t, _, r in pairs(ws) if t == "turn_end"] == ["error", "error"]
         assert_paired(ws)
+
+
+# ── Channel-level edges (review of 2b.1) ──────────────────────────────────
+
+
+class _Orchestrator:
+    """`send` acks with `r1`, `r2`… once `ack` is set (set by default); records aborts."""
+
+    def __init__(self, *, acked: bool = True) -> None:
+        self.ack = asyncio.Event()
+        if acked:
+            self.ack.set()
+        self.sent = 0
+        self.aborted: list[str] = []
+
+    async def send(self, text, session_key, *, queue_mode=None):
+        await self.ack.wait()
+        self.sent += 1
+        return f"r{self.sent}"
+
+    async def abort_run(self, session_key, run_id):
+        self.aborted.append(run_id)
+
+    async def abort(self, session_key):
+        self.aborted.append("THE WHOLE KEY")
+
+
+class _Subscriber:
+    conversation_id = "conv-q"
+    wants_audio = False
+    wants_push = True
+    wants_progress = False
+    tracker = None
+
+    def __init__(self) -> None:
+        self.client = Client(id="tv", key_hash="k", is_active=True, name="TV")
+        self.got: list[tuple] = []
+
+    def agent_allowed(self, session_key):
+        return True
+
+    def on_turn_start(self, turn):
+        self.got.append(("start", turn.origin, turn.run_id))
+
+    def on_event(self, turn, event):
+        self.got.append(("event", getattr(event, "code", event.kind)))
+
+    def on_turn_end(self, turn, reason):
+        self.got.append(("end", reason))
+
+    def on_message(self, message):
+        self.got.append(("message", message.id, message.state))
+
+
+def _channel(orchestrator):
+    index = ConversationIndex()
+    index.add(CONVERSATION)
+    turns = TurnRegistry()
+    hub = ChannelHub(index=index, turn_registry=turns, orchestrator=orchestrator)
+    channel = hub.get_or_create(CONVERSATION)
+    subscriber = _Subscriber()
+    channel.subscribe(subscriber)
+    return hub, channel, subscriber, FrameDispatcher(turns, hub)
+
+
+def _event(name, payload):
+    return {"type": "event", "event": name, "payload": {"sessionKey": SK, **payload}}
+
+
+async def test_held_frames_go_to_the_push_when_the_send_is_cancelled_before_its_ack():
+    """A `chat.send` cancelled while it waits for its ack (close_all cancels the input loop):
+    what was held is released (here, a push), never stranded."""
+    hub, channel, subscriber, dispatcher = _channel(_Orchestrator(acked=False))
+    sending = asyncio.create_task(channel.send_user_message(subscriber, "hola"))
+    await wait_until(lambda: channel._acks == 1)
+    await dispatcher.dispatch(_event("agent", {"runId": "run-x", "stream": "lifecycle", "data": {"phase": "start"}}))
+    await dispatcher.dispatch(_event("chat", {"runId": "run-x", "state": "delta", "deltaText": "aviso"}))
+    assert len(channel._held) == 2
+    sending.cancel()
+    await asyncio.gather(sending, return_exceptions=True)
+    assert channel._acks == 0 and channel._held == []
+
+    await dispatcher.dispatch(_event("agent", {"runId": "run-x", "stream": "lifecycle", "data": {"phase": "end"}}))
+    await channel.push_idle()
+    assert subscriber.got == [("start", "push", "run-x"), ("event", "token"), ("end", "done")]
+    assert channel.idle is False  # still subscribed
+    await hub.aclose(1.0)
+
+
+async def test_a_held_run_status_is_its_run_s_first_event():
+    """During the ack wait, an `agent` `run_status` of a run nobody knows yet is held too (not
+    dropped): it is the first event of the sender's run and opens its turn."""
+    hub, channel, subscriber, dispatcher = _channel(_Orchestrator(acked=False))
+    sending = asyncio.create_task(channel.send_user_message(subscriber, "hola"))
+    await wait_until(lambda: channel._acks == 1)
+    await dispatcher.dispatch(_event("agent", {"runId": "r1", "stream": "run_status", "data": {"phase": "queued"}}))
+    hub.orchestrator.ack.set()
+    await asyncio.wait_for(sending, 2)
+    await channel.push_idle()
+    assert subscriber.got == [("message", "r1", "delivered"), ("start", "user", "r1")]
+    await hub.aclose(1.0)
+
+
+async def test_a_queued_head_that_never_starts_times_out_alone(monkeypatch):
+    """Decision 2: two messages whose runs never send anything. Each, when nothing is ahead
+    of it, gets its pair with TURN_ERROR turn_timeout; only its own runId is aborted."""
+    from fogar_gateway.core.config import settings
+
+    monkeypatch.setattr(settings, "TURN_TIMEOUT_S", 0.2)
+    orchestrator = _Orchestrator()
+    hub, channel, subscriber, _ = _channel(orchestrator)
+    await channel.send_user_message(subscriber, "a")
+    await channel.send_user_message(subscriber, "b")
+    await wait_until(lambda: not channel._runs, timeout=3)
+    await wait_until(lambda: len(orchestrator.aborted) == 2)
+
+    assert subscriber.got == [
+        ("message", "r1", "delivered"), ("message", "r2", "pending"),
+        ("start", "user", "r1"), ("event", "turn_timeout"), ("end", "timeout"),
+        ("message", "r2", "delivered"),
+        ("start", "user", "r2"), ("event", "turn_timeout"), ("end", "timeout"),
+    ]  # fmt: skip
+    assert orchestrator.aborted == ["r1", "r2"]
+    await hub.aclose(1.0)
+
+
+async def test_an_ack_after_the_channel_closed_aborts_its_run_and_registers_nothing():
+    """Shutdown while a `chat.send` waits for its ack: the late ack's run is aborted (only it)
+    and never registered in the closed channel (nothing waits for it forever)."""
+    orchestrator = _Orchestrator(acked=False)
+    hub, channel, subscriber, _ = _channel(orchestrator)
+    sending = asyncio.create_task(channel.send_user_message(subscriber, "hola"))
+    await wait_until(lambda: channel._acks == 1)
+    await hub.aclose(1.0)
+    orchestrator.ack.set()
+    assert await asyncio.wait_for(sending, 2) is None
+    assert channel._runs == {}
+    assert orchestrator.aborted == ["r1"]
+    assert hub.turn_registry.is_run_aborted("r1")

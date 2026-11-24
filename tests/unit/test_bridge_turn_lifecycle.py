@@ -412,7 +412,8 @@ async def test_a_push_without_progress_is_closed_with_turn_timeout(make_bridge, 
     monkeypatch.setattr(settings, "TURN_TIMEOUT_S", 0.1)
     bridge, ws = make_bridge(client_id="hab_sito")
     sk = bridge._session_key()
-    await push(bridge, *push_reply("primer aviso", sk=sk, end=False))
+    for kind, arg in push_reply("primer aviso", sk=sk, end=False):
+        enqueue_push(bridge, kind, arg, run_id="run-p")
     await wait_until(lambda: bool(ws.of("turn_end")))
 
     msgs = [m for m in await sent(bridge) if isinstance(m, dict)]
@@ -421,7 +422,9 @@ async def test_a_push_without_progress_is_closed_with_turn_timeout(make_bridge, 
         "type": "error", "code": "TURN_ERROR", "message": "turn_timeout", "fatal": False, "turn_id": "t-1",
     }  # fmt: skip
     assert bridge.turns.last_ended.end_reason == "timeout"
-    bridge.orchestrator.abort.assert_awaited_once_with(sk)
+    await wait_until(lambda: bridge.orchestrator.abort_run.await_count == 1)
+    bridge.orchestrator.abort_run.assert_awaited_once_with(sk, "run-p")  # only its run
+    bridge.orchestrator.abort.assert_not_awaited()
 
     # the next push opens its own turn
     await push(bridge, *push_reply("segundo", sk=sk))
@@ -462,11 +465,13 @@ async def test_failed_push_ends_with_reason_error(make_bridge):
 
 
 async def test_an_interrupting_send_over_a_push_ends_it_with_reason_interrupted(make_bridge):
-    """5.0 PR 2b: «send now» cuts the open push (only its run is aborted) before its chat.send;
-    a plain `send` waits for it (tests/unit/test_channel_queue.py)."""
+    """5.0 PR 2b: «send now» cuts the open push (only its run is aborted, by its runId) before
+    its chat.send; a plain `send` waits for it (tests/unit/test_channel_queue.py)."""
     bridge, ws = make_bridge(client_id="hab_sito")
     sk = bridge._session_key()
-    await push(bridge, *push_reply("aviso", sk=sk, end=False))
+    for kind, arg in push_reply("aviso", sk=sk, end=False):
+        enqueue_push(bridge, kind, arg, run_id="run-p")
+    await bridge.push_idle()
     bridge.orchestrator.stream_response = tokens("hola")
     await bridge.turns.start_user_turn("hola", interrupt=True)
     replaced = bridge.turns.last_ended
@@ -476,7 +481,23 @@ async def test_an_interrupting_send_over_a_push_ends_it_with_reason_interrupted(
     order = [(m["type"], m.get("turn_id")) for m in ws.sent if m["type"] in ("turn_start", "turn_end")]
     assert order == [("turn_start", "t-1"), ("turn_end", "t-1"), ("turn_start", "t-2"), ("turn_end", "t-2")]
     assert (replaced.origin, replaced.end_reason) == ("push", "interrupted")
-    bridge.orchestrator.abort.assert_awaited_once_with(sk)  # the push carried no runId
+    bridge.orchestrator.abort_run.assert_awaited_once_with(sk, "run-p")
+    bridge.orchestrator.abort.assert_not_awaited()  # never the whole key: the queue stays
+    await bridge.close_all()
+
+
+async def test_cutting_a_push_without_run_id_aborts_nothing(make_bridge, caplog):
+    """5.0 PR 2b: a push without a runId is cut here only: aborting the whole key would take
+    the queued messages with it."""
+    bridge, ws = make_bridge(client_id="hab_sito")
+    sk = bridge._session_key()
+    await push(bridge, *push_reply("aviso", sk=sk, end=False))
+    assert await bridge.turns.cancel("cancelled") == (True, "t-1")
+    await sent(bridge)
+    assert ws.of("turn_end")[0]["reason"] == "cancelled"
+    bridge.orchestrator.abort.assert_not_awaited()
+    bridge.orchestrator.abort_run.assert_not_awaited()
+    assert "sin runId" in caplog.text
     await bridge.close_all()
 
 
@@ -511,14 +532,20 @@ async def test_a_send_during_the_push_timeout_cut_waits_for_its_abort(make_bridg
     provider.connect = AsyncMock(side_effect=[stream, None])  # the user turn: TTS down
     bridge, ws = make_bridge(client_id="hab_sito", output_mode=("audio", "text"), tts=provider)
     order = []
-    bridge.orchestrator.abort = AsyncMock(side_effect=lambda sk: order.append("abort"))
+    abort_run = bridge.orchestrator.abort_run.side_effect
+
+    async def abort(sk, run_id):
+        order.append("abort")
+        await abort_run(sk, run_id)
+
+    bridge.orchestrator.abort_run.side_effect = abort
 
     async def user_stream(*a, **k):
         order.append("send")
         yield OrchestratorEvent(type="token", content="hola")
 
     bridge.orchestrator.stream_response = user_stream
-    enqueue_push(bridge, "turn_start", bridge._session_key())
+    enqueue_push(bridge, "turn_start", bridge._session_key(), run_id="run-p")
     await asyncio.wait_for(closing.wait(), 2)  # the timeout cut is releasing the push TTS
 
     starter = asyncio.create_task(bridge.turns.start_user_turn("hola"))
@@ -561,7 +588,7 @@ async def test_a_second_cancellation_during_tts_release_still_closes_the_stream(
     await asyncio.wait_for(cancelling.wait(), 2)  # the release waits for the audio
     await asyncio.wait_for(bridge.close_all(), 2)  # close_all
 
-    assert task.done()
+    assert task.cancelled()  # the barge-in cut its run
     stream.close.assert_awaited_once()
     assert [m["turn_id"] for m in ws.of("turn_end")] == ["t-1"]
 

@@ -135,9 +135,14 @@ async def test_push_of_a_retired_agent_is_dropped_and_aborted(make_push_bridge):
         output_mode=("text",), config=ClientConfig(allowed_agents=["Main"]),
         conversation=fixed_conversation("hab_sito", agent="x"),
     )
-    await push(bridge, *push_reply("hola", sk=sk))
+    for kind, arg in push_reply("hola", sk=sk):
+        enqueue_push(bridge, kind, arg, run_id="run-x")
+    await bridge.push_idle()
     assert await sent(bridge) == []
-    bridge.orchestrator.abort.assert_awaited_with(sk)
+    # 5.0 PR 2b: only its run, never the whole key.
+    await wait_until(lambda: bridge.orchestrator.abort_run.await_count == 1)
+    bridge.orchestrator.abort_run.assert_awaited_with(sk, "run-x")
+    bridge.orchestrator.abort.assert_not_awaited()
 
 
 async def test_an_open_push_of_a_retired_agent_is_cut_at_its_next_start(make_push_bridge):
@@ -147,14 +152,19 @@ async def test_an_open_push_of_a_retired_agent_is_cut_at_its_next_start(make_pus
     bridge, _ = make_push_bridge(
         output_mode=("text",), conversation=fixed_conversation("hab_sito", agent="x")
     )
-    await push(bridge, *push_reply("hola", sk=sk, end=False))
+    for kind, arg in push_reply("hola", sk=sk, end=False):
+        enqueue_push(bridge, kind, arg, run_id="run-x")
+    await bridge.push_idle()
     bridge.turns.allowed_agents = ["main"]  # lo que deja la revalidación
-    await asyncio.wait_for(push(bridge, ("turn_start", sk)), 1)
+    enqueue_push(bridge, "turn_start", sk, run_id="run-x")
+    await asyncio.wait_for(bridge.push_idle(), 1)
     assert _turn_frames(await sent(bridge)) == [
         {"type": "turn_start", "turn_id": "t-1", "turn_seq": 1, "conversation": "conv-1", "origin": "push", "by": None},
         {"type": "turn_end", "turn_id": "t-1", "reason": "cancelled"},
     ]
-    bridge.orchestrator.abort.assert_awaited_with(sk)
+    await wait_until(lambda: bridge.orchestrator.abort_run.await_count >= 1)
+    bridge.orchestrator.abort_run.assert_awaited_with(sk, "run-x")
+    bridge.orchestrator.abort.assert_not_awaited()
 
 
 async def test_revalidation_refreshes_allowed_agents_for_pushes(make_push_bridge, monkeypatch):

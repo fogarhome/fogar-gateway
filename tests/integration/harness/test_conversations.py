@@ -240,14 +240,14 @@ async def test_push_of_a_conversation_reaches_the_session_that_has_it_open(harne
 
 
 @pytest.mark.xfail(
-    strict=False,
-    reason="Decisión 8 de la 5.0 PR 2: hasta la 2b.3, /v1 sigue en stream_response con su propio "
-    "registro por clave. Desde la 2b.1 el canal ya no registra la clave ni aborta antes de enviar, "
-    "así que contra este OpenClaw falso (que corre los dos runs a la vez) pasa; contra el real, "
-    "el mensaje de /v1 se plegaría en el turno vivo (steer) hasta que la 2b.3 lo mande por el "
-    "canal esperando su turno.",
+    strict=True,
+    reason="Decisión 8 de la 5.0 PR 2: hasta la 2b.3, /v1 sigue en stream_response y manda su "
+    "chat.send en el acto; con OpenClaw en `steer` (su modo por defecto, que el falso imita aquí) "
+    "el mensaje de /v1 se pliega en el turno vivo del canal y /v1 no recibe su respuesta. La 2b.3 "
+    "lo manda por el canal esperando su turno.",
 )
 async def test_v1_talks_in_a_conversation_with_a_live_channel(harness, clock):
+    harness.openclaw.steer = True  # OpenClaw's default queue mode (2026.11.7)
     client = await harness.connect()
     await client.send({"type": "send", "text": "partial_hold"})
     await client.collect(lambda m: bool(of_type(m, "token")))

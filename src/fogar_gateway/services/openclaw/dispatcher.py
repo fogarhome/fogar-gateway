@@ -14,10 +14,6 @@ def _as_dict(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-# `chat` states that end a run (#219, #300).
-_TERMINAL_CHAT = ("final", "aborted", "error")
-
-
 def _run_id(payload: dict) -> str | None:
     run_id = payload.get("runId")
     return run_id if isinstance(run_id, str) else None
@@ -130,16 +126,14 @@ class FrameDispatcher:
         sk = payload.get("sessionKey")
         if sk is None or self._of_aborted_run(payload):
             return
-        ended = payload.get("state") in _TERMINAL_CHAT
-        self._turns.note_run_activity(sk, _run_id(payload), ended=ended)
         channel = self._channels.channel_for(sk)
         if _taken(channel, "chat", payload):
             return
         if self._turns.deliver_by_session(sk, ("chat", payload), _run_id(payload)):
             return
-        if self._turns.is_aborted(sk):
-            return  # late frame of a turn aborted for overflow (#130 S3b)
-        if channel is not None and not _taken(channel, "chat", payload, hold=True):
+        if channel is None or _taken(channel, "chat", payload, hold=True):
+            return
+        if not self._turns.blocks_push(sk, "chat"):
             channel.enqueue_push("chat", payload, run_id=_run_id(payload))
 
     async def _handle_agent_lifecycle(self, payload: dict) -> None:
@@ -151,62 +145,36 @@ class FrameDispatcher:
         if _taken(channel, "agent", payload):
             # A run the channel sent: every stream of it is the channel's (it opens its turn
             # on the run's first event, not on `start`: docs/openclaw-protocol.md, C3).
-            self._turns.note_run_activity(sk, _run_id(payload), ended=False)
-            return
-        if stream is not None and stream != "lifecycle":
-            # `agent` events of other streams (`item`, `tool`, `assistant`, `thinking`,
-            # `run_status`…) also carry `data.phase` (`item`: start/update/end), but only
-            # `lifecycle` opens or ends a run (OpenClaw's own `lifecyclePhase`, 2026.10.5): an
-            # `item` `end` must not close a push, nor a `tool` `start` open one. They still
-            # show the run is alive. A frame without `stream` keeps the old reading.
-            self._turns.note_run_activity(sk, _run_id(payload), ended=False)
             return
         data = _as_dict(payload.get("data"))
         phase = data.get("phase")
-        self._turns.note_run_activity(sk, _run_id(payload), ended=phase in ("end", "error"))
-        if phase == "fallback_step":
+        if phase == "fallback_step" and stream in (None, "lifecycle"):
             # #397: the run's failure reason, for classifying its error later (failures.py).
             # Only its structural fields are read; it opens or ends nothing.
             if self._turns.deliver_by_session(sk, ("agent", data), _run_id(payload)):
                 return
-            if channel is not None and not _taken(channel, "agent", payload, hold=True):
-                channel.enqueue_push("fallback", data, run_id=_run_id(payload))
+        if channel is None or _taken(channel, "agent", payload, hold=True):
+            # Held while a `chat.send` of the channel waits for its ack (any stream: a
+            # `run_status` or a lifecycle `model` may be its run's first event).
             return
-        if channel is None:
+        if stream is not None and stream != "lifecycle":
+            # `agent` events of other streams (`item`, `tool`, `assistant`, `thinking`,
+            # `run_status`…) also carry `data.phase` (`item`: start/update/end), but only
+            # `lifecycle` opens or ends a push (OpenClaw's own `lifecyclePhase`, 2026.10.5): an
+            # `item` `end` must not close a push, nor a `tool` `start` open one. A frame without
+            # `stream` keeps the old reading.
             return
-        if phase == "start":
-            if self._turns.get_queue_by_session(sk) is not None:
-                # Issue #112: a normal chat.send turn is active for this
-                # session_key — OpenClaw's own agent start pairs (tool use,
-                # multi-step reasoning) must not open a second client-facing
-                # turn on top of it. That turn's chat tokens and session.tool
-                # events already reach the client via _handle_chat/
-                # _handle_session_tool's own queue routing; only the
-                # lifecycle framing (which would open a *second* turn) is
-                # dropped.
-                logger.debug(
-                    "agent start suppressed: normal turn active for sk=%s", sk
-                )
-                return
-            if self._turns.is_aborted(sk):
-                logger.debug("agent start suppressed: turn aborted for overflow sk=%s", sk)
-                return
-            if not _taken(channel, "agent", payload, hold=True):
+        if phase == "fallback_step":
+            channel.enqueue_push("fallback", data, run_id=_run_id(payload))
+        elif phase == "start":
+            # #112 and #130 S3b (`TurnRegistry.blocks_push`): not over a /v1 turn holding the
+            # key, nor for a turn aborted for overflow.
+            if not self._turns.blocks_push(sk, "turn_start"):
                 channel.enqueue_push("turn_start", sk, run_id=_run_id(payload))
         elif phase in ("end", "error"):
-            # "error" (#300): a failed run ends with it instead of "end".
-            # Always forwarded, never suppressed: the push end already
-            # no-ops when no push turn is open (issue #84's orphan-end
-            # branch), so a start suppressed above never produces a
-            # client-visible turn_end here. Suppressing "end" too — as this
-            # guard originally did — could orphan a push turn that was
-            # already open *before* a normal turn started for the same
-            # session_key: its own "end" would be dropped, leaving
-            # the push open forever, its TTS connection never closed,
-            # and the push path permanently dead for the rest of the session
-            # (caught in final review, 2026-08-04).
-            if _taken(channel, "agent", payload, hold=True):
-                return
+            # "error" (#300): a failed run ends with it instead of "end". Always forwarded,
+            # never suppressed: the push end no-ops when no push turn is open (#84), and
+            # suppressing it could orphan a push opened before a /v1 turn (2026-08-04).
             if phase == "error":  # #397: its `data`, which the push classifies
                 channel.enqueue_push("turn_error", data, run_id=_run_id(payload))
             else:
@@ -216,7 +184,6 @@ class FrameDispatcher:
         sk = payload.get("sessionKey")
         if sk is None or self._of_aborted_run(payload):
             return
-        self._turns.note_run_activity(sk, _run_id(payload), ended=False)
         data = _as_dict(payload.get("data"))
         if data.get("phase") not in ("start", "result"):
             return
@@ -225,9 +192,9 @@ class FrameDispatcher:
             return
         if self._turns.deliver_by_session(sk, ("tool", data), _run_id(payload)):
             return
-        if self._turns.is_aborted(sk):
-            return  # late frame of a turn aborted for overflow (#130 S3b)
-        if channel is not None and not _taken(channel, "session.tool", payload, hold=True):
+        if channel is None or _taken(channel, "session.tool", payload, hold=True):
+            return
+        if not self._turns.blocks_push(sk, "tool"):
             channel.enqueue_push("tool", data, run_id=_run_id(payload))
 
     def connection_lost(self, code: str) -> None:

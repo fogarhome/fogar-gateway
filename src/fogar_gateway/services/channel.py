@@ -593,6 +593,7 @@ class ConversationChannel:
             and self.current_turn is None
             and not self._runs
             and self._acks == 0
+            and not self._held
             and self._backlog.pending == 0
             and not self._deferred
         )
@@ -675,9 +676,11 @@ class ConversationChannel:
             recorder = _SenderTracker(self, sender, tracker) if tracker is not None else None
             code: str | None = None
             run_id = ""
+            accepted = False
             self._acks += 1
             try:
                 run_id = await self.orchestrator.send(text, self.session_key)
+                accepted = True
             except orchestration.OrchestratorError as e:
                 code = str(e)  # siempre un código estable (#228)
             except Exception as e:  # noqa: BLE001 — frontera: un envío roto no cierra el canal
@@ -687,14 +690,25 @@ class ConversationChannel:
                 code = "internal_error"
             finally:
                 self._acks -= 1
+                if not accepted:
+                    # Sin run propio (fallo o cancelación de quien envía, p. ej. close_all): lo
+                    # retenido no espera más; lo que no es de nadie va al push.
+                    self._release_held()
             if code is not None:
-                self._release_held()
                 logger.error(f"[{self._tag}] Orchestrator error: {code}")
                 if tracker is not None:
                     tracker.start_turn()
                 gateway_stats.turn_started("normal")
                 gateway_stats.turn_error(code)
                 return code
+            if self._closed:
+                # El canal se cerró mientras se esperaba el ack: el run no se registra (nadie
+                # resolvería su `finished`); se aborta, solo él, y lo retenido se suelta.
+                logger.info(f"[{self._tag}] ack de un canal ya cerrado: chat.abort de su run")
+                self._abort_run(run_id)
+                self._held.clear()
+                await self._abort_step(run_id, "chat.abort de un run tras el cierre")
+                return None
             ahead = self.current_turn is not None or bool(self._runs)
             info = RunInfo(
                 run_id=run_id,
@@ -794,13 +808,18 @@ class ConversationChannel:
         td.raise_if_cancelled()
 
     async def _abort(self, run_id: str | None) -> None:
-        """`chat.abort` de un run (solo ese); sin runId (un push sin él), el de la clave."""
-        if run_id is not None:
-            await self.orchestrator.abort_run(self.session_key, run_id)
-        else:
-            await self.orchestrator.abort(self.session_key)
+        """`chat.abort` de un run (solo ese). Sin runId (un push sin él) no se aborta nada:
+        abortar la clave entera se llevaría también los mensajes en la cola (2b); el turno ya
+        se cerró aquí."""
+        if run_id is None:
+            logger.warning(f"[{self._tag}] turno cortado sin runId: no se aborta nada en OpenClaw")
+            return
+        await self.orchestrator.abort_run(self.session_key, run_id)
 
     def _spawn_abort(self, run_id: str | None) -> None:
+        if run_id is None:
+            logger.warning(f"[{self._tag}] turno cortado sin runId: no se aborta nada en OpenClaw")
+            return
         self._hub.spawn(self._abort(run_id), "chat_abort")
 
     # -- frames from the dispatcher ----------------------------------------------------
@@ -839,27 +858,29 @@ class ConversationChannel:
 
     def _forward_push(self, event: str, payload: dict) -> None:
         """Un frame que resultó no ser de un run propio: lo que el dispatcher habría hecho con
-        él como push (solo el lifecycle abre o cierra un push)."""
+        él como push (solo el lifecycle abre o cierra un push), con sus mismos filtros
+        (`TurnRegistry.blocks_push`: #112, #130 S3b). Un push abierto así cuenta su tope
+        (#286) desde ahora, no desde que llegó retenido."""
         run_id = _str_run_id(payload)
-        if event == "chat":
-            self.enqueue_push("chat", payload, run_id)
-            return
         data = _as_dict(payload.get("data"))
-        if event == "session.tool":
+        kind: str | None = None
+        arg: Any = None
+        if event == "chat":
+            kind, arg = "chat", payload
+        elif event == "session.tool":
             if data.get("phase") in ("start", "result"):
-                self.enqueue_push("tool", data, run_id)
+                kind, arg = "tool", data
+        elif event == "agent" and payload.get("stream") in (None, "lifecycle"):
+            phase = data.get("phase")
+            if phase == "fallback_step":
+                kind, arg = "fallback", data
+            elif phase in ("start", "end"):
+                kind, arg = ("turn_start" if phase == "start" else "turn_end"), self.session_key
+            elif phase == "error":
+                kind, arg = "turn_error", data
+        if kind is None or self._turn_registry.blocks_push(self.session_key, kind):
             return
-        if event != "agent" or payload.get("stream") not in (None, "lifecycle"):
-            return
-        phase = data.get("phase")
-        if phase == "fallback_step":
-            self.enqueue_push("fallback", data, run_id)
-        elif phase == "start":
-            self.enqueue_push("turn_start", self.session_key, run_id)
-        elif phase == "end":
-            self.enqueue_push("turn_end", self.session_key, run_id)
-        elif phase == "error":
-            self.enqueue_push("turn_error", data, run_id)
+        self.enqueue_push(kind, arg, run_id)
 
     def fail_run(self, run_id: str, code: str, *, crashed: bool = False) -> None:
         """One of the channel's runs failed outside OpenClaw's frames (a stable `code`): its

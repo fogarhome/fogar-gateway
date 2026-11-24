@@ -172,6 +172,10 @@ class FakeOpenClawServer:
         port=0, remote=False, challenge_nonce=True, queue=False,
     ):
         self.queue = queue
+        # `steer=True`: un `chat.send` con otro run de `chat.send` en marcha en su clave se
+        # pliega en él (ver `_chat_send`). Se puede activar en mitad de un test.
+        self.steer = False
+        self._live: dict[str, int] = {}  # sessionKey -> runs de `chat.send` en marcha
         self.queued: dict[str, list[str]] = {}  # sessionKey -> runIds en cola (modo `queue`)
         self.running: dict[str, str] = {}  # sessionKey -> runId que corre (modo `queue`)
         self._lanes: dict[str, asyncio.Lock] = {}
@@ -634,6 +638,7 @@ class FakeOpenClawServer:
         sk = raw.lower()
         aliases = {"sessionKeyAliases": [raw]} if raw != sk else {}
         self._record(sk, "user", text)
+        counted = False
         try:
             if text == "close":
                 await ws.close(1000)
@@ -646,6 +651,15 @@ class FakeOpenClawServer:
                 await ws.send(self._res(rid, {"runId": run_id, "status": "accepted", **aliases}))
             else:
                 await ws.send(self._res(rid, {"runId": run_id, "status": "started", **aliases}))
+            if self.steer and self._live.get(sk):
+                # `steer` (el modo por defecto del real, 2026.11.7): con un run en marcha en la
+                # clave, este se pliega en él; su propio run solo trae un `final` `seq: 1` sin
+                # `message` (la respuesta, si la hay, va bajo el run que lo absorbió).
+                payload = {"sessionKey": sk, "runId": run_id, "state": "final", "seq": 1}
+                await ws.send(json.dumps({"type": "event", "event": "chat", "payload": payload}))
+                return
+            self._live[sk] = self._live.get(sk, 0) + 1
+            counted = True
             # Un run empieza con su lifecycle `start`, como el real (5.0 PR 2b: el turno se
             # abre con el primer evento de su run).
             await ws.send(self._agent(sk, "start", run_id))
@@ -704,6 +718,9 @@ class FakeOpenClawServer:
                 await ws.send(self._chat(sk, "final", run_id=run_id))
         except websockets.ConnectionClosed:
             pass
+        finally:
+            if counted:
+                self._live[sk] -= 1
 
 
 class SendOnlyOpenClawWS:

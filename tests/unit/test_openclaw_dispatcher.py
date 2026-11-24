@@ -893,26 +893,6 @@ async def test_a_rejected_send_is_delivered_even_with_frames_held():
     assert [k for k, _ in _drain(q)] == ["done"]
 
 
-async def test_active_runs_follow_their_frames():
-    """Review 3: a run is active on its key from its first frame to its terminal one; a
-    tombstone or a lost connection forgets it."""
-    dispatcher, turn_reg, _ = make_dispatcher()
-    await dispatcher.dispatch(_agent("run-1", "start"))
-    await dispatcher.dispatch(_chat("run-2"))
-    assert sorted(turn_reg.active_runs(SK)) == ["run-1", "run-2"]
-    assert turn_reg.active_runs("agent:otro:client-a") == []
-    await dispatcher.dispatch(_chat("run-2", "final"))
-    assert turn_reg.active_runs(SK) == ["run-1"]
-    await dispatcher.dispatch(_agent("run-1", "end"))
-    assert turn_reg.active_runs(SK) == []
-    await dispatcher.dispatch(_agent("run-3", "start"))
-    turn_reg.abort_run("run-3")
-    assert turn_reg.active_runs(SK) == []
-    await dispatcher.dispatch(_tool("run-4"))
-    turn_reg.error_all("orchestrator_disconnected")
-    assert turn_reg.active_runs(SK) == []
-
-
 # ── `agent` de streams que no son `lifecycle` (2026.10.5; revisión de #254) ──
 
 
@@ -943,7 +923,6 @@ async def test_only_the_lifecycle_stream_opens_or_ends_a_push(stream, phase):
     client_reg.register("client-a", bridge, keyed_conversation("client-a"))
     await dispatcher.dispatch(_agent_stream(stream, phase))
     bridge.enqueue_push.assert_not_called()
-    assert turn_reg.active_runs(SK) == ["r1"]  # the run is still alive
 
 
 @pytest.mark.parametrize(

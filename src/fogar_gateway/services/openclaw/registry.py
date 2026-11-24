@@ -72,11 +72,6 @@ class TurnRegistry:
         self._abandoned_reqs: dict[str, float] = {}
         # runId -> deadline; see RUN_ABORT_TOMBSTONE_S.
         self._aborted_runs: dict[str, float] = {}
-        # runId -> (session_key, last frame seen): runs OpenClaw is running, from their
-        # frames (agent lifecycle, chat, session.tool) until a terminal one. A `chat.send`
-        # while another run is active on its key is folded into that run (see
-        # docs/openclaw-protocol.md), so the bridge aborts these before sending.
-        self._active_runs: dict[str, tuple[str, float]] = {}
         self._sessions: dict[str, asyncio.Queue] = {}
         # session_key -> max queue depth seen; not cleared by unregister (the bridge
         # reads it after the turn and calls pop_peak) (#219).
@@ -163,24 +158,6 @@ class TurnRegistry:
     def abort_run(self, run_id: str) -> None:
         _prune(self._aborted_runs)
         self._aborted_runs[run_id] = time.monotonic() + RUN_ABORT_TOMBSTONE_S
-        self._active_runs.pop(run_id, None)
-
-    def note_run_activity(self, session_key: str, run_id: str | None, *, ended: bool) -> None:
-        """A frame of `run_id` on `session_key`: the run is active until a terminal one."""
-        if run_id is None:
-            return
-        if ended:
-            self._active_runs.pop(run_id, None)
-        else:
-            self._active_runs[run_id] = (session_key, time.monotonic())
-
-    def active_runs(self, session_key: str) -> list[str]:
-        """Runs active on `session_key` (not ended, not tombstoned). A run with no frame for
-        RUN_ABORT_TOMBSTONE_S is forgotten: its end was probably lost (a reconnect)."""
-        stale = time.monotonic() - RUN_ABORT_TOMBSTONE_S
-        for run_id in [r for r, (_, seen) in self._active_runs.items() if seen <= stale]:
-            del self._active_runs[run_id]
-        return [r for r, (sk, _) in self._active_runs.items() if sk == session_key]
 
     def note_abort_result(self, payload: object) -> None:
         """A `chat.abort` answer (`{ok, aborted, runIds}`) names the runs it aborted."""
@@ -308,6 +285,18 @@ class TurnRegistry:
                 except asyncio.QueueEmpty:
                     pass
 
+    def blocks_push(self, session_key: str, kind: str) -> bool:
+        """A push event the key cannot take now: after a /v1 turn's overflow its late frames
+        are dropped (#130 S3b), and while a /v1 turn holds the key OpenClaw's own `agent start`
+        pairs must not open a second turn on top of it (#112). `kind`: the push kind."""
+        if kind in ("turn_start", "chat", "tool") and self.is_aborted(session_key):
+            logger.debug("push %s dropped: turn aborted for overflow sk=%s", kind, session_key)
+            return True
+        if kind == "turn_start" and self.get_queue_by_session(session_key) is not None:
+            logger.debug("agent start suppressed: normal turn active for sk=%s", session_key)
+            return True
+        return False
+
     def is_aborted(self, session_key: str) -> bool:
         """True while late frames of an overflow-aborted turn must be dropped."""
         now = time.monotonic()
@@ -325,8 +314,6 @@ class TurnRegistry:
         self._run_of_req.clear()
         self._held.clear()
         self._announce.clear()
-        # The connection is gone: what was running on it is not known any more.
-        self._active_runs.clear()
 
 
 def _prune(deadlines: dict[str, float]) -> None:

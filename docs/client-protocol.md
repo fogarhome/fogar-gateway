@@ -384,7 +384,7 @@ Señala que el turno terminó. **Todo turno con `turn_start` recibe exactamente 
 |---|---|
 | `done` | Terminó solo: la respuesta completa (o el push, con su fin) |
 | `error` | Falló: va precedido de su `error` `TURN_ERROR` (§9), también un push cuyo agente falla (desde 5.0, #397) |
-| `cancelled` | Tu `cancel` (también el de un `send` que aún no había empezado: recibe su par igual) |
+| `cancelled` | Un `cancel` de cualquier sesión de la conversación (§4), o OpenClaw abortó el run por su cuenta. Un mensaje parado antes de que empiece su run no tiene par: su `message` queda `withdrawn` (5.0) |
 | `interrupted` | Un `send` con `interrupt` lo cortó («enviar ahora», también un push), o hablaste encima: un barge-in (§7) o una transcripción final con el turno en curso. Sustituye al antiguo mensaje `interrupted` |
 | `replaced` | Tu sesión pasó a la conversación del día nuevo (§14), o un `send` tuyo que no llegó a la conversación dejó atrás el turno que mostrabas. Desde 5.0 un `send` ya no sustituye el turno en curso |
 | `timeout` | `TURN_TIMEOUT_S` sin progreso del orquestador (§13), tras su `error` `turn_timeout` |

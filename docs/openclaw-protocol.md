@@ -1185,17 +1185,21 @@ explicitly requested agent, as `resolve_agent` does; the handshake keeps its 402
   the per-message param is still untried live); during a turn it waits in OpenClaw's queue. The
   ack's `runId` is the message's id. Only `cancel`, a `send` with `interrupt` and `withdraw`
   abort, each with `chat.abort {sessionKey, runId}` (only that run; the gateway tombstones it
-  first, so its `aborted`/lifecycle `end` are dropped). `chat.abort` of the whole key is left
-  for a push without `runId` and for `/v1` (`stream_response`, until 2b.3).
+  first, so its `aborted`/lifecycle `end` are dropped). The WebSocket path never aborts the
+  whole key: a push without `runId` is only cut on the gateway's side (WARNING, nothing sent),
+  because `chat.abort` of the key would also take the queued messages. `/v1`
+  (`stream_response`, until 2b.3) still sends a whole-key `chat.abort` when it gives up.
 - **A run opens its turn on its first event**, not on lifecycle `start`: `chat` status, delta,
   tool or an `error`, a `final` that carries text, `agent` lifecycle `start`/`model`/
   `fallback_step` or a `run_status`. The `seq gap` `agent` `stream:"error"` opens nothing (it
   only shows the run alive). A `final` without `message` closes the turn with the text the
   deltas already brought (`ChatTextTracker`).
 - **Origin before the ack:** while a `chat.send` of the channel waits for its ack, frames of a
-  `runId` nobody knows yet are held by the channel; the ack says whose they are, and what is
-  still unowned is a push (lifecycle `start` still opens a push for a run the channel does not
-  know: removing that rule is 2b.2).
+  `runId` nobody knows yet are held by the channel (every `agent` stream too: a `run_status`
+  or a lifecycle `model` may be the run's first event); the ack says whose they are, and what
+  is still unowned is a push, through the same filters as any push (#112, #130). A send
+  cancelled or failed before its ack releases what was held. (Lifecycle `start` still opens a
+  push for a run the channel does not know: removing that rule is 2b.2.)
 - **Not yet (2b.2):** a steered run (`session.message` `steerTargetRunId`) is only recognised by
   its `final` `seq: 1` without `message` and without prior events: the message turns
   `delivered` and no turn opens; `session.message` is still ignored, and `pendingInputs` is not
