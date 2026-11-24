@@ -660,8 +660,8 @@ class ConversationChannel:
     @property
     def idle(self) -> bool:
         """Nothing keeps the channel alive: no subscribers, no open turn, no run of its own
-        unfinished (queued, running or waiting for its ack) and nothing waiting for the
-        worker."""
+        unfinished (queued, running or waiting for its ack), nothing waiting for the worker
+        and no `chat.abort` promised for the next reconnection (`_abort_on_reconnect`)."""
         return (
             not self._subscriptions
             and self.current_turn is None
@@ -670,6 +670,7 @@ class ConversationChannel:
             and not self._held
             and self._backlog.pending == 0
             and not self._deferred
+            and not self._abort_on_reconnect
         )
 
     # -- state for the sessions (watchdogs, /admin/state) ------------------------------
@@ -1417,6 +1418,10 @@ class ConversationChannel:
                 f"[{self._tag}] OpenClaw caído: {len(waiting)} mensaje(s) en cola sin confirmar"
             )
         for info in failing:
+            # Su cliente sabrá que falló: que no siga corriendo en OpenClaw. Se entierra ya y se
+            # aborta por su runId al reconectar (`_on_reconnected`).
+            self._abort_run(info.run_id)
+            self._abort_on_reconnect.add(info.run_id)
             self._handle(("fail", (code, False), info.run_id))
 
     def _reconcile(self, alive: set[str] | None) -> None:

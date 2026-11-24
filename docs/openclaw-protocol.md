@@ -1264,9 +1264,11 @@ fake's copies of the sequences above (`tests/unit/test_channel_runs.py`), not li
   progress while a `chat.send` waits for its ack; one with an earlier frame of its run still
   held waits behind it (order first), and its arrival still counts as the push's progress.
 - **Runs failed after a drop are aborted:** each one the reconnection (or `RECONNECT_GRACE_S`)
-  fails is tombstoned and `chat.abort`ed by its `runId`, at once when connected, on the next
-  reconnection otherwise, so it does not go on running (tools, side effects) after its client
-  was told it failed. The reconnection is handled by each channel's worker, behind the drop.
+  fails, and each one whose open turn the drop itself failed, is tombstoned and `chat.abort`ed by
+  its `runId`: at once when connected, on the next reconnection otherwise, so it does not go on
+  running (tools, side effects) after its client was told it failed. A channel with an abort
+  still promised for the next reconnection is not idle (it is not forgotten). The reconnection
+  is handled by each channel's worker, behind the drop.
 - **#112 is now partly checked in the channel's worker:** for push openers other than
   lifecycle `start`, "a /v1 turn holds the key" is read when the worker handles the frame, so
   a frame of a /v1 run handled after /v1 unregistered may open a push. 2b.3 moves /v1 into the

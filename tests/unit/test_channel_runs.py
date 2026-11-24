@@ -585,13 +585,16 @@ async def test_pending_inputs_against_the_fake_after_a_drop(make_bridge):
             hub.reconnected()
             await wait_until(lambda: ("chat.history", {"sessionKey": SK, "limit": 1}) in server.reads)
             channel = hub.get(SK)
-            await wait_until(lambda: not channel._runs[run_b].unconfirmed)
+            # A's abort lets OpenClaw start B at once: confirmed (or already done) by then.
+            await wait_until(lambda: run_b not in channel._runs or not channel._runs[run_b].unconfirmed)
 
             server.release.set()
             await wait_until(lambda: len(tv_ws.of("turn_end")) == 2, timeout=5)
             await channel.push_idle()
             await sent(tv)
             assert [e["message"] for e in tv_ws.of("error")] == ["orchestrator_disconnected"]
+            run_a = next(m["id"] for m in tv_ws.of("message") if m["text"] == "hold-a")
+            assert {"sessionKey": SK, "runId": run_a} in server.aborts  # A, by its runId
             assert [r for t, _, r in pairs(tv_ws) if t == "turn_end"] == ["error", "done"]
             assert [m["state"] for m in tv_ws.of("message") if m["id"] == run_b] == ["pending", "delivered"]
             assert "".join(t["text"] for t in tv_ws.of("token") if t["turn_id"] == "t-2") == "reply-b"
@@ -695,8 +698,9 @@ async def test_runs_failed_after_a_reconnect_are_aborted_by_run_id(history):
     dispatcher.connection_lost("orchestrator_disconnected")
     hub.reconnected()  # before the worker handled the drop: it still reconciles
     await wait_until(lambda: not channel._runs)
-    await wait_until(lambda: orchestrator.aborted == ["r2"])
-    assert hub.turn_registry.is_run_aborted("r2")
+    # r1 (its turn open at the drop) and r2 (failed here), each by its runId.
+    await wait_until(lambda: sorted(orchestrator.aborted) == ["r1", "r2"])
+    assert hub.turn_registry.is_run_aborted("r1") and hub.turn_registry.is_run_aborted("r2")
     await hub.aclose(1.0)
 
 
@@ -707,8 +711,47 @@ async def test_runs_failed_at_the_grace_are_aborted_on_the_next_reconnect(monkey
     await _a_running_and_b_pending(channel, subscriber, dispatcher)
     dispatcher.connection_lost("orchestrator_disconnected")
     await wait_until(lambda: not channel._runs)
-    assert hub.turn_registry.is_run_aborted("r2")
+    assert hub.turn_registry.is_run_aborted("r1") and hub.turn_registry.is_run_aborted("r2")
     assert orchestrator.aborted == []  # still disconnected: nothing to send it to
     hub.reconnected()
-    await wait_until(lambda: orchestrator.aborted == ["r2"])
+    await wait_until(lambda: sorted(orchestrator.aborted) == ["r1", "r2"])
+    await hub.aclose(1.0)
+
+
+async def test_a_run_whose_turn_the_drop_failed_is_aborted_on_reconnect():
+    """The drop fails the open turn at once (orchestrator_disconnected); its run may still be
+    running in OpenClaw: it is tombstoned now and aborted by its runId on reconnection, and
+    its late frames reach nobody."""
+    orchestrator = _Orchestrator(history=_history())
+    hub, channel, subscriber, dispatcher = _channel(orchestrator)
+    await channel.send_user_message(subscriber, "a")
+    await feed(dispatcher, channel, lifecycle("r1", "start"))
+    dispatcher.connection_lost("orchestrator_disconnected")
+    await channel.push_idle()
+    assert hub.turn_registry.is_run_aborted("r1")
+    assert orchestrator.aborted == []
+    hub.reconnected()
+    await wait_until(lambda: orchestrator.aborted == ["r1"])
+    subscriber.got.clear()
+    await feed(dispatcher, channel, delta("r1", "tarde"), final("r1"))
+    assert subscriber.got == []
+    await hub.aclose(1.0)
+
+
+async def test_a_promised_abort_keeps_an_unattended_channel_alive(monkeypatch):
+    """No subscribers, queued runs failed at the grace while disconnected: the channel is not
+    idle (not forgotten) until the next reconnection sends the promised aborts."""
+    monkeypatch.setattr(channel_module, "RECONNECT_GRACE_S", 0.1)
+    orchestrator = _Orchestrator(history=_history())
+    hub, channel, subscriber, dispatcher = _channel(orchestrator)
+    await _a_running_and_b_pending(channel, subscriber, dispatcher)
+    channel.unsubscribe(subscriber)
+    dispatcher.connection_lost("orchestrator_disconnected")
+    await wait_until(lambda: not channel._runs)
+    await channel.push_idle()
+    assert hub.get(SK) is channel and not channel.idle
+    hub.reconnected()
+    await wait_until(lambda: sorted(orchestrator.aborted) == ["r1", "r2"])
+    await channel.push_idle()
+    assert channel.idle
     await hub.aclose(1.0)
