@@ -136,6 +136,9 @@ async def test_nothing_from_an_aborted_run(harness, no_rate_cap):
     client = await harness.connect(output_mode=WITH_PROGRESS)
     await client.send({"type": "send", "text": "waitprogress"})
     await harness.openclaw.wait_held(1)
+    # El turno se abre con el primer evento del run (5.0): sin esperar su turn_start,
+    # el cancel podría llegar antes y retirar el mensaje en vez de cortar el turno.
+    await client.collect(lambda ms: bool(of_type(ms, "turn_start")))
     await client.send({"type": "cancel"})
     await client.collect(turn_ended)
     await harness.openclaw.finish_next()  # el run cancelado manda su fase y su herramienta
