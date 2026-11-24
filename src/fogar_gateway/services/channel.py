@@ -471,6 +471,8 @@ class ConversationChannel:
         # Tras una caída: hasta cuándo esperan los runs sin confirmar, y con qué código fallan.
         self._lost_deadline: float | None = None
         self._lost_code = _DISCONNECTED
+        # Runs dados por fallidos sin conexión: se abortan (por runId) al reconectar.
+        self._abort_on_reconnect: set[str] = set()
         self._push_text = ChatTextTracker()  # #241: texto ya emitido en la respuesta del push
         # #254: runId → (última fase de arranque, cuándo) de runs sin push abierto todavía.
         self._early_phases: OrderedDict[str, tuple[ProgressPhase, float]] = OrderedDict()
@@ -912,9 +914,13 @@ class ConversationChannel:
             if push is not None and not push.ended:
                 # El push abierto no es de nadie que espere su ack: sus frames no se retienen
                 # (retenidos, su tope #286 vencería sin que le faltara progreso; 2b.2).
-                if push.run_id == run_id:
+                if push.run_id == run_id and not any(
+                    _str_run_id(held) == run_id for _, held in self._held
+                ):
                     return False
-                if push.run_id is None:
+                if push.run_id is None or push.run_id == run_id:
+                    # Retenido (detrás de uno suyo que ya espera, para no adelantarlo): su
+                    # llegada cuenta como progreso del push (#286).
                     push.progress_at = time.monotonic()
             if len(self._held) >= settings.TURN_QUEUE_MAX:
                 logger.warning(f"[{self._tag}] demasiados frames retenidos: se descarta uno")
@@ -987,6 +993,19 @@ class ConversationChannel:
         return not self._closed and (
             bool(self._subscriptions) or any(i.unconfirmed for i in self._runs.values())
         )
+
+    def reconnected(self) -> None:
+        """OpenClaw is back (`ChannelHub.reconnected`): the worker decides, in order behind the
+        drop (`lost`) it may not have handled yet (`_on_reconnected`)."""
+        if not self._closed:
+            self._enqueue(("reconnected", None, None))
+
+    def _on_reconnected(self) -> None:
+        for run_id in sorted(self._abort_on_reconnect):
+            self._spawn_abort(run_id)
+        self._abort_on_reconnect.clear()
+        if self.needs_reconcile:
+            self._hub.spawn(self.reconcile_pending(), "pending_inputs")
 
     async def reconcile_pending(self) -> None:
         """OpenClaw is back (`ReconnectingOpenClawClient.on_connected`): re-read the key's
@@ -1095,6 +1114,8 @@ class ConversationChannel:
             self._session_message(arg)
         elif kind == "reconcile":
             self._reconcile(arg)
+        elif kind == "reconnected":
+            self._on_reconnected()
         else:
             self._push_item(kind, arg, run_id)
 
@@ -1115,7 +1136,7 @@ class ConversationChannel:
                 return True
             event, payload = arg
             return _opens_run(event, payload) or _lifecycle_error(event, payload)
-        if kind in ("lost", "smsg", "reconcile"):
+        if kind in ("lost", "smsg", "reconcile", "reconnected"):
             return False
         if self._defer_push:
             return True
@@ -1417,14 +1438,22 @@ class ConversationChannel:
             f"[{self._tag}] pendingInputs tras reconectar: {kept} sigue(n) en cola, "
             f"{len(unconfirmed) - kept} falla(n)"
         )
-        self._fail_unconfirmed()
+        self._fail_unconfirmed(connected=True)
         self._touch_head()
 
-    def _fail_unconfirmed(self) -> None:
-        """Los runs aún sin confirmar fallan, cada uno con su par y su TURN_ERROR."""
+    def _fail_unconfirmed(self, *, connected: bool) -> None:
+        """Los runs aún sin confirmar fallan, cada uno con su par y su TURN_ERROR. A quien se
+        le dijo que falló no le sigue corriendo en OpenClaw: cada uno se entierra (#285) y se
+        aborta por su runId; sin conexión (vence RECONNECT_GRACE_S), en la próxima
+        reconexión (`_on_reconnected`)."""
         self._lost_deadline = None
         for info in [i for i in self._runs.values() if i.unconfirmed]:
             info.unconfirmed = False
+            self._abort_run(info.run_id)
+            if connected:
+                self._spawn_abort(info.run_id)
+            else:
+                self._abort_on_reconnect.add(info.run_id)
             self._handle(("fail", (self._lost_code, False), info.run_id))
 
     def _on_timeouts(self) -> None:
@@ -1437,7 +1466,7 @@ class ConversationChannel:
                 f"[{self._tag}] sin reconexión en RECONNECT_GRACE_S={RECONNECT_GRACE_S}s: "
                 "fallan los mensajes en cola sin confirmar"
             )
-            self._fail_unconfirmed()
+            self._fail_unconfirmed(connected=False)
         info = self._active_run()
         if info is not None and info.progress_at + settings.TURN_TIMEOUT_S <= time.monotonic():
             self._run_timed_out(info)
@@ -1869,12 +1898,12 @@ class ChannelHub:
             channel.connection_lost(code)
 
     def reconnected(self) -> None:
-        """OpenClaw is back (`ReconnectingOpenClawClient.on_connected`, 2b.2): every channel
-        with subscribers, or with runs that wait unconfirmed since the drop, re-reads its
-        `pendingInputs` (`ConversationChannel.reconcile_pending`). Never blocks."""
+        """OpenClaw is back (`ReconnectingOpenClawClient.on_connected`, 2b.2): every live
+        channel's worker aborts the runs it failed while disconnected and, with subscribers or
+        runs that wait unconfirmed since the drop, re-reads its `pendingInputs`
+        (`ConversationChannel.reconcile_pending`). Never blocks."""
         for channel in list(self._channels.values()):
-            if channel.needs_reconcile:
-                self.spawn(channel.reconcile_pending(), "pending_inputs")
+            channel.reconnected()
 
     def drop_if_idle(self, session_key: str, channel: ConversationChannel | None = None) -> bool:
         """Forget the channel if nothing keeps it alive (`ConversationChannel.idle`). With

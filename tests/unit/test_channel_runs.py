@@ -234,11 +234,14 @@ def assert_socket_invariants(ws) -> None:
         assert 0 <= start["turn_seq"] <= 0xFFFF
 
 
-async def test_steered_message_is_absorbed_into_active_turn(make_bridge, steer_hub):
+@pytest.mark.parametrize("empty_final", [True, False], ids=["with-final", "mark-only"])
+async def test_steered_message_is_absorbed_into_active_turn(make_bridge, steer_hub, empty_final):
     """B sent from the Mac while the TV's turn runs, in `steer`: both see B `pending` then
     `delivered` (once); the answer stays inside the TV's turn (its `by`, its audio), and B's
-    empty `final` opens and closes nothing."""
+    empty `final` opens and closes nothing. `mark-only`: B's `final` never comes, so only
+    its `session.message` (the steer mark) can tell it was absorbed; it ends with A's turn."""
     server, hub = steer_hub
+    server.steer_final = empty_final
     tv, tv_ws = _session(make_bridge, hub, "tv")
     mac, mac_ws = _session(make_bridge, hub, "mac")
     await tv.turns.start_user_turn("partial_hold")
@@ -249,12 +252,14 @@ async def test_steered_message_is_absorbed_into_active_turn(make_bridge, steer_h
     await mac.turns.start_user_turn("b")
     await sent(mac)
     (run_b,) = {m["id"] for m in mac_ws.of("message") if m["text"] == "b"}
-    await wait_until(lambda: run_b not in channel._runs)
+    if empty_final:
+        await wait_until(lambda: run_b not in channel._runs)  # B's empty `final` ended it
+    else:
+        await wait_until(lambda: run_b in channel._runs and channel._runs[run_b].state == "absorbed")
     await channel.push_idle()
     await sent(tv), await sent(mac)
     for ws in (tv_ws, mac_ws):
         assert [m["state"] for m in ws.of("message") if m["id"] == run_b] == ["pending", "delivered"]
-    assert run_b not in channel._runs  # B's empty `final` ended it
     assert channel.current_turn is not None and channel.current_turn.audio_session is sender
 
     server.release.set()
@@ -269,6 +274,7 @@ async def test_steered_message_is_absorbed_into_active_turn(make_bridge, steer_h
         assert ws.of("error") == []
         assert_socket_invariants(ws)
     assert server.aborts == []
+    assert channel._runs == {}  # absorbed B ended with A's turn at the latest
     await tv.close_all(), await mac.close_all()
 
 
@@ -325,8 +331,12 @@ async def test_a_steer_mark_held_while_its_ack_waits_still_counts():
     assert len(channel._held) == 1
     orchestrator.ack.set()
     await asyncio.wait_for(sending, 2)
-    await feed(dispatcher, channel, final("r2", seq=1))
+    await channel.push_idle()
+    # Absorbed by its mark alone, before (and without needing) B's empty `final`.
+    assert channel._runs["r2"].state == "absorbed"
     assert subscriber.got[-2:] == [("message", "r2", "pending"), ("message", "r2", "delivered")]
+    await feed(dispatcher, channel, final("r2", seq=1))
+    assert subscriber.got[-1] == ("message", "r2", "delivered")
     assert "r2" not in channel._runs
     await hub.aclose(1.0)
 
@@ -650,4 +660,55 @@ async def test_an_open_push_does_not_time_out_while_a_send_waits_for_its_ack(mon
     assert subscriber.got[:2] == [("start", "push", "run-x"), ("token", ".")]
     assert ("end", "done") in subscriber.got
     assert orchestrator.aborted == []
+    await hub.aclose(1.0)
+
+
+# ── Review of 2b.2 ──────────────────────────────────────────────────────────
+
+
+async def test_push_tokens_keep_their_order_when_the_push_opens_during_an_ack():
+    """A push's frame held while an ack waits; the worker opens the push meanwhile; a later
+    frame of the same run must not overtake the held one."""
+    hub, channel, subscriber, dispatcher = _channel()
+    await dispatcher.dispatch(lifecycle("P", "start"))  # to the worker queue, not yet run
+    channel._acks = 1  # a chat.send starts waiting for its ack (as send_user_message does)
+    await dispatcher.dispatch(delta("P", "uno "))  # push not open yet -> held
+    assert len(channel._held) == 1
+    await channel.push_idle()  # the worker opens P's push
+    await dispatcher.dispatch(delta("P", "dos "))  # behind its held frame, not past it
+    await channel.push_idle()
+    channel._acks = 0
+    channel._release_held()  # the ack (or failed send) releases what was held
+    await channel.push_idle()
+    assert [g[1] for g in subscriber.got if g[0] == "token"] == ["uno ", "dos "]
+    await hub.aclose(1.0)
+
+
+@pytest.mark.parametrize("history", [RuntimeError("down"), {"messages": []}, _history()],
+                         ids=["unreadable", "no-pending", "not-listed"])  # fmt: skip
+async def test_runs_failed_after_a_reconnect_are_aborted_by_run_id(history):
+    """Told it failed, a queued run must not go on running in OpenClaw: each run the
+    reconnection fails is tombstoned and aborted by its runId (never the whole key)."""
+    orchestrator = _Orchestrator(history=history)
+    hub, channel, subscriber, dispatcher = _channel(orchestrator)
+    await _a_running_and_b_pending(channel, subscriber, dispatcher)
+    dispatcher.connection_lost("orchestrator_disconnected")
+    hub.reconnected()  # before the worker handled the drop: it still reconciles
+    await wait_until(lambda: not channel._runs)
+    await wait_until(lambda: orchestrator.aborted == ["r2"])
+    assert hub.turn_registry.is_run_aborted("r2")
+    await hub.aclose(1.0)
+
+
+async def test_runs_failed_at_the_grace_are_aborted_on_the_next_reconnect(monkeypatch):
+    monkeypatch.setattr(channel_module, "RECONNECT_GRACE_S", 0.1)
+    orchestrator = _Orchestrator(history=_history())
+    hub, channel, subscriber, dispatcher = _channel(orchestrator)
+    await _a_running_and_b_pending(channel, subscriber, dispatcher)
+    dispatcher.connection_lost("orchestrator_disconnected")
+    await wait_until(lambda: not channel._runs)
+    assert hub.turn_registry.is_run_aborted("r2")
+    assert orchestrator.aborted == []  # still disconnected: nothing to send it to
+    hub.reconnected()
+    await wait_until(lambda: orchestrator.aborted == ["r2"])
     await hub.aclose(1.0)

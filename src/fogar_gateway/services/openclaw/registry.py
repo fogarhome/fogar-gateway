@@ -289,7 +289,7 @@ class TurnRegistry:
         """A push event the key cannot take now: after a /v1 turn's overflow its late frames
         are dropped (#130 S3b), and while a /v1 turn holds the key OpenClaw's own `agent start`
         pairs must not open a second turn on top of it (#112). `kind`: the push kind."""
-        if kind in ("turn_start", "open", "chat", "tool") and self.is_aborted(session_key):
+        if kind in ("turn_start", "open", "chat", "tool", "fallback") and self.is_aborted(session_key):
             logger.debug("push %s dropped: turn aborted for overflow sk=%s", kind, session_key)
             return True
         if kind in ("turn_start", "open") and self.get_queue_by_session(session_key) is not None:

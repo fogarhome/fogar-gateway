@@ -186,6 +186,9 @@ class FakeOpenClawServer:
         # `steer=True`: un `chat.send` con otro run de `chat.send` en marcha en su clave se
         # pliega en él (ver `_chat_send`). Se puede activar en mitad de un test.
         self.steer = False
+        # `steer_final=False`: el run absorbido no manda su `final` vacío (para comprobar que el
+        # gateway lo reconoce por su `session.message`, no por ese `final`).
+        self.steer_final = True
         self._live: dict[str, int] = {}  # sessionKey -> runs de `chat.send` en marcha
         self._live_runs: dict[str, list[str]] = {}  # sessionKey -> sus runIds, en orden
         self._texts: dict[str, str] = {}  # runId -> texto de su `chat.send` (pendingInputs)
@@ -762,6 +765,8 @@ class FakeOpenClawServer:
             payload = {"sessionKey": sk, "agentId": sk.split(":")[1], "message": message,
                        "messageId": message_id, "messageSeq": self._messages}
             await ws.send(json.dumps({"type": "event", "event": "session.message", "payload": payload}))
+        if not self.steer_final:
+            return
         payload = {"sessionKey": sk, "runId": run_id, "state": "final", "seq": 1}
         await ws.send(json.dumps({"type": "event", "event": "chat", "payload": payload}))
 
