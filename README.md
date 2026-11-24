@@ -224,15 +224,17 @@ Auth (4.0): `X-Admin-Token` = `ADMIN_TOKEN` (la CLI, en la máquina del gateway)
 
 El cliente envía un handshake JSON como primer mensaje. Si es válido, el gateway responde con `ready` y la sesión comienza.
 
-**Cada turno de respuesta:**
+**Cada mensaje y su turno de respuesta (5.0):**
 ```
-← {"type":"turn_start","turn_id":"t-1","turn_seq":1,"conversation":"<id>","origin":"user"}
+→ {"type":"send","text":"Hola"}
+← {"type":"message","id":"<runId>","conversation":"<id>","text":"Hola","from":{"source":"device","device_id":"<id>","name":"<nombre>","self":true},"state":"delivered"}
+← {"type":"turn_start","turn_id":"t-1","turn_seq":1,"conversation":"<id>","origin":"user","by":{"device_id":"<id>","name":"<nombre>","self":true}}
 ← {"type":"token","turn_id":"t-1","text":"Hola,"}
 ← [0xA1][0x00][0x01][PCM16 24kHz...]   ← audio binario con header
 ← {"type":"turn_end","turn_id":"t-1","reason":"done"}
 ```
 
-Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la referencia completa incluyendo interrupciones, transcripción, push turns y manejo de errores.
+Un `send` con un turno en curso no lo corta: queda `pending` en la cola de OpenClaw (`"interrupt": true` corta y envía; `withdraw` quita un pendiente; `cancel` para el turno para todas las sesiones de la conversación). Hablar encima no corta nada: el barge-in lo decide el cliente. Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la referencia completa incluyendo interrupciones, transcripción, push turns y manejo de errores.
 
 ---
 
