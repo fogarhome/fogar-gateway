@@ -286,7 +286,10 @@ async def test_turn_cancelled_by_close_all_still_sends_its_turn_end(make_bridge)
     await asyncio.wait_for(b.close_all(), timeout=2.0)
     await sent(b)
 
-    assert ws.of("turn_start") == [{"type": "turn_start", "turn_id": "t-1", "turn_seq": 1, "conversation": "conv-1", "origin": "user"}]
+    assert ws.of("turn_start") == [{
+        "type": "turn_start", "turn_id": "t-1", "turn_seq": 1, "conversation": "conv-1",
+        "origin": "user", "by": {"device_id": "u", "name": "", "self": True},
+    }]  # fmt: skip
     assert ws.of("turn_end") == [{"type": "turn_end", "turn_id": "t-1", "reason": "closed"}]
 
 

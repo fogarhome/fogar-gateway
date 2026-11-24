@@ -231,7 +231,9 @@ async def test_cancel_ends_the_turn_once_for_every_subscriber(session, hub):
         assert pairs(ws) == [("turn_start", "t-1", "user"), ("turn_end", "t-1", "cancelled")]
 
 
-async def test_a_replacing_send_ends_the_turn_once_for_every_subscriber(session, hub):
+async def test_an_interrupting_send_ends_the_turn_once_for_every_subscriber(session, hub):
+    """5.0 PR 2b: only «send now» (`interrupt`) ends another device's turn (`interrupted`); a
+    plain `send` queues (tests/unit/test_channel_queue.py)."""
     tv, tv_ws = session("tv")
     mac, mac_ws = session("mac")
     started = asyncio.Event()
@@ -239,13 +241,13 @@ async def test_a_replacing_send_ends_the_turn_once_for_every_subscriber(session,
     await tv.turns.start_user_turn("uno")
     await asyncio.wait_for(started.wait(), 2)
     hub.orchestrator.stream_response = tokens("dos")
-    await mac.turns.start_user_turn("dos")
+    await mac.turns.start_user_turn("dos", interrupt=True)
     await asyncio.wait_for(mac.turns.user_task, 2)
     await sent(tv), await sent(mac)
 
     for ws in (tv_ws, mac_ws):
         assert pairs(ws) == [
-            ("turn_start", "t-1", "user"), ("turn_end", "t-1", "replaced"),
+            ("turn_start", "t-1", "user"), ("turn_end", "t-1", "interrupted"),
             ("turn_start", "t-2", "user"), ("turn_end", "t-2", "done"),
         ]  # fmt: skip
 

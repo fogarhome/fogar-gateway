@@ -142,10 +142,11 @@ async def _cancel_turn_during(make_tts_bridge, monkeypatch, *, tokens_block):
     await asyncio.wait_for(bridge.turns.idle(), 2.0)
     tts_client.close.assert_awaited()
     await asyncio.sleep(0)
-    # The session's worker waits for its next turn (5.0); nothing else is left behind.
+    # The session's worker waits for its next turn, the channel's for its next frame (5.0);
+    # nothing else is left behind.
     leftover = [
         t for t in asyncio.all_tasks() - before
-        if not t.done() and t is not task and t.get_name() != "turn_worker"
+        if not t.done() and t is not task and t.get_name() not in ("turn_worker", "push_worker")
     ]
     assert leftover == []
 

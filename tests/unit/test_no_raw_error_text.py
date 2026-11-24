@@ -36,15 +36,11 @@ def _logged(caplog) -> str:
 
 
 async def test_turn_error_from_raw_runtime_error_is_internal_error(make_bridge, caplog):
+    """5.0 PR 2b: what can break with an arbitrary exception is the channel's chat.send."""
     caplog.set_level(logging.DEBUG)
     bridge, ws = make_bridge()
-
-    async def s(*a, **k):
-        raise RuntimeError(SECRET)
-        yield  # pragma: no cover
-
-    bridge.orchestrator.stream_response = s
-    await run_turn(bridge, "x")
+    bridge.orchestrator.send.side_effect = RuntimeError(SECRET)
+    await bridge.turns.start_user_turn("x")
     await sent(bridge)
 
     err = ws.of("error")[0]

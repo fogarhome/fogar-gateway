@@ -67,13 +67,25 @@ async def _running_turn(bridge, stream=None) -> asyncio.Task:
 
 
 async def test_cancel_turn_caller_cancelled_while_waiting_is_not_swallowed(bridge):
-    """#221: a caller cancelled while it waits for the old turn to finish gets its
-    CancelledError, after the turn has finished (and sent its turn_end)."""
+    """#221: a caller cancelled while it waits for the turn's chat.abort (5.0 PR 2b: only
+    that run's) gets its CancelledError, after the abort finished and the turn ended (its
+    turn_end sent)."""
     turn = await _running_turn(bridge, _stream_cancelled_slowly)
+    aborting, release = asyncio.Event(), asyncio.Event()
+    abort_run = bridge.orchestrator.abort_run.side_effect
 
+    async def slow_abort(sk, run_id):
+        aborting.set()
+        await release.wait()
+        await abort_run(sk, run_id)
+
+    bridge.orchestrator.abort_run.side_effect = slow_abort
     caller = asyncio.create_task(bridge.turns.cancel("cancelled"))
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(aborting.wait(), 2)
     caller.cancel()
+    await asyncio.sleep(0.01)
+    assert not caller.done(), "the abort was abandoned"
+    release.set()
     await asyncio.gather(caller, return_exceptions=True)
 
     assert caller.cancelled()
@@ -104,11 +116,12 @@ async def test_inherited_cancellation_does_not_kill_the_barge_in_caller(bridge):
     assert bridge.turns.user_task is None
 
 
-async def test_cancel_turn_logs_the_turn_failure_by_type(bridge, caplog):
+async def test_cancel_turn_logs_the_abort_failure_by_type(bridge, caplog):
+    """5.0 PR 2b: what can fail when a turn is cut is its run's chat.abort: logged by type,
+    never by its text; the turn still ends once."""
     started = asyncio.Event()
-    bridge.orchestrator.stream_response = _stream_cancelled_slowly(
-        started, finally_raises=RuntimeError("secreto del turno")
-    )
+    bridge.orchestrator.stream_response = blocking(started)
+    bridge.orchestrator.abort_run.side_effect = RuntimeError("secreto del turno")
     await start_turn(bridge)
     await asyncio.wait_for(started.wait(), 2)
     with caplog.at_level(logging.DEBUG):
@@ -327,18 +340,20 @@ async def test_partial_with_active_turn_barges_in_from_the_client_threshold(
     turn.cancel()
 
 
-async def test_barge_in_before_turn_start_still_gives_the_send_its_pair(make_bridge):
-    """A send cancelled before its task started still gets its turn_start/turn_end pair
-    (auditoría 3.0 ronda 2, G-r2-1), ended `interrupted`."""
+async def test_barge_in_before_turn_start_withdraws_the_send(make_bridge):
+    """5.0 PR 2b: a send cut before its run's first event never opens a turn (its turn opens
+    with that event): its message, already `delivered`, ends `withdrawn` and no pair is owed
+    (G-r2-1 changes with the queue: what a `send` always gets is its `message`)."""
     bridge, ws = make_bridge(**_AUDIO, transcriber=_transcriber())
     bridge.orchestrator.stream_response = blocking()
-    await bridge.turns.start_user_turn("x")  # the task has not run yet
+    await bridge.turns.start_user_turn("x")  # its run has not sent anything yet
 
     await bridge._on_transcription("hello world", False)
 
     msgs = [m for m in await sent(bridge) if isinstance(m, dict)]
-    assert [m["type"] for m in msgs] == ["transcription_partial", "turn_start", "turn_end"]
-    assert msgs[2] == {"type": "turn_end", "turn_id": "t-1", "reason": "interrupted"}
+    assert sorted(m["type"] for m in msgs) == ["message", "message", "transcription_partial"]
+    assert [m["state"] for m in ws.of("message")] == ["delivered", "withdrawn"]
+    assert ws.of("turn_start") == []
 
 
 # ── _on_transcriber_warning ──────────────────────────────────────────────────

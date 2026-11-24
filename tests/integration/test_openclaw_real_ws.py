@@ -386,7 +386,7 @@ def _final(sk, text, seq=11):
 
 
 class Scripted2026_10_5(FakeOpenClawServer):
-    async def _chat_send(self, ws, rid, params):
+    async def _chat_send(self, ws, rid, params, run_id=None):
         sk, scenario = params["sessionKey"], params["message"]
         await ws.send(self._res(rid, {"status": "started"}))
         if scenario == "captured":

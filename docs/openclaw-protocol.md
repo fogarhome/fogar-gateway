@@ -1176,7 +1176,36 @@ the open push). Codes: `auth`/`auth_permanent`/`session_expired`, `auth_invalid_
 explicitly requested agent, as `resolve_agent` does; the handshake keeps its 4020/4021 closes and
 `/v1` its 403).
 
+### How the gateway reacts (5.0 PR 2b.1, 2026-11-24)
+
+`src/fogar_gateway/services/channel.py` (`ConversationChannel`), `services/openclaw/client.py`
+(`send`, `abort_run`), `services/openclaw/dispatcher.py`:
+
+- **No abort before `chat.send`.** A WebSocket message is a plain `chat.send` (no `queueMode`:
+  the per-message param is still untried live); during a turn it waits in OpenClaw's queue. The
+  ack's `runId` is the message's id. Only `cancel`, a `send` with `interrupt` and `withdraw`
+  abort, each with `chat.abort {sessionKey, runId}` (only that run; the gateway tombstones it
+  first, so its `aborted`/lifecycle `end` are dropped). `chat.abort` of the whole key is left
+  for a push without `runId` and for `/v1` (`stream_response`, until 2b.3).
+- **A run opens its turn on its first event**, not on lifecycle `start`: `chat` status, delta,
+  tool or an `error`, a `final` that carries text, `agent` lifecycle `start`/`model`/
+  `fallback_step` or a `run_status`. The `seq gap` `agent` `stream:"error"` opens nothing (it
+  only shows the run alive). A `final` without `message` closes the turn with the text the
+  deltas already brought (`ChatTextTracker`).
+- **Origin before the ack:** while a `chat.send` of the channel waits for its ack, frames of a
+  `runId` nobody knows yet are held by the channel; the ack says whose they are, and what is
+  still unowned is a push (lifecycle `start` still opens a push for a run the channel does not
+  know: removing that rule is 2b.2).
+- **Not yet (2b.2):** a steered run (`session.message` `steerTargetRunId`) is only recognised by
+  its `final` `seq: 1` without `message` and without prior events: the message turns
+  `delivered` and no turn opens; `session.message` is still ignored, and `pendingInputs` is not
+  re-read on reconnect.
+
 ## Change log of this file
+
+- **2026-11-24**: "C3 queue behaviour" gains how the gateway reacts in 5.0 PR 2b.1 (#406): no
+  abort before `chat.send`, `chat.abort` by `runId`, a run opens on its first event, frames
+  held until the ack.
 
 - **2026-11-23**: "Failure fields over the WebSocket" gains how the gateway classifies them (#397).
 

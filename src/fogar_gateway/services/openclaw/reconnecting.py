@@ -10,6 +10,7 @@ from fogar_gateway.services.openclaw.client import (
     OrchestratorRequestError,
 )
 from fogar_gateway.services.openclaw.models import GatewayInfo
+from fogar_gateway.services.orchestration import OrchestratorError
 from fogar_gateway.services.protocol import OrchestratorEvent
 from fogar_gateway.services.reconnection import (
     ConnectionState,
@@ -108,6 +109,25 @@ class ReconnectingOpenClawClient:
     async def abort(self, session_key: str) -> None:
         if self.state == ConnectionState.CONNECTED:
             await self._client.abort(session_key)
+
+    async def send(self, text: str, session_key: str, *, queue_mode: str | None = None) -> str:
+        """`OpenClawClient.send`; sin conexión, `orchestrator_unavailable`. Raises
+        OrchestratorError (a stable code), never anything else."""
+        if self.state != ConnectionState.CONNECTED:
+            self._ensure_loop()
+            raise OrchestratorError(ORCHESTRATOR_UNAVAILABLE_ERROR)
+        try:
+            return await self._client.send(text, session_key, queue_mode=queue_mode)
+        except OrchestratorError:
+            raise
+        except Exception as e:  # noqa: BLE001 — frontera: el envío cede orchestrator_error
+            logger.warning("[%s] send error (%s)", self._name, type(e).__name__)
+            logger.debug("[%s] send traceback (no message): %s", self._name, traceback_no_message(e))
+            raise OrchestratorError(ORCHESTRATOR_ERROR) from None
+
+    async def abort_run(self, session_key: str, run_id: str) -> None:
+        if self.state == ConnectionState.CONNECTED:
+            await self._client.abort_run(session_key, run_id)
 
     async def request(self, method: str, params: dict, timeout: float = 10.0) -> dict:
         """Petición de lectura (`OpenClawClient.request`); sin conexión, `orchestrator_unavailable`."""

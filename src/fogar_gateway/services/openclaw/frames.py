@@ -60,20 +60,32 @@ def health(req_id: str) -> dict:
 # ── Chat ──────────────────────────────────────────────────────────
 
 
-def chat_send(req_id: str, session_key: str, message: str, idempotency_key: str) -> dict:
-    return _req(
-        "chat.send",
-        req_id,
-        {
-            "sessionKey": session_key,
-            "message": message,
-            "idempotencyKey": idempotency_key,
-        },
-    )
+def chat_send(
+    req_id: str,
+    session_key: str,
+    message: str,
+    idempotency_key: str,
+    *,
+    queue_mode: str | None = None,
+) -> dict:
+    """`queue_mode` (`queueMode`, `ChatSendParamsSchema`) only when given: read in OpenClaw's
+    source, not tried live (docs/openclaw-protocol.md, «C3 queue behaviour»)."""
+    params = {
+        "sessionKey": session_key,
+        "message": message,
+        "idempotencyKey": idempotency_key,
+    }
+    if queue_mode is not None:
+        params["queueMode"] = queue_mode
+    return _req("chat.send", req_id, params)
 
 
-def chat_abort(req_id: str, session_key: str) -> dict:
-    return _req("chat.abort", req_id, {"sessionKey": session_key})
+def chat_abort(req_id: str, session_key: str, run_id: str | None = None) -> dict:
+    """Without `run_id`, every run of the key; with it, only that run (a queued one too)."""
+    params = {"sessionKey": session_key}
+    if run_id is not None:
+        params["runId"] = run_id
+    return _req("chat.abort", req_id, params)
 
 
 # ── Lectura (sessions.list, chat.history; M19) ────────────────────

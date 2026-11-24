@@ -17,6 +17,7 @@ from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.main import app
 from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.protocol import OrchestratorEvent
+from tests.fakes.orchestrator import wire_stream_orchestrator
 from tests.integration.conftest import (
     CLIENT_ID,
     CLIENT_NAME,
@@ -161,6 +162,7 @@ def test_disabled_barge_in_does_not_interrupt_in_flight_response(
     received_types = []
 
     with TestClient(app) as client, client.websocket_connect("/ws/stream") as ws:
+        wire_stream_orchestrator(mock_reg, app.state.channel_hub)  # 5.0 PR 2b
         ws.send_json(HANDSHAKE_AUDIO)
         ws.send_bytes(b"\x00" * 512)  # chunk 1 -> final transcription
 
@@ -174,6 +176,7 @@ def test_disabled_barge_in_does_not_interrupt_in_flight_response(
 
         ws.send_json({"type": "send", "text": msg["text"]})  # starts the turn
 
+        assert ws.receive_json()["type"] == "message"  # 5.0 PR 2b: its echo
         msg = ws.receive_json()  # turn_start
         assert msg["type"] == "turn_start"
 

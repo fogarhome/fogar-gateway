@@ -18,7 +18,6 @@ from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.reconnecting import ReconnectingOpenClawClient
 from fogar_gateway.services.openclaw.registry import (
     TURN_IN_PROGRESS_ERROR,
-    ClientRegistry,
     TurnRegistry,
 )
 from fogar_gateway.services.reconnection import ConnectionState
@@ -253,8 +252,7 @@ class SmartFakeWS:
 
 def make_client(fake_ws: SmartFakeWS) -> OpenClawClient:
     turn_reg = TurnRegistry()
-    client_reg = ClientRegistry()
-    dispatcher = FrameDispatcher(turn_reg, client_reg)
+    dispatcher = FrameDispatcher(turn_reg, ChannelHub())
     client = OpenClawClient("127.0.0.1", 18789, "test-token", turn_reg, dispatcher)
     return client
 

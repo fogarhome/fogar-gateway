@@ -179,13 +179,10 @@ async def test_queue_peaks_in_session_end(make_reason_bridge):
     turns.deliver_by_session(sk, ("token", "b"))
     turns.unregister(sk, "req-1")
     assert q.qsize() == 2
-    channel = bridge.channel
-    await channel._lock.acquire()  # a turn being replaced: the push worker waits
-    for kind in ("turn_start", "chat", "chat"):
+    for kind in ("chat", "chat", "chat"):  # 3 at once in the worker's queue (no push opens)
         enqueue_push(bridge, kind, {})
     await asyncio.sleep(0.01)
     await bridge.close_all()
-    channel._lock.release()
     meta = _end_meta(bridge)
     assert meta["turn_queue_peak"] == 2
     assert meta["push_backlog_peak"] == 3

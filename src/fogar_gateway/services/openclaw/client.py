@@ -42,6 +42,7 @@ from fogar_gateway.services.openclaw.registry import (
     TurnInProgress,
     TurnRegistry,
 )
+from fogar_gateway.services.orchestration import OrchestratorError
 from fogar_gateway.services.protocol import ACCEPTED, OrchestratorEvent
 from fogar_gateway.services.reconnection import describe_error, traceback_no_message
 from fogar_gateway.services.teardown import Teardown
@@ -329,6 +330,8 @@ class OpenClawClient:
         self._keepalive_task: asyncio.Task | None = None
         self._connect_lock = asyncio.Lock()
         self._health_futures: dict[str, asyncio.Future] = {}
+        # `chat.send` waiting for their ack (send()): failed at once when the connection drops.
+        self._send_futures: dict[str, asyncio.Future] = {}
         self.gateway_info: GatewayInfo | None = None
         # Called only on unexpected disconnect (not on clean close()).
         # Set by ReconnectingOrchestrator after wrapping this client.
@@ -843,6 +846,75 @@ class OpenClawClient:
             # names are tombstoned for whatever of them is still in flight.
             self._turn_registry.note_abort_result(payload)
 
+    async def send(self, text: str, session_key: str, *, queue_mode: str | None = None) -> str:
+        """`chat.send` and its ack: the run's `runId` (5.0, #406). The run's frames reach the
+        conversation's channel through the dispatcher; this only waits for the ack, never for
+        the reply. `queue_mode` goes as `queueMode` only when given (not tried live).
+
+        Raises:
+            OrchestratorError: a stable code: `orchestrator_unavailable` (not connected),
+                `orchestrator_send_failed` (the frame could not be written),
+                `orchestrator_disconnected` (the connection dropped before the ack),
+                `turn_timeout` (no ack in TURN_TIMEOUT_S) or `orchestrator_error` (OpenClaw
+                refused it, or acked without a runId). Never OpenClaw's own text.
+        """
+        ws = self._ws
+        if ws is None:
+            raise OrchestratorError(ORCHESTRATOR_UNAVAILABLE_ERROR)
+        req_id = str(uuid.uuid4())
+        ack: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._send_futures[req_id] = ack
+        try:
+            frame = frames.chat_send(
+                req_id, session_key, text, str(uuid.uuid4()), queue_mode=queue_mode
+            )
+            try:
+                await ws.send(json.dumps(frame))
+            except Exception as e:  # noqa: BLE001 — frontera: el envío cede orchestrator_send_failed
+                logger.warning("chat.send failed (%s)", type(e).__name__)
+                logger.debug("chat.send traceback (no message): %s", _traceback_no_message(e))
+                raise OrchestratorError(ORCHESTRATOR_SEND_FAILED_ERROR) from None
+            try:
+                res = await asyncio.wait_for(ack, timeout=settings.TURN_TIMEOUT_S)
+            except TimeoutError:
+                logger.warning("chat.send: no ack in TURN_TIMEOUT_S=%ss", settings.TURN_TIMEOUT_S)
+                raise OrchestratorError("turn_timeout") from None
+        finally:
+            self._send_futures.pop(req_id, None)
+        if not isinstance(res, dict) or not res.get("ok"):
+            error = res.get("error") if isinstance(res, dict) else None
+            logger.warning(
+                "OpenClaw rejected the turn (code=%s, %s)", _safe_error_code(error), ORCHESTRATOR_ERROR
+            )
+            raise OrchestratorError(ORCHESTRATOR_ERROR)
+        payload = res.get("payload")
+        run_id = payload.get("runId") if isinstance(payload, dict) else None
+        if not isinstance(run_id, str) or not run_id:
+            logger.warning("chat.send acked without a runId (%s)", ORCHESTRATOR_ERROR)
+            raise OrchestratorError(ORCHESTRATOR_ERROR)
+        return run_id
+
+    async def abort_run(self, session_key: str, run_id: str, timeout: float = 1.0) -> None:
+        """`chat.abort` of one run (`runId`): only that one, a queued one too; the others on
+        the key go on. The caller tombstones the run first (#285), so its `aborted` is dropped
+        by the dispatcher. The answer's `runIds` are tombstoned too. Never raises an
+        Exception."""
+        ws = self._ws
+        if ws is None:
+            return
+        req_id = str(uuid.uuid4())
+        res: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._health_futures[req_id] = res
+        try:
+            await ws.send(json.dumps(frames.chat_abort(req_id, session_key, run_id)))
+            answer = await asyncio.wait_for(res, timeout=timeout)
+            if answer.get("ok"):
+                self._turn_registry.note_abort_result(answer.get("payload"))
+        except Exception as e:  # noqa: BLE001 — frontera: el abort es best-effort
+            logger.debug("chat.abort of a run failed (%s)", describe_error(e))
+        finally:
+            self._health_futures.pop(req_id, None)
+
     async def stream_response(
         self,
         text: str,
@@ -995,6 +1067,13 @@ class OpenClawClient:
             # response — without error_all() it would wait TURN_TIMEOUT_S and keep its
             # session_key occupied (G-04). Stable message: no raw exception text.
             self._turn_registry.error_all(ORCHESTRATOR_DISCONNECTED_ERROR)
+            # 5.0 (#406): a `chat.send` still waiting for its ack, and every run a channel
+            # still waits for, will never hear from this connection again.
+            for ack in self._send_futures.values():
+                if not ack.done():
+                    ack.set_exception(OrchestratorError(ORCHESTRATOR_DISCONNECTED_ERROR))
+            self._send_futures.clear()
+            self._dispatcher.connection_lost(ORCHESTRATOR_DISCONNECTED_ERROR)
             self.access.reset()  # the connection is gone: its access no longer applies
         # A cancellation (clean close()/reconnect) propagates from the `finally` above and
         # never gets here: on_disconnect would wrongly start the reconnect loop (#103).
@@ -1010,8 +1089,8 @@ class OpenClawClient:
         if not isinstance(frame, dict):
             raise TypeError("frame is not an object")
         fid = frame.get("id", "")
-        if fid in self._health_futures:
-            fut = self._health_futures.pop(fid)
+        if fid in self._health_futures or fid in self._send_futures:
+            fut = self._health_futures.pop(fid, None) or self._send_futures.pop(fid)
             if not fut.done():
                 fut.set_result(frame)
             return

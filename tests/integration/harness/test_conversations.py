@@ -240,10 +240,12 @@ async def test_push_of_a_conversation_reaches_the_session_that_has_it_open(harne
 
 
 @pytest.mark.xfail(
-    strict=True,
+    strict=False,
     reason="Decisión 8 de la 5.0 PR 2: hasta la 2b.3, /v1 sigue en stream_response con su propio "
-    "registro por clave y choca con el canal vivo de la conversación (409 turn_in_progress o el "
-    "aborto antes de enviar del canal); la 2b.3 lo manda por el canal.",
+    "registro por clave. Desde la 2b.1 el canal ya no registra la clave ni aborta antes de enviar, "
+    "así que contra este OpenClaw falso (que corre los dos runs a la vez) pasa; contra el real, "
+    "el mensaje de /v1 se plegaría en el turno vivo (steer) hasta que la 2b.3 lo mande por el "
+    "canal esperando su turno.",
 )
 async def test_v1_talks_in_a_conversation_with_a_live_channel(harness, clock):
     client = await harness.connect()
@@ -315,8 +317,7 @@ async def test_a_new_conversation_is_saved_only_if_the_session_opens(harness, db
 async def test_a_revoked_session_ends_its_open_turn_before_the_close(harness, monkeypatch):
     monkeypatch.setattr(settings, "SESSION_REVALIDATE_INTERVAL_S", 0.1)
     client = await harness.connect()
-    await client.send({"type": "send", "text": "wait-revoked"})
-    await harness.openclaw.wait_held(1)
+    await client.send({"type": "send", "text": "hold"})  # 5.0 PR 2b: abierto con su `start`
     await client.collect(lambda m: bool(of_type(m, "turn_start")))
 
     async with harness.admin() as admin:
@@ -436,14 +437,16 @@ async def test_turn_end_reason_for_each_way_a_turn_ends(harness, monkeypatch):
     assert of_type(await run_turn(client, "hola"), "turn_end")[0]["reason"] == "done"
     assert of_type(await run_turn(client, "fail"), "turn_end")[0]["reason"] == "error"
 
-    await client.send({"type": "send", "text": "wait-1"})  # se queda esperando
-    await harness.openclaw.wait_held(1)
-    msgs = await run_turn(client, "otra", ends=2)  # un send nuevo lo sustituye
-    replaced, done = of_type(msgs, "turn_end")
-    assert (replaced["reason"], done["reason"]) == ("replaced", "done")
+    await client.send({"type": "send", "text": "hold"})  # se queda esperando
+    await client.collect(lambda m: len(of_type(m, "turn_start")) == 3)
+    # 5.0 PR 2b: solo un `send` que interrumpe lo corta (sin `interrupt`, esperaría su turno).
+    before = len(client.messages)
+    await client.send({"type": "send", "text": "otra", "interrupt": True})
+    await client.collect(lambda m: len(of_type(m, "turn_end")) == 4)
+    interrupted_, done = of_type(client.messages[before:], "turn_end")
+    assert (interrupted_["reason"], done["reason"]) == ("interrupted", "done")
 
-    await client.send({"type": "send", "text": "wait-2"})
-    await harness.openclaw.wait_held(2)
+    await client.send({"type": "send", "text": "hold"})
     await client.collect(lambda m: len(of_type(m, "turn_start")) == 5)
     await client.send({"type": "cancel"})
     await client.collect(lambda m: len(of_type(m, "turn_end")) == 5)

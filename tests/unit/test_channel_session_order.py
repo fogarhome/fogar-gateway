@@ -92,8 +92,9 @@ async def test_barge_in_during_the_reply_s_audio_spares_the_push_not_yet_shown(m
 
 
 async def test_a_cut_s_turn_end_does_not_wait_for_a_stuck_tts(make_bridge, monkeypatch):
-    """A-r2-2: a `send` cuts the open push while the worker is stuck feeding its TTS: the
-    push's turn_end (`replaced`) goes out at once, the new turn_start behind it."""
+    """A-r2-2: a `send` that interrupts (5.0 PR 2b) cuts the open push while the worker is stuck
+    feeding its TTS: the push's turn_end (`interrupted`) goes out at once, the new turn_start
+    behind it."""
     monkeypatch.setattr(settings, "PUSH_TTS_DRAIN_TIMEOUT_S", 5.0)
     feeding = asyncio.Event()
     stream = _slow_feed_stream(feeding)
@@ -105,17 +106,18 @@ async def test_a_cut_s_turn_end_does_not_wait_for_a_stuck_tts(make_bridge, monke
     await asyncio.wait_for(feeding.wait(), 2)  # the worker is stuck in the push's TTS feed
 
     t0 = time.monotonic()
-    await bridge.turns.start_user_turn("hola")
+    await bridge.turns.start_user_turn("hola", interrupt=True)
     await wait_until(lambda: bool(ws.of("turn_end")), timeout=1.0)
     assert time.monotonic() - t0 < 1.0
-    assert ws.of("turn_end")[0] == {"type": "turn_end", "turn_id": "t-1", "reason": "replaced"}
+    assert ws.of("turn_end")[0] == {"type": "turn_end", "turn_id": "t-1", "reason": "interrupted"}
     assert [t for t, _, _ in _marks(ws)] == ["turn_start", "turn_end"]  # t-2 waits behind it
     await bridge.close_all()
 
 
 async def test_close_drains_the_queue_in_order_never_two_turns_open(make_bridge):
-    """#202 on close: the push cut by a `send` ends `replaced`, and only then the send's own
-    turn_start goes out, with its queued end (its reply was already done in the channel)."""
+    """#202 on close: the push cut by an interrupting `send` ends `interrupted`, and only then
+    the send's own turn_start goes out, with its queued end (its reply was already done in the
+    channel)."""
     feeding = asyncio.Event()
     stream = _slow_feed_stream(feeding)
     bridge, ws = make_bridge(client_id="hab", output_mode=("audio", "text"), tts=_provider(stream))
@@ -124,7 +126,7 @@ async def test_close_drains_the_queue_in_order_never_two_turns_open(make_bridge)
     enqueue_push(bridge, "turn_start", sk, "rp")
     enqueue_push(bridge, "chat", {"sessionKey": sk, "runId": "rp", "deltaText": "aviso"}, "rp")
     await asyncio.wait_for(feeding.wait(), 2)
-    await bridge.turns.start_user_turn("hola")  # cuts the push, opens the user turn
+    await bridge.turns.start_user_turn("hola", interrupt=True)  # cuts the push
     await asyncio.sleep(0.05)
     await asyncio.wait_for(bridge.close_all(), 5)
 
@@ -133,7 +135,7 @@ async def test_close_drains_the_queue_in_order_never_two_turns_open(make_bridge)
     for kind, _, _ in marks:
         open_ += 1 if kind == "turn_start" else -1
         assert 0 <= open_ <= 1, f"two turns open at once on the socket: {marks}"
-    assert marks[:2] == [("turn_start", "t-1", "push"), ("turn_end", "t-1", "replaced")]
+    assert marks[:2] == [("turn_start", "t-1", "push"), ("turn_end", "t-1", "interrupted")]
     assert marks[2:] == [("turn_start", "t-2", "user"), ("turn_end", "t-2", "done")]
 
 
@@ -246,7 +248,7 @@ async def test_close_does_not_leave_a_cut_s_turn_end_running(make_bridge, monkey
     enqueue_push(bridge, "turn_start", sk, "rp")
     enqueue_push(bridge, "chat", {"sessionKey": sk, "runId": "rp", "deltaText": "aviso"}, "rp")
     await asyncio.wait_for(feeding.wait(), 2)
-    await bridge.turns.start_user_turn("hola")  # cuts the push: its turn_end in a task
+    await bridge.turns.start_user_turn("hola", interrupt=True)  # its turn_end in a task
     await wait_until(lambda: bool(ws.of("turn_end")), timeout=1.0)
     cuts = [t for t in bridge.turns._cuts if not t.done()]
     assert cuts, "the cut's turn_end is not stuck in its TTS release"
@@ -257,7 +259,7 @@ async def test_close_does_not_leave_a_cut_s_turn_end_running(make_bridge, monkey
     for _ in range(3):
         await asyncio.sleep(0)
     assert all(t.done() for t in cuts), "a cut's turn_end task outlived the close"
-    assert ws.of("turn_end")[0] == {"type": "turn_end", "turn_id": "t-1", "reason": "replaced"}
+    assert ws.of("turn_end")[0] == {"type": "turn_end", "turn_id": "t-1", "reason": "interrupted"}
 
 
 async def test_hub_close_retrieves_an_overrunning_channel_close(caplog):

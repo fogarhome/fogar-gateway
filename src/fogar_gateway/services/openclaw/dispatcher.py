@@ -23,18 +23,31 @@ def _run_id(payload: dict) -> str | None:
     return run_id if isinstance(run_id, str) else None
 
 
+def _taken(
+    channel: "ConversationChannel | None", event: str, payload: dict, *, hold: bool = False
+) -> bool:
+    """The channel took the frame: one of its own runs (or, with `hold`, one it holds until a
+    `chat.send` ack names its run). `is True`: a stand-in channel never takes anything."""
+    return channel is not None and channel.take_frame(event, payload, hold=hold) is True
+
+
 class Channels(Protocol):
-    """Where a push goes: `ChannelHub` (services/channel.py)."""
+    """Where a key's frames go: `ChannelHub` (services/channel.py)."""
 
     def channel_for(self, session_key: str) -> "ConversationChannel | None": ...
+
+    def connection_lost(self, code: str) -> None: ...
 
 
 class FrameDispatcher:
     """Routes incoming OpenClaw frames to the correct queue or channel.
 
     Knows about TurnRegistry and the conversation channels (5.0, #406). Does not touch
-    WebSocket or TTS. The run of a user turn still reaches its turn by `deliver_by_session`;
-    every other frame of a key goes to its conversation's channel (`channel_for`: the
+    WebSocket or TTS. A frame of a run a channel sent (`ConversationChannel.take_frame`) goes
+    to that channel first; the run of a /v1 turn (`stream_response`, until 5.0 PR 2b.3)
+    reaches it by `deliver_by_session`; a frame of a run no one knows yet while its channel
+    waits for a `chat.send` ack is held by the channel (decision 3 of the 5.0 PR 2 plan);
+    everything else is a push of the key's conversation's channel (`channel_for`: the
     conversation from the index, the channel created if none is live). A key no
     conversation has goes nowhere.
 
@@ -119,12 +132,14 @@ class FrameDispatcher:
             return
         ended = payload.get("state") in _TERMINAL_CHAT
         self._turns.note_run_activity(sk, _run_id(payload), ended=ended)
+        channel = self._channels.channel_for(sk)
+        if _taken(channel, "chat", payload):
+            return
         if self._turns.deliver_by_session(sk, ("chat", payload), _run_id(payload)):
             return
         if self._turns.is_aborted(sk):
             return  # late frame of a turn aborted for overflow (#130 S3b)
-        channel = self._channels.channel_for(sk)
-        if channel is not None:
+        if channel is not None and not _taken(channel, "chat", payload, hold=True):
             channel.enqueue_push("chat", payload, run_id=_run_id(payload))
 
     async def _handle_agent_lifecycle(self, payload: dict) -> None:
@@ -132,6 +147,12 @@ class FrameDispatcher:
         if sk is None or self._of_aborted_run(payload):
             return
         stream = payload.get("stream")
+        channel = self._channels.channel_for(sk)
+        if _taken(channel, "agent", payload):
+            # A run the channel sent: every stream of it is the channel's (it opens its turn
+            # on the run's first event, not on `start`: docs/openclaw-protocol.md, C3).
+            self._turns.note_run_activity(sk, _run_id(payload), ended=False)
+            return
         if stream is not None and stream != "lifecycle":
             # `agent` events of other streams (`item`, `tool`, `assistant`, `thinking`,
             # `run_status`…) also carry `data.phase` (`item`: start/update/end), but only
@@ -148,10 +169,9 @@ class FrameDispatcher:
             # Only its structural fields are read; it opens or ends nothing.
             if self._turns.deliver_by_session(sk, ("agent", data), _run_id(payload)):
                 return
-            if (channel := self._channels.channel_for(sk)) is not None:
+            if channel is not None and not _taken(channel, "agent", payload, hold=True):
                 channel.enqueue_push("fallback", data, run_id=_run_id(payload))
             return
-        channel = self._channels.channel_for(sk)
         if channel is None:
             return
         if phase == "start":
@@ -171,7 +191,8 @@ class FrameDispatcher:
             if self._turns.is_aborted(sk):
                 logger.debug("agent start suppressed: turn aborted for overflow sk=%s", sk)
                 return
-            channel.enqueue_push("turn_start", sk, run_id=_run_id(payload))
+            if not _taken(channel, "agent", payload, hold=True):
+                channel.enqueue_push("turn_start", sk, run_id=_run_id(payload))
         elif phase in ("end", "error"):
             # "error" (#300): a failed run ends with it instead of "end".
             # Always forwarded, never suppressed: the push end already
@@ -184,6 +205,8 @@ class FrameDispatcher:
             # the push open forever, its TTS connection never closed,
             # and the push path permanently dead for the rest of the session
             # (caught in final review, 2026-08-04).
+            if _taken(channel, "agent", payload, hold=True):
+                return
             if phase == "error":  # #397: its `data`, which the push classifies
                 channel.enqueue_push("turn_error", data, run_id=_run_id(payload))
             else:
@@ -197,10 +220,19 @@ class FrameDispatcher:
         data = _as_dict(payload.get("data"))
         if data.get("phase") not in ("start", "result"):
             return
+        channel = self._channels.channel_for(sk)
+        if _taken(channel, "session.tool", payload):
+            return
         if self._turns.deliver_by_session(sk, ("tool", data), _run_id(payload)):
             return
         if self._turns.is_aborted(sk):
             return  # late frame of a turn aborted for overflow (#130 S3b)
-        channel = self._channels.channel_for(sk)
-        if channel is not None:
+        if channel is not None and not _taken(channel, "session.tool", payload, hold=True):
             channel.enqueue_push("tool", data, run_id=_run_id(payload))
+
+    def connection_lost(self, code: str) -> None:
+        """The OpenClaw connection dropped (`OpenClawClient._listen`): every channel ends the
+        runs it was waiting for with `code` (a stable one, `orchestrator_disconnected`)."""
+        lost = getattr(self._channels, "connection_lost", None)
+        if lost is not None:
+            lost(code)

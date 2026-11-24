@@ -23,6 +23,7 @@ from fogar_gateway.services.openclaw.models import GatewayInfo
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
 from fogar_gateway.services.protocol import OrchestratorEvent, OrchestratorProtocol
 from fogar_gateway.services.reconnection import ConnectionState, ServiceStatus
+from tests.fakes.orchestrator import wire_stream_orchestrator
 
 # ---------------------------------------------------------------------------
 # Datos de test estándar
@@ -237,6 +238,7 @@ def client(mock_services, mock_registry, seed_client, monkeypatch):
     with TestClient(
         app, client=("127.0.0.1", 50000), headers={"x-real-ip": "127.0.0.1"}
     ) as c:
+        wire_stream_orchestrator(mock_registry, app.state.channel_hub)
         yield c
 
 
@@ -246,6 +248,7 @@ def client_untrusted(mock_services, mock_registry, seed_client, monkeypatch):
     (203.0.113.5 es TEST-NET-3, RFC 5737 — rango reservado para documentación)."""
     _configure_app_mocks(mock_registry, monkeypatch)
     with TestClient(app, client=("203.0.113.5", 54321)) as c:
+        wire_stream_orchestrator(mock_registry, app.state.channel_hub)
         yield c
 
 

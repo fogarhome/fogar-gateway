@@ -161,7 +161,8 @@ async def test_a_revoked_slow_client_gets_the_whole_pair_or_nothing(make_bridge)
     await asyncio.sleep(0.05)
     ws.gate.set()
     await asyncio.wait_for(close, 2)
-    assert turn_marks(ws) == [("turn_start", "t-1"), ("turn_end", "t-1")]
+    # 5.0 PR 2b: its turn opens with its run's first event, which may not have come yet.
+    assert turn_marks(ws) in ([], [("turn_start", "t-1"), ("turn_end", "t-1")])
 
 
 async def test_turn_end_of_a_cancelled_turn_does_not_wait_for_the_tts_close(make_bridge, monkeypatch):
@@ -197,8 +198,9 @@ async def test_turn_end_of_a_cancelled_turn_does_not_wait_for_the_tts_close(make
     assert not any(isinstance(m, bytes) for m in ws.sent[ends[0]:])
 
 
-async def test_a_send_replaced_before_it_starts_still_gets_its_pair(make_bridge):
-    """G-r2-1: dos `send` seguidos → dos pares; el del primero, `replaced`."""
+async def test_two_sends_in_a_row_get_two_pairs_in_order(make_bridge):
+    """G-r2-1 con la cola (5.0 PR 2b): dos `send` seguidos → dos pares, el segundo detrás del
+    primero (ya no lo sustituye): los dos `done`."""
     bridge, ws = make_bridge()
     bridge.orchestrator.stream_response = tokens("ok")
     await bridge.turns.start_user_turn("uno")
@@ -208,19 +210,22 @@ async def test_a_send_replaced_before_it_starts_still_gets_its_pair(make_bridge)
     assert turn_marks(ws) == [
         ("turn_start", "t-1"), ("turn_end", "t-1"), ("turn_start", "t-2"), ("turn_end", "t-2"),
     ]
-    assert [m["reason"] for m in ws.of("turn_end")] == ["replaced", "done"]
+    assert [m["reason"] for m in ws.of("turn_end")] == ["done", "done"]
     assert {m["conversation"] for m in ws.of("turn_start")} == {bridge.conversation.id}
 
 
-async def test_a_send_cancelled_before_it_starts_still_gets_its_pair(make_bridge):
-    """G-r2-1: `send` y `cancel` seguidos → un par `cancelled`."""
+async def test_a_send_cancelled_before_it_starts_is_withdrawn_without_a_pair(make_bridge):
+    """G-r2-1 con la cola (5.0 PR 2b): `send` y `cancel` seguidos, antes del primer evento de su
+    run → su run se aborta (solo ese) y su mensaje queda `withdrawn`; sin turno, sin par."""
     bridge, ws = make_bridge()
     bridge.orchestrator.stream_response = tokens("ok")
     await bridge.turns.start_user_turn("uno")
-    assert await bridge.turns.cancel("cancelled") == (True, "t-1")
+    assert await bridge.turns.cancel("cancelled") == (False, None)
     await sent(bridge)
-    assert turn_marks(ws) == [("turn_start", "t-1"), ("turn_end", "t-1")]
-    assert ws.of("turn_end")[0]["reason"] == "cancelled"
+    assert turn_marks(ws) == []
+    assert [m["state"] for m in ws.of("message")] == ["delivered", "withdrawn"]
+    (run_id,) = {m["id"] for m in ws.of("message")}
+    bridge.orchestrator.abort_run.assert_awaited_once_with(bridge._session_key(), run_id)
 
 
 async def test_turn_end_of_a_turn_cancelled_while_its_audio_plays_is_not_late(make_bridge, monkeypatch):
@@ -257,8 +262,9 @@ async def test_turn_end_of_a_turn_cancelled_while_its_audio_plays_is_not_late(ma
     assert not any(isinstance(m, bytes) for m in ws.sent[ends[0]:])
 
 
-async def test_the_pair_of_an_unstarted_send_does_not_count_as_a_turn(make_bridge):
-    """G-r2-1 (revisión): el par de un send que no llegó a OpenClaw no suma en la conversación."""
+async def test_each_turn_of_the_channel_counts_once(make_bridge):
+    """G-r2-1 (revisión) con la cola (5.0 PR 2b): dos `send` son dos turnos, y cada uno suma
+    una vez en la conversación (al abrirse)."""
     bridge, ws = make_bridge()
     bridge.orchestrator.stream_response = tokens("ok")
     noted = []
@@ -267,26 +273,27 @@ async def test_the_pair_of_an_unstarted_send_does_not_count_as_a_turn(make_bridg
     await bridge.turns.start_user_turn("dos")
     await asyncio.wait({bridge.turns.user_task}, timeout=2)
     await sent(bridge)
-    assert len(ws.of("turn_start")) == 2 and noted == [bridge.conversation.id]
+    assert len(ws.of("turn_start")) == 2 and noted == [bridge.conversation.id] * 2
 
 
-async def test_a_revocation_gives_an_unstarted_send_its_pair(make_bridge):
-    """G-r2-1 (revisión): revocada, un send aceptado cuya tarea aún no corrió recibe su par
-    `closed`."""
+async def test_a_revocation_before_the_send_s_turn_opens_leaves_no_lone_turn_end(make_bridge):
+    """G-r2-1 (revisión) con la cola (5.0 PR 2b): revocada antes del primer evento de su run,
+    la sesión no tiene turno que cerrar: nunca un turn_end solo (o el par entero)."""
     bridge, ws = make_bridge(ClosingWS())
     bridge.orchestrator.stream_response = blocking()
-    await bridge.turns.start_user_turn("uno")  # su tarea aún no corrió
+    await bridge.turns.start_user_turn("uno")  # su run aún no mandó nada
     await asyncio.wait_for(bridge.revoke(), 2)
-    assert turn_marks(ws) == [("turn_start", "t-1"), ("turn_end", "t-1")]
-    assert ws.of("turn_end")[0]["reason"] == "closed"
+    assert turn_marks(ws) in ([], [("turn_start", "t-1"), ("turn_end", "t-1")])
+    assert [m["reason"] for m in ws.of("turn_end")] in ([], ["closed"])
 
 
-async def test_close_all_gives_an_unstarted_send_its_pair(make_bridge):
-    """A-r3-1: un send aceptado cuya tarea aún no corrió y close_all → su par `closed`."""
+async def test_close_all_before_the_send_s_turn_opens_leaves_no_lone_turn_end(make_bridge):
+    """A-r3-1 con la cola (5.0 PR 2b): close_all antes del primer evento de su run → ningún
+    turno que cerrar (o el par entero, `closed`)."""
     bridge, ws = make_bridge()
     bridge.orchestrator.stream_response = blocking()
-    await bridge.turns.start_user_turn("uno")  # su tarea aún no corrió
+    await bridge.turns.start_user_turn("uno")  # su run aún no mandó nada
     await bridge.close_all()
     await sent(bridge)
-    assert turn_marks(ws) == [("turn_start", "t-1"), ("turn_end", "t-1")]
-    assert ws.of("turn_end")[0]["reason"] == "closed"
+    assert turn_marks(ws) in ([], [("turn_start", "t-1"), ("turn_end", "t-1")])
+    assert [m["reason"] for m in ws.of("turn_end")] in ([], ["closed"])

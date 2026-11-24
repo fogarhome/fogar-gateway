@@ -1,0 +1,420 @@
+"""Messages go to OpenClaw's queue (5.0 PR 2b.1, #406).
+
+Two real sessions (`FogarBridge`) of two devices attached to one conversation's channel, a real
+`OpenClawClient` and `FrameDispatcher`, and the OpenClaw fake in `queue` mode (2026.11.7,
+`followup`: one run at a time per key; a run drained from the queue gets no lifecycle `start`
+and its `final` carries no `message`; docs/openclaw-protocol.md «C3 queue behaviour»).
+
+What the plan asks of 2b.1: a `send` during a turn never aborts anything (it waits, `pending`);
+every accepted message reaches every attached session as `message` (with `self`); `interrupt`
+aborts the active run only; `withdraw` aborts that pending run only; `cancel` from any session
+ends the turn for all; frames before the ack wait for it; `turn_start.by`; a late session gets
+the pending messages; one turn_end per turn_start on every socket.
+"""
+
+import asyncio
+import json
+
+import pytest
+
+from fogar_gateway.models.schemas import Client
+from fogar_gateway.services.channel import ChannelHub
+from fogar_gateway.services.conversations import ConversationIndex, SessionConversation
+from fogar_gateway.services.openclaw.client import OpenClawClient
+from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
+from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+from tests.fakes.bridge import keyed_conversation, sent, wait_until
+from tests.fakes.openclaw import FakeOpenClawServer, SendOnlyOpenClawWS
+
+CONVERSATION = keyed_conversation("shared", id="conv-q")
+SK = CONVERSATION.session_key
+NAMES = {"tv": "Tele del salón", "mac": "Mac de Ana", "web": "Web"}
+
+
+@pytest.fixture
+async def openclaw():
+    async with FakeOpenClawServer(queue=True) as server:
+        yield server
+
+
+@pytest.fixture
+async def hub(openclaw):
+    index = ConversationIndex()
+    index.add(CONVERSATION)
+    turns = TurnRegistry()
+    hub = ChannelHub(index=index, turn_registry=turns)
+    client = OpenClawClient("127.0.0.1", openclaw.port, "tok", turns, FrameDispatcher(turns, hub))
+    hub.orchestrator = client
+    await client.connect()
+    yield hub
+    await hub.aclose(1.0)
+    await client.close()
+
+
+@pytest.fixture
+def session(make_bridge, hub):
+    """`session(client_id) -> (bridge, ws)`: a device's session attached to the shared
+    conversation's channel."""
+
+    def _make(client_id, **overrides):
+        return make_bridge(
+            client=Client(id=client_id, key_hash="k", is_active=True, name=NAMES[client_id]),
+            client_id=client_id,
+            orchestrator=hub.orchestrator,
+            turn_registry=hub.turn_registry,
+            channel_hub=hub,
+            client_registry=ClientRegistry(hub.index),
+            conversation=SessionConversation(CONVERSATION, explicit=True),
+            **overrides,
+        )
+
+    return _make
+
+
+def pairs(ws) -> list[tuple]:
+    """(type, turn_id, origin or reason) of every turn_start/turn_end the client got."""
+    return [
+        (m["type"], m["turn_id"], m.get("origin") or m.get("reason"))
+        for m in ws.sent
+        if isinstance(m, dict) and m["type"] in ("turn_start", "turn_end")
+    ]
+
+
+def messages(ws) -> list[tuple]:
+    """(id, text, state, self) of every `message` the client got."""
+    return [(m["id"], m["text"], m["state"], m["from"]["self"]) for m in ws.of("message")]
+
+
+def texts(ws, turn_id) -> str:
+    return "".join(m["text"] for m in ws.of("token") if m["turn_id"] == turn_id)
+
+
+def assert_paired(ws) -> None:
+    """Per socket: one turn_end per turn_start, never two turns open at once."""
+    open_turn = None
+    for kind, turn_id, _ in pairs(ws):
+        if kind == "turn_start":
+            assert open_turn is None, f"{turn_id} opened with {open_turn} still open"
+            open_turn = turn_id
+        else:
+            assert turn_id == open_turn, f"turn_end of {turn_id} without its turn_start"
+            open_turn = None
+    assert open_turn is None, f"{open_turn} was never closed"
+
+
+async def settle(*bridges) -> None:
+    """The channel's worker and each session's queue and sender, drained."""
+    for bridge in bridges:
+        channel = bridge.channel_hub.get(SK)
+        if channel is not None:
+            await channel.push_idle()
+        await sent(bridge)
+
+
+async def turns_ended(ws, n: int) -> None:
+    await wait_until(lambda: len(ws.of("turn_end")) >= n, timeout=5)
+
+
+# ── A message during a turn waits in OpenClaw's queue ─────────────────────
+
+
+async def test_send_during_turn_does_not_abort(session, openclaw):
+    tv, tv_ws = session("tv")
+    mac, mac_ws = session("mac")
+    await tv.turns.start_user_turn("hold-a")
+    run_a = await openclaw.wait_running(SK)
+    await wait_until(lambda: tv_ws.of("token"))
+
+    await mac.turns.start_user_turn("b")  # A is running: B goes to the queue, nothing aborted
+    await openclaw.wait_queued(SK, 1)
+    await settle(tv, mac)
+    assert openclaw.aborts == []
+    assert [m for m, _ in openclaw.calls] == ["chat.send", "chat.send"]
+    (run_b,) = openclaw.queued[SK]
+    for ws in (tv_ws, mac_ws):
+        assert pairs(ws) == [("turn_start", "t-1", "user")]  # A goes on, not replaced
+        assert [(i, s) for i, _, s, _ in messages(ws)] == [(run_a, "delivered"), (run_b, "pending")]
+
+    openclaw.release_run(run_a)
+    await turns_ended(tv_ws, 2), await turns_ended(mac_ws, 2)
+    await settle(tv, mac)
+    for ws in (tv_ws, mac_ws):
+        assert pairs(ws) == [
+            ("turn_start", "t-1", "user"), ("turn_end", "t-1", "done"),
+            ("turn_start", "t-2", "user"), ("turn_end", "t-2", "done"),
+        ]  # fmt: skip
+        assert texts(ws, "t-1") == "reply-hold-a"
+        # B ran drained from the queue: no lifecycle `start`, its `final` without `message`.
+        assert texts(ws, "t-2") == "reply-b"
+        assert [(i, s) for i, _, s, _ in messages(ws)][-1] == (run_b, "delivered")
+        assert ws.of("error") == []
+        assert_paired(ws)
+    assert openclaw.aborts == []
+
+
+async def test_message_echo_to_all_with_self_flag(session, openclaw):
+    tv, tv_ws = session("tv")
+    mac, mac_ws = session("mac")
+    await tv.turns.start_user_turn("hola")
+    await turns_ended(tv_ws, 1), await turns_ended(mac_ws, 1)
+    await settle(tv, mac)
+
+    for ws, me in ((tv_ws, True), (mac_ws, False)):
+        (message,) = ws.of("message")
+        assert message == {
+            "type": "message",
+            "id": message["id"],
+            "conversation": "conv-q",
+            "text": "hola",
+            "from": {"source": "device", "device_id": "tv", "name": "Tele del salón", "self": me},
+            "state": "delivered",
+        }
+        # The echo goes before the turn that answers it, through the session's own queue.
+        types = ws.types(messages=True)
+        assert types.index("message") < types.index("turn_start")
+        (start,) = ws.of("turn_start")
+        assert start["by"] == {"device_id": "tv", "name": "Tele del salón", "self": me}
+    assert tv_ws.of("message")[0]["id"] == mac_ws.of("message")[0]["id"]
+
+
+async def test_message_text_never_reaches_the_logs(session, openclaw, caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    tv, tv_ws = session("tv")
+    await tv.turns.start_user_turn("SECRETO-del-usuario")
+    await turns_ended(tv_ws, 1)
+    await settle(tv)
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "SECRETO" not in logged
+    assert "text_len=19" in logged
+
+
+# ── Interrupt, withdraw, cancel ───────────────────────────────────────────
+
+
+async def test_interrupt_aborts_only_active_run(session, openclaw):
+    tv, tv_ws = session("tv")
+    mac, mac_ws = session("mac")
+    await tv.turns.start_user_turn("hold-a")
+    run_a = await openclaw.wait_running(SK)
+    await mac.turns.start_user_turn("b")
+    await openclaw.wait_queued(SK, 1)
+    (run_b,) = openclaw.queued[SK]
+
+    await tv.turns.start_user_turn("c", interrupt=True)  # «send now»
+    await turns_ended(tv_ws, 3), await turns_ended(mac_ws, 3)
+    await settle(tv, mac)
+
+    assert openclaw.aborts == [{"sessionKey": SK, "runId": run_a}]  # only A, never the key
+    for ws in (tv_ws, mac_ws):
+        assert pairs(ws) == [
+            ("turn_start", "t-1", "user"), ("turn_end", "t-1", "interrupted"),
+            ("turn_start", "t-2", "user"), ("turn_end", "t-2", "done"),
+            ("turn_start", "t-3", "user"), ("turn_end", "t-3", "done"),
+        ]  # fmt: skip
+        # B (queued) was not touched: it runs before C, as OpenClaw's queue says.
+        assert texts(ws, "t-2") == "reply-b"
+        assert texts(ws, "t-3") == "reply-c"
+        assert [s for i, _, s, _ in messages(ws) if i == run_b] == ["pending", "delivered"]
+        assert_paired(ws)
+
+
+async def test_withdraw_aborts_queued_run_only(session, openclaw):
+    tv, tv_ws = session("tv")
+    mac, mac_ws = session("mac")
+    await tv.turns.start_user_turn("hold-a")
+    run_a = await openclaw.wait_running(SK)
+    await mac.turns.start_user_turn("b")
+    await openclaw.wait_queued(SK, 1)
+    (run_b,) = openclaw.queued[SK]
+
+    assert await tv.turns.withdraw(run_b)  # any device may withdraw a pending message
+    assert not await mac.turns.withdraw(run_b)  # already withdrawn: nothing happens
+    assert not await mac.turns.withdraw(run_a)  # delivered, not pending: nothing happens
+    await settle(tv, mac)
+    assert openclaw.aborts == [{"sessionKey": SK, "runId": run_b}]
+    for ws in (tv_ws, mac_ws):
+        assert [s for i, _, s, _ in messages(ws) if i == run_b] == ["pending", "withdrawn"]
+
+    openclaw.release_run(run_a)  # A was not touched
+    await turns_ended(tv_ws, 1), await turns_ended(mac_ws, 1)
+    await asyncio.sleep(0.1)
+    await settle(tv, mac)
+    for ws in (tv_ws, mac_ws):
+        assert pairs(ws) == [("turn_start", "t-1", "user"), ("turn_end", "t-1", "done")]
+        assert texts(ws, "t-1") == "reply-hold-a"
+        assert_paired(ws)
+
+
+async def test_withdraw_from_the_wire(session, openclaw):
+    """`{"type":"withdraw","message_id":...}` reaches the channel; a malformed one is
+    INVALID_MESSAGE and the session goes on."""
+    tv, tv_ws = session("tv")
+    mac, mac_ws = session("mac")
+    await tv.turns.start_user_turn("hold-a")
+    run_a = await openclaw.wait_running(SK)
+    await tv.turns.start_user_turn("b")
+    await openclaw.wait_queued(SK, 1)
+    (run_b,) = openclaw.queued[SK]
+
+    for frame in ({"type": "withdraw"}, {"type": "withdraw", "message_id": 3},
+                  {"type": "withdraw", "message_id": run_b}):  # fmt: skip
+        mac_ws.inbox.put_nowait({"type": "websocket.message", "text": json.dumps(frame)})
+    mac_ws.inbox.put_nowait({"type": "websocket.disconnect"})
+    await mac._client_input_loop()
+    await settle(tv, mac)
+
+    assert [e["code"] for e in mac_ws.of("error")] == ["INVALID_MESSAGE", "INVALID_MESSAGE"]
+    assert openclaw.aborts == [{"sessionKey": SK, "runId": run_b}]
+    assert [s for i, _, s, _ in messages(tv_ws) if i == run_b] == ["pending", "withdrawn"]
+    openclaw.release_run(run_a)
+    await turns_ended(tv_ws, 1)
+
+
+async def test_cancel_from_any_subscriber_ends_turn_for_all(session, openclaw):
+    tv, tv_ws = session("tv")
+    mac, mac_ws = session("mac")
+    await tv.turns.start_user_turn("hold-a")
+    run_a = await openclaw.wait_running(SK)
+    await wait_until(lambda: mac_ws.of("turn_start"))
+
+    assert await mac.turns.cancel("cancelled") == (True, "t-1")  # «Parar» on the other device
+    await settle(tv, mac)
+
+    assert openclaw.aborts == [{"sessionKey": SK, "runId": run_a}]
+    for ws in (tv_ws, mac_ws):
+        assert pairs(ws) == [("turn_start", "t-1", "user"), ("turn_end", "t-1", "cancelled")]
+        assert_paired(ws)
+
+
+async def test_an_interrupt_from_the_wire_is_a_bool(session, openclaw):
+    tv, tv_ws = session("tv")
+    tv_ws.inbox.put_nowait({
+        "type": "websocket.message", "text": json.dumps({"type": "send", "text": "x", "interrupt": "yes"}),
+    })  # fmt: skip
+    tv_ws.inbox.put_nowait({"type": "websocket.disconnect"})
+    await tv._client_input_loop()
+    await settle(tv)
+    assert [e["code"] for e in tv_ws.of("error")] == ["INVALID_MESSAGE"]
+    assert openclaw.calls == []
+
+
+# ── Order between devices ─────────────────────────────────────────────────
+
+
+async def test_two_sends_from_two_devices_go_in_arrival_order(session, openclaw):
+    tv, tv_ws = session("tv")
+    mac, mac_ws = session("mac")
+    await asyncio.gather(tv.turns.start_user_turn("uno"), mac.turns.start_user_turn("dos"))
+    await turns_ended(tv_ws, 2), await turns_ended(mac_ws, 2)
+    await settle(tv, mac)
+
+    said = [m["content"] for m in openclaw.sessions[SK]["messages"] if m["role"] == "user"]
+    assert said == ["uno", "dos"]
+    for ws in (tv_ws, mac_ws):
+        assert ws.of("error") == []  # no turn_in_progress between devices
+        assert [m["by"]["device_id"] for m in ws.of("turn_start")] == ["tv", "mac"]
+        assert [texts(ws, t) for t in ("t-1", "t-2")] == ["reply-uno", "reply-dos"]
+        assert_paired(ws)
+
+
+# ── A session that attaches later ─────────────────────────────────────────
+
+
+async def test_late_attach_gets_pending_messages(session, openclaw):
+    tv, tv_ws = session("tv")
+    await tv.turns.start_user_turn("hold-a")
+    run_a = await openclaw.wait_running(SK)
+    await wait_until(lambda: tv_ws.of("token"))
+    await tv.turns.start_user_turn("b")
+    await openclaw.wait_queued(SK, 1)
+    (run_b,) = openclaw.queued[SK]
+    await settle(tv)
+
+    web, web_ws = session("web")  # joins mid-turn, with B still waiting
+    await settle(web)
+    assert pairs(web_ws) == [("turn_start", "t-1", "user")]
+    assert texts(web_ws, "t-1") == "reply-hold-a"  # the turn's text so far, in one token
+    assert messages(web_ws) == [(run_b, "b", "pending", False)]  # only what still waits
+    assert web_ws.of("turn_start")[0]["by"] == {"device_id": "tv", "name": "Tele del salón", "self": False}
+
+    openclaw.release_run(run_a)
+    await turns_ended(web_ws, 2)
+    await settle(tv, web)
+    assert [s for i, _, s, _ in messages(web_ws)] == ["pending", "delivered"]
+    assert_paired(web_ws)
+    assert_paired(tv_ws)
+
+
+# ── Origin before the ack (decision 3) ────────────────────────────────────
+
+
+async def test_frames_held_before_the_ack_go_to_the_right_sender(make_bridge):
+    """Frames of a run nobody knows yet, while a `chat.send` waits for its ack, are held: the
+    ack's runId says whose they are. The sender's run gets its own (its turn, its `by`);
+    another run's, still unowned after the ack, is a push."""
+    turns = TurnRegistry()
+    index = ConversationIndex()
+    index.add(CONVERSATION)
+    hub = ChannelHub(index=index, turn_registry=turns)
+    dispatcher = FrameDispatcher(turns, hub)
+    client = OpenClawClient("127.0.0.1", 1, "tok", turns, dispatcher)
+    hub.orchestrator = client
+    client._ws = ws = SendOnlyOpenClawWS()
+    tv, tv_ws = make_bridge(
+        client=Client(id="tv", key_hash="k", is_active=True, name="Tele"), client_id="tv",
+        orchestrator=client, turn_registry=turns, channel_hub=hub,
+        client_registry=ClientRegistry(index), conversation=SessionConversation(CONVERSATION, explicit=True),
+    )  # fmt: skip
+
+    def event(name, payload):
+        return {"type": "event", "event": name, "payload": {"sessionKey": SK, **payload}}
+
+    sending = asyncio.create_task(tv.turns.start_user_turn("hola"))
+    await wait_until(lambda: ws.ids("chat.send"))
+    # Before the ack: a frame of the sender's run and one of another run, both unknown yet.
+    await dispatcher.dispatch(event("chat", {"runId": "run-u", "state": "delta", "deltaText": "mi"}))
+    await dispatcher.dispatch(event("agent", {"runId": "run-x", "stream": "lifecycle", "data": {"phase": "start"}}))
+    (req,) = ws.ids("chat.send")
+    await client._handle_raw_frame(
+        json.dumps({"type": "res", "id": req, "ok": True, "payload": {"runId": "run-u"}})
+    )
+    await asyncio.wait_for(sending, 2)
+    await dispatcher.dispatch(event("chat", {"runId": "run-u", "state": "final"}))
+    await asyncio.wait_for(tv.turns.user_task, 2)
+    await dispatcher.dispatch(event("chat", {"runId": "run-x", "state": "delta", "deltaText": "aviso"}))
+    await dispatcher.dispatch(event("agent", {"runId": "run-x", "stream": "lifecycle", "data": {"phase": "end"}}))
+    await hub.get(SK).push_idle()
+    await sent(tv)
+
+    starts = tv_ws.of("turn_start")
+    assert [(s["origin"], s["by"]) for s in starts] == [
+        ("user", {"device_id": "tv", "name": "Tele", "self": True}), ("push", None),
+    ]
+    assert texts(tv_ws, "t-1") == "mi"
+    assert texts(tv_ws, "t-2") == "aviso"
+    assert_paired(tv_ws)
+    await tv.close_all()
+    await hub.aclose(1.0)
+
+
+async def test_a_lost_connection_ends_the_runs_with_a_stable_error(session, openclaw, hub):
+    """Every run of the channel still waiting when OpenClaw drops ends for every session with
+    TURN_ERROR `orchestrator_disconnected`: the open one, and a queued one (its own pair)."""
+    tv, tv_ws = session("tv")
+    mac, mac_ws = session("mac")
+    await tv.turns.start_user_turn("hold-a")
+    await openclaw.wait_running(SK)
+    await wait_until(lambda: mac_ws.of("token"))
+    await mac.turns.start_user_turn("b")
+    await openclaw.wait_queued(SK, 1)
+
+    for conn in list(openclaw._conns):
+        await conn.close(1011)
+    await turns_ended(tv_ws, 2), await turns_ended(mac_ws, 2)
+    await settle(tv, mac)
+    for ws in (tv_ws, mac_ws):
+        assert [e["message"] for e in ws.of("error")] == ["orchestrator_disconnected"] * 2
+        assert [r for t, _, r in pairs(ws) if t == "turn_end"] == ["error", "error"]
+        assert_paired(ws)

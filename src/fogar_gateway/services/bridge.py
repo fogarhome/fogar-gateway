@@ -755,20 +755,35 @@ class FogarBridge:
                             await self.transcriber.send_end()
 
                     elif json_msg.get("type") == "cancel":
-                        # Cliente cancela el turn activo (o el push que suena) sin lanzar uno nuevo
+                        # Para el turno de la conversación (o el push que suena), lo iniciara
+                        # quien lo iniciara, sin lanzar uno nuevo (C3)
                         await self.turns.cancel("cancelled")
 
                     elif json_msg.get("type") == "send":
-                        # Cliente confirma/edita la transcripción y la envía al orquestador
+                        # Cliente confirma/edita la transcripción y la envía al orquestador:
+                        # entra en la cola de OpenClaw; `interrupt` corta antes el turno activo
                         raw_text = json_msg.get("text", "")
-                        if not isinstance(raw_text, str):
+                        interrupt = json_msg.get("interrupt", False)
+                        if not isinstance(raw_text, str) or not isinstance(interrupt, bool):
                             await self._send_invalid_message()
                         else:
                             # G-r3-1: sin surrogates sueltos, que OpenClaw guardaría tal cual.
                             text = without_lone_surrogates(raw_text).strip()
                             if text:
-                                logger.info(f"[{self.client_id}] send recibido: len={len(text)}")
-                                await self.turns.start_user_turn(text)
+                                logger.info(
+                                    f"[{self.client_id}] send recibido: len={len(text)}"
+                                    f"{' interrupt' if interrupt else ''}"
+                                )
+                                await self.turns.start_user_turn(text, interrupt=interrupt)
+
+                    elif json_msg.get("type") == "withdraw":
+                        # Quita un mensaje pendiente de la conversación (2b): si ya no lo está,
+                        # no pasa nada (otra sesión lo quitó, o ya le tocó su turno)
+                        message_id = json_msg.get("message_id")
+                        if not isinstance(message_id, str) or not message_id:
+                            await self._send_invalid_message()
+                        elif not await self.turns.withdraw(message_id):
+                            logger.debug(f"[{self.client_id}] withdraw ignorado: no está pendiente")
 
         except WebSocketDisconnect as e:
             logger.info(f"[{self.client_id}] Cliente físico desconectado.")

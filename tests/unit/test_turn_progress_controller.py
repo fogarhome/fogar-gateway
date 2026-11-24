@@ -113,7 +113,9 @@ async def test_no_new_progress_once_the_turn_is_marked_cancelled(make_bridge, in
 # ── 2. Un toolCallId raro no rompe el turno ─────────────────────────────────
 
 
-@pytest.mark.parametrize("call_id", [{"id": 1}, ["c1"], None, 3.5])
+# (5.0 PR 2b: a tool call without a `toolCallId` no longer reaches a session's turn: it is
+# dropped when its `session.tool` frame is parsed, `ToolCallEvent.from_session_tool_payload`.)
+@pytest.mark.parametrize("call_id", [{"id": 1}, ["c1"], 3.5])
 async def test_a_malformed_tool_call_id_never_fails_the_turn(make_bridge, interval, call_id):
     interval(0)
     bridge, _ = make_bridge(output_mode=WITH_PROGRESS)

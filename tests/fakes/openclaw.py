@@ -83,6 +83,9 @@ _DEVICE_AUTH_CODES = {
 class FakeOpenClawServer:
     """OpenClaw mínimo y real: handshake v4 + comportamiento de `chat.send` según el texto.
 
+    Todo run de un `chat.send` (salvo `close` y `fail`) empieza con su `agent` lifecycle
+    `start`, como el real.
+
     ok        -> ack started, un delta y final
     hold      -> ack started y espera a `release` antes del final
     partial_hold -> ack started, un delta `reply-partial `, espera a `release`, un delta `fin`
@@ -107,10 +110,10 @@ class FakeOpenClawServer:
                  `release` antes de delta y final
     progress_burst -> ack started, `burst_tools` herramientas seguidas (start y result), una
                  pausa de `burst_pause_s` y delta y final (el ritmo de `turn_progress`)
-    wait*     -> ack started y se queda en cola hasta `finish_next()` (o `release`); entonces
-                 emite su respuesta como una ejecución del agente: agent start, delta
-                 `reply-<texto>`, final, agent end. Ignora `chat.abort`, como un run cuya
-                 respuesta ya iba en camino cuando llegó el abort. `waitprogress*` emite
+    wait*     -> ack started y agent start, y espera a `finish_next()` (o `release`); entonces
+                 emite su respuesta: delta `reply-<texto>`, final, agent end. Ignora
+                 `chat.abort`, como un run cuya respuesta ya iba en camino cuando llegó el
+                 abort. `waitprogress*` emite
                  además, tras su agent start, una fase y una herramienta `late_tool`.
     push(sk, text, end=True, progress=False) -> agent start, chat delta, chat final y agent
                  end, sin `chat.send`; con `end=False` el push queda abierto hasta
@@ -122,6 +125,17 @@ class FakeOpenClawServer:
     chat.abort -> si hay un push abierto en esa `sessionKey`: chat `aborted`, agent end y
                  `res {ok, aborted: true, runIds}`, en el orden del real (6g); si no, solo
                  `res {aborted: false}`. Tras el abort, `push_end`/`push_fail` no emiten nada.
+                 Con `runId` (5.0 PR 2b), solo ese run: el push abierto si es él, o un
+                 `chat.send` en curso o en cola (salvo los `wait*`); los demás siguen.
+                 `aborts` guarda los `params` de cada uno.
+
+    `queue=True` (5.0 PR 2b, la cola de OpenClaw 2026.11.7 en `followup`, docs/openclaw-
+    protocol.md «C3 queue behaviour»): los `chat.send` de una clave corren de uno en uno. El
+    primero, como un run normal: lifecycle `start`, un delta `reply-<texto>` y un `final` con
+    `message` (el texto completo) y lifecycle `end`. Los que esperan en la cola, cuando les
+    toca: sin `start` (en su lugar, `agent` `stream:"error"` `seq gap`), su delta y un `final`
+    SIN `message`. Un texto que empieza por `hold` se para tras su delta hasta `release_run()`
+    (o `release`). `queued` = los runIds que esperan, por clave; `running` = el que corre.
 
     Cada `chat.send` y cada push tienen su `runId` (en el ack y en sus eventos), como el real.
 
@@ -155,8 +169,15 @@ class FakeOpenClawServer:
 
     def __init__(
         self, hello_payload=None, big_bytes=2 * MIB, startup_pending=0, startup_retry_after_ms=50, token=None,
-        port=0, remote=False, challenge_nonce=True,
+        port=0, remote=False, challenge_nonce=True, queue=False,
     ):
+        self.queue = queue
+        self.queued: dict[str, list[str]] = {}  # sessionKey -> runIds en cola (modo `queue`)
+        self.running: dict[str, str] = {}  # sessionKey -> runId que corre (modo `queue`)
+        self._lanes: dict[str, asyncio.Lock] = {}
+        self._run_go: dict[str, asyncio.Event] = {}  # runId -> sigue (los `hold` en `queue`)
+        self._send_runs: dict[str, tuple[str, asyncio.Task]] = {}  # runId -> (sk, su tarea)
+        self.aborts: list[dict] = []  # los `params` de cada chat.abort
         self.connections = 0
         self.token = token
         self.remote = remote
@@ -485,12 +506,18 @@ class FakeOpenClawServer:
                     await self._read(ws, rid, method, params)
                 elif method == "chat.abort":
                     self.calls.append((method, params["sessionKey"]))
-                    await self._chat_abort(ws, rid, params["sessionKey"].lower())
+                    self.aborts.append(params)
+                    await self._chat_abort(ws, rid, params["sessionKey"].lower(), params.get("runId"))
                 elif method == "chat.send":
                     self.calls.append((method, params["sessionKey"]))
-                    task = asyncio.create_task(self._chat_send(ws, rid, params))
+                    run_id = self._new_run()
+                    sender = self._queued_send if self.queue else self._chat_send
+                    task = asyncio.create_task(sender(ws, rid, params, run_id))
                     self._tasks.add(task)
                     task.add_done_callback(self._tasks.discard)
+                    if not params["message"].startswith("wait"):  # los `wait*` ignoran el abort
+                        self._send_runs[run_id] = (params["sessionKey"].lower(), task)
+                        task.add_done_callback(lambda _t, r=run_id: self._send_runs.pop(r, None))
         except websockets.ConnectionClosed:
             pass
         finally:
@@ -516,7 +543,19 @@ class FakeOpenClawServer:
         if text == "progress_late":
             await self._progress_frames(ws, sk, run_id, ("starting_model",), "late_tool")
 
-    async def _chat_abort(self, ws, rid, sk):
+    async def _chat_abort(self, ws, rid, sk, only=None):
+        if only is not None and self._open_pushes.get(sk) != only:
+            run = self._send_runs.get(only)
+            if run is None or run[0] != sk:
+                await ws.send(self._res(rid, {"ok": True, "aborted": False, "runIds": []}))
+                return
+            # Solo ese run (en curso o en cola): los demás de la clave siguen (2026.11.7).
+            run[1].cancel()
+            self._send_runs.pop(only, None)
+            await ws.send(self._chat(sk, "aborted", run_id=only))
+            await ws.send(self._agent_end_aborted(sk, only))
+            await ws.send(self._res(rid, {"ok": True, "aborted": True, "runIds": [only]}))
+            return
         run_id = self._open_pushes.pop(sk, None)
         if run_id is None:
             await ws.send(self._res(rid, {"ok": True, "aborted": False, "runIds": []}))
@@ -525,13 +564,75 @@ class FakeOpenClawServer:
         await ws.send(self._agent(sk, "end", run_id))
         await ws.send(self._res(rid, {"ok": True, "aborted": True, "runIds": [run_id]}))
 
-    async def _chat_send(self, ws, rid, params):
+    @staticmethod
+    def _agent_end_aborted(sk, run_id):
+        data = {"phase": "end", "aborted": True, "status": "cancelled", "providerStarted": False}
+        payload = {"sessionKey": sk, "runId": run_id, "stream": "lifecycle", "data": data}
+        return json.dumps({"type": "event", "event": "agent", "payload": payload})
+
+    def release_run(self, run_id):
+        """Deja seguir un run `hold…` del modo `queue`."""
+        self._run_go.setdefault(run_id, asyncio.Event()).set()
+
+    async def wait_queued(self, sk, n, timeout=5.0):
+        """Espera a que haya `n` runs en la cola de `sk` (modo `queue`)."""
+        async with asyncio.timeout(timeout):
+            while len(self.queued.get(sk, [])) < n:
+                await asyncio.sleep(0.005)
+
+    async def wait_running(self, sk, timeout=5.0):
+        """Espera a que corra un run en `sk` (modo `queue`) y devuelve su runId."""
+        async with asyncio.timeout(timeout):
+            while sk not in self.running:
+                await asyncio.sleep(0.005)
+        return self.running[sk]
+
+    async def _queued_send(self, ws, rid, params, run_id):
+        """Modo `queue`: el ack en el acto; el run, cuando le toca (ver el docstring)."""
+        raw, text = params["sessionKey"], params["message"]
+        sk = raw.lower()
+        self._record(sk, "user", text)
+        lane = self._lanes.setdefault(sk, asyncio.Lock())
+        drained = lane.locked()
+        queued = self.queued.setdefault(sk, [])
+        queued.append(run_id)
+        try:
+            await ws.send(self._res(rid, {"runId": run_id, "status": "started"}))
+            async with lane:
+                queued.remove(run_id)
+                self.running[sk] = run_id
+                try:
+                    if drained:  # sacado de la cola: sin `start`, un aviso `seq gap`
+                        data = {"reason": "seq gap", "expected": 3, "received": 4}
+                        payload = {"sessionKey": sk, "runId": run_id, "stream": "error", "data": data}
+                        await ws.send(json.dumps({"type": "event", "event": "agent", "payload": payload}))
+                    else:
+                        await ws.send(self._agent(sk, "start", run_id))
+                    reply = f"reply-{text}"
+                    await ws.send(self._chat(sk, "delta", reply, run_id))
+                    if text.startswith("hold"):
+                        await self._until_go(self._run_go.setdefault(run_id, asyncio.Event()))
+                    self._record(sk, "assistant", reply)
+                    final = {"sessionKey": sk, "runId": run_id, "state": "final"}
+                    if not drained:  # 2026.10.5: el texto completo en `message`
+                        final["message"] = {"role": "assistant", "content": [{"type": "text", "text": reply}]}
+                    await ws.send(json.dumps({"type": "event", "event": "chat", "payload": final}))
+                    await ws.send(self._agent(sk, "end", run_id))
+                finally:
+                    if self.running.get(sk) == run_id:
+                        del self.running[sk]
+        except websockets.ConnectionClosed:
+            pass
+        finally:
+            if run_id in queued:
+                queued.remove(run_id)
+
+    async def _chat_send(self, ws, rid, params, run_id):
         # OpenClaw 2026.10.5 pasa la clave entera a minúsculas: los eventos llevan la canónica y
         # el ack, `sessionKeyAliases` con la que se pidió (auditoría 3.0, C-1).
         raw, text = params["sessionKey"], params["message"]
         sk = raw.lower()
         aliases = {"sessionKeyAliases": [raw]} if raw != sk else {}
-        run_id = self._new_run()
         self._record(sk, "user", text)
         try:
             if text == "close":
@@ -545,12 +646,14 @@ class FakeOpenClawServer:
                 await ws.send(self._res(rid, {"runId": run_id, "status": "accepted", **aliases}))
             else:
                 await ws.send(self._res(rid, {"runId": run_id, "status": "started", **aliases}))
+            # Un run empieza con su lifecycle `start`, como el real (5.0 PR 2b: el turno se
+            # abre con el primer evento de su run).
+            await ws.send(self._agent(sk, "start", run_id))
             if text.startswith("wait"):
                 go, done = asyncio.Event(), asyncio.Event()
                 self._held.append((go, done))
                 try:
                     await self._until_go(go)
-                    await ws.send(self._agent(sk, "start", run_id))
                     if text.startswith("waitprogress"):
                         await self._progress_frames(ws, sk, run_id, ("starting_model",), "late_tool")
                     await ws.send(self._chat(sk, "delta", f"reply-{text}", run_id))

@@ -14,6 +14,7 @@ import pytest
 from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
 from tests.fakes.bridge import (
+    blocking,
     enqueue_push,
     fixed_conversation,
     push,
@@ -71,7 +72,7 @@ async def test_text_push_is_one_turn_with_its_tokens(make_push_bridge):
     bridge, _ = make_push_bridge(output_mode=("text",))
     await push(bridge, *push_reply("Buenos días!", sk=SK))
     assert await sent(bridge) == [
-        {"type": "turn_start", "turn_id": "t-1", "turn_seq": 1, "conversation": "conv-1", "origin": "push"},
+        {"type": "turn_start", "turn_id": "t-1", "turn_seq": 1, "conversation": "conv-1", "origin": "push", "by": None},
         {"type": "token", "turn_id": "t-1", "text": "Buenos días!"},
         {"type": "turn_end", "turn_id": "t-1", "reason": "done"},
     ]
@@ -150,7 +151,7 @@ async def test_an_open_push_of_a_retired_agent_is_cut_at_its_next_start(make_pus
     bridge.turns.allowed_agents = ["main"]  # lo que deja la revalidación
     await asyncio.wait_for(push(bridge, ("turn_start", sk)), 1)
     assert _turn_frames(await sent(bridge)) == [
-        {"type": "turn_start", "turn_id": "t-1", "turn_seq": 1, "conversation": "conv-1", "origin": "push"},
+        {"type": "turn_start", "turn_id": "t-1", "turn_seq": 1, "conversation": "conv-1", "origin": "push", "by": None},
         {"type": "turn_end", "turn_id": "t-1", "reason": "cancelled"},
     ]
     bridge.orchestrator.abort.assert_awaited_with(sk)
@@ -232,7 +233,7 @@ async def test_multiple_push_starts_and_ends_collapse_to_single_pair(make_push_b
 
     await sent(bridge)
     assert _turn_frames(ws.sent) == [
-        {"type": "turn_start", "turn_id": "t-1", "turn_seq": 1, "conversation": "conv-1", "origin": "push"},
+        {"type": "turn_start", "turn_id": "t-1", "turn_seq": 1, "conversation": "conv-1", "origin": "push", "by": None},
         {"type": "turn_end", "turn_id": "t-1", "reason": "done"},
     ]
     # the next push is t-2: the intermediate starts consumed no turn_seq
@@ -419,12 +420,18 @@ async def test_queued_events_of_a_cut_push_never_reopen_it(make_push_bridge, mon
 
 
 async def test_close_all_while_a_push_waits_for_the_user_turn_ends_promptly(make_push_bridge):
+    """A push that starts while a user turn is open waits for it (5.0 PR 2b: deferred in the
+    channel, one turn at a time); closing the session meanwhile ends promptly and the push
+    never shows."""
     bridge, _ = make_push_bridge(output_mode=("text",))
-    await bridge.channel._lock.acquire()  # a turn being replaced holds the lock
+    started = asyncio.Event()
+    bridge.orchestrator.stream_response = blocking(started)
+    await bridge.turns.start_user_turn("hola")
+    await asyncio.wait_for(started.wait(), 2)
     enqueue_push(bridge, "turn_start", SK)
-    await asyncio.sleep(0.02)
+    await bridge.push_idle()
     await asyncio.wait_for(bridge.close_all(), 2)
-    assert [m for m in await sent(bridge) if m.get("type") == "turn_start"] == []
+    assert [m["origin"] for m in await sent(bridge) if m.get("type") == "turn_start"] == ["user"]
 
 
 async def test_close_all_sends_the_turn_end_of_an_open_push(make_push_bridge):
@@ -438,10 +445,11 @@ async def test_close_all_sends_the_turn_end_of_an_open_push(make_push_bridge):
 
 
 
-async def test_a_queued_push_run_is_aborted_before_the_user_s_chat_send(make_push_bridge):
-    """Review 3: a push run on our key still in the worker backlog (never opened) when the
-    user sends. A chat.send while it runs would be folded into it by OpenClaw: it is
-    tombstoned and aborted first, and the user's turn gets its own reply."""
+async def test_a_push_run_is_not_aborted_by_the_user_s_chat_send(make_push_bridge):
+    """5.0 PR 2b (replaces review 3's abort-before-send): a push run is going when the user
+    sends. Nothing is aborted: the chat.send goes to OpenClaw's queue; the user's run, whose
+    frames are told apart by the ack's runId (held until it), waits for the push to end and
+    then gets its own turn with its own reply."""
     import json
 
     from fogar_gateway.services.channel import ChannelHub
@@ -474,23 +482,36 @@ async def test_a_queued_push_run_is_aborted_before_the_user_s_chat_send(make_pus
 
     await dispatcher.dispatch(event("agent", {"runId": "run-p", "data": {"phase": "start"}}))
     await dispatcher.dispatch(event("chat", {"runId": "run-p", "state": "delta", "deltaText": "aviso"}))
-    await bridge.turns.start_user_turn("hola")  # the push is still queued, unopened
+    sending = asyncio.create_task(bridge.turns.start_user_turn("hola"))
     await wait_until(lambda: ws.ids("chat.send"))
-    assert ws.methods().index("chat.abort") < ws.methods().index("chat.send")
+    assert "chat.abort" not in ws.methods()
 
+    # Before the ack: a frame of a run nobody knows yet is held (it may be the user's).
+    await dispatcher.dispatch(event("chat", {"runId": "run-u", "state": "delta", "deltaText": "mi"}))
     (req,) = ws.ids("chat.send")
-    await dispatcher.dispatch({"type": "res", "id": req, "ok": True, "payload": {"runId": "run-u"}})
-    await dispatcher.dispatch(event("chat", {"runId": "run-p", "state": "delta", "deltaText": "más"}))
-    await dispatcher.dispatch(event("chat", {"runId": "run-u", "state": "delta", "deltaText": "mio"}))
-    await dispatcher.dispatch(event("chat", {"runId": "run-u", "state": "final", "deltaText": ""}))
+    await client._handle_raw_frame(
+        json.dumps({"type": "res", "id": req, "ok": True, "payload": {"runId": "run-u"}})
+    )
+    await asyncio.wait_for(sending, 2)
+    await dispatcher.dispatch(event("chat", {"runId": "run-p", "state": "delta", "deltaText": " más"}))
+    await dispatcher.dispatch(event("chat", {"runId": "run-u", "state": "delta", "deltaText": "o"}))
+    await dispatcher.dispatch(event("chat", {"runId": "run-u", "state": "final"}))
+    await dispatcher.dispatch(event("agent", {"runId": "run-p", "data": {"phase": "end"}}))
     await asyncio.wait_for(bridge.turns.user_task, 2)
     await bridge.push_idle()
 
     msgs = await sent(bridge)
-    assert [(m["type"], m.get("turn_id"), m.get("text")) for m in msgs] == [
-        ("turn_start", "t-1", None), ("token", "t-1", "mio"), ("turn_end", "t-1", None),
+    assert [(m["type"], m.get("turn_id"), m.get("text")) for m in msgs if m["type"] != "message"] == [
+        ("turn_start", "t-1", None), ("token", "t-1", "aviso"), ("token", "t-1", " más"),
+        ("turn_end", "t-1", None),
+        ("turn_start", "t-2", None), ("token", "t-2", "mi"), ("token", "t-2", "o"),
+        ("turn_end", "t-2", None),
     ]  # fmt: skip
-    assert turns.is_run_aborted("run-p")
+    assert [(m["id"], m["state"]) for m in msgs if m["type"] == "message"] == [
+        ("run-u", "pending"), ("run-u", "delivered"),
+    ]
+    assert "chat.abort" not in ws.methods()
+    assert not turns.is_run_aborted("run-p")
     await bridge.close_all()
 
 
@@ -498,8 +519,8 @@ async def test_a_push_whose_turn_start_fails_leaves_no_turn_and_the_next_send_ab
     make_push_bridge,
 ):
     """Review 5, 5.0: no turn_start, no push in this session. The push is the channel's, and
-    a session that failed to show it does not abort it (decision 2); the next `send` cuts and
-    aborts it before its chat.send, so no run is left going under it."""
+    a session that failed to show it does not abort it (decision 2); the next `send` neither
+    (5.0 PR 2b): its run waits for the push to end, then gets its turn."""
     from tests.fakes.bridge import GoneSender
 
     turns = TurnRegistry()
@@ -511,6 +532,11 @@ async def test_a_push_whose_turn_start_fails_leaves_no_turn_and_the_next_send_ab
 
     bridge.orchestrator.stream_response = tokens("ok")
     await bridge.turns.start_user_turn("hola")
-    bridge.orchestrator.abort.assert_awaited_with(SK)
-    assert turns.is_run_aborted("run-p")
+    await bridge.push_idle()
+    assert not bridge.turns.user_task.done()  # its run waits behind the push
+    enqueue_push(bridge, "turn_end", SK, run_id="run-p")
+    await asyncio.wait_for(bridge.turns.user_task, 2)
+    bridge.orchestrator.abort.assert_not_awaited()
+    bridge.orchestrator.abort_run.assert_not_awaited()
+    assert not turns.is_run_aborted("run-p")
     await bridge.close_all()
