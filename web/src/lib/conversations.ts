@@ -16,7 +16,7 @@ export function conversationKind(kind: string): string | null {
 }
 
 /** Se escribe solo en las conversaciones empezadas en este navegador; las demás que puedes ver se
- * leen. Abrir aquí la de otro aparato lo cortaría (4102) mientras no haya varios en una (C3). */
+ * leen (5.0 deja abrir una conversación en varios aparatos a la vez; el rediseño de la web lo usará). */
 export const canWrite = (c: Pick<Conversation, 'client_id'>, deviceId: string | null) =>
   deviceId !== null && c.client_id === deviceId
 

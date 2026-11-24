@@ -383,14 +383,14 @@ async def test_a_day_move_frees_the_old_keys_queue_peak_and_keeps_its_value(make
     assert bridge._session_end_meta("completed")["turn_queue_peak"] == 3
 
 
-async def test_a_session_that_lost_its_conversation_never_aborts_on_that_key(make_bridge):
-    """Red de seguridad del desplazamiento. 5.0: la sesión desplazada deja el canal (`let_go`);
-    después, ni corta nada en él ni aborta en su clave (solo el canal aborta)."""
+async def test_a_session_that_left_its_channel_never_aborts_on_that_key(make_bridge):
+    """5.0 (#406): una sesión que se va (aquí, revocada) deja el canal; después, ni corta nada en
+    él ni aborta en su clave (solo el canal aborta)."""
     from tests.fakes.bridge import push
 
     bridge, _ = make_bridge()
     await push(bridge, ("turn_start", bridge.conversation.session_key))
-    await bridge.turns.let_go(1.0)
+    await asyncio.wait_for(bridge.revoke(), 2)
     assert await bridge.turns.cancel("cancelled") == (False, None)
     bridge.orchestrator.abort.assert_not_awaited()
     await bridge.close_all()
@@ -400,14 +400,17 @@ def _conv(cid, client="tv", agent="main"):
     return Conversation(cid, client, agent, session_key_for(agent, cid), "default", date(2026, 11, 14))
 
 
-def test_a_conversation_is_open_in_one_session_only():
+def test_several_sessions_of_a_client_share_a_conversation():
+    """5.0 (#406): abrir una conversación en otra sesión ya no desplaza a nadie (4102 retirado):
+    las dos quedan registradas, y la conversación, indexada para su push."""
     reg = ClientRegistry()
     old, new = object(), object()
-    assert reg.register("tv", old, _conv("c1")) is None
-    assert reg.register("tv", new, _conv("c1")) is old  # el llamador cierra la vieja
-    assert reg.holder("c1") is new
+    reg.register("tv", old, _conv("c1"))
+    reg.register("tv", new, _conv("c1"))
+    assert reg.for_client("tv") == [old, new]
+    assert reg.index.get(session_key_for("main", "c1")).id == "c1"
     reg.unregister("tv", old)  # el cierre tardío de la vieja no quita a la nueva
-    assert reg.holder("c1") is new and reg.get("tv") is new
+    assert reg.for_client("tv") == [new] and reg.get("tv") is new
 
 
 def _hub(*conversations):
@@ -440,12 +443,3 @@ def test_push_of_a_key_without_a_conversation_goes_nowhere():
     hub = _hub(_conv("today"))
     assert hub.channel_for("agent:main:tv") is None
     assert len(hub) == 0
-
-
-def test_moving_a_session_to_another_conversation():
-    reg = ClientRegistry()
-    tv = object()
-    reg.register("tv", tv, _conv("d1"))
-    reg.close("d1", tv)
-    assert reg.open(_conv("d2"), tv) is None
-    assert reg.holder("d1") is None and reg.holder("d2") is tv

@@ -314,8 +314,8 @@ async def gateway_websocket(websocket: WebSocket):
             await send_close(websocket, Close.ORCHESTRATOR_UNAVAILABLE)
             return
 
-        # 3.55 CONVERSACIÓN (M19): solo una sesión que pasó el health check la abre; la que la
-        # tuviera se cierra (4102) y se espera a que suelte sus turnos antes de `ready`.
+        # 3.55 CONVERSACIÓN (M19): solo una sesión que pasó el health check la abre y se adjunta
+        # a su canal, justo antes de `ready` (5.0: varias sesiones a la vez, sin 4102).
         if handshake.conversation == NEW:
             # Solo ahora: un handshake que acaba en 1011 no deja una conversación vacía (C-3).
             try:
@@ -377,7 +377,7 @@ async def gateway_websocket(websocket: WebSocket):
             await td.step(bridge.close_all(status="error"), "close_all")
             # close_all() queued session_end; drain it before the socket goes away.
             await td.step(sender.aclose(settings.SESSION_TEARDOWN_S), "drenado de la salida")
-            # Un solo cierre por sesión: si ya salió uno de la tabla (4200, 4102, 1011 del
+            # Un solo cierre por sesión: si ya salió uno de la tabla (4200, 4020, 1011 del
             # arranque, 1013…), ese es el que vale.
             if close_sent(websocket) is None and "DISCONNECTED" not in websocket.client_state.name:
                 # 1000 si la sesión acabó bien (inactividad, silencio); 1011 si fue un fallo.

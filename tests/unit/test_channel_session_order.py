@@ -13,7 +13,14 @@ from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.conversations import SessionConversation
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
 from fogar_gateway.services.protocol import OrchestratorEvent
-from tests.fakes.bridge import enqueue_push, keyed_conversation, start_turn, tokens, wait_until
+from tests.fakes.bridge import (
+    enqueue_push,
+    keyed_conversation,
+    sent,
+    start_turn,
+    tokens,
+    wait_until,
+)
 
 
 def _provider(stream):
@@ -136,7 +143,7 @@ async def test_a_send_without_a_channel_gets_a_stable_turn_error(make_bridge):
     bridge, ws = make_bridge(attach=False)
     bridge.turns.attach = lambda: None  # the channel refused it
     await bridge.turns.start_user_turn("hola")
-    await bridge._sender.flush()
+    await sent(bridge)
     assert ws.types() == ["turn_start", "error", "turn_end"]
     assert ws.of("error")[0]["message"] == "internal_error"
     assert ws.of("turn_end")[0]["reason"] == "error"
@@ -186,3 +193,94 @@ async def test_a_departed_sender_s_tracker_gets_no_llm_events(make_bridge):
     await mac.close_all()
     await hub.aclose(1.0)
 
+
+
+async def test_a_refused_send_waits_behind_the_turn_still_open(make_bridge, monkeypatch):
+    """2a.2 review (a): a `send` refused for want of a channel gets its pair through the
+    session's queue: never while an earlier turn is still open on the socket (#202)."""
+    monkeypatch.setattr(settings, "PUSH_TTS_DRAIN_TIMEOUT_S", 0.3)
+    feeding = asyncio.Event()
+    stream = _slow_feed_stream(feeding)
+    bridge, ws = make_bridge(client_id="hab", output_mode=("audio", "text"), tts=_provider(stream))
+    sk = bridge._session_key()
+    enqueue_push(bridge, "turn_start", sk, "rp")
+    enqueue_push(bridge, "chat", {"sessionKey": sk, "runId": "rp", "deltaText": "aviso"}, "rp")
+    await asyncio.wait_for(feeding.wait(), 2)  # the worker is busy with the push's TTS
+    # The channel refuses the session from now on (as if its conversation were not visible).
+    bridge.channel.unsubscribe(bridge.turns)
+    bridge.turns._channel = None
+    bridge.turns.attach = lambda: None
+
+    await bridge.turns.start_user_turn("hola")
+    await wait_until(lambda: len(ws.of("turn_end")) == 2, timeout=3)
+    await bridge._sender.flush()
+
+    marks = _marks(ws)
+    open_ = 0
+    for kind, _, _ in marks:
+        open_ += 1 if kind == "turn_start" else -1
+        assert 0 <= open_ <= 1, f"two turns open at once on the socket: {marks}"
+    assert marks == [
+        ("turn_start", "t-1", "push"), ("turn_end", "t-1", "replaced"),
+        ("turn_start", "t-2", "user"), ("turn_end", "t-2", "error"),
+    ]  # fmt: skip
+    assert ws.of("error")[0]["message"] == "internal_error"
+    await bridge.close_all()
+
+
+async def test_close_does_not_leave_a_cut_s_turn_end_running(make_bridge, monkeypatch):
+    """2a.2 review (b): a cut's turn_end task (its TTS release stuck) is waited for within the
+    teardown bound and then cancelled: it never outlives the session's close unchecked."""
+    monkeypatch.setattr(settings, "PUSH_TTS_DRAIN_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(settings, "SESSION_TEARDOWN_S", 0.1)
+    feeding = asyncio.Event()
+    stream = _slow_feed_stream(feeding)  # the worker stays in the push's TTS feed
+
+    async def stuck_close():
+        await asyncio.sleep(3600)
+
+    stream.close = stuck_close
+    bridge, ws = make_bridge(client_id="hab", output_mode=("audio", "text"), tts=_provider(stream))
+    sk = bridge._session_key()
+    bridge.orchestrator.stream_response = tokens("hola")
+    enqueue_push(bridge, "turn_start", sk, "rp")
+    enqueue_push(bridge, "chat", {"sessionKey": sk, "runId": "rp", "deltaText": "aviso"}, "rp")
+    await asyncio.wait_for(feeding.wait(), 2)
+    await bridge.turns.start_user_turn("hola")  # cuts the push: its turn_end in a task
+    await wait_until(lambda: bool(ws.of("turn_end")), timeout=1.0)
+    cuts = [t for t in bridge.turns._cuts if not t.done()]
+    assert cuts, "the cut's turn_end is not stuck in its TTS release"
+
+    t0 = time.monotonic()
+    await bridge.close_all()
+    assert time.monotonic() - t0 < 0.45  # within the teardown bound, not the TTS one
+    assert all(t.done() or t.cancelling() for t in cuts)
+    assert ws.of("turn_end")[0] == {"type": "turn_end", "turn_id": "t-1", "reason": "replaced"}
+
+
+async def test_hub_close_retrieves_an_overrunning_channel_close(caplog):
+    """2a.2 review (c): a channel close cut by the hub's bound has its outcome retrieved (no
+    «Task exception was never retrieved» with its text)."""
+    import gc
+
+    from fogar_gateway.services.conversations import ConversationIndex
+
+    index = ConversationIndex()
+    conversation = keyed_conversation("x", id="conv-x")
+    index.add(conversation)
+    hub = ChannelHub(index=index, orchestrator=AsyncMock(), turn_registry=TurnRegistry())
+    channel = hub.get_or_create(conversation)
+
+    async def overrunning(limit=None):
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise RuntimeError("secret detail") from None
+
+    channel.aclose = overrunning
+    await hub.aclose(0.05)
+    for _ in range(3):
+        await asyncio.sleep(0)
+    gc.collect()
+    assert "never retrieved" not in caplog.text
+    assert "secret detail" not in caplog.text

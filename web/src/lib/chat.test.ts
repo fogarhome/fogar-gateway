@@ -265,8 +265,8 @@ describe('endReasonText', () => {
 })
 
 describe('closeAction', () => {
-  it('«conversation opened elsewhere» (4102) nunca reconecta solo', () => {
-    expect(closeAction(4102)).toBe('elsewhere')
+  it('el 4102 retirado (5.0) de un gateway viejo cae en la regla de su rango: no reconecta solo', () => {
+    expect(closeAction(4102)).toBe('stop')
   })
   it('para con 4000–4899 (también los que no conoce) y 1008, sin mirar el texto', () => {
     for (const code of [4000, 4001, 4002, 4010, 4020, 4021, 4100, 4101, 4200, 4350, 4899, 1008]) {

@@ -11,7 +11,6 @@ CloseReason = Literal[
     "slow_client",
     "revoked",
     "agent_revoked",  # C-r6-1: su agente salió de allowed_agents (4020); la clave vale
-    "displaced",
     "shutdown",
     "error",
     "unknown",

@@ -46,24 +46,15 @@ _WATCHDOG_POLL_S = 2
 _sleep = asyncio.sleep
 
 
-# Lo que espera una sesión nueva a que la que desplaza suelte su clave (M19): SESSION_TEARDOWN_S
-# para que su turno suelte la clave, más esto para sus chat.abort (cada uno con tope de 1 s).
-_ABORT_SLACK_S = 3.0
-# Revocada o desplazada, la sesión solo manda ya los turn_start/turn_end de sus turnos (G-18):
-# el turn_start pasa también (A-r2-1), o uno aún en la cola se tiraría y su turn_end saldría solo.
+# Revocada o con el agente retirado, la sesión solo manda ya los turn_start/turn_end de sus
+# turnos (G-18): el turn_start pasa también (A-r2-1), o uno aún en la cola se tiraría y su
+# turn_end saldría solo.
 _ONLY_TURN_END = frozenset({"turn_start", "turn_end"})
 
 _REASON_BY_STATUS: dict[str, CloseReason] = {
     "revoked": "revoked",
     "error": "error",
 }
-
-
-async def _take_over(other: "FogarBridge | None") -> None:
-    """La sesión que tenía abierta la conversación (si había otra) se cierra (M19), y se
-    espera, acotado, a que suelte sus turnos: ningún chat.abort suyo sale después."""
-    if other is not None:
-        await other.displace()
 
 
 class FogarBridge:
@@ -110,9 +101,9 @@ class FogarBridge:
         self.conversation = conversation
         conversation.bind(self._spawn_background)
         conversation.on_move = self._on_conversation_move
-        # Desplazada por otra sesión (M19): su cierre, y el aviso de que ya soltó sus turnos.
+        # Su cierre por política (4200 revocada, 4020 agente retirado, 1011 configuración
+        # ilegible): uno por sesión.
         self._policy_close: asyncio.Task | None = None
-        self._released = asyncio.Event()
         # Máximo de la cola de turno de las conversaciones que la sesión ya dejó (#219).
         self._turn_queue_peak = 0
         self.transcriber: SttSession | None = None
@@ -193,10 +184,12 @@ class FogarBridge:
         self._client_registry.register(self.client_id, self)
 
     async def claim_conversation(self) -> None:
-        """Abre la conversación de la sesión (M19) y se adjunta a su canal (5.0). Tras el
-        health check y antes de `ready`: una sesión que no llega a abrirse nunca cierra la que
-        la tenía, ni recibe un turno antes de `ready`."""
-        await _take_over(self._client_registry.open(self.conversation.current, self))
+        """Abre la conversación de la sesión (M19) y se adjunta a su canal (5.0, #406). Tras el
+        health check y justo antes de `ready`: ningún turno llega antes de `ready`. Nunca
+        cierra otra sesión (el 4102 se retiró): las que ya la tenían abierta siguen en el mismo
+        canal. Solo se adjunta si la conversación es visible para su dispositivo
+        (`Conversation.visible_to`, en `TurnController.attach`)."""
+        self._client_registry.index.add(self.conversation.current)
         self.turns.attach()
 
     @property
@@ -208,12 +201,13 @@ class FogarBridge:
         return self.conversation.session_key
 
     async def _on_conversation_move(self, old: Conversation, new: Conversation) -> None:
-        """Cambio de día (M19): la sesión deja la conversación de ayer y abre la de hoy."""
-        self._client_registry.close(old.id, self)
+        """Cambio de día (M19): la conversación de hoy se indexa (su push llega a su canal). El
+        cambio de canal lo hace `TurnController` en ese mismo `send` (decisión 6: deja el de
+        ayer, donde su turno sigue para los demás, y se adjunta al de hoy)."""
+        self._client_registry.index.add(new)
         self._turn_queue_peak = max(
             self._turn_queue_peak, self._turn_registry.pop_peak(old.session_key)
         )
-        await _take_over(self._client_registry.open(new, self))
 
     def snapshot(self) -> dict[str, Any]:
         """Estado vivo de la sesión para /admin/state (#219): solo números, estados e
@@ -556,31 +550,6 @@ class FogarBridge:
         # no debe cancelar el cierre.
         await asyncio.wait({self.revoke()})
 
-    async def displace(self) -> None:
-        """Otra sesión abrió la conversación de esta (M19): se cierra con
-        `Close.CONVERSATION_OPENED_ELSEWHERE` (4102). El cierre corre en una tarea propia de esta sesión; quien la desplaza
-        espera solo a su primer paso, dejar el canal de la conversación (`turns.let_go`),
-        acotado. Desde la 5.0 el canal es el único que aborta en esa clave (5.0 PR 2a.3 quita
-        el desplazamiento)."""
-        if self._policy_close is None:
-            logger.info(
-                f"[{self.client_id}] Conversación {self.conversation.id} abierta en otra sesión."
-            )
-        self._start_policy_close(
-            Close.CONVERSATION_OPENED_ELSEWHERE, "displaced", "session_displaced"
-        )
-        wait_s = settings.SESSION_TEARDOWN_S + _ABORT_SLACK_S
-        try:
-            await asyncio.wait_for(self._released.wait(), timeout=wait_s)
-        except TimeoutError:
-            logger.warning(
-                f"[{self.client_id}] La sesión desplazada no soltó su clave en {wait_s}s; "
-                "la nueva sigue."
-            )
-        finally:
-            # Red de seguridad: pase lo que pase, ya no aborta en la clave que ha perdido.
-            self.conversation.released = True
-
     def _start_policy_close(
         self,
         frame: CloseFrame,
@@ -589,7 +558,7 @@ class FogarBridge:
         status: SessionStatus | None = None,
     ) -> asyncio.Task:
         """Un solo cierre por política por sesión: el primero gana (motivo incluido) y quien
-        llegue después (una revocación durante un desplazamiento) espera a ese."""
+        llegue después (una revocación durante un agente retirado) espera a ese."""
         if self._policy_close is None:
             task = asyncio.create_task(
                 self._policy_close_run(frame, close_reason, event, status), name=close_reason
@@ -607,25 +576,20 @@ class FogarBridge:
         event: str,
         status: SessionStatus | None = None,
     ) -> None:
-        """Cierre por política (4200 revocada, 4102 conversación abierta en otra sesión).
+        """Cierre por política (4200 revocada, 4020 agente retirado, 1011 configuración ilegible).
 
         1. Desde ya no sale nada más que turn_start/turn_end (G-18: ni audio, ni tokens, ni
            avisos); el par entero, nunca un turn_end sin su turn_start (A-r2-1).
-        2. Antes que nada, deja el canal de su conversación (`let_go`): sus turnos se cierran
-           aquí y el del canal sigue para los demás (decisión 2 de la 5.0: nada se aborta). Lo
-           espera quien la desplaza (`_released`), pase lo que pase.
-        3. Exactamente un turn_end por turn_start (G-10): el turno abierto y el push se cierran
-           con `closed` y su turn_end sale, acotado, antes del cierre. Después, el cierre de siempre.
+        2. La sesión deja el canal de su conversación y cierra lo suyo: exactamente un turn_end
+           por turn_start (G-10), con `closed`, acotado, antes del cierre. Nunca aborta nada:
+           el turno del canal sigue para las demás sesiones adjuntas (decisión 2 de la 5.0).
+        3. Después, el cierre de la tabla y el cierre de siempre.
         """
         limit = settings.SESSION_TEARDOWN_S
-        try:
-            self.note_close_reason(close_reason)
-            self._sender.restrict(_ONLY_TURN_END)
-            if self._turn_in_flight_at_close is None:
-                self._turn_in_flight_at_close = self.turns.in_flight()
-            await self.turns.let_go(limit)
-        finally:
-            self._released.set()
+        self.note_close_reason(close_reason)
+        self._sender.restrict(_ONLY_TURN_END)
+        if self._turn_in_flight_at_close is None:
+            self._turn_in_flight_at_close = self.turns.in_flight()
         try:
             await self.tracker.record(event)
         except Exception as e:  # noqa: BLE001 — una métrica nunca impide el cierre
@@ -685,7 +649,7 @@ class FogarBridge:
 
     async def run(self):
         if self._policy_close is not None:
-            # Desplazada o revocada antes de arrancar (durante claim_conversation, A-4): nada
+            # Revocada antes de arrancar (A-4): nada
             # que lanzar. Se espera a su cierre, que manda (su código y su status), en vez de
             # dejar que el close_all(status="error") de routes.py gane.
             await asyncio.wait({self._policy_close})

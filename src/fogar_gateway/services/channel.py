@@ -67,7 +67,7 @@ from fogar_gateway.services.openclaw.models import ToolCallEvent
 from fogar_gateway.services.openclaw.registry import TurnRegistry
 from fogar_gateway.services.reconnection import describe_error, traceback_no_message
 from fogar_gateway.services.stats import gateway_stats
-from fogar_gateway.services.teardown import Teardown
+from fogar_gateway.services.teardown import Teardown, retrieve_outcome
 from fogar_gateway.services.turn_progress import Progress, ProgressPhase, chat_status_phase
 
 if TYPE_CHECKING:
@@ -288,8 +288,9 @@ class ConversationChannel:
     def subscribe(self, subscriber: ChannelSubscriber) -> bool:
         """Attach a session. With a turn open, it gets `on_turn_start` for it. False if it was
         already subscribed or belongs to another conversation."""
-        # Only the conversation id is checked here; whether the session may see the
-        # conversation (`Conversation.visible_to`) is the caller's check (2a.3).
+        # Whether the device may see the conversation (`Conversation.visible_to`) is checked by
+        # the caller (`TurnController.attach`, 2a.3); here, the conversation id and the
+        # private-owner safety net.
         if subscriber.conversation_id != self.conversation.id:
             logger.debug(
                 "Channel subscribe refused: conversation=%s client=%s (other conversation)",
@@ -1040,7 +1041,9 @@ class ChannelHub:
             for task in closing:
                 await td.wait(task, "cierre de un canal", left())
                 if not task.done():
+                    # Abandonado por el tope: su excepción se recoge igual (como Teardown.step).
                     task.cancel()
+                    task.add_done_callback(retrieve_outcome)
             for task in list(self._tasks):
                 task.cancel()
             for task in list(self._tasks):

@@ -102,8 +102,9 @@ async def test_no_audio_leaves_once_the_turn_is_cancelled(make_bridge, monkeypat
     assert frames == []
 
 
-async def test_a_displaced_session_never_sends_a_lone_turn_end(make_bridge):
-    """A-3: un push que esperaba al turno del usuario no se abre en una sesión que se cierra."""
+async def test_a_revoked_session_never_sends_a_lone_turn_end(make_bridge):
+    """A-3: un push que esperaba al turno del usuario no se abre en una sesión que se cierra
+    (por política: desde la 5.0, la revocación; el desplazamiento 4102 se retiró)."""
     bridge, ws = make_bridge(ClosingWS())
     started = asyncio.Event()
     bridge.orchestrator.stream_response = blocking(started)
@@ -111,19 +112,19 @@ async def test_a_displaced_session_never_sends_a_lone_turn_end(make_bridge):
     await asyncio.wait_for(started.wait(), 2)
     enqueue_push(bridge, "turn_start", "agent:main:u")
     await asyncio.sleep(0.02)  # el worker queda esperando al turno del usuario
-    await bridge.displace()
+    bridge.revoke()
     await asyncio.wait_for(bridge._policy_close, 2)
     starts = {i for t, i in turn_marks(ws) if t == "turn_start"}
     ends = [i for t, i in turn_marks(ws) if t == "turn_end"]
     assert ends == ["t-1"] and all(i in starts for i in ends)
-    assert ws.closed is not None and ws.closed[0] == 4102
+    assert ws.closed is not None and ws.closed[0] == 4200
 
 
-async def test_run_after_a_displacement_spawns_nothing_and_keeps_4102(make_bridge):
-    """A-4: desplazada antes de run() (durante claim_conversation), run() no deja tareas vivas y
-    el cierre sigue siendo 4102 con su status, aunque routes.py llame a close_all(status=error)."""
+async def test_run_after_a_policy_close_spawns_nothing_and_keeps_its_close(make_bridge):
+    """A-4: revocada antes de run(), run() no deja tareas vivas y el cierre sigue siendo el suyo
+    (4200) con su status, aunque routes.py llame a close_all(status=error)."""
     bridge, ws = make_bridge(ClosingWS())
-    await bridge.displace()
+    bridge.revoke()
     await asyncio.wait_for(bridge._policy_close, 2)  # el cierre terminó antes de run()
     run = asyncio.create_task(bridge.run())
     await asyncio.wait({run}, timeout=1)
@@ -132,9 +133,9 @@ async def test_run_after_a_displacement_spawns_nothing_and_keeps_4102(make_bridg
         t.cancel()
     assert run.done() and leaked == []
     await bridge.close_all(status="error")  # el finally de routes.py
-    assert ws.closed == (4102, "conversation opened elsewhere")
+    assert ws.closed == (4200, "credential revoked")
     statuses = [c.kwargs.get("status") for c in bridge.tracker.close.await_args_list]
-    assert statuses and "error" not in statuses
+    assert statuses == ["revoked"]
 
 
 
@@ -150,17 +151,16 @@ class GatedClosingWS(ClosingWS):
         self.sent.append(p)
 
 
-async def test_a_displaced_slow_client_gets_the_whole_pair_or_nothing(make_bridge):
-    """A-r2-1: con el turn_start aún en la cola al desplazar, no sale su turn_end solo."""
+async def test_a_revoked_slow_client_gets_the_whole_pair_or_nothing(make_bridge):
+    """A-r2-1: con el turn_start aún en la cola al revocar, no sale su turn_end solo."""
     bridge, ws = make_bridge(GatedClosingWS())
     bridge.orchestrator.stream_response = blocking()
     await bridge._sender.send_json({"type": "status", "service": "tts", "state": "ok"})
     await start_turn(bridge)  # su turn_start espera detrás del status
-    displace = asyncio.create_task(bridge.displace())
+    close = bridge.revoke()
     await asyncio.sleep(0.05)
     ws.gate.set()
-    await asyncio.wait_for(displace, 2)
-    await asyncio.wait_for(bridge._policy_close, 2)
+    await asyncio.wait_for(close, 2)
     assert turn_marks(ws) == [("turn_start", "t-1"), ("turn_end", "t-1")]
 
 
@@ -270,14 +270,13 @@ async def test_the_pair_of_an_unstarted_send_does_not_count_as_a_turn(make_bridg
     assert len(ws.of("turn_start")) == 2 and noted == [bridge.conversation.id]
 
 
-async def test_let_go_gives_an_unstarted_send_its_pair(make_bridge):
-    """G-r2-1 (revisión): desplazada o revocada, un send aceptado cuya tarea aún no corrió
-    recibe su par `closed` (let_go)."""
-    bridge, ws = make_bridge()
+async def test_a_revocation_gives_an_unstarted_send_its_pair(make_bridge):
+    """G-r2-1 (revisión): revocada, un send aceptado cuya tarea aún no corrió recibe su par
+    `closed`."""
+    bridge, ws = make_bridge(ClosingWS())
     bridge.orchestrator.stream_response = blocking()
     await bridge.turns.start_user_turn("uno")  # su tarea aún no corrió
-    await bridge.turns.let_go(1.0)
-    await sent(bridge)
+    await asyncio.wait_for(bridge.revoke(), 2)
     assert turn_marks(ws) == [("turn_start", "t-1"), ("turn_end", "t-1")]
     assert ws.of("turn_end")[0]["reason"] == "closed"
 

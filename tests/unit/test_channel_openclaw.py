@@ -320,3 +320,78 @@ async def test_a_channel_nobody_uses_is_dropped_once_its_turn_ends(session, hub)
     await asyncio.wait_for(task, 2)
     await wait_until(lambda: hub.get(SK) is None)
     assert hub.channel_for(SK) is not None  # a later push gets a fresh one from the index
+
+
+# ── Several sessions in one conversation (2a.3) ───────────────────────────
+
+
+async def test_a_late_session_gets_the_accumulated_text_without_audio(session, hub):
+    """A session that attaches mid-turn gets the turn's turn_start and one `token` with what the
+    turn said so far, then the rest; never the audio (it is the sender's)."""
+    tv, tv_ws = session("tv")
+    tts, stream = _tts()
+    started, go_on = asyncio.Event(), asyncio.Event()
+
+    async def stream_response(*a, **k):
+        yield OrchestratorEvent(type="token", content="uno ")
+        yield OrchestratorEvent(type="token", content="dos ")
+        started.set()
+        await go_on.wait()
+        yield OrchestratorEvent(type="token", content="tres")
+
+    hub.orchestrator.stream_response = stream_response
+    await tv.turns.start_user_turn("hola")
+    task = tv.turns.user_task
+    await asyncio.wait_for(started.wait(), 2)
+
+    mac, mac_ws = session("mac", output_mode=("text", "audio"), tts=tts)
+    go_on.set()
+    await asyncio.wait_for(task, 2)
+    await sent(mac)
+    await sent(tv)
+
+    assert pairs(mac_ws) == [("turn_start", "t-1", "user"), ("turn_end", "t-1", "done")]
+    assert texts(mac_ws) == ["uno dos ", "tres"]
+    assert not any(isinstance(m, bytes) for m in mac_ws.sent)
+    tts.connect.assert_not_awaited()
+    assert texts(tv_ws) == ["uno ", "dos ", "tres"]
+
+
+async def test_a_late_session_without_text_gets_no_catch_up(session, hub):
+    tv, _ = session("tv")
+    started, go_on = asyncio.Event(), asyncio.Event()
+
+    async def stream_response(*a, **k):
+        yield OrchestratorEvent(type="token", content="uno")
+        started.set()
+        await go_on.wait()
+
+    hub.orchestrator.stream_response = stream_response
+    await tv.turns.start_user_turn("hola")
+    task = tv.turns.user_task
+    await asyncio.wait_for(started.wait(), 2)
+    mute, mute_ws = session("mute", output_mode=("status",))
+    go_on.set()
+    await asyncio.wait_for(task, 2)
+    await sent(mute)
+    assert pairs(mute_ws) == [("turn_start", "t-1", "user"), ("turn_end", "t-1", "done")]
+    assert mute_ws.of("token") == []
+
+
+async def test_a_home_device_never_attaches_to_a_private_conversation(make_bridge, hub):
+    """M20: a device attaches only to a conversation visible to it (`visible_to`): never to a
+    private one of a person (from a home device or another person's), never to another home's."""
+    private = keyed_conversation("ana-web", id="conv-private")
+    object.__setattr__(private, "owner_user_id", "ana")
+    other_home = keyed_conversation("vecino", id="conv-other-home")
+    object.__setattr__(other_home, "home_id", "otro-hogar")
+    for conversation in (private, other_home):
+        hub.index.add(conversation)
+        bridge, _ = make_bridge(
+            client_id="tv", orchestrator=hub.orchestrator, turn_registry=hub.turn_registry,
+            channel_hub=hub, client_registry=ClientRegistry(hub.index),
+            conversation=SessionConversation(conversation, explicit=True),
+        )  # fmt: skip
+        assert bridge.channel is None
+        assert hub.get(conversation.session_key) is None
+        await bridge.close_all()

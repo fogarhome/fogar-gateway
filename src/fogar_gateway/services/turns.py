@@ -22,6 +22,12 @@ Cada turno lleva su conversación y su origen en `turn_start`, y el motivo de su
 (`EndReason`) en `turn_end` (M19). La conversación de la sesión se evalúa al empezar cada turno
 del usuario (cambio de día, services/conversations.py): la sesión deja el canal de ayer y se
 adjunta al de hoy.
+
+Varias sesiones en una conversación (5.0 PR 2a.3): cada una es un suscriptor más del canal y
+recibe su propio par de cada turno. Una sesión que se adjunta con un turno abierto recibe su
+`turn_start` y, si muestra texto, un `token` con lo que el turno ya llevaba (`ChannelTurn.text`),
+sin audio. Una sesión que se va (desconexión, revocación, inactividad) cierra lo suyo con
+`closed` y se desuscribe: nunca cancela el turno del canal ni aborta su run.
 """
 
 import asyncio
@@ -390,9 +396,9 @@ class TurnController:
     módulo.
 
     Lo que es de la sesión (socket de entrada, STT, watchdogs, revalidación, cierre) queda en
-    `FogarBridge`, que llama a `attach`, `start_user_turn`, `cancel`, `in_flight`, `let_go` y
-    `close`. Lo que es de la conversación (runs, abortos, cola de push, lock de envío) es del
-    canal (`services/channel.py`).
+    `FogarBridge`, que llama a `attach`, `start_user_turn`, `cancel`, `in_flight` y `close`.
+    Lo que es de la conversación (runs, abortos, cola de push, lock de envío) es del canal
+    (`services/channel.py`).
     """
 
     def __init__(
@@ -495,6 +501,13 @@ class TurnController:
         self._by_channel[turn.id] = local
         self._live.append(local)
         self._put(("turn_start", local))
+        caught_up = turn.text
+        if caught_up:
+            # 2a.3: se adjunta con el turno ya en marcha. Lo dicho hasta ahora le llega en un
+            # solo `token` (solo si muestra texto), nunca como voz: este turno no suena aquí.
+            local.silent = True
+            if self._wants_text:
+                self._put(("event", local, ChannelToken(caught_up)))
 
     def on_event(self, turn: ChannelTurn, event: ChannelEvent) -> None:
         local = self._by_channel.get(turn.id)
@@ -531,7 +544,18 @@ class TurnController:
         await aquí dejaría que un turn_start del canal saliera antes que `ready`."""
         if self._closing or self._channel is not None:
             return
-        channel = self._channels.get_or_create(self._conversation.current)
+        conversation = self._conversation.current
+        client = self._client
+        if not conversation.visible_to(client.home_id, client.user_id):
+            # M20: el handshake ya lo miró (4100); un dispositivo nunca se adjunta a una
+            # conversación que no puede ver (privada de otra persona, u otro hogar). Sin canal,
+            # cada `send` recibe un TURN_ERROR estable.
+            logger.warning(
+                f"[{self._client_id}] La conversación {conversation.id} no es visible para este "
+                "dispositivo: no se adjunta a su canal."
+            )
+            return
+        channel = self._channels.get_or_create(conversation)
         self._channel = channel  # antes de subscribe: su on_turn_start lo mira
         if not channel.subscribe(self):
             # No debería pasar (el handshake ya miró `visible_to`): sin canal, cada `send`
@@ -679,10 +703,22 @@ class TurnController:
             await channel.send_user_message(self, text)
 
     async def _refuse_send(self) -> None:
-        """Sin canal (no pudo adjuntarse): el `send` recibe su par con un TURN_ERROR estable."""
+        """Sin canal (no pudo adjuntarse): el `send` recibe su par con un TURN_ERROR estable.
+        Por la cola de la sesión, como cualquier turno (#202): su turn_start sale detrás del
+        turn_end de los anteriores."""
         turn = self._new_turn("user")
         turn.conversation_id = self._conversation.id
         self._live.append(turn)
+        self._enqueue(("refused", turn))
+
+    async def _paint_refused(self, turn: Turn) -> None:
+        if turn.ended:
+            return
+        for earlier in list(self._live):
+            # Red de seguridad: la cola ya cerró los anteriores; nunca dos turnos abiertos.
+            if earlier is not turn and earlier.opened:
+                earlier.cancel_reason = earlier.cancel_reason or "replaced"
+                await self._end(earlier, "replaced")
         if await self._open(turn):
             await self._send_turn_error(turn, "internal_error")
         await self._end(turn, "error")
@@ -768,6 +804,8 @@ class TurnController:
                     await self._paint_event(item[1], item[2])
                 elif kind == "turn_end":
                     await self._paint_end(item[1], item[2])
+                elif kind == "refused":
+                    await self._paint_refused(item[1])
                 elif kind == "leave":
                     _, conversation_id, reason = item
                     for turn in list(self._live):
@@ -1061,15 +1099,6 @@ class TurnController:
 
     # ── Cierre ────────────────────────────────────────────────────────────
 
-    async def let_go(self, limit: float) -> None:
-        """La sesión deja su conversación (M19: desplazada o revocada): se desuscribe de su
-        canal y cierra sus turnos (`closed`), acotado por `limit`. Desde la 5.0 (decisión 2)
-        nada de lo que corre en el canal se cancela ni se aborta: sigue para los demás (o se
-        acaba solo)."""
-        td = Teardown(f"[{self._client_id}] dejar la conversación")
-        await self._close_turns(td, limit)
-        td.raise_if_cancelled()
-
     def stop_intake(self) -> None:
         """Desde ya, ni turnos nuevos (G-09) ni turnos del canal."""
         self._closing = True
@@ -1078,8 +1107,9 @@ class TurnController:
         """Pasos de close_all() para los turnos; cada uno acotado por `limit`.
 
         7d / G-23 / decisión 2: la sesión deja su canal; el turno en curso no se cancela ni se
-        aborta (sigue en el canal), y cada turno abierto aquí recibe su turn_end `closed` con
-        el socket aún abierto (G-10).
+        aborta (sigue en el canal para las demás sesiones adjuntas, o se acaba solo), y cada
+        turno abierto aquí recibe su turn_end `closed` con el socket aún abierto (G-10). Lo
+        mismo en un cierre por política (4200, 4020) y en la desconexión.
         """
         await self._close_turns(td, limit)
 
@@ -1110,7 +1140,7 @@ class TurnController:
                 for turn in list(self._live):
                     if turn.conversation_id == item[1] and turn.opened:
                         await self._close_one(td, turn, item[2], limit)
-            elif kind == "turn_start" and not item[1].ended:
+            elif kind in ("turn_start", "refused") and not item[1].ended:
                 turn = item[1]
                 if turn.origin != "user":
                     self._forget(turn)  # un push que este socket nunca mostró
@@ -1123,8 +1153,15 @@ class TurnController:
             # Su turn_end, tras soltar su TTS (su audio ya no sale); uno que nunca abrió no
             # recibe nada (nunca un turn_end solo).
             await self._close_one(td, turn, "closed", limit)
+        # Los turn_end de cortes en curso, bajo un mismo tope; lo que no acabe se cancela (no
+        # sobrevive a la sesión: están supervisadas, su resultado se recoge igual).
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + limit
         for task in list(self._cuts):
-            await td.wait(task, "turn_end de un corte", limit)
+            await td.wait(task, "turn_end de un corte", max(0.0, deadline - loop.time()))
+        for task in list(self._cuts):
+            if not task.done():
+                task.cancel()
 
     async def _close_one(self, td: Teardown, turn: Turn, reason: EndReason, limit: float) -> None:
         if turn.ended:
