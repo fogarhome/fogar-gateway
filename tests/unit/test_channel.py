@@ -2,7 +2,7 @@
 
 Pure fan-out, no OpenClaw: every subscriber of a conversation gets its own
 start/event/end of each channel turn, in order, and one failing subscriber never stops
-the others.
+the others. Callbacks are synchronous: delivery happens inside the channel call.
 """
 
 import asyncio
@@ -36,7 +36,7 @@ def _conversation(cid: str = "c1", agent: str = "main") -> Conversation:
 
 
 class FakeSubscriber:
-    """Records what the channel delivers; never blocks (decision 1)."""
+    """Records what the channel delivers; only appends (decision 1)."""
 
     def __init__(self, name: str, conversation_id: str = "c1", *, wants_audio: bool = True):
         self.name = name
@@ -57,13 +57,13 @@ class FakeSubscriber:
     def wants_audio(self) -> bool:
         return self._wants_audio
 
-    async def on_turn_start(self, turn: ChannelTurn) -> None:
+    def on_turn_start(self, turn: ChannelTurn) -> None:
         self.calls.append(("start", turn.id))
 
-    async def on_event(self, turn: ChannelTurn, event: ChannelEvent) -> None:
+    def on_event(self, turn: ChannelTurn, event: ChannelEvent) -> None:
         self.calls.append(("event", turn.id, event))
 
-    async def on_turn_end(self, turn: ChannelTurn, reason: EndReason) -> None:
+    def on_turn_end(self, turn: ChannelTurn, reason: EndReason) -> None:
         self.calls.append(("end", turn.id, reason))
 
     def kinds(self) -> list[str]:
@@ -71,23 +71,23 @@ class FakeSubscriber:
 
 
 class FailingSubscriber(FakeSubscriber):
-    async def on_turn_start(self, turn: ChannelTurn) -> None:
+    def on_turn_start(self, turn: ChannelTurn) -> None:
         raise RuntimeError(SECRET)
 
-    async def on_event(self, turn: ChannelTurn, event: ChannelEvent) -> None:
+    def on_event(self, turn: ChannelTurn, event: ChannelEvent) -> None:
         raise RuntimeError(SECRET)
 
-    async def on_turn_end(self, turn: ChannelTurn, reason: EndReason) -> None:
+    def on_turn_end(self, turn: ChannelTurn, reason: EndReason) -> None:
         raise RuntimeError(SECRET)
 
 
-async def test_turn_fans_out_to_every_subscriber():
+def test_turn_fans_out_to_every_subscriber():
     channel = ConversationChannel(_conversation())
     a, b = FakeSubscriber("a"), FakeSubscriber("b")
-    await channel.subscribe(a)
-    await channel.subscribe(b)
+    assert channel.subscribe(a) is True
+    assert channel.subscribe(b) is True
 
-    turn = await channel.open_turn("user", sender=a)
+    turn = channel.open_turn("user", sender=a)
     tool = ToolCallEvent(phase="start", name="search", tool_call_id="t1")
     events: list[ChannelEvent] = [
         ChannelToken("hola"),
@@ -96,8 +96,8 @@ async def test_turn_fans_out_to_every_subscriber():
         ChannelError("orchestrator_error"),
     ]
     for event in events:
-        await channel.emit(turn, event)
-    assert await channel.end_turn(turn, "done") is True
+        assert channel.emit(turn, event) is True
+    assert channel.end_turn(turn, "done") is True
 
     expected = [("start", turn.id), *[("event", turn.id, e) for e in events], ("end", turn.id, "done")]
     assert a.calls == expected
@@ -110,53 +110,62 @@ async def test_turn_fans_out_to_every_subscriber():
     assert channel.current_turn is None
 
 
-async def test_events_are_tagged():
+def test_events_are_tagged():
     assert ChannelToken("x").kind == "token"
     assert ChannelToolCall(ToolCallEvent(phase="start", name="n", tool_call_id="i")).kind == "tool_call"
     assert ChannelProgress(Progress("tool", "n")).kind == "progress"
     assert ChannelError("turn_timeout").kind == "error"
 
 
-async def test_late_subscriber_gets_open_turn():
+def test_late_subscriber_gets_open_turn():
     channel = ConversationChannel(_conversation())
     a, late = FakeSubscriber("a"), FakeSubscriber("late")
-    await channel.subscribe(a)
-    turn = await channel.open_turn("user", sender=a)
-    await channel.emit(turn, ChannelToken("hola "))
+    channel.subscribe(a)
+    turn = channel.open_turn("user", sender=a)
+    channel.emit(turn, ChannelToken("hola "))
 
-    await channel.subscribe(late)
+    channel.subscribe(late)
     assert late.calls == [("start", turn.id)]
     # The hook for 2a.3: the text the turn has carried so far.
     assert turn.text == "hola "
 
-    await channel.emit(turn, ChannelToken("mundo"))
-    await channel.end_turn(turn, "done")
+    channel.emit(turn, ChannelToken("mundo"))
+    channel.end_turn(turn, "done")
     assert late.kinds() == ["start", "event", "end"]
     assert turn.text == "hola mundo"
 
 
-async def test_subscribe_twice_is_a_no_op():
+def test_subscribe_twice_is_a_no_op():
     channel = ConversationChannel(_conversation())
     a = FakeSubscriber("a")
-    await channel.subscribe(a)
-    turn = await channel.open_turn("push")
-    await channel.subscribe(a)
-    await channel.end_turn(turn, "done")
+    channel.subscribe(a)
+    turn = channel.open_turn("push")
+    assert channel.subscribe(a) is False
+    channel.end_turn(turn, "done")
     assert a.kinds() == ["start", "end"]
     assert channel.subscribers() == [a]
 
 
-async def test_end_turn_once_per_subscriber():
+def test_subscriber_of_another_conversation_is_refused():
+    channel = ConversationChannel(_conversation("c1"))
+    other = FakeSubscriber("other", conversation_id="c2")
+    assert channel.subscribe(other) is False
+    assert channel.subscribers() == []
+    channel.open_turn("push")
+    assert other.calls == []
+
+
+def test_end_turn_once_per_subscriber():
     channel = ConversationChannel(_conversation())
     a, b, gone = FakeSubscriber("a"), FakeSubscriber("b"), FakeSubscriber("gone")
     for s in (a, b, gone):
-        await channel.subscribe(s)
-    turn = await channel.open_turn("user", sender=a)
+        channel.subscribe(s)
+    turn = channel.open_turn("user", sender=a)
     assert channel.unsubscribe(gone) is True
     assert channel.unsubscribe(gone) is False
 
-    assert await channel.end_turn(turn, "cancelled") is True
-    assert await channel.end_turn(turn, "done") is False
+    assert channel.end_turn(turn, "cancelled") is True
+    assert channel.end_turn(turn, "done") is False
 
     assert a.calls.count(("end", turn.id, "cancelled")) == 1
     assert b.kinds() == ["start", "end"]
@@ -164,47 +173,63 @@ async def test_end_turn_once_per_subscriber():
     assert turn.end_reason == "cancelled"
 
     after = FakeSubscriber("after")
-    await channel.subscribe(after)
-    await channel.emit(turn, ChannelToken("tarde"))  # an ended turn takes no events
+    channel.subscribe(after)
+    assert channel.emit(turn, ChannelToken("tarde")) is False  # an ended turn takes no events
     assert after.calls == []
     assert a.kinds() == ["start", "end"]
 
 
-async def test_unsubscribed_mid_turn_gets_nothing_more():
+def test_foreign_turn_is_left_untouched():
+    one, two = ConversationChannel(_conversation("c1")), ConversationChannel(_conversation("c2"))
+    a, b = FakeSubscriber("a", "c1"), FakeSubscriber("b", "c2")
+    one.subscribe(a)
+    two.subscribe(b)
+    turn_one = one.open_turn("user")
+    turn_two = two.open_turn("user")
+
+    assert two.emit(turn_one, ChannelToken("x")) is False
+    assert two.end_turn(turn_one, "done") is False
+    assert not turn_one.ended and turn_one.end_reason is None
+    assert one.current_turn is turn_one and two.current_turn is turn_two
+    assert a.kinds() == ["start"] and b.kinds() == ["start"]
+    assert turn_one.text == ""
+
+
+def test_unsubscribed_mid_turn_gets_nothing_more():
     channel = ConversationChannel(_conversation())
     a, b = FakeSubscriber("a"), FakeSubscriber("b")
-    await channel.subscribe(a)
-    await channel.subscribe(b)
-    turn = await channel.open_turn("user", sender=a)
+    channel.subscribe(a)
+    channel.subscribe(b)
+    turn = channel.open_turn("user", sender=a)
     channel.unsubscribe(a)
-    await channel.emit(turn, ChannelToken("x"))
-    await channel.end_turn(turn, "done")
+    channel.emit(turn, ChannelToken("x"))
+    channel.end_turn(turn, "done")
     assert a.kinds() == ["start"]
     assert b.kinds() == ["start", "event", "end"]
 
 
-async def test_open_turn_while_open_is_refused():
+def test_open_turn_while_open_is_refused():
     channel = ConversationChannel(_conversation())
-    turn = await channel.open_turn("user")
+    turn = channel.open_turn("user")
     with pytest.raises(ChannelBusy):
-        await channel.open_turn("push")
-    await channel.end_turn(turn, "replaced")
-    second = await channel.open_turn("push", run_id="run-2")
+        channel.open_turn("push")
+    channel.end_turn(turn, "replaced")
+    second = channel.open_turn("push", run_id="run-2")
     assert channel.current_turn is second
     assert second.run_id == "run-2"
     assert second.id != turn.id
 
 
-async def test_failing_subscriber_does_not_stop_others(caplog):
+def test_failing_subscriber_does_not_stop_others(caplog):
     caplog.set_level(logging.DEBUG, logger="fogar_gateway.services.channel")
     channel = ConversationChannel(_conversation())
     bad, good = FailingSubscriber("bad"), FakeSubscriber("good")
-    await channel.subscribe(bad)
-    await channel.subscribe(good)
+    channel.subscribe(bad)
+    channel.subscribe(good)
 
-    turn = await channel.open_turn("user", sender=bad)
-    await channel.emit(turn, ChannelToken(SECRET))
-    await channel.end_turn(turn, "done")
+    turn = channel.open_turn("user", sender=bad)
+    channel.emit(turn, ChannelToken(SECRET))
+    channel.end_turn(turn, "done")
 
     assert good.kinds() == ["start", "event", "end"]
     assert channel.subscribers() == [bad, good]  # a failure does not unsubscribe
@@ -214,99 +239,87 @@ async def test_failing_subscriber_does_not_stop_others(caplog):
     assert all(SECRET not in r.getMessage() for r in caplog.records)
 
 
-async def test_subscriber_cancellation_propagates_and_nothing_is_lost():
+def test_cancelled_error_from_a_callback_propagates():
     channel = ConversationChannel(_conversation())
 
     class Cancelling(FakeSubscriber):
-        armed = True
+        def on_event(self, turn, event):
+            raise asyncio.CancelledError
 
-        async def on_event(self, turn, event):
-            if self.armed:
-                self.armed = False
-                raise asyncio.CancelledError
-            await super().on_event(turn, event)
-
-    first, second = Cancelling("first"), FakeSubscriber("second")
-    await channel.subscribe(first)
-    await channel.subscribe(second)
-    turn = await channel.open_turn("user")
+    channel.subscribe(Cancelling("c"))
+    turn = channel.open_turn("user")
     with pytest.raises(asyncio.CancelledError):
-        await channel.emit(turn, ChannelToken("x"))
-    # The pending delivery to `second` goes out with the next call, in order.
-    await channel.end_turn(turn, "done")
-    assert second.kinds() == ["start", "event", "end"]
-    assert first.kinds() == ["start", "end"]
+        channel.emit(turn, ChannelToken("x"))
 
 
-async def test_reentrant_callbacks_do_not_deadlock():
+def test_reentrant_callbacks_are_safe():
     channel = ConversationChannel(_conversation())
 
     class Leaving(FakeSubscriber):
-        async def on_event(self, turn, event):
-            await super().on_event(turn, event)
+        def on_event(self, turn, event):
+            super().on_event(turn, event)
             channel.unsubscribe(self)
-            await channel.end_turn(turn, "error")
+            channel.end_turn(turn, "error")
 
     leaving, other = Leaving("leaving"), FakeSubscriber("other")
-    await channel.subscribe(leaving)
-    await channel.subscribe(other)
-    turn = await channel.open_turn("user")
-    await asyncio.wait_for(channel.emit(turn, ChannelToken("x")), timeout=1)
+    channel.subscribe(leaving)
+    channel.subscribe(other)
+    turn = channel.open_turn("user")
+    channel.emit(turn, ChannelToken("x"))
+    # `other` comes after `leaving`: the turn ended before its event, so it gets only the end.
     assert leaving.kinds() == ["start", "event"]
-    assert other.kinds() == ["start", "event", "end"]
+    assert other.kinds() == ["start", "end"]
     assert turn.end_reason == "error"
 
 
-async def test_order_holds_per_subscriber_across_tasks():
-    """A subscriber that yields while delivering never sees an event after its end, nor
-    one before its start, even when another task ends the turn meanwhile."""
+def test_end_during_start_never_ends_before_start():
+    """A callback that ends the turn from inside its `on_turn_start`: those already started
+    get one end after their start; those not yet started never hear of the turn."""
     channel = ConversationChannel(_conversation())
+    first = FakeSubscriber("first")
 
-    class Yielding(FakeSubscriber):
-        async def on_event(self, turn, event):
-            for _ in range(5):
-                await asyncio.sleep(0)
-            await super().on_event(turn, event)
+    class Ender(FakeSubscriber):
+        def on_turn_start(self, turn):
+            super().on_turn_start(turn)
+            channel.end_turn(turn, "cancelled")
 
-    slow, fast = Yielding("slow"), FakeSubscriber("fast")
-    await channel.subscribe(slow)
-    await channel.subscribe(fast)
-    turn = await channel.open_turn("user")
-    emitting = asyncio.create_task(channel.emit(turn, ChannelToken("x")))
-    await asyncio.sleep(0)
-    ending = asyncio.create_task(channel.end_turn(turn, "cancelled"))
-    await asyncio.gather(emitting, ending)
-    assert slow.kinds() == ["start", "event", "end"]
-    assert fast.kinds() == ["start", "event", "end"]
+    ender, last = Ender("ender"), FakeSubscriber("last")
+    for s in (first, ender, last):
+        channel.subscribe(s)
+    turn = channel.open_turn("user")
+    assert first.kinds() == ["start", "end"]
+    assert ender.kinds() == ["start", "end"]
+    assert last.calls == []
+    assert channel.current_turn is None and turn.ended
 
 
-async def test_by_session_is_weak_and_by_client_id_durable():
+def test_by_session_is_weak_and_by_client_id_durable():
     channel = ConversationChannel(_conversation())
     sender = FakeSubscriber("s")
-    turn = await channel.open_turn("user", sender=sender)
+    turn = channel.open_turn("user", sender=sender)
     assert turn.by_session is sender
     del sender
     gc.collect()
     assert turn.by_session is None
     assert turn.by_client_id == "client-s"
 
-    await channel.end_turn(turn, "done")
-    push = await channel.open_turn("push")
+    channel.end_turn(turn, "done")
+    push = channel.open_turn("push")
     assert push.by_session is None and push.by_client_id is None
 
 
-async def test_token_text_is_never_logged(caplog):
+def test_token_text_is_never_logged(caplog):
     caplog.set_level(logging.DEBUG, logger="fogar_gateway.services.channel")
     channel = ConversationChannel(_conversation())
-    await channel.subscribe(FakeSubscriber("a"))
-    turn = await channel.open_turn("user")
-    await channel.emit(turn, ChannelToken(SECRET))
-    await channel.end_turn(turn, "done")
+    channel.subscribe(FakeSubscriber("a"))
+    turn = channel.open_turn("user")
+    channel.emit(turn, ChannelToken(SECRET))
+    channel.end_turn(turn, "done")
     assert all(SECRET not in r.getMessage() for r in caplog.records)
     assert "texto" not in repr(turn)
 
 
-async def test_hub_drops_idle_channel():
+def test_hub_drops_idle_channel():
     hub = ChannelHub()
     conversation = _conversation()
     key = conversation.session_key
@@ -317,15 +330,15 @@ async def test_hub_drops_idle_channel():
     assert channel.session_key == key and channel.conversation is conversation
 
     a = FakeSubscriber("a")
-    await channel.subscribe(a)
+    channel.subscribe(a)
     assert hub.drop_if_idle(key) is False  # a subscriber
 
     channel.unsubscribe(a)
-    turn = await channel.open_turn("push")
+    turn = channel.open_turn("push")
     assert channel.idle is False
     assert hub.drop_if_idle(key) is False  # an open turn
 
-    await channel.end_turn(turn, "done")
+    channel.end_turn(turn, "done")
     assert channel.idle is True
     assert hub.drop_if_idle(key) is True
     assert hub.get(key) is None
@@ -333,7 +346,7 @@ async def test_hub_drops_idle_channel():
     assert hub.get_or_create(conversation) is not channel
 
 
-async def test_hub_keeps_channels_apart():
+def test_hub_keeps_channels_apart():
     hub = ChannelHub()
     one, two = _conversation("c1"), _conversation("c2")
     assert hub.get_or_create(one) is not hub.get_or_create(two)

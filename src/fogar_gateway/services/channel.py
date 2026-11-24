@@ -5,26 +5,28 @@ A `ConversationChannel` holds the conversation's open turn (one at a time) and i
 subscribers: the live sessions that opened the conversation. Each subscriber gets its own
 `on_turn_start`, `on_event` and `on_turn_end` of each channel turn and paints its own part
 (its `turn_id`/`turn_seq`, its output mode, the TTS only if it is the sender). The channel
-never waits for anyone to finish a turn: callbacks only enqueue on the subscriber
-(decision 1 of the 5.0 PR 2 plan), and every socket closes its own `turn_end`.
+never waits for anyone to finish a turn: every socket closes its own `turn_end`.
+
+Callbacks are synchronous (decision 1 of the 5.0 PR 2 plan): a subscriber only enqueues on
+its own ordered queue and returns. It must not block, must not await (it cannot), and must
+not call into another channel's lock-holding methods. Delivery happens inline, in the
+caller, so when a channel method returns every subscriber has been called.
 
 Delivery rules:
 
-- Every call that changes the channel (`subscribe`, `open_turn`, `emit`, `end_turn`) changes
-  its state at once and queues its deliveries in a single channel outbox; the outbox is
-  delivered in order, so each subscriber sees start, events and end in the order they
-  happened, whichever task made them. A callback may call back into the channel (unsubscribe,
-  end the turn): its deliveries join the outbox and go out after the current one, with no
-  lock to deadlock on. A call from another task while the outbox is being delivered waits
-  until it is empty, so once a call returns its deliveries have been made.
+- Each subscriber sees a turn's start, its events and its end in order. A callback may call
+  back into this channel (unsubscribe, emit, end the turn): the channel changes its state
+  before delivering and checks it before every call, so nobody gets `on_turn_end` (or an
+  event) before its `on_turn_start`, and nobody gets anything after leaving.
 - A subscriber that joins while a turn is open gets `on_turn_start` for it (and what follows);
-  `ChannelTurn.text` holds the turn's text so far for whoever needs to catch up (2a.3).
+  `ChannelTurn.text` holds the turn's text so far for whoever needs to catch up (2a.3). An
+  event emitted before a subscriber got the turn's start is not replayed: it is in `text`.
 - A subscriber that leaves gets nothing more, not even `on_turn_end`: its session ends its own
-  turn (`closed`). Deliveries queued before it left are dropped too.
+  turn (`closed`).
 - `end_turn` is idempotent: one `on_turn_end` per subscriber that got the turn's
   `on_turn_start` and is still subscribed.
 - A failing callback never stops the others (a boundary: logged by type, never by text); a
-  `CancelledError` propagates, and the deliveries still queued go out with the next call.
+  `CancelledError` (a `BaseException`) is not caught and propagates.
 
 No user text in logs: token text is counted, never logged, and `ChannelTurn` keeps it out of
 its `repr`. This module has no OpenClaw yet (5.0 PR 2a.1); runs arrive in 2a.2.
@@ -32,11 +34,9 @@ its `repr`. This module has no OpenClaw yet (5.0 PR 2a.1); runs arrive in 2a.2.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import weakref
-from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -56,8 +56,11 @@ logger = logging.getLogger(__name__)
 
 
 class ChannelSubscriber(Protocol):
-    """A session attached to a conversation's channel. Callbacks only enqueue on the
-    session (its `QueuedSender`) and return: they never wait for the client."""
+    """A session attached to a conversation's channel.
+
+    The callbacks are synchronous: they only enqueue on the session's own ordered queue and
+    return. They must not block, must not await, and must not call into another channel's
+    lock-holding methods. Calling back into this channel (e.g. `unsubscribe`) is safe."""
 
     @property
     def client(self) -> Client: ...
@@ -68,11 +71,11 @@ class ChannelSubscriber(Protocol):
     @property
     def wants_audio(self) -> bool: ...
 
-    def on_turn_start(self, turn: ChannelTurn) -> Awaitable[None]: ...
+    def on_turn_start(self, turn: ChannelTurn) -> None: ...
 
-    def on_event(self, turn: ChannelTurn, event: ChannelEvent) -> Awaitable[None]: ...
+    def on_event(self, turn: ChannelTurn, event: ChannelEvent) -> None: ...
 
-    def on_turn_end(self, turn: ChannelTurn, reason: EndReason) -> Awaitable[None]: ...
+    def on_turn_end(self, turn: ChannelTurn, reason: EndReason) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -116,7 +119,7 @@ class ChannelTurn:
     # Decision 5: only a weak reference to the sender; the live session is resolved on use
     # (if it left, nobody gets the audio).
     _sender: weakref.ref[ChannelSubscriber] | None = field(default=None, repr=False)
-    _text: list[str] = field(default_factory=list, repr=False)
+    _text: list[str] = field(default_factory=list, init=False, repr=False)
 
     @property
     def by_session(self) -> ChannelSubscriber | None:
@@ -139,13 +142,6 @@ class _Subscription:
     active: bool = True
 
 
-@dataclass(frozen=True)
-class _Delivery:
-    subscription: _Subscription
-    name: str  # the callback, for the failure log
-    call: Callable[[], Awaitable[None]]
-
-
 class ConversationChannel:
     """One conversation's channel: its subscribers and its open turn."""
 
@@ -154,11 +150,7 @@ class ConversationChannel:
         self.session_key = conversation.session_key
         self.current_turn: ChannelTurn | None = None
         self._subscriptions: list[_Subscription] = []
-        self._receivers: list[_Subscription] = []  # those that got the open turn's start
-        self._outbox: deque[_Delivery] = deque()
-        self._drainer: asyncio.Task | None = None
-        self._drained = asyncio.Event()
-        self._drained.set()
+        self._started: list[_Subscription] = []  # those that got the open turn's start
 
     # -- subscribers -------------------------------------------------------------------
 
@@ -168,11 +160,19 @@ class ConversationChannel:
     def _subscription(self, subscriber: ChannelSubscriber) -> _Subscription | None:
         return next((s for s in self._subscriptions if s.subscriber is subscriber), None)
 
-    async def subscribe(self, subscriber: ChannelSubscriber) -> None:
-        """Attach a session. With a turn open, it gets `on_turn_start` for it. Subscribing
-        twice is a no-op."""
+    def subscribe(self, subscriber: ChannelSubscriber) -> bool:
+        """Attach a session. With a turn open, it gets `on_turn_start` for it. False if it was
+        already subscribed or belongs to another conversation."""
+        # Only the conversation id is checked here; whether the session may see the
+        # conversation (`Conversation.visible_to`) is the caller's check (2a.3).
+        if subscriber.conversation_id != self.conversation.id:
+            logger.debug(
+                "Channel subscribe refused: conversation=%s client=%s (other conversation)",
+                self.conversation.id, subscriber.client.id,
+            )
+            return False
         if self._subscription(subscriber) is not None:
-            return
+            return False
         subscription = _Subscription(subscriber)
         self._subscriptions.append(subscription)
         logger.debug(
@@ -181,9 +181,8 @@ class ConversationChannel:
         )
         turn = self.current_turn
         if turn is not None:
-            self._receivers.append(subscription)
-            self._queue(subscription, "on_turn_start", partial(subscriber.on_turn_start, turn))
-        await self._flush()
+            self._start(turn, subscription)
+        return True
 
     def unsubscribe(self, subscriber: ChannelSubscriber) -> bool:
         """Detach a session: it gets nothing more from this channel, not even the open turn's
@@ -193,8 +192,8 @@ class ConversationChannel:
             return False
         subscription.active = False
         self._subscriptions.remove(subscription)
-        if subscription in self._receivers:
-            self._receivers.remove(subscription)
+        if subscription in self._started:
+            self._started.remove(subscription)
         logger.debug(
             "Channel unsubscribe: conversation=%s client=%s subscribers=%d",
             self.conversation.id, subscriber.client.id, len(self._subscriptions),
@@ -203,7 +202,7 @@ class ConversationChannel:
 
     # -- turns -------------------------------------------------------------------------
 
-    async def open_turn(
+    def open_turn(
         self,
         origin: TurnOrigin,
         *,
@@ -223,100 +222,86 @@ class ConversationChannel:
             _sender=weakref.ref(sender) if sender is not None else None,
         )
         self.current_turn = turn
-        self._receivers = list(self._subscriptions)
+        self._started = []
         logger.debug(
             "Channel turn open: conversation=%s turn=%s origin=%s subscribers=%d",
-            self.conversation.id, turn.id, origin, len(self._receivers),
+            self.conversation.id, turn.id, origin, len(self._subscriptions),
         )
-        for subscription in self._receivers:
-            self._queue(
-                subscription, "on_turn_start", partial(subscription.subscriber.on_turn_start, turn),
-            )
-        await self._flush()
+        for subscription in list(self._subscriptions):
+            if turn is not self.current_turn:
+                break  # a callback ended it: the rest never see it
+            if subscription.active and subscription not in self._started:
+                self._start(turn, subscription)
         return turn
 
-    async def emit(self, turn: ChannelTurn, event: ChannelEvent) -> None:
-        """Give `event` to every subscriber that has the turn. An event for a turn that is no
-        longer open is dropped."""
-        if turn.ended or turn is not self.current_turn:
+    def _start(self, turn: ChannelTurn, subscription: _Subscription) -> None:
+        # Marked before the call: from here on its `on_turn_end` is owed, even if a callback
+        # ends the turn from inside this very `on_turn_start`.
+        self._started.append(subscription)
+        self._call(subscription, "on_turn_start", partial(subscription.subscriber.on_turn_start, turn))
+
+    def emit(self, turn: ChannelTurn, event: ChannelEvent) -> bool:
+        """Give `event` to every subscriber that has the turn. An event for a turn that is not
+        this channel's open turn is dropped (False)."""
+        if turn is not self.current_turn:
             logger.debug(
-                "Channel event dropped: conversation=%s turn=%s kind=%s (turn not open)",
+                "Channel event dropped: conversation=%s turn=%s kind=%s (not the open turn)",
                 self.conversation.id, turn.id, event.kind,
             )
-            return
+            return False
         if isinstance(event, ChannelToken):
             turn._text.append(event.text)
-        for subscription in self._receivers:
-            self._queue(
-                subscription, "on_event", partial(subscription.subscriber.on_event, turn, event),
-            )
-        await self._flush()
+        for subscription in list(self._started):
+            if turn is not self.current_turn:
+                break  # a callback ended it
+            if subscription.active:
+                self._call(
+                    subscription, "on_event", partial(subscription.subscriber.on_event, turn, event),
+                )
+        return True
 
-    async def end_turn(self, turn: ChannelTurn, reason: EndReason) -> bool:
-        """End the turn: one `on_turn_end` per subscriber that got its start and is still
-        subscribed. Idempotent: False if it had already ended."""
-        if turn.ended:
+    def end_turn(self, turn: ChannelTurn, reason: EndReason) -> bool:
+        """End the channel's open turn: one `on_turn_end` per subscriber that got its start and
+        is still subscribed. Idempotent; False (turn untouched) if `turn` is not this
+        channel's open turn."""
+        if turn is not self.current_turn:
+            logger.debug(
+                "Channel turn end ignored: conversation=%s turn=%s (not the open turn)",
+                self.conversation.id, turn.id,
+            )
             return False
         turn.ended = True
         turn.end_reason = reason
-        receivers: list[_Subscription] = []
-        if turn is self.current_turn:
-            self.current_turn = None
-            receivers, self._receivers = self._receivers, []
+        self.current_turn = None
+        started, self._started = self._started, []
         logger.debug(
             "Channel turn end: conversation=%s turn=%s reason=%s text_len=%d subscribers=%d",
-            self.conversation.id, turn.id, reason, len(turn.text), len(receivers),
+            self.conversation.id, turn.id, reason, len(turn.text), len(started),
         )
-        for subscription in receivers:
-            self._queue(
-                subscription, "on_turn_end",
-                partial(subscription.subscriber.on_turn_end, turn, reason),
-            )
-        await self._flush()
+        for subscription in started:
+            if subscription.active:
+                self._call(
+                    subscription, "on_turn_end",
+                    partial(subscription.subscriber.on_turn_end, turn, reason),
+                )
         return True
 
     @property
     def idle(self) -> bool:
-        """Nothing keeps the channel alive: no subscribers, no open turn, nothing to deliver.
-        2a.2 adds the active run."""
-        return not self._subscriptions and self.current_turn is None and not self._outbox
+        """Nothing keeps the channel alive: no subscribers and no open turn. 2a.2 adds the
+        active run."""
+        return not self._subscriptions and self.current_turn is None
 
     # -- delivery ----------------------------------------------------------------------
 
-    def _queue(
-        self, subscription: _Subscription, name: str, call: Callable[[], Awaitable[None]],
-    ) -> None:
-        self._outbox.append(_Delivery(subscription, name, call))
-
-    async def _flush(self) -> None:
-        """Deliver the outbox in order. Reentrant calls (from a callback) return at once; a
-        call from another task waits until the current delivery empties the outbox."""
-        me = asyncio.current_task()
-        while self._outbox:
-            if self._drainer is me:
-                return  # a callback calling back: the running loop below delivers it
-            if self._drainer is not None:
-                await self._drained.wait()
-                continue
-            self._drainer = me
-            self._drained.clear()
-            try:
-                while self._outbox:
-                    await self._deliver(self._outbox.popleft())
-            finally:
-                self._drainer = None
-                self._drained.set()
-
-    async def _deliver(self, delivery: _Delivery) -> None:
-        if not delivery.subscription.active:
-            return  # it left after this was queued
+    def _call(self, subscription: _Subscription, name: str, call: Callable[[], None]) -> None:
         try:
-            await delivery.call()
+            call()
         except Exception as exc:  # noqa: BLE001 — boundary: one subscriber's failure must not stop the channel's fan-out to the others
             logger.warning(
                 "Channel delivery failed: conversation=%s client=%s callback=%s error=%s",
-                self.conversation.id, delivery.subscription.subscriber.client.id,
-                delivery.name, describe_error(exc),
+                self.conversation.id, subscription.subscriber.client.id, name,
+                describe_error(exc),
             )
 
 
@@ -333,6 +318,8 @@ class ChannelHub:
         return self._channels.get(session_key)
 
     def get_or_create(self, conversation: Conversation) -> ConversationChannel:
+        """The channel of `conversation.session_key`. The first `Conversation` object given
+        for a key is the one the channel keeps (same key → same conversation id)."""
         channel = self._channels.get(conversation.session_key)
         if channel is None:
             channel = ConversationChannel(conversation)
