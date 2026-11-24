@@ -57,6 +57,7 @@ from fogar_gateway.services.channel import (
     ChannelToolCall,
     ChannelTurn,
     ConversationChannel,
+    SendTicket,
 )
 from fogar_gateway.services.conversations import SessionConversation
 from fogar_gateway.services.openclaw.failures import ORCHESTRATOR_AGENT_UNAVAILABLE_ERROR
@@ -454,8 +455,9 @@ class TurnController:
         # 2b.3: los `send` del cliente esperan aquí, en su orden, a que su tarea los envíe
         # (`submit_send`): el bucle de entrada nunca se para detrás de un envío (uno que
         # espera a que termine el turno de /v1 puede tardar).
-        self._sends: deque[tuple[str, bool]] = deque()
+        self._sends: deque[tuple[str, SendTicket]] = deque()
         self._send_task: asyncio.Task | None = None
+        self._sending: SendTicket | None = None  # el que su tarea tiene entre manos
         # Worker de la sesión: un solo worker conserva el orden start → eventos → fin de
         # cada turno, y el turn_start del siguiente detrás del turn_end del anterior.
         self._worker: asyncio.Task | None = None
@@ -707,27 +709,48 @@ class TurnController:
 
     # ── Turno del usuario ─────────────────────────────────────────────────
 
-    def submit_send(self, text: str, *, interrupt: bool = False) -> None:
+    def submit_send(self, text: str) -> None:
         """Un `send` del cliente (el bucle de entrada, 2b.3): a la cola de envíos de la sesión,
         sin esperar. Una sola tarea los envía en su orden de llegada (`start_user_turn`); uno
         que espera (detrás del turno de /v1) no tiene id ni sale nada al cable hasta que se
-        envía, y el bucle de entrada sigue leyendo (audio, `cancel`, `withdraw`)."""
+        envía, y el bucle de entrada sigue leyendo (audio, `cancel`, `withdraw`). «Enviar
+        ahora» es `interrupt_now` y después esto: el envío no vuelve a cortar nada (N1)."""
         if self._closing:
             logger.info(f"[{self._client_id}] send ignorado: la sesión se está cerrando.")
             return
-        self._sends.append((text, interrupt))
+        self._sends.append((text, SendTicket()))
         if self._send_task is None or self._send_task.done():
             self._send_task = self._spawn(self._send_loop(), "turn_sends")
 
+    def cancel_sends(self) -> None:
+        """Un `cancel` del cliente (N2) cubre también sus `send` aún sin respuesta de OpenClaw:
+        el que está en `chat.send` (su run se aborta con su ack, sin anunciarse) y, si no hay
+        un mensaje de /v1 delante, los que aún esperan su turno aquí (no salen). Detrás de /v1
+        los que esperan siguen (el `cancel` para el turno de /v1 y ellos salen después)."""
+        channel = self._channel
+        behind_v1 = channel is not None and channel.exclusive_pending
+        current = self._sending
+        if current is not None and (current.sending or not behind_v1):
+            current.cut = True
+        if not behind_v1:
+            for _, ticket in self._sends:
+                ticket.cut = True
+
     async def _send_loop(self) -> None:
         while self._sends and not self._closing:
-            text, interrupt = self._sends.popleft()
+            text, ticket = self._sends.popleft()
+            if ticket.cut:
+                logger.info(f"[{self._client_id}] send cancelado antes de salir")
+                continue
+            self._sending = ticket
             try:
-                await self.start_user_turn(text, interrupt=interrupt)
+                await self.start_user_turn(text, ticket=ticket)
             except Exception as e:  # noqa: BLE001 — frontera: un envío roto no para los siguientes
                 # Solo el tipo: el mensaje puede llevar texto del usuario.
                 logger.error(f"[{self._client_id}] send falló: {describe_error(e)}")
                 logger.debug(f"[{self._client_id}] send: {traceback_no_message(e)}")
+            finally:
+                self._sending = None
 
     @property
     def sends_waiting(self) -> bool:
@@ -748,7 +771,9 @@ class TurnController:
         await self._cut_finishing("interrupted")
         await channel.interrupt_now()
 
-    async def start_user_turn(self, text: str, *, interrupt: bool = False) -> None:
+    async def start_user_turn(
+        self, text: str, *, interrupt: bool = False, ticket: SendTicket | None = None
+    ) -> None:
         """Envía `text` al canal de la conversación (C3, 2b): entra en la cola de OpenClaw;
         el turno en curso sigue. Con `interrupt` («enviar ahora»), el canal aborta antes el run
         activo (su turno termina `interrupted` para todos) y esta sesión deja de sonar lo que
@@ -789,7 +814,7 @@ class TurnController:
                 gateway_stats.turn_error(code)
                 await self._refuse_send(code)
                 return
-            result = await channel.send_user_message(self, text, interrupt=interrupt)
+            result = await channel.send_user_message(self, text, interrupt=interrupt, ticket=ticket)
             if isinstance(result, str):
                 # OpenClaw no lo tomó (sin conexión, rechazo): solo esta sesión recibe su par
                 # con el código estable; el canal y sus turnos siguen igual.

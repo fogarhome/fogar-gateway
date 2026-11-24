@@ -596,3 +596,100 @@ async def test_an_ack_after_the_channel_closed_aborts_its_run_and_registers_noth
     assert channel._runs == {}
     assert orchestrator.aborted == ["r1"]
     assert hub.turn_registry.is_run_aborted("r1")
+
+
+# ── 2b.3 review, round 2: «send now» cuts once (N1), a cancel right after a send (N2) ──
+
+
+def _wire(ws, payload) -> None:
+    ws.inbox.put_nowait({"type": "websocket.message", "text": json.dumps(payload)})
+
+
+async def test_wire_send_now_aborts_only_the_open_run(session, openclaw):
+    """N1: `{"type":"send","interrupt":true}` on the wire cuts the run open when it is read
+    (A) and nothing else: B, another device's message queued behind A, then runs as its own
+    turn; the new message goes after it. Exactly one `chat.abort`."""
+    tv, tv_ws = session("tv")
+    mac, mac_ws = session("mac")
+    await tv.turns.start_user_turn("hold-a")
+    run_a = await openclaw.wait_running(SK)
+    await mac.turns.start_user_turn("hold-b")
+    await openclaw.wait_queued(SK, 1)
+    (run_b,) = openclaw.queued[SK]
+
+    loop = asyncio.create_task(tv._client_input_loop())
+    _wire(tv_ws, {"type": "send", "text": "c", "interrupt": True})
+    await wait_until(lambda: openclaw.running.get(SK) == run_b, timeout=5)
+    await tv.turns.sends_idle()
+    await asyncio.sleep(0.2)
+    assert [a["runId"] for a in openclaw.aborts] == [run_a]
+    openclaw.release_run(run_b)
+    await turns_ended(mac_ws, 3)
+    await settle(tv, mac)
+
+    assert [a["runId"] for a in openclaw.aborts] == [run_a]
+    assert [r for _, _, r in pairs(mac_ws) if r not in ("user", "push")] == ["interrupted", "done", "done"]
+    assert texts(mac_ws, "t-3") == "reply-c"
+    states: dict[str, list[str]] = {}
+    for _, text, state, _ in messages(mac_ws):
+        states.setdefault(text, []).append(state)
+    assert states["hold-a"] == ["delivered"]
+    assert states["hold-b"] == ["pending", "delivered"]  # never withdrawn
+    assert states["c"][-1] == "delivered" and "withdrawn" not in states["c"]
+    tv_ws.inbox.put_nowait({"type": "websocket.disconnect"})
+    await loop
+    assert_paired(tv_ws)
+    assert_paired(mac_ws)
+
+
+async def test_a_cancel_right_after_a_send_stops_that_message(session, openclaw):
+    """N2: `send` and `cancel` read back to back (no turn open yet): the message never plays.
+    Whether the cancel finds it still waiting here (it is not sent) or already in `chat.send`
+    (its run is aborted by its runId when acked), nothing of it reaches the wire: no
+    `message`, no turn. A later `send` is not affected."""
+    tv, tv_ws = session("tv")
+    loop = asyncio.create_task(tv._client_input_loop())
+    _wire(tv_ws, {"type": "send", "text": "hold-x"})
+    _wire(tv_ws, {"type": "cancel"})
+    await wait_until(lambda: tv_ws.inbox.empty())
+    await tv.turns.sends_idle()
+    await asyncio.sleep(0.3)
+    assert SK not in openclaw.running and not openclaw.queued.get(SK)
+    sent_runs = [m for m, sk in openclaw.calls if sk == SK].count("chat.send")
+    assert len(openclaw.aborts) == sent_runs  # sent → aborted by its runId; else nothing
+    assert all(a.get("runId") for a in openclaw.aborts)
+    await settle(tv)
+    assert tv_ws.of("message") == [] and pairs(tv_ws) == []
+
+    _wire(tv_ws, {"type": "send", "text": "dos"})
+    await turns_ended(tv_ws, 1)
+    await settle(tv)
+    assert texts(tv_ws, "t-1") == "reply-dos"
+    assert [(text, state) for _, text, state, _ in messages(tv_ws)] == [("dos", "delivered")]
+    tv_ws.inbox.put_nowait({"type": "websocket.disconnect"})
+    await loop
+    assert_paired(tv_ws)
+
+
+async def test_a_cancel_while_a_send_waits_for_its_ack_aborts_it_unannounced():
+    """N2, the in-`chat.send` case made exact: the send is past the lock and waits for its ack
+    when the cancel covers it; on the ack its run is tombstoned and aborted, never announced,
+    and what was held for it reaches nobody."""
+    from fogar_gateway.services.channel import SendTicket
+
+    orchestrator = _Orchestrator(acked=False)
+    hub, channel, subscriber, dispatcher = _channel(orchestrator)
+    ticket = SendTicket()
+    sending = asyncio.create_task(channel.send_user_message(subscriber, "hola", ticket=ticket))
+    await wait_until(lambda: channel._acks == 1)
+    assert ticket.sending
+    await dispatcher.dispatch(_event("agent", {"runId": "r1", "stream": "lifecycle", "data": {"phase": "start"}}))
+    ticket.cut = True  # what TurnController.cancel_sends does
+    orchestrator.ack.set()
+    assert await asyncio.wait_for(sending, 2) is None
+    await dispatcher.dispatch(_event("chat", {"runId": "r1", "state": "delta", "deltaText": "no"}))
+    await channel.push_idle()
+    assert orchestrator.aborted == ["r1"] and hub.turn_registry.is_run_aborted("r1")
+    assert subscriber.got == [] and not channel._runs and channel._held == []
+    assert await asyncio.wait_for(channel.send_user_message(subscriber, "otra"), 2) is not None
+    await hub.aclose(1.0)

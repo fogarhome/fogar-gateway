@@ -743,6 +743,8 @@ class FogarBridge:
                     elif json_msg.get("type") == "cancel":
                         # Para el turno de la conversación (o el push que suena), lo iniciara
                         # quien lo iniciara, sin lanzar uno nuevo (C3)
+                        # N2: también sus `send` aún sin respuesta de OpenClaw.
+                        self.turns.cancel_sends()
                         await self.turns.cancel("cancelled")
 
                     elif json_msg.get("type") == "send":
@@ -761,10 +763,11 @@ class FogarBridge:
                                     f"{' interrupt' if interrupt else ''}"
                                 )
                                 # 2b.3: el bucle no espera al envío (puede esperar detrás
-                                # del turno de /v1); un `interrupt` corta ya.
+                                # del turno de /v1); un `interrupt` corta ya lo que está
+                                # abierto y el envío ya no corta nada más (N1).
                                 if interrupt:
                                     await self.turns.interrupt_now()
-                                self.turns.submit_send(text, interrupt=interrupt)
+                                self.turns.submit_send(text)
 
                     elif json_msg.get("type") == "withdraw":
                         # Quita un mensaje pendiente de la conversación (2b): si ya no lo está,

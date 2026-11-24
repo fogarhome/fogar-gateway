@@ -447,6 +447,16 @@ class RunInfo:
         return self._sender() if self._sender is not None else None
 
 
+@dataclass(eq=False)
+class SendTicket:
+    """One `send` of a session on its way to the channel (2b.3 review N2). `cut`: a client
+    `cancel` read after it covers it (it is not sent, or its run is aborted on its ack, never
+    announced); `sending`: it is past the send lock, in `chat.send`."""
+
+    cut: bool = False
+    sending: bool = False
+
+
 class ChannelBusy(RuntimeError):
     """`open_turn` with a turn still open: a conversation has one open turn at a time."""
 
@@ -494,6 +504,7 @@ class ConversationChannel:
         # Quienes tienen o esperan el lock (un lock recién soltado aún no es de quien espera:
         # `idle` no puede fiarse de `locked()`).
         self._senders = 0
+        self._exclusive = 0  # mensajes de /v1 esperando o con su run en marcha (2b.3)
         # Los runs propios sin terminar, en el orden de sus acks (decisión 5).
         self._runs: dict[str, RunInfo] = {}
         self._done_runs: OrderedDict[str, None] = OrderedDict()
@@ -787,7 +798,12 @@ class ConversationChannel:
     # -- sending (2b: OpenClaw's queue) ------------------------------------------------
 
     async def send_user_message(
-        self, sender: ChannelSubscriber, text: str, *, interrupt: bool = False
+        self,
+        sender: ChannelSubscriber,
+        text: str,
+        *,
+        interrupt: bool = False,
+        ticket: SendTicket | None = None,
     ) -> RunInfo | str | None:
         """Send `text` from `sender` to OpenClaw (`chat.send`), never aborting anything first:
         during a turn it waits in OpenClaw's queue. With `interrupt` («send now»), the active
@@ -798,8 +814,9 @@ class ConversationChannel:
         Returns the accepted message's `RunInfo` (its turn opens with its run's first event);
         a stable error code if OpenClaw did not take it (the session answers its `send` alone,
         `TurnController.start_user_turn`); or None if nothing was sent: the channel is closing,
-        `sender` left while waiting (G-09), or `sender` may not use this agent (#397: the
-        channel is left untouched)."""
+        `sender` left while waiting (G-09), `sender` may not use this agent (#397: the
+        channel is left untouched), or a `cancel` cut its `ticket` (before the `chat.send`,
+        or before its ack: then its run is aborted by its runId and never announced)."""
         if self._closed:
             return None
         if not sender.agent_allowed(self.session_key):
@@ -811,12 +828,17 @@ class ConversationChannel:
                     await self._interrupt()
                 if self._closed or not self.is_subscribed(sender):
                     return None  # close_all() pudo empezar durante la espera
+                if ticket is not None:
+                    if ticket.cut:
+                        return None  # un `cancel` lo cubrió antes de salir
+                    ticket.sending = True
                 return await self._chat_send(
                     text,
                     sender=sender,
                     by_client_id=sender.client.id,
                     by_name=sender.client.name,
                     tracker=sender.tracker,
+                    ticket=ticket,
                 )
         finally:
             self._senders -= 1
@@ -849,6 +871,7 @@ class ConversationChannel:
         its own turn (`steer` folded it into a run that started after its `chat.send`, e.g. a
         push) is `turn_absorbed`: its answer went to someone else's turn."""
         self._senders += 1
+        self._exclusive += 1
         loop = asyncio.get_running_loop()
         deadline = loop.time() + settings.TURN_TIMEOUT_S
         try:
@@ -901,8 +924,15 @@ class ConversationChannel:
                 self._lock.release()
         finally:
             self._senders -= 1
+            self._exclusive -= 1
             # Nadie más lo va a mirar si no tiene suscriptores (el de un origen de confianza).
             self._hub.drop_if_idle(self.session_key, self)
+
+    @property
+    def exclusive_pending(self) -> bool:
+        """A /v1 message waits for its turn or has its run going: a session's sends wait
+        behind it (2b.3)."""
+        return self._exclusive > 0
 
     async def interrupt_now(self) -> None:
         """«Enviar ahora» de una sesión cuyo envío aún espera su turno (detrás de /v1, p. ej.):
@@ -990,6 +1020,7 @@ class ConversationChannel:
         tracker: PipelineTracker | None,
         sink: Callable[[ChannelEvent], None] | None = None,
         counts_turn: bool = True,
+        ticket: SendTicket | None = None,
     ) -> RunInfo | str | None:
         """The `chat.send` itself, with the send lock held: its ack registers the run and
         announces its message (`pending` behind an open turn or another run, else
@@ -1040,6 +1071,16 @@ class ConversationChannel:
             self._abort_run(run_id)
             self._held.clear()
             await self._abort_step(run_id, "chat.abort de un run tras el cierre")
+            return None
+        if ticket is not None and ticket.cut:
+            # Un `cancel` del cliente llegó mientras se esperaba el ack (N2): el run no se
+            # registra ni se anuncia; se entierra y se aborta (solo él), y lo suyo retenido se
+            # descarta.
+            logger.info(f"[{self._tag}] envío cancelado antes de su ack: chat.abort de {run_id}")
+            self._abort_run(run_id)
+            self._held = [(e, p) for e, p in self._held if _str_run_id(p) != run_id]
+            self._release_held()
+            await self._abort_step(run_id, "chat.abort de un envío cancelado")
             return None
         ahead = self.current_turn is not None or bool(self._runs)
         info = RunInfo(
