@@ -18,6 +18,7 @@ from fogar_gateway.core.agent_policy import AgentPolicyKind
 from fogar_gateway.models.close_codes import (
     ALL_CLOSES,
     MAX_REASON_BYTES,
+    RETIRED_CODES,
     RETRYABLE_APPLICATION_CODES,
     Close,
     close_sent,
@@ -53,13 +54,35 @@ def test_codes_are_unique_except_the_shared_standard_ones():
     assert all(len(classes) == 1 for classes in by_code.values())
 
 
+def test_a_retired_code_is_never_reused():
+    """4102 se retiró en la 5.0 (#406): fuera de la tabla activa y sin ningún sitio que lo use
+    (ni como número), para que un cliente viejo nunca lo vea con otro significado."""
+    active = {f.code for f in ALL_CLOSES.values()}
+    assert 4102 in RETIRED_CODES
+    assert active.isdisjoint(RETIRED_CODES)
+    assert {f.reason for f in ALL_CLOSES.values()}.isdisjoint(RETIRED_CODES.values())
+    numbers = [
+        f"{path.relative_to(ROOT)}:{node.lineno}"
+        for path, tree in _src_trees()
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and type(node.value) is int and node.value in RETIRED_CODES
+    ]
+    assert numbers == []
+
+
+def test_a_retired_code_is_documented_as_retired():
+    docs = DOCS.read_text()
+    for code in RETIRED_CODES:
+        assert re.search(rf"\|\s*`?{code}`?\s*\|[^\n]*retirado en la 5\.0", docs), code
+
+
 def test_the_range_says_whether_to_reconnect():
     """4900-4999 se reintenta con espera; 4000-4899 nunca se reconecta solo (§13)."""
     for name, f in ALL_CLOSES.items():
         if f.code in RETRYABLE_APPLICATION_CODES:
             assert f.reconnect == "backoff", name
         elif 4000 <= f.code <= 4999:
-            assert f.reconnect in {"fix", "never_auto"}, name
+            assert f.reconnect == "fix", name
 
 
 @pytest.mark.parametrize("name", sorted(ALL_CLOSES))
@@ -190,6 +213,9 @@ def test_the_web_panel_copy_matches_the_table():
     first, last = RETRYABLE_APPLICATION_CODES[0], RETRYABLE_APPLICATION_CODES[-1]
     assert f"code >= {first} && code <= {last}) return 'backoff'" in text
     assert f"code >= 4000 && code <= {first - 1}) return 'fix'" in text
+    retired = re.search(r"export const RETIRED_CLOSE_CODES = \[(.*?)\]", text, re.S)
+    assert retired is not None
+    assert {int(c) for c in re.findall(r"\d{4}", retired.group(1))} == set(RETIRED_CODES)
 
 
 class _WS:

@@ -85,6 +85,8 @@ class FakeOpenClawServer:
 
     ok        -> ack started, un delta y final
     hold      -> ack started y espera a `release` antes del final
+    partial_hold -> ack started, un delta `reply-partial `, espera a `release`, un delta `fin`
+                 y final (un turno a medias: lo que lleva ya dicho cuando otra sesión se adjunta)
     accepted  -> ack `ok:true,status:"accepted"` (no es fin de turno), delta y final
     malformed -> ack started, frames basura, luego delta y final
     close     -> cierra la conexión con 1000 sin responder
@@ -556,6 +558,12 @@ class FakeOpenClawServer:
                     await ws.send(self._agent(sk, "end", run_id))
                 finally:
                     done.set()
+                return
+            if text == "partial_hold":
+                await ws.send(self._chat(sk, "delta", "reply-partial ", run_id))
+                await self.release.wait()
+                await ws.send(self._chat(sk, "delta", "fin", run_id))
+                await ws.send(self._chat(sk, "final", run_id=run_id))
                 return
             if text == "hold":
                 await self.release.wait()

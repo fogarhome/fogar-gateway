@@ -6,6 +6,7 @@ import logging
 import pytest
 
 from fogar_gateway.core.config import settings
+from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.openclaw.client import (
     READ_METHODS,
     OpenClawClient,
@@ -13,13 +14,13 @@ from fogar_gateway.services.openclaw.client import (
 )
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.reconnecting import ReconnectingOpenClawClient
-from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+from fogar_gateway.services.openclaw.registry import TurnRegistry
 from tests.fakes.openclaw import FakeOpenClawServer
 
 
 def _client(port: int) -> OpenClawClient:
     turns = TurnRegistry()
-    return OpenClawClient("127.0.0.1", port, "tok", turns, FrameDispatcher(turns, ClientRegistry()))
+    return OpenClawClient("127.0.0.1", port, "tok", turns, FrameDispatcher(turns, ChannelHub()))
 
 
 async def test_read_methods_return_their_payload():

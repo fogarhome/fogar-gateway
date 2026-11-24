@@ -1,13 +1,19 @@
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable
+from typing import Any, Protocol
 
 from fogar_gateway.services.openclaw.models import ToolCallEvent
-from fogar_gateway.services.pipeline_tracker import PipelineTracker
 from fogar_gateway.services.protocol import ACCEPTED, OrchestratorProtocol
 from fogar_gateway.services.turn_progress import ProgressPhase
 
 logger = logging.getLogger(__name__)
+
+
+class PipelineRecorder(Protocol):
+    """What `call_orchestrator` records on: a `PipelineTracker` or a stand-in for it."""
+
+    async def record(self, stage: str, **meta: Any) -> Any: ...
 
 
 class OrchestratorError(RuntimeError):
@@ -20,7 +26,7 @@ async def call_orchestrator(
     orchestrator: OrchestratorProtocol,
     text: str,
     session_key: str,
-    tracker: PipelineTracker | None = None,
+    tracker: PipelineRecorder | None = None,
     on_token: Callable[[str], Awaitable[None]] | None = None,
     on_tool_call: Callable[[ToolCallEvent], Awaitable[None]] | None = None,
     on_accepted: Callable[[], Awaitable[None]] | None = None,

@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.openclaw.client import (
     ORCHESTRATOR_HANDSHAKE_FAILED_ERROR,
     OpenClawClient,
@@ -487,7 +488,7 @@ async def test_connect_frame_schema(fake_ws):
 
 def real_ws_client(port: int) -> OpenClawClient:
     turns = TurnRegistry()
-    return OpenClawClient("127.0.0.1", port, "tok", turns, FrameDispatcher(turns, ClientRegistry()))
+    return OpenClawClient("127.0.0.1", port, "tok", turns, FrameDispatcher(turns, ChannelHub()))
 
 
 @pytest.mark.parametrize(
@@ -500,7 +501,7 @@ def real_ws_client(port: int) -> OpenClawClient:
 )
 def test_ipv6_host_is_bracketed_in_uri(host, uri):
     turns = TurnRegistry()
-    client = OpenClawClient(host, 18789, "tok", turns, FrameDispatcher(turns, ClientRegistry()))
+    client = OpenClawClient(host, 18789, "tok", turns, FrameDispatcher(turns, ChannelHub()))
     assert client._uri == uri
 
 
@@ -510,7 +511,7 @@ def test_ipv6_host_is_bracketed_in_uri(host, uri):
 )
 def test_tls_uses_wss(host, uri):
     turns = TurnRegistry()
-    client = OpenClawClient(host, 443, "tok", turns, FrameDispatcher(turns, ClientRegistry()), tls=True)
+    client = OpenClawClient(host, 443, "tok", turns, FrameDispatcher(turns, ChannelHub()), tls=True)
     assert client._uri == uri
 
 

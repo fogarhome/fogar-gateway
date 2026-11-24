@@ -219,6 +219,7 @@ async def test_state_reflects_a_real_pairing_flow(tmp_path, monkeypatch):
     """OpenClawClient real contra el fake remoto; /admin/state lee el mismo objeto de acceso."""
     import fogar_gateway.api.admin_routes as admin_routes
     from fogar_gateway.main import app
+    from fogar_gateway.services.channel import ChannelHub
     from fogar_gateway.services.openclaw.client import OpenClawClient, OrchestratorPairingRequired
     from fogar_gateway.services.openclaw.device import DeviceStore
     from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
@@ -239,7 +240,7 @@ async def test_state_reflects_a_real_pairing_flow(tmp_path, monkeypatch):
     monkeypatch.setattr(app.state, "client_registry", ClientRegistry(), raising=False)
     async with FakeOpenClawServer(token="t", remote=True) as server:
         client = OpenClawClient("127.0.0.1", server.port, "t", turns,
-                                FrameDispatcher(turns, ClientRegistry()),
+                                FrameDispatcher(turns, ChannelHub()),
                                 device_store=DeviceStore(tmp_path / "d.json"), access=access)
         with pytest.raises(OrchestratorPairingRequired):
             await client.connect()

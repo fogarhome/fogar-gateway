@@ -13,7 +13,7 @@ from fogar_gateway.services.pipeline_tracker import PipelineTracker
 from fogar_gateway.services.protocol import OrchestratorEvent
 from fogar_gateway.services.reconnection import ConnectionState
 from fogar_gateway.services.teardown import Teardown
-from tests.fakes.bridge import push, sent
+from tests.fakes.bridge import enqueue_push, push, sent
 
 _CONFIG = ClientConfig(silence_timeout_s=1)
 
@@ -388,7 +388,7 @@ async def test_idle_watchdog_closes_when_push_exceeds_grace_period(make_wd_bridg
     bridge._last_client_activity = time.monotonic() - 10  # idle-timeout would fire
 
     await push(bridge, ("turn_start", "sk"))
-    (worker,) = [t for t in bridge.tasks if t.get_name() == "push_worker"]
+    worker = bridge.channel._push_worker  # 5.0: the push worker is the channel's
     worker.cancel()  # wedged: nobody closes the push on its budget
     await asyncio.wait({worker})
     await asyncio.sleep(0.1)  # past TURN_TIMEOUT_S without progress
@@ -408,13 +408,13 @@ async def test_idle_watchdog_closes_when_push_exceeds_grace_period(make_wd_bridg
 async def _wedged_backlog(bridge):
     """A push event queued that the worker cannot handle yet: a turn being replaced holds
     the turn lock, so only the backlog keeps the session busy."""
-    await bridge.turns._lock.acquire()
-    bridge.enqueue_push("turn_start", "sk")
+    await bridge.channel._lock.acquire()
+    enqueue_push(bridge, "turn_start", "sk")
     await asyncio.sleep(0.01)
 
 
 async def _release(bridge):
-    bridge.turns._lock.release()
+    bridge.channel._lock.release()
     await bridge.turns.close(Teardown("test"), 1.0)
 
 
@@ -642,8 +642,8 @@ async def test_push_with_audio_playing_counts_as_in_flight(make_bridge, monkeypa
     tts.connect = AsyncMock(return_value=stream)
     tts.resolve_voice = lambda v: v
     bridge, _ = make_bridge(output_mode=("audio", "text"), tts=tts)
-    bridge.enqueue_push("turn_start", "sk")
-    bridge.enqueue_push("turn_end", "sk")  # the worker now drains its audio
+    enqueue_push(bridge, "turn_start", "sk")
+    enqueue_push(bridge, "turn_end", "sk")  # the worker now drains its audio
     try:
         await asyncio.sleep(0.15)  # past TURN_TIMEOUT_S since the last event
         assert bridge.turns.in_flight() is True

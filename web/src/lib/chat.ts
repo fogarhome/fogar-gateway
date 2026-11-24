@@ -209,18 +209,15 @@ export function endReasonText(line: Pick<ChatLine, 'reason' | 'error'>): string 
 
 /**
  * Qué hacer al cerrarse el socket, según la clase del código (`closeCodes.ts`, nunca el texto):
- * - `elsewhere` (`never_auto`, 4102): otra sesión abrió esta conversación. Nunca se reconecta solo
- *   (§9): las dos se echarían una a otra sin fin; solo si lo pide la persona.
  * - `stop` (`fix`: el resto de 4000–4899 y 1008): no tiene arreglo reconectando (conversación que ya
  *   no existe, panel desactivado, acceso retirado…). Lo decide la persona, con «Reintentar».
  * - `idle` (`on_input`, 1000): inactividad de 5 min: se reabre al escribir, no antes.
  * - `retry` (`backoff`): caída (1006), fallo del gateway u OpenClaw caído (1011), reinicio (1012),
  *   cliente lento (1013), 49xx (handshake a destiempo…).
  */
-export type CloseAction = 'elsewhere' | 'stop' | 'idle' | 'retry'
+export type CloseAction = 'stop' | 'idle' | 'retry'
 
 const ACTION: Record<Reconnect, CloseAction> = {
-  never_auto: 'elsewhere',
   fix: 'stop',
   on_input: 'idle',
   backoff: 'retry',

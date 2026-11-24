@@ -62,8 +62,7 @@ function cerrarChat(): void {
   chat.value?.dispose()
   chat.value = null
 }
-// Si la conversación estaba abierta en otra pestaña, aquella se queda con el aviso «Abierta en otro
-// sitio» (el 4102 del gateway) y no vuelve sola: no hace falta mirarlo antes.
+// La conversación puede estar abierta a la vez en otras pestañas o aparatos (5.0): cada una la sigue.
 function abrirChat(): void {
   if (chat.value || !escribible.value || !session.token) return
   chat.value = createChatSession({ conversationId: id.value, token: session.token })
@@ -87,8 +86,8 @@ watch(
 watch(escribible, (si) => si && abrirChat(), { immediate: true })
 onBeforeUnmount(cerrarChat)
 
-async function seguirAqui(): Promise<void> {
-  chat.value?.retake()
+async function reintentar(): Promise<void> {
+  chat.value?.reconnect()
   await cargarHistoria()
 }
 
@@ -211,16 +210,9 @@ watch(firma, () => {
     </section>
 
     <div v-if="estado" class="pie">
-      <section v-if="estado.connection === 'elsewhere'" class="banner" role="status" aria-labelledby="h-fuera">
-        <div>
-          <h2 id="h-fuera" class="fg-h2">Abierta en otro sitio</h2>
-          <p class="fg-suave">Esta conversación está abierta en otra pestaña o ventana, y allí sigue. Si la sigues aquí, se cierra allí.</p>
-        </div>
-        <FgBoton variante="principal" @click="seguirAqui">Seguir aquí</FgBoton>
-      </section>
-      <section v-else-if="estado.connection === 'stopped'" class="banner" role="alert">
+      <section v-if="estado.connection === 'stopped'" class="banner" role="alert">
         <FgEstado tono="bad" :texto="estado.notice ?? 'El chat se ha parado.'" />
-        <FgBoton @click="seguirAqui">Reintentar</FgBoton>
+        <FgBoton @click="reintentar">Reintentar</FgBoton>
       </section>
       <form v-else class="redactar" @submit.prevent="enviar">
         <label for="mensaje" class="fg-solo-lector">Mensaje para Fogar</label>
@@ -337,15 +329,6 @@ textarea:disabled {
   padding: 18px 20px;
   border-radius: var(--radio-bloque);
   background: var(--piedra-alta);
-}
-.banner > div {
-  flex: 1 1 320px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.banner p {
-  margin: 0;
 }
 .linea {
   padding-left: 16px;

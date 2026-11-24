@@ -60,12 +60,15 @@ def make_bridge(
     stt=None,
     transcriber=None,
     register=False,
+    attach=True,
     **overrides,
 ):
     """Return `(bridge, ws)`. Any `FogarBridge` argument can be overridden by name.
 
     Must run inside the event loop (the `QueuedSender` starts its writer task).
-    `register=True` adds the bridge to its `client_registry`, as `routes.py` does.
+    `register=True` adds the bridge to its `client_registry`, as `routes.py` does. The bridge
+    is attached to its conversation's channel (what `claim_conversation` does before `ready`);
+    `attach=False` leaves it out.
     """
     ws = ws if ws is not None else RecWS()
     kwargs = dict(
@@ -87,6 +90,8 @@ def make_bridge(
     bridge.transcriber = transcriber
     if register:
         kwargs["client_registry"].register(bridge.client_id, bridge, bridge.conversation.current)
+    if attach:
+        bridge.turns.attach()
     return bridge, ws
 
 
@@ -115,8 +120,12 @@ def keyed_conversation(client_id: str, agent: str = "main", id: str | None = Non
 async def sent(bridge) -> list:
     """Everything the client has received so far, after draining the sender.
 
+    The session paints its turns on its own worker (5.0: the channel only enqueues there), so
+    this waits for that queue first.
+
     Raises `ClientGone` if the sender broke: an empty list must mean "nothing was
     sent", not "the sender dropped it". With a broken sender, read `ws.sent`."""
+    await asyncio.wait_for(bridge.turns.idle(), 5.0)
     await bridge._sender.flush()
     return bridge.client_ws.sent
 
@@ -136,13 +145,22 @@ async def run_turn(bridge, text: str = "x", timeout: float = 5.0) -> None:
     if not done:
         task.cancel()
         raise AssertionError(f"the turn did not end in {timeout}s")
+    await asyncio.wait_for(bridge.turns.idle(), timeout)
+
+
+def enqueue_push(bridge, kind: str, arg, run_id: str | None = None) -> None:
+    """A push event `(kind, arg)` for the channel the bridge is attached to (what
+    FrameDispatcher does with `channel_for(sessionKey).enqueue_push`)."""
+    channel = bridge.channel
+    assert channel is not None, "the bridge is not attached to a channel"
+    channel.enqueue_push(kind, arg, run_id)
 
 
 async def push(bridge, *events) -> None:
-    """Feed OpenClaw push events `(kind, arg)` through the bridge's push worker and wait
-    until it handled them all (what FrameDispatcher does with `enqueue_push`)."""
+    """Feed OpenClaw push events `(kind, arg)` through the channel's push worker and wait
+    until the channel and the session handled them all."""
     for kind, arg in events:
-        bridge.enqueue_push(kind, arg)
+        enqueue_push(bridge, kind, arg)
     await bridge.push_idle()
 
 

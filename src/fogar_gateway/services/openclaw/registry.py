@@ -89,29 +89,6 @@ class TurnRegistry:
         self._session_owner: dict[str, str] = {}
         # req_ids whose ack is announced in their queue (register(announce=True)).
         self._announce: set[str] = set()
-        # session_key -> waiters of wait_released() (M19: a displaced session letting go).
-        self._release_waiters: dict[str, list[asyncio.Future]] = {}
-
-    async def wait_released(self, session_key: str) -> None:
-        """Until no turn owns `session_key` (at once if none does). A turn's stream releases
-        its key in its `finally`, right before sending its chat.abort."""
-        if session_key not in self._sessions:
-            return
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        waiters = self._release_waiters.setdefault(session_key, [])
-        waiters.append(fut)
-        try:
-            await fut
-        finally:
-            if fut in waiters:
-                waiters.remove(fut)
-            if not waiters:
-                self._release_waiters.pop(session_key, None)
-
-    def _wake_released(self, session_key: str) -> None:
-        for fut in self._release_waiters.pop(session_key, []):
-            if not fut.done():
-                fut.set_result(None)
 
     def register(
         self, req_id: str, session_key: str, *, by_run: bool = True, announce: bool = False
@@ -140,7 +117,6 @@ class TurnRegistry:
             self._sessions.pop(session_key, None)
             self._session_owner.pop(session_key, None)
             self._overflowed.discard(session_key)
-            self._wake_released(session_key)
         self._req_to_session.pop(req_id, None)
         self._run_of_req.pop(req_id, None)
         self._held.pop(req_id, None)
@@ -343,8 +319,6 @@ class TurnRegistry:
         for queue in self._sessions.values():
             self._force_put(queue, ("error", message))
         self._overflowed.clear()
-        for session_key in list(self._sessions):
-            self._wake_released(session_key)
         self._sessions.clear()
         self._req_to_session.clear()
         self._session_owner.clear()
@@ -362,14 +336,11 @@ def _prune(deadlines: dict[str, float]) -> None:
 
 
 class ClientRegistry:
-    """Sesiones vivas (#113, M19): quién recibe un push y qué conversación está abierta dónde.
-
-    Cada sesión se registra con su cliente y su conversación (un cliente puede tener varias
-    sesiones, cada una en una conversación). Una conversación está abierta en una sola sesión:
-    abrirla en otra devuelve la anterior, que el llamador cierra (4102 «conversation opened
-    elsewhere»). El push se enruta por su `sessionKey`: conversación (`index`) → la sesión que
-    la tiene abierta o, si ninguna, la sesión más reciente de su cliente (p. ej. un recordatorio
-    en la conversación de ayer de la tele, que ya está en la de hoy).
+    """Sesiones vivas de cada cliente (#113): los avisos de estado (`broadcast_status`) y la
+    revocación (`for_client`). Desde la 5.0 (#406) una conversación puede estar abierta en
+    varias sesiones a la vez: cada una se adjunta al canal de su conversación
+    (services/channel.py), que reparte sus turnos y sus push; aquí no hay nada por
+    conversación (el 4102 «conversation opened elsewhere» se retiró).
 
     Las identidades se comparan con `is` (#113): el cierre tardío de una sesión vieja nunca
     quita a la nueva.
@@ -378,28 +349,15 @@ class ClientRegistry:
     def __init__(self, index: ConversationIndex | None = None) -> None:
         self.index = index if index is not None else ConversationIndex()
         self._clients: dict[str, list[Any]] = {}  # client_id -> sesiones vivas, la última al final
-        self._open: dict[str, Any] = {}  # conversation id -> la sesión que la tiene abierta
 
-    def register(
-        self, client_id: str, bridge: Any, conversation: Conversation | None = None
-    ) -> Any | None:
-        """Registra la sesión (y abre su conversación). Devuelve la sesión que tenía abierta
-        esa conversación, si era otra."""
+    def register(self, client_id: str, bridge: Any, conversation: Conversation | None = None) -> None:
+        """Registra la sesión; con `conversation`, la indexa (el push de su `sessionKey` llega
+        a su canal)."""
         live = self._clients.setdefault(client_id, [])
         if not any(b is bridge for b in live):
             live.append(bridge)
-        return self.open(conversation, bridge) if conversation is not None else None
-
-    def open(self, conversation: Conversation, bridge: Any) -> Any | None:
-        """`bridge` abre `conversation`; devuelve la sesión que la tenía abierta, si era otra."""
-        self.index.add(conversation)
-        previous = self._open.get(conversation.id)
-        self._open[conversation.id] = bridge
-        return previous if previous is not None and previous is not bridge else None
-
-    def close(self, conversation_id: str, bridge: Any) -> None:
-        if self._open.get(conversation_id) is bridge:
-            del self._open[conversation_id]
+        if conversation is not None:
+            self.index.add(conversation)
 
     def unregister(self, client_id: str, expected_bridge: Any) -> None:
         live = self._clients.get(client_id)
@@ -407,30 +365,11 @@ class ClientRegistry:
             live[:] = [b for b in live if b is not expected_bridge]
             if not live:
                 del self._clients[client_id]
-        for conversation_id in [c for c, b in self._open.items() if b is expected_bridge]:
-            del self._open[conversation_id]
 
     def get(self, client_id: str) -> Any | None:
         """La sesión viva más reciente del cliente."""
         live = self._clients.get(client_id)
         return live[-1] if live else None
-
-    def holder(self, conversation_id: str) -> Any | None:
-        """La sesión que tiene abierta la conversación, si hay una."""
-        return self._open.get(conversation_id)
-
-    def route(self, session_key: str) -> Any | None:
-        """La sesión que recibe un push de `session_key`, o None."""
-        conversation = self.index.get(session_key)
-        if conversation is not None:
-            target = self._open.get(conversation.id) or self.get(conversation.client_id)
-            # M20: lo privado nunca a un dispositivo del hogar ni a uno de otra persona. Su
-            # dispositivo es de su dueño (`_stamp`): esto es la red de seguridad.
-            owner = conversation.owner_user_id
-            if target is not None and owner is not None and target.client.user_id != owner:
-                return None
-            return target
-        return None
 
     def for_client(self, client_id: str) -> list[Any]:
         """Las sesiones vivas de un cliente (una copia)."""

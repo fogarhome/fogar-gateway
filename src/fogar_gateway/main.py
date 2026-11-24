@@ -36,7 +36,8 @@ from fogar_gateway.core.startup_checks import (
 from fogar_gateway.core.transport import TransportCaptureMiddleware
 from fogar_gateway.db.database import dispose_engine, require_database, run_migrations
 from fogar_gateway.services.auth import LoginLimiter
-from fogar_gateway.services.conversations import ConversationService, TitleCache
+from fogar_gateway.services.channel import ChannelHub
+from fogar_gateway.services.conversations import ConversationService, TitleCache, note_turn_safely
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.models import OrchestratorAccess
@@ -105,7 +106,19 @@ async def _lifespan_body(app: FastAPI):
     await conversations.load()
     turn_registry = TurnRegistry()
     client_registry = ClientRegistry(conversations.index)
-    dispatcher = FrameDispatcher(turn_registry, client_registry)
+    # Un canal por conversación (5.0, #406): el único dueño de sus runs; reparte cada turno a
+    # las sesiones adjuntas. Su orquestador se pone en cuanto existe (el cliente necesita el
+    # dispatcher, y el dispatcher los canales).
+    channel_hub = ChannelHub(
+        index=conversations.index,
+        turn_registry=turn_registry,
+        note_turn=lambda conversation_id: _count_turn(conversation_id),
+    )
+
+    def _count_turn(conversation_id: str) -> None:
+        channel_hub.spawn(note_turn_safely(conversations, conversation_id), "conversation_turn")
+
+    dispatcher = FrameDispatcher(turn_registry, channel_hub)
     # Acceso a OpenClaw (permisos, emparejamiento): lo actualiza el cliente, lo lee /admin/state.
     openclaw_access = OrchestratorAccess()
     inner = OpenClawClient(
@@ -123,6 +136,7 @@ async def _lifespan_body(app: FastAPI):
         initial_backoff=settings.ORCHESTRATOR_RECONNECT_INITIAL_BACKOFF,
         max_backoff=settings.ORCHESTRATOR_RECONNECT_MAX_BACKOFF,
     )
+    channel_hub.orchestrator = openclaw
     # Never raises: a failed first connect is logged and retried in the background.
     await openclaw.connect()
 
@@ -175,6 +189,7 @@ async def _lifespan_body(app: FastAPI):
     app.state.speech = speech
     app.state.turn_registry = turn_registry  # read by routes.py for queue depths (#219)
     app.state.client_registry = client_registry
+    app.state.channel_hub = channel_hub
     app.state.conversations = conversations
     app.state.conversation_titles = TitleCache()  # títulos de /admin/conversations
     app.state.session_registry = SessionRegistry()
@@ -197,6 +212,10 @@ async def _lifespan_body(app: FastAPI):
             for provider in (speech.stt, speech.tts):
                 await td.step(provider.aclose(), f"cierre del proveedor {provider.name}")
             await td.step(app.state.conversation_titles.aclose(), "títulos de conversaciones")
+            # Los turnos que siguen en los canales (sin nadie adjunto) antes que OpenClaw.
+            await td.step(
+                channel_hub.aclose(settings.SESSION_TEARDOWN_S), "canales de conversación"
+            )
             await td.step(openclaw.close(), "cierre de OpenClaw")
             # 3. Notification tasks still in flight.
             for task in list(_notification_tasks):

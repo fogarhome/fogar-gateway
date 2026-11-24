@@ -10,9 +10,9 @@ Reglas, iguales para todos los clientes (el gateway no mira el tipo de cliente):
 - Quien no elige cae en la **conversación por defecto**: una por cliente, agente y día. El día
   empieza a las `CONVERSATION_DAY_START_HOUR` (hora local del host) y se evalúa al empezar cada
   turno: una sesión abierta días (la tele) pasa a la del día nuevo en su primer turno tras el corte.
-- Una conversación está abierta en una sola sesión (`ClientRegistry`): abrirla en otra cierra la
-  anterior con 4102 «conversation opened elsewhere».
-- El push se enruta por su `sessionKey`: índice → conversación → sesión viva (`ClientRegistry`).
+- Una conversación puede estar abierta en varias sesiones a la vez (5.0, #406): cada una se
+  adjunta a su canal (services/channel.py). El 4102 «conversation opened elsewhere» se retiró.
+- El push se enruta por su `sessionKey`: índice → conversación → su canal, que lo reparte.
 
 Nada de esto guarda ni registra texto del usuario.
 """
@@ -103,7 +103,7 @@ class _Requester(Protocol):
 
 class ConversationIndex:
     """`session_key` → conversación, en memoria: cargado de la BD al arrancar y al día con cada
-    alta. Lo usa el reparto de push (`ClientRegistry.route`). Solo se toca desde el hilo del
+    alta. Lo usa el reparto de push (`ChannelHub.channel_for`). Solo se toca desde el hilo del
     loop (los métodos async de ConversationService lo actualizan al volver del hilo de la BD)."""
 
     def __init__(self) -> None:
@@ -453,8 +453,6 @@ class SessionConversation:
         self._service = service
         self._index = index if index is not None else (service.index if service else None)
         self.on_move: Callable[[Conversation, Conversation], Awaitable[None]] | None = None
-        # La sesión perdió su conversación (otra la abrió): ya no aborta nada en su clave.
-        self.released = False
         self._spawn: Callable[[Coroutine[Any, Any, None], str], None] | None = None
 
     @property

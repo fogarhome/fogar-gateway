@@ -1,59 +1,65 @@
 """Turnos de cara al cliente: `TurnController` y el TTS de cada turno (M19; #271, #285, #286).
 
 Un turno es lo que el cliente ve entre un `turn_start` y su `turn_end`. Hay dos orígenes:
-`user` (un `send` del cliente) y `push` (OpenClaw abre una ejecución por su cuenta). Este
-módulo es el único que los abre y los cierra, con las mismas reglas para los dos:
+`user` (un `send`) y `push` (OpenClaw abre una ejecución por su cuenta). Desde la 5.0 (PR 2a,
+#406) cada conversación tiene un canal (`services/channel.py`), el único dueño de sus runs en
+OpenClaw: el lock de envío, la tarea del turno, el worker de push, las lápidas, la cuenta de
+turnos. `TurnController` es la parte de una sesión: un suscriptor del canal que pinta cada
+turno del canal a su manera, con las mismas reglas de siempre por socket:
 
-- Un solo turno abierto por sesión (#202): un push que llega con un turno del usuario en
-  curso espera; un `send`, un `cancel` o un barge-in cortan el push abierto y lo abortan en
-  OpenClaw si es de la misma sesión de agente.
+- Un solo turno abierto por sesión (#202): las callbacks del canal solo encolan en la cola
+  ordenada de la sesión; su worker abre el siguiente turno detrás del `turn_end` del anterior
+  (decisión 1 del plan de la PR 2: el canal no espera a nadie, cada socket cierra lo suyo).
 - Exactamente un `turn_end` por `turn_start`, sea cual sea el camino (`_end`, idempotente).
-- Un mismo presupuesto de tiempo: `TURN_TIMEOUT_S` sin progreso del orquestador cierra el
-  turno con `turn_timeout` (el normal, dentro de `stream_response`; el push, en el worker).
-- Un TTS por turno (`TurnTts`): abrir, alimentar, terminar esperando el audio por
-  inactividad, y liberar; las métricas (`tts_start`, `tts_first_chunk`, `tts_done`) son las
-  mismas para los dos orígenes.
+- Su propia numeración (`t-{n}`, `turn_seq` & 0xFFFF), su `output_mode`, sus `tool_calls`, su
+  `push_enabled` (sin él no ve los push) y su `turn_progress` (#254) con su ritmo.
+- Un TTS por turno (`TurnTts`), solo en la sesión que suena: la que envió un turno del usuario
+  o, para un push, la que el canal elige (2a: la última adjunta con audio; 2c lo sustituye).
+  Abrir, alimentar, terminar esperando el audio por inactividad, y liberar; las métricas
+  (`tts_start`, `tts_first_chunk`, `tts_done`) son las mismas para los dos orígenes.
 
 Cada turno lleva su conversación y su origen en `turn_start`, y el motivo de su fin
-(`EndReason`) en `turn_end` (M19). La conversación de un turno del usuario es la de la sesión,
-evaluada al empezarlo (cambio de día, services/conversations.py); la de un push, la de su
-`sessionKey`.
+(`EndReason`) en `turn_end` (M19). La conversación de la sesión se evalúa al empezar cada turno
+del usuario (cambio de día, services/conversations.py): la sesión deja el canal de ayer y se
+adjunta al de hoy.
+
+Varias sesiones en una conversación (5.0 PR 2a.3): cada una es un suscriptor más del canal y
+recibe su propio par de cada turno. Una sesión que se adjunta con un turno abierto recibe su
+`turn_start` y, si muestra texto, un `token` con lo que el turno ya llevaba (`ChannelTurn.text`),
+sin audio. Una sesión que se va (desconexión, revocación, inactividad) cierra lo suyo con
+`closed` y se desuscribe: nunca cancela el turno del canal ni aborta su run.
 """
 
 import asyncio
 import logging
 import time
-from collections import OrderedDict
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from fogar_gateway.core.config import settings
-from fogar_gateway.models.schemas import ClientConfig, Handshake
-from fogar_gateway.services import orchestration
-from fogar_gateway.services.conversations import SessionConversation
-from fogar_gateway.services.openclaw.chat_text import ChatTextTracker
-from fogar_gateway.services.openclaw.failures import (
-    ORCHESTRATOR_AGENT_UNAVAILABLE_ERROR,
-    classify_failure,
-    fallback_reason,
+from fogar_gateway.models.schemas import Client, ClientConfig, Handshake
+from fogar_gateway.services.channel import (
+    ChannelError,
+    ChannelEvent,
+    ChannelHub,
+    ChannelProgress,
+    ChannelToken,
+    ChannelToolCall,
+    ChannelTurn,
+    ConversationChannel,
 )
+from fogar_gateway.services.conversations import SessionConversation
+from fogar_gateway.services.openclaw.failures import ORCHESTRATOR_AGENT_UNAVAILABLE_ERROR
 from fogar_gateway.services.openclaw.models import ToolCallEvent
-from fogar_gateway.services.openclaw.registry import TurnRegistry
 from fogar_gateway.services.outbound import ClientGone, OutboundSender, log_send_failed
 from fogar_gateway.services.pacing import AudioPacer
 from fogar_gateway.services.pipeline_tracker import PipelineTracker
-from fogar_gateway.services.protocol import OrchestratorProtocol
-from fogar_gateway.services.reconnection import describe_error, traceback_no_message
+from fogar_gateway.services.reconnection import describe_error
 from fogar_gateway.services.speech.ports import TextToSpeechProvider, TtsStream
 from fogar_gateway.services.stats import gateway_stats
 from fogar_gateway.services.teardown import Teardown
-from fogar_gateway.services.turn_progress import (
-    Progress,
-    ProgressPhase,
-    TurnProgress,
-    chat_status_phase,
-)
+from fogar_gateway.services.turn_progress import Progress, TurnProgress
 
 logger = logging.getLogger(__name__)
 
@@ -63,16 +69,6 @@ TurnOrigin = Literal["user", "push"]
 # un `send` nuevo · timeout: TURN_TIMEOUT_S sin progreso · closed: la sesión se cierra o el
 # cliente se fue.
 EndReason = Literal["done", "error", "cancelled", "interrupted", "replaced", "timeout", "closed"]
-
-
-# Fases de arranque de runs cuyo push aún no se abrió (#254): las de los últimos runs, un rato.
-_EARLY_PHASE_RUNS = 8
-_EARLY_PHASE_TTL_S = 30.0
-
-
-def _other_run(open_run: str | None, run_id: object) -> bool:
-    """El frame es de otro run que el del push abierto (los dos con runId y distintos)."""
-    return isinstance(open_run, str) and isinstance(run_id, str) and run_id != open_run
 
 
 def _tool_call_message(turn_id: str, tool_call: ToolCallEvent) -> dict:
@@ -96,20 +92,27 @@ class Turn:
     seq: int  # el contador & 0xFFFF: el uint16 de `turn_start` y del header de audio (G-11)
     origin: TurnOrigin
     started_at: float
-    progress_at: float  # último evento del orquestador (presupuesto del push, #286)
-    session_key: str | None = None  # push: sesión de OpenClaw en la que corre
-    conversation_id: str | None = None  # su conversación (None: push de una clave desconocida)
-    run_id: str | None = None  # push: el runId de OpenClaw de su `agent start`
-    fallback_reason: str | None = None  # push: la del último `fallback_step` de su run (#397)
-    task: asyncio.Task | None = None  # user: la tarea que lo ejecuta
+    progress_at: float  # último evento del canal (el push cuenta en in_flight, #286)
+    conversation_id: str | None = None  # su conversación
+    channel: ChannelTurn | None = None  # el turno del canal que pinta
     opened: bool = False  # su turn_start ya está en la cola del cliente
     ended: bool = False  # su turn_end ya está en la cola (o se abandonó al cerrar)
     end_reason: EndReason | None = None
-    cancel_reason: EndReason | None = None  # quien cancela su tarea dice por qué
-    finishing: bool = False  # push: llegó el fin del agente, solo queda su audio
-    tts: "TurnTts | None" = None
+    cancel_reason: EndReason | None = None  # quien lo corta en esta sesión dice por qué
+    silent: bool = False  # sin audio en esta sesión: dejó su canal, o un `send` lo dejó atrás
+    tts: "TurnTts | None" = None  # push: su TTS
+    pending: "_PendingTts | None" = None  # user: su TTS mientras conecta (E-2)
     progress: TurnProgress = field(default_factory=TurnProgress)  # su `turn_progress` (#254)
     progress_flush: asyncio.Task | None = None  # el `turn_progress` aplazado por el ritmo
+
+    @property
+    def halted(self) -> bool:
+        """Terminado o cancelado (aquí o en su canal): ni audio ni progreso desde ya (A-2)."""
+        return (
+            self.ended
+            or self.cancel_reason is not None
+            or (self.channel is not None and self.channel.cancel_reason is not None)
+        )
 
 
 @dataclass
@@ -209,7 +212,7 @@ class TurnTts:
                 first = False
                 await self._tracker.record("tts_first_chunk", **self._meta())
             async for frame in pacer.frames(chunk):
-                if self._turn.ended or self._turn.cancel_reason is not None:
+                if self._turn.halted:
                     return  # nada después de su turn_end, ni desde que se cancela
                 try:
                     await self._sender.send_bytes(header + frame)
@@ -351,8 +354,11 @@ class _PendingTts:
                 await self.tts.feed(text)
 
     async def connected(self) -> "TurnTts | None":
-        """Espera a la conexión (acotada por el proveedor) y a que reciba el texto pendiente."""
+        """Espera a la conexión (acotada por el proveedor) y a que reciba el texto pendiente.
+        None si se soltó (`release`) mientras tanto: un turno cortado."""
         await asyncio.wait({self._task})
+        if self._task.cancelled():
+            return None
         self._task.result()  # un fallo inesperado sigue rompiendo el turno, como antes
         return self.tts
 
@@ -365,40 +371,54 @@ class _PendingTts:
         td.raise_if_cancelled()
 
 
+# Fines que terminan de sonar su audio antes del turn_end (lo que no es un corte). El timeout
+# del turno del usuario también (como antes: `stream_response` devolvía y se drenaba); el del
+# push es un corte.
+_DRAINED: frozenset[str] = frozenset({"done", "error"})
+
+
+def _drains(turn: "Turn", reason: EndReason) -> bool:
+    if turn.channel is not None and turn.channel.crashed:
+        return False  # una tarea rota no espera a la voz (como antes: sin drenar)
+    return reason in _DRAINED or (turn.origin == "user" and reason == "timeout")
+
+
 @dataclass
-class _PushBacklog:
-    """Eventos de push encolados y aún sin procesar (#130 S3a)."""
+class _Inbox:
+    """La cola ordenada de la sesión (decisión 1): lo que el canal le entrega, en orden."""
 
     pending: int = 0
     peak: int = 0
     since: float | None = None
-    queue: asyncio.Queue[tuple[str, Any, str | None]] = field(default_factory=asyncio.Queue)
+    queue: asyncio.Queue[tuple] = field(default_factory=asyncio.Queue)
 
 
 class TurnController:
-    """Abre, alimenta y cierra los turnos de una sesión. Ver el docstring del módulo.
+    """Los turnos de una sesión: suscriptor del canal de su conversación. Ver el docstring del
+    módulo.
 
     Lo que es de la sesión (socket de entrada, STT, watchdogs, revalidación, cierre) queda en
-    `FogarBridge`, que llama a `start_user_turn`, `cancel`, `enqueue_push`, `in_flight` y
-    `close`.
+    `FogarBridge`, que llama a `attach`, `start_user_turn`, `cancel`, `in_flight` y `close`.
+    Lo que es de la conversación (runs, abortos, cola de push, lock de envío) es del canal
+    (`services/channel.py`).
     """
 
     def __init__(
         self,
         *,
-        client_id: str,
+        client: Client,
         config: ClientConfig,
         handshake: Handshake,
-        orchestrator: OrchestratorProtocol,
         tts: TextToSpeechProvider,
         tracker: PipelineTracker,
         sender: OutboundSender,
         conversation: SessionConversation,
+        channels: ChannelHub,
         spawn: Callable[[Coroutine[Any, Any, None], str], asyncio.Task],
         supervise: Callable[[asyncio.Task], None],
-        turn_registry: TurnRegistry,
     ) -> None:
-        self._client_id = client_id
+        self._client = client
+        self._client_id = client.id
         self._config = config
         # C-r7-1: el `allowed_agents` vigente; la revalidación del bridge lo refresca.
         self.allowed_agents = config.allowed_agents
@@ -406,99 +426,256 @@ class TurnController:
         self._wants_audio = "audio" in handshake.output_mode
         # `turn_progress` (#254) va con los mensajes de diagnóstico del turno: `status`.
         self._wants_progress = "status" in handshake.output_mode
-        self._orchestrator = orchestrator
         self._tts = tts
         self._tracker = tracker
         self._sender = sender
         self._conversation = conversation
+        self._channels = channels
         self._spawn = spawn
         self._supervise = supervise
-        # Runs de OpenClaw (#285): lápidas (el dispatcher descarta los frames de un run
-        # abortado que aún no llegaron, y el worker de push lo que ya tenía en cola) y runs
-        # activos en nuestra session_key (se abortan antes de un chat.send).
-        self._turn_registry = turn_registry
 
         self._seq = 0
-        # Serializa cancelar/arrancar (G-08, #201): un turno nuevo no arranca hasta que el
-        # anterior terminó, y el abort de un push cortado sale antes del chat.send del usuario.
-        self._lock = asyncio.Lock()
-        self._user_task: asyncio.Task | None = None
-        self._user_started_at: float | None = None
-        self._user_turn: Turn | None = None
-        self._push: Turn | None = None
-        self._push_text = ChatTextTracker()  # #241: texto ya emitido en la respuesta del push
-        # #254: runId → (última fase de arranque, cuándo) de runs sin push abierto todavía.
-        self._early_phases: OrderedDict[str, tuple[ProgressPhase, float]] = OrderedDict()
-        # Worker de push (#130 S3a): el dispatcher encola sin esperar desde el bucle de
-        # OpenClaw; un solo worker por sesión conserva el orden start → deltas → tool → end.
-        self._push_worker: asyncio.Task | None = None
-        self._backlog = _PushBacklog()
-        # Una vez puesto no vuelve atrás: ni turnos nuevos (G-09) ni eventos de push.
+        self._channel: ConversationChannel | None = None  # el canal al que está adjunta
+        self._sent_on: ConversationChannel | None = None  # donde envió su último `send`
+        self._by_channel: dict[str, Turn] = {}  # ChannelTurn.id → su turno en esta sesión
+        self._live: list[Turn] = []  # sus turnos sin turn_end, en orden
+        # Serializa los `send` de la sesión (su cambio de día y su envío al canal).
+        self._send_lock = asyncio.Lock()
+        # Worker de la sesión: un solo worker conserva el orden start → eventos → fin de
+        # cada turno, y el turn_start del siguiente detrás del turn_end del anterior.
+        self._worker: asyncio.Task | None = None
+        self._inbox = _Inbox()
+        self._backlog_peak = 0  # máximo de la cola de push de los canales que ya dejó
+        self._cuts: set[asyncio.Task] = set()  # turn_end de cortes en curso (on_turn_end)
+        # Una vez puesto no vuelve atrás: ni turnos nuevos (G-09) ni turnos del canal.
         self._closing = False
-        # El cliente se fue (desconexión o ClientGone): su turno deja de enviar (G-18).
+        # El cliente se fue (desconexión o ClientGone): deja de enviar y de sonar (G-18).
         self.client_gone = False
         self.last_ended: Turn | None = None
 
+    # ── Suscriptor del canal (ChannelSubscriber) ──────────────────────────
+
+    @property
+    def client(self) -> Client:
+        return self._client
+
+    @property
+    def conversation_id(self) -> str:
+        return self._conversation.id
+
+    @property
+    def wants_audio(self) -> bool:
+        return self._wants_audio
+
+    @property
+    def wants_push(self) -> bool:
+        return self._config.push_enabled
+
+    @property
+    def wants_progress(self) -> bool:
+        return self._wants_progress
+
+    @property
+    def tracker(self) -> PipelineTracker:
+        return self._tracker
+
+    def agent_allowed(self, session_key: str) -> bool:
+        allowed = self.allowed_agents
+        parts = session_key.split(":")
+        if allowed is None or len(parts) < 3 or parts[0] != "agent":
+            return True
+        return parts[1].lower() in {a.lower() for a in allowed}
+
+    def on_turn_start(self, turn: ChannelTurn) -> None:
+        if self._closing:
+            return
+        if turn.origin == "push":
+            if not self._config.push_enabled:
+                return  # el push entero se descarta para esta sesión
+            channel = self._channel
+            if channel is not None and not self.agent_allowed(channel.session_key):
+                # C-r7-1: push de un agente retirado de allowed_agents: no llega al cliente.
+                logger.info(f"[{self._client_id}] push de un agente no permitido: descartado")
+                return
+        local = self._new_turn(turn.origin)
+        local.conversation_id = turn.conversation_id
+        local.channel = turn
+        self._by_channel[turn.id] = local
+        self._live.append(local)
+        self._put(("turn_start", local))
+        caught_up = turn.text
+        if caught_up:
+            # 2a.3: se adjunta con el turno ya en marcha. Lo dicho hasta ahora le llega en un
+            # solo `token` (solo si muestra texto), nunca como voz: este turno no suena aquí.
+            local.silent = True
+            if self._wants_text:
+                self._put(("event", local, ChannelToken(caught_up)))
+
+    def on_event(self, turn: ChannelTurn, event: ChannelEvent) -> None:
+        local = self._by_channel.get(turn.id)
+        if local is not None and not local.ended:
+            self._put(("event", local, event))
+
+    def on_turn_end(self, turn: ChannelTurn, reason: EndReason) -> None:
+        local = self._by_channel.get(turn.id)
+        if local is None or local.ended:
+            return
+        self._put(("turn_end", local, reason))
+        if local.opened and not _drains(local, reason):
+            # Un corte (un `send` que lo sustituye, su timeout, un agente retirado): su turn_end
+            # sale ya (A-r2-2), sin esperar detrás de un worker ocupado con su TTS; lo que venga
+            # después sigue en la cola, detrás de él. Su fin encolado ya no hará nada.
+            local.cancel_reason = local.cancel_reason or reason
+            task = asyncio.create_task(self._cut(local, reason), name="turn_cut")
+            self._cuts.add(task)
+            task.add_done_callback(self._cuts.discard)
+            self._supervise(task)
+
+    # ── Canal ─────────────────────────────────────────────────────────────
+
+    @property
+    def channel(self) -> ConversationChannel | None:
+        """El canal al que está adjunta la sesión, si lo está."""
+        return self._channel
+
+    def attach(self) -> None:
+        """Se adjunta al canal de la conversación de la sesión (tras el health check, antes de
+        `ready`: claim_conversation). Con un turno abierto, recibe su turn_start ya.
+
+        Síncrono a propósito: claim_conversation lo llama justo antes de encolar `ready`, y un
+        await aquí dejaría que un turn_start del canal saliera antes que `ready`."""
+        if self._closing or self._channel is not None:
+            return
+        conversation = self._conversation.current
+        client = self._client
+        if not conversation.visible_to(client.home_id, client.user_id):
+            # M20: el handshake ya lo miró (4100); un dispositivo nunca se adjunta a una
+            # conversación que no puede ver (privada de otra persona, u otro hogar). Sin canal,
+            # cada `send` recibe un TURN_ERROR estable.
+            logger.warning(
+                f"[{self._client_id}] La conversación {conversation.id} no es visible para este "
+                "dispositivo: no se adjunta a su canal."
+            )
+            return
+        channel = self._channels.get_or_create(conversation)
+        self._channel = channel  # antes de subscribe: su on_turn_start lo mira
+        if not channel.subscribe(self):
+            # No debería pasar (el handshake ya miró `visible_to`): sin canal, cada `send`
+            # recibe un TURN_ERROR estable en vez de silencio.
+            self._channel = None
+            self._channels.drop_if_idle(channel.session_key, channel)
+            logger.warning(
+                f"[{self._client_id}] La sesión no pudo adjuntarse al canal de su conversación "
+                f"{self._conversation.id}."
+            )
+
+    async def _follow_conversation(self) -> None:
+        """Decisión 6 (cambio de día): la sesión cierra su turno del canal de ayer (`replaced`,
+        sin esperar a su TTS), lo deja (el turno sigue para los demás) y se adjunta al de hoy."""
+        channel = self._channel
+        if channel is not None and channel.conversation.id != self._conversation.id:
+            self._channel = None
+            await self._leave(channel, "replaced")
+        self.attach()
+
+    async def _leave(self, channel: ConversationChannel, reason: EndReason) -> None:
+        """Deja `channel` (cambio de día): nada más llega de él. Sus turnos en esta sesión se
+        cierran con `reason`: los abiertos ya (sin esperar a su audio), los que aún esperan su
+        turn_start en la cola, detrás de él (G-r2-1: todo turno visto recibe su par). Nunca
+        cancela el turno del canal ni aborta su run (decisión 2)."""
+        channel.unsubscribe(self)
+        self._backlog_peak = max(self._backlog_peak, channel.push_backlog()[1])
+        self._channels.drop_if_idle(channel.session_key, channel)
+        conversation_id = channel.conversation.id
+        for turn in self._live:
+            if turn.conversation_id == conversation_id:
+                turn.silent = True
+        for turn in list(self._live):
+            if turn.conversation_id == conversation_id and turn.opened:
+                turn.cancel_reason = turn.cancel_reason or reason
+                await self._end(turn, reason)
+        self._enqueue(("leave", conversation_id, reason))
+
     # ── Estado ────────────────────────────────────────────────────────────
-
-    def _session_key(self) -> str:
-        """La sesión de OpenClaw de la conversación actual de la sesión."""
-        return self._conversation.session_key
-
-    def _may_abort(self, session_key: str) -> bool:
-        """Se aborta en OpenClaw solo en la clave propia, y no una vez perdida la conversación
-        (M19: otra sesión la abrió y puede tener ya su turno en ella)."""
-        return not self._conversation.released and session_key == self._session_key()
 
     def in_flight(self) -> bool:
         """Hay un turno en curso: el único cálculo para los dos watchdogs.
 
-        El turno del usuario está acotado por dentro (TURN_TIMEOUT_S en stream_response). El
-        push y la cola de push, por TURN_TIMEOUT_S sin progreso, así que un worker atascado no
-        para el idle watchdog para siempre; un push cuyo audio sigue sonando (con ritmo, puede
-        durar más) cuenta mientras ese audio avanza.
+        El turno del usuario está acotado por dentro (TURN_TIMEOUT_S en stream_response, y su
+        audio por inactividad). El push y la cola, por TURN_TIMEOUT_S sin progreso, así que
+        un worker atascado no para el idle watchdog para siempre; un push cuyo audio sigue
+        sonando (con ritmo, puede durar más) cuenta mientras ese audio avanza.
         """
         now = time.monotonic()
-        task = self._user_task
-        if task is not None and not task.done():
+        channel = self._channel
+        if channel is not None and channel.user_turn_running():
             return True
-        push = self._push
-        if push is not None:
-            if now - push.progress_at < settings.TURN_TIMEOUT_S:
+        for turn in self._live:
+            if turn.origin == "user":
                 return True
-            if push.tts is not None and push.tts.progressing(now):
+            if now - turn.progress_at < settings.TURN_TIMEOUT_S:
                 return True
-        backlog = self._backlog
-        return backlog.pending > 0 and (
-            backlog.since is None or now - backlog.since < settings.TURN_TIMEOUT_S
+            if turn.tts is not None and turn.tts.progressing(now):
+                return True
+        if channel is not None and self._config.push_enabled:
+            pending, _, since = channel.push_backlog()
+            if pending > 0 and (since is None or now - since < settings.TURN_TIMEOUT_S):
+                return True
+        inbox = self._inbox
+        return inbox.pending > 0 and (
+            inbox.since is None or now - inbox.since < settings.TURN_TIMEOUT_S
         )
 
     def snapshot(self, now: float) -> dict[str, Any]:
         """El turno en curso y la cola de push para /admin/state (#219): solo números."""
         kind, since = "idle", None
-        task, push = self._user_task, self._push
-        if task is not None and not task.done():
-            kind, since = "normal", self._user_started_at
+        user = next((t for t in self._live if t.origin == "user"), None)
+        push = next((t for t in self._live if t.origin == "push"), None)
+        channel = self._channel
+        if user is not None:
+            kind, since = "normal", user.started_at
+        elif channel is not None and channel.user_turn_running():
+            kind = "normal"
         elif push is not None:
             kind, since = "push", push.started_at
+        pending = self._inbox.pending
+        if channel is not None:
+            pending += channel.push_backlog()[0]
         return {
             "turn": {"kind": kind, "since_s": round(now - since, 3) if since else None},
-            "push_backlog": {"pending": self._backlog.pending, "peak": self._backlog.peak},
+            "push_backlog": {"pending": pending, "peak": max(pending, self.push_backlog_peak)},
         }
 
     @property
     def push_backlog_peak(self) -> int:
-        return self._backlog.peak
+        """El máximo de lo que esperó: la cola de push de su canal y la de la sesión."""
+        channel = self._channel
+        peak = channel.push_backlog()[1] if channel is not None else 0
+        return max(peak, self._backlog_peak, self._inbox.peak)
 
     @property
     def user_task(self) -> asyncio.Task | None:
-        """The task running the user's turn, if one was started (done or not)."""
-        return self._user_task
+        """The channel's task running the user turn this session sent last (done or not);
+        None once cancelled."""
+        channel = self._sent_on
+        return channel.user_task if channel is not None else None
+
+    async def idle(self) -> None:
+        """Espera a que la cola de la sesión esté vacía (para tests)."""
+        await self._inbox.queue.join()
+
+    async def push_idle(self) -> None:
+        """Espera a que el canal y la sesión terminen todo lo encolado (para tests)."""
+        channel = self._channel
+        if channel is not None:
+            await channel.push_idle()
+        await self.idle()
 
     # ── Turno del usuario ─────────────────────────────────────────────────
 
     async def start_user_turn(self, text: str) -> None:
-        """Sustituye el turno en curso (normal o push) por uno nuevo para `text`.
+        """Envía `text` al canal de la conversación: sustituye su turno en curso (normal o
+        push) por uno nuevo, de esta sesión.
 
         Rechazado una vez que la sesión se cierra (G-09): el bucle de entrada sigue leyendo
         mientras corre close_all(), y un turno creado entonces sobreviviría al cierre.
@@ -506,400 +683,196 @@ class TurnController:
         if self._closing:
             logger.info(f"[{self._client_id}] send ignorado: la sesión se está cerrando.")
             return
-        async with self._lock:
+        async with self._send_lock:
             if self._closing:
                 return
-            current = self._user_task
-            if current is not None and not current.done():
-                self._mark_cancel(current, "replaced")
-                await self._cancel_and_wait(current)
-                await self._end_unstarted(current, "replaced")
-            # Dentro del lock: el abort del push termina antes de que salga el chat.send.
-            await self._cut_push(None, "replaced")
-            # Después de cortar (el push de la conversación de ayer se aborta en su clave) y
-            # antes de mirar los runs activos: el cambio de día se evalúa al empezar cada turno.
+            # 7e: un `send` deja atrás el audio de todo turno anterior en esta sesión: lo que
+            # aún suena de uno que ya terminó en su canal se corta, y los que aún esperan su
+            # turn_start en la cola reciben su par y su texto, pero sin voz.
+            for turn in self._live:
+                turn.silent = True
+            await self._cut_finishing("replaced")
+            # El cambio de día se evalúa al empezar cada turno (services/conversations.py).
             await self._conversation.refresh()
-            await self._abort_other_runs()
-            if self._closing:  # close_all() pudo empezar durante la espera
+            await self._follow_conversation()
+            channel = self._channel
+            if self._closing:
                 return
-            task = asyncio.create_task(self._run_user_turn(text), name="turn")
-            self._supervise(task)
-            self._user_task = task
-            self._user_started_at = time.monotonic()
+            if channel is None:
+                await self._refuse_send()
+                return
+            if not self.agent_allowed(channel.session_key):
+                # #397 (decisión a): la política del gateway, antes del chat.send (OpenClaw solo
+                # diría INVALID_REQUEST). Solo esta sesión recibe su par con el error: el turno
+                # del canal, sus push y sus runs no se tocan (las demás sesiones no lo ven).
+                code = ORCHESTRATOR_AGENT_UNAVAILABLE_ERROR
+                logger.warning(f"[{self._client_id}] Turno sin agente disponible: {code}")
+                gateway_stats.turn_started("normal")
+                gateway_stats.turn_error(code)
+                await self._refuse_send(code)
+                return
+            self._sent_on = channel
+            await channel.send_user_message(self, text)
 
-    async def cancel(self, reason: EndReason, *, push: bool = True) -> tuple[bool, str | None]:
-        """Cancela el turno en curso; con `push`, también el push abierto *ahora* (uno que el
-        worker abra después sigue). Devuelve (cancelado, su turn_id si llegó a abrirse)."""
-        push_id = self._push.turn_id if push and self._push is not None else None
-        cancelled, turn_id = await self._cancel_user(reason)
-        if push_id is not None and not cancelled:
-            async with self._lock:
-                if await self._cut_push(push_id, reason):
-                    cancelled, turn_id = True, push_id
-        return cancelled, turn_id
+    async def _refuse_send(self, code: str = "internal_error") -> None:
+        """Un `send` que no llega al canal (sin canal, o un agente no permitido) recibe su par
+        con un TURN_ERROR estable (`code`). Por la cola de la sesión, como cualquier turno
+        (#202): su turn_start sale detrás del turn_end de los anteriores."""
+        turn = self._new_turn("user")
+        turn.conversation_id = self._conversation.id
+        self._live.append(turn)
+        self._enqueue(("refused", turn, code))
 
-    def _mark_cancel(self, task: asyncio.Task, reason: EndReason) -> None:
-        turn = self._user_turn
-        if turn is not None and turn.task is task and turn.cancel_reason is None:
-            turn.cancel_reason = reason
-            # Desde aquí el turno ya no cuenta progreso (#254): mientras su tarea se limpia,
-            # ni el aplazado ni uno nuevo salen antes de su turn_end.
-            if turn.progress_flush is not None:
-                turn.progress_flush.cancel()
+    async def _paint_refused(self, turn: Turn, code: str) -> None:
+        if turn.ended:
+            return
+        for earlier in list(self._live):
+            # Red de seguridad: la cola ya cerró los anteriores; nunca dos turnos abiertos.
+            if earlier is not turn and earlier.opened:
+                earlier.cancel_reason = earlier.cancel_reason or "replaced"
+                await self._end(earlier, "replaced")
+        if await self._open(turn):
+            await self._send_turn_error(turn, code)
+        await self._end(turn, "error")
 
-    async def _cancel_user(self, reason: EndReason) -> tuple[bool, str | None]:
-        """G-08 (#201): el objetivo se captura al entrar y las llamadas se serializan; dos
-        llamadas a la vez cancelan el turno una vez y ninguna pierde uno arrancado entre medias."""
-        task = self._user_task
-        if task is None or task.done():
-            return False, None
-        async with self._lock:
-            if task.done():  # otro lo canceló mientras esperábamos el lock
+    async def cancel(
+        self, reason: EndReason, *, push: bool = True, own_only: bool = False
+    ) -> tuple[bool, str | None]:
+        """Cancela lo que la sesión muestra ahora: el turno abierto en este socket (el del
+        usuario y, con `push`, también un push). Si es una copia de un turno que ya terminó en
+        el canal (su audio aún suena), se corta solo aquí y el turno abierto del canal sigue
+        (se abrirá después, como antes); si es la copia del turno abierto del canal (o el
+        socket aún no muestra nada), se cancela en el canal: el `cancel` del cliente para el
+        turno para todos (C3). Con `own_only` (la voz: barge-in y transcripción final, hasta
+        que la 2b quite el barge-in) solo corta un turno que esta sesión envió; de un push,
+        solo su copia aquí (el canal sigue), y el turno de otra sesión, nada: un cliente de
+        voz que oye la tele no le corta su turno. Devuelve (cancelado, su turn_id en esta
+        sesión)."""
+        channel = self._channel
+        current = channel.current_turn if channel is not None else None
+        mine = self._by_channel.get(current.id) if current is not None else None
+        shown = next((t for t in self._live if t.opened and not t.ended), None)
+        if shown is not None and shown is not mine:
+            if shown.origin == "push" and not push:
                 return False, None
-            self._mark_cancel(task, reason)
-            await self._cancel_and_wait(task)
-            await self._end_unstarted(task, reason)
-            turn = self._user_turn
-            opened = turn is not None and turn.task is task and turn.opened
-            return True, turn.turn_id if opened and turn is not None else None
+            source = shown.channel
+            if own_only and shown.origin == "user" and source is not None and source.by_session is not self:
+                return False, None  # el turno de otra sesión: la voz de aquí no lo corta
+            shown.cancel_reason = shown.cancel_reason or reason
+            await self._end(shown, reason)
+            return True, shown.turn_id
+        if channel is None or current is None or mine is None:
+            return False, None
+        if current.origin == "push" and not push:
+            return False, None
+        if own_only and current.by_session is not self:
+            if current.origin != "push" or not mine.opened:
+                return False, None
+            # Solo su copia: el push sigue en el canal para las demás sesiones.
+            mine.cancel_reason = mine.cancel_reason or reason
+            await self._end(mine, reason)
+            return True, mine.turn_id
+        if await channel.cancel(reason, push=push, expected=current) is None:
+            return False, None
+        if mine.opened:
+            # Su fin ya está en la cola; aquí sale ya (A-r2-2), sin esperar a que el worker
+            # termine lo que esté haciendo con su TTS.
+            mine.cancel_reason = mine.cancel_reason or reason
+            await self._end(mine, reason)
+        return True, mine.turn_id
 
-    async def _end_unstarted(self, task: asyncio.Task, reason: EndReason) -> None:
-        """G-r2-1: todo `send` aceptado recibe su par turn_start/turn_end, también el que se
-        cancela antes de que su tarea llegue a crear el turno (dos `send` seguidos, o `send` y
-        `cancel`): se abre y se cierra aquí con `reason`, bajo el lock de quien llama."""
-        turn = self._user_turn
-        if turn is not None and turn.task is task:
-            return
-        turn = self._new_turn("user")
-        turn.conversation_id = self._conversation.id
-        turn.task = task
-        self._user_turn = turn
-        if await self._open(turn, count=False):  # no llegó a OpenClaw: no cuenta en la conversación
+    async def _cut_finishing(self, reason: EndReason, *, push: bool = True) -> Turn | None:
+        """Corta los turnos de la sesión cuyo turno del canal ya terminó solo y que siguen
+        abiertos aquí porque su audio suena (7e, A-r2-2): su turn_end sale ya, sin esperar a
+        cerrar su TTS. Devuelve el primero cortado."""
+        first: Turn | None = None
+        for turn in list(self._live):
+            source = turn.channel
+            if not turn.opened or turn.ended or source is None or not source.ended:
+                continue
+            if source.end_reason is None or not _drains(turn, source.end_reason):
+                continue  # su fin (un corte) ya está en la cola y no espera a nada
+            if turn.tts is None and turn.pending is None:
+                continue  # sin audio que esperar: su fin ya sale tal cual (`done`)
+            if turn.origin == "push" and not push:
+                continue
+            turn.cancel_reason = reason
             await self._end(turn, reason)
+            first = first or turn
+        return first
 
-    async def _abort_other_runs(self) -> None:
-        """Ningún otro run activo en nuestra session_key cuando sale el chat.send del
-        usuario: OpenClaw lo plegaría en ese run (docs/openclaw-protocol.md, #219) y la
-        respuesta llegaría con otro runId. Pasa con un push que no llegó a abrirse (aún en la
-        cola del worker, `push_enabled=False`, o su turn_start falló). Lápida y chat.abort,
-        bajo el lock de quien llama."""
-        session_key = self._session_key()
-        runs = self._turn_registry.active_runs(session_key)
-        if not runs or not self._may_abort(session_key):
+    # ── Worker de la sesión ───────────────────────────────────────────────
+
+    def _put(self, item: tuple) -> None:
+        """Lo que entrega el canal (síncrono, nunca bloquea). Nada una vez cerrándose, salvo
+        lo de turnos que la sesión ya vio (su fin)."""
+        if self._closing and item[0] == "turn_start":
             return
-        for run_id in runs:
-            self._turn_registry.abort_run(run_id)
-        logger.info(
-            f"[{self._client_id}] {len(runs)} run(s) de OpenClaw activos en la sesión: "
-            f"chat.abort antes del send"
-        )
-        await self._orchestrator.abort(session_key)
+        self._enqueue(item)
 
-    async def _cancel_and_wait(self, task: asyncio.Task) -> None:
-        # Sin tope: el turno nuevo no arranca hasta que el viejo terminó. Si cancelan a quien
-        # llama, se termina de esperar y se relanza (#221); solo esa cancelación: una heredada
-        # (cancelling() > 0) no debe tumbar el STT en un barge-in.
-        td = Teardown(f"[{self._client_id}] cancelar turno")
-        await td.cancel(task, "turno anterior")
-        if self._user_task is task:
-            self._user_task = None
-        td.raise_if_cancelled()
+    def _enqueue(self, item: tuple) -> None:
+        if self._worker is None or self._worker.done():
+            self._worker = self._spawn(self._worker_loop(), "turn_worker")
+        inbox = self._inbox
+        if inbox.pending == 0:
+            inbox.since = time.monotonic()
+        inbox.pending += 1
+        inbox.peak = max(inbox.peak, inbox.pending)
+        inbox.queue.put_nowait(item)
 
-    async def _run_user_turn(self, text: str) -> None:
-        turn = self._new_turn("user")
-        turn.conversation_id = self._conversation.id
-        turn.task = asyncio.current_task()
-        self._user_turn = turn
-        self._tracker.start_turn()
-        if not await self._open(turn):
-            return
-        gateway_stats.turn_started("normal")
-        # Desde aquí el cliente vio turn_start: le sigue exactamente un turn_end (G-10).
-        reason: EndReason = "error"
-        try:
-            reason = await self._converse(turn, text)
-        except asyncio.CancelledError:
-            reason = turn.cancel_reason or "cancelled"
-            raise
-        except Exception as e:  # noqa: BLE001 — frontera: un turno roto no cierra la sesión
-            if isinstance(e, ClientGone):
-                reason = "closed"
-            else:
-                # Solo el tipo: el mensaje puede llevar texto del usuario.
-                logger.error(f"[{self._client_id}] Turno falló: {type(e).__name__}")
-                gateway_stats.turn_error("internal_error")
-                await self._send_turn_error(turn, "internal_error")
-        finally:
-            await self._end(turn, reason)
-
-    async def _converse(self, turn: Turn, text: str) -> EndReason:
-        """El texto va al orquestador; sus tokens y eventos, al cliente y al TTS del turno.
-
-        El TTS se conecta a la vez (auditoría 3.0, E-2): un fogar-speaker colgado no retrasa el
-        texto; solo el `turn_end`, que espera a la voz como antes."""
-        if not self._agent_allowed(self._session_key()):
-            # #397 (decisión a): la política del gateway, antes del chat.send. Solo el gateway
-            # sabe qué agentes puede usar cada dispositivo; OpenClaw solo diría INVALID_REQUEST.
-            code = ORCHESTRATOR_AGENT_UNAVAILABLE_ERROR
-            logger.warning(f"[{self._client_id}] Turno sin agente disponible: {code}")
-            gateway_stats.turn_error(code)
-            await self._send_turn_error(turn, code)
-            return "error"
-        if not self._wants_audio:
-            return await self._stream(turn, text, None)
-        pending = _PendingTts(lambda: self._connect_tts(turn), self._config.tts_voice or "", self._client_id)
-        # Sin await entre crearlo y el try: una cancelación no deja el stream huérfano.
-        try:
+    async def _worker_loop(self) -> None:
+        queue = self._inbox.queue
+        while True:
+            item = await queue.get()
+            kind = item[0]
             try:
-                reason = await self._stream(turn, text, pending)
-            except asyncio.CancelledError:
-                raise  # abajo: su turn_end, sin cerrar antes el TTS
-            except BaseException:
-                if pending.tts is not None:
-                    await pending.tts.end()  # el servidor TTS sabe que no hay más
-                raise
-            tts = pending.tts if self.client_gone else await pending.connected()
-            if tts is not None:
-                await tts.end()
-                if not self.client_gone:  # G-18: nadie a quien sonárselo
-                    await tts.drain()
-            return reason
-        except asyncio.CancelledError:
-            # A-r2-2: el turn_end de un turno cortado (también mientras su audio suena) no
-            # espera a que cierre el TTS.
-            await self._end(turn, turn.cancel_reason or "cancelled")
-            raise
-        finally:
-            await pending.release()
-
-    async def _stream(self, turn: Turn, text: str, tts: "_PendingTts | None") -> EndReason:
-        async def on_token(token_text: str) -> None:
-            # G-18: un cliente ido aborta el turno (al deshacer aclosing() el stream manda
-            # chat.abort) en vez de seguir hasta que close_all() lo cancele.
-            if self.client_gone:
-                raise ClientGone("cliente no disponible")
-            if self._wants_text:
-                try:
-                    await self._sender.send_json(
-                        {"type": "token", "turn_id": turn.turn_id, "text": token_text}
-                    )
-                    turn.progress.text_arrived()  # solo si este cliente ve el token
-                except ClientGone:
-                    self.client_gone = True
-                    raise
-                except Exception as e:  # noqa: BLE001 — frontera: envío a un cliente que puede haberse ido
-                    self._log_send_failed("token", e)
-            if tts is not None:
-                await tts.feed(token_text)
-
-        async def on_tool_call(tool_call: ToolCallEvent) -> None:
-            if self.client_gone:
-                raise ClientGone("cliente no disponible")
-            # El progreso (solo el nombre) no depende de tool_calls_enabled (#254).
-            await self._offer_tool_progress(turn, tool_call)
-            if not self._config.tool_calls_enabled:
-                return
-            try:
-                await self._sender.send_json(_tool_call_message(turn.turn_id, tool_call))
-            except ClientGone:
-                self.client_gone = True
-                raise
-            except Exception as e:  # noqa: BLE001 — frontera: envío a un cliente que puede haberse ido
-                self._log_send_failed("tool_call", e)
-
-        async def on_progress(phase: ProgressPhase) -> None:
-            if self.client_gone:
-                raise ClientGone("cliente no disponible")
-            await self._offer_progress(turn, Progress(phase))
-
-        try:
-            await orchestration.call_orchestrator(
-                self._orchestrator,
-                text,
-                self._session_key(),
-                tracker=self._tracker,
-                on_token=on_token,
-                on_tool_call=on_tool_call,
-                on_progress=on_progress,
-            )
-            return "done"
-        except ClientGone:
-            logger.info(f"[{self._client_id}] Cliente no disponible: turno abortado.")
-            return "closed"
-        except RuntimeError as e:
-            # Solo OrchestratorError lleva un código estable; cualquier otro texto de
-            # excepción puede llevar detalle interno y no sale del proceso (#238).
-            stable = isinstance(e, orchestration.OrchestratorError)
-            code = str(e) if stable else "internal_error"
-            logger.error(f"[{self._client_id}] Orchestrator error: {code} ({type(e).__name__})")
-            gateway_stats.turn_error(code)
-            if not stable:
-                logger.debug(f"[{self._client_id}] turno: {traceback_no_message(e)}")
-            await self._send_turn_error(turn, code)
-            return "timeout" if code == "turn_timeout" else "error"
-
-    # ── Push ──────────────────────────────────────────────────────────────
-
-    def enqueue_push(self, kind: str, arg: Any, run_id: str | None = None) -> None:
-        """Encola un evento de push para el worker (#130 S3a). Síncrono, nunca bloquea: lo
-        llama el bucle de OpenClaw vía FrameDispatcher. `kind`: "turn_start" | "chat" |
-        "tool" | "fallback" | "turn_end" | "turn_error"; `arg`: la session_key (turn_start,
-        turn_end), el payload (chat/tool) o el `data` del `agent` (fallback/turn_error, #397);
-        `run_id`: el runId del evento, si lo trae. No hace nada una vez que la sesión se cierra."""
-        if self._closing:
-            return
-        if self._push_worker is None or self._push_worker.done():
-            self._push_worker = self._spawn(self._push_worker_loop(), "push_worker")
-        backlog = self._backlog
-        if backlog.pending == 0:
-            backlog.since = time.monotonic()
-        backlog.pending += 1
-        backlog.peak = max(backlog.peak, backlog.pending)
-        backlog.queue.put_nowait((kind, arg, run_id))
-
-    async def push_idle(self) -> None:
-        """Espera a que el worker termine todo lo encolado (para tests)."""
-        await self._backlog.queue.join()
-
-    def _push_budget_left(self) -> float | None:
-        """Segundos que le quedan al push abierto sin progreso (#286); None si no aplica."""
-        push = self._push
-        if push is None or push.finishing or push.ended:
-            return None
-        return push.progress_at + settings.TURN_TIMEOUT_S - time.monotonic()
-
-    async def _push_worker_loop(self) -> None:
-        queue = self._backlog.queue
-        while not self._closing:
-            budget = self._push_budget_left()
-            # Con eventos en cola el push no está parado: solo se espera con tope si no hay.
-            if budget is not None and queue.empty():
-                try:
-                    kind, arg, run_id = await asyncio.wait_for(queue.get(), timeout=budget)
-                except TimeoutError:
-                    await self._run_push_step("timeout", self._push_timed_out())
-                    continue
-            else:
-                kind, arg, run_id = await queue.get()
-            try:
-                if self._run_aborted(run_id):
-                    # #285: lo que quedaba en cola de un run abortado no llega (ni abre push).
-                    logger.debug(f"[{self._client_id}] push {kind} de un run abortado descartado")
-                elif kind == "turn_start":
-                    await self._push_start(arg, run_id)
-                elif kind == "chat":
-                    await self._push_chat(arg)
-                elif kind == "tool":
-                    await self._push_tool(arg)
-                elif kind == "fallback":
-                    self._push_fallback(arg, run_id)
+                if kind == "turn_start":
+                    await self._paint_start(item[1])
+                elif kind == "event":
+                    await self._paint_event(item[1], item[2])
                 elif kind == "turn_end":
-                    await self._push_end()
-                elif kind == "turn_error":
-                    await self._push_end(failure=arg)
-                else:
-                    logger.warning(f"[{self._client_id}] push event desconocido: {kind!r}")
+                    await self._paint_end(item[1], item[2])
+                elif kind == "refused":
+                    await self._paint_refused(item[1], item[2])
+                elif kind == "leave":
+                    _, conversation_id, reason = item
+                    for turn in list(self._live):
+                        if turn.conversation_id == conversation_id:
+                            await self._end(turn, reason)
             except Exception as e:  # noqa: BLE001 — frontera: un evento roto no para el worker
-                self._log_push_failure(kind, e)
+                # Solo el tipo: el evento puede llevar texto del usuario.
+                origin = item[1].origin if kind != "leave" else "turno"
+                logger.warning(f"[{self._client_id}] {origin} {kind} falló: {type(e).__name__}")
             finally:
-                backlog = self._backlog
-                backlog.pending = max(0, backlog.pending - 1)
-                if backlog.pending == 0:
-                    backlog.since = None
+                inbox = self._inbox
+                inbox.pending = max(0, inbox.pending - 1)
+                if inbox.pending == 0:
+                    inbox.since = None
                 queue.task_done()
 
-    async def _run_push_step(self, what: str, step: Coroutine[Any, Any, None]) -> None:
-        try:
-            await step
-        except Exception as e:  # noqa: BLE001 — frontera: un paso roto no para el worker
-            self._log_push_failure(what, e)
-
-    def _log_push_failure(self, what: str, e: Exception) -> None:
-        # Solo el tipo: el payload puede llevar texto del usuario.
-        logger.warning(f"[{self._client_id}] push {what} falló: {type(e).__name__}")
-
-    def _run_aborted(self, run_id: str | None) -> bool:
-        return run_id is not None and self._turn_registry.is_run_aborted(run_id)
-
-    def _abort_run(self, run_id: str | None) -> None:
-        if run_id is not None:
-            self._turn_registry.abort_run(run_id)
-
-    def _agent_allowed(self, session_key: str) -> bool:
-        allowed = self.allowed_agents
-        parts = session_key.split(":")
-        if allowed is None or len(parts) < 3 or parts[0] != "agent":
-            return True
-        return parts[1].lower() in {a.lower() for a in allowed}
-
-    async def _push_start(self, session_key: str, run_id: str | None = None) -> None:
-        if not self._agent_allowed(session_key):
-            # C-r7-1: push de un agente retirado de allowed_agents (conversación de otro día): no llega al cliente y se para en OpenClaw.
-            logger.info(f"[{self._client_id}] push de un agente no permitido: descartado")
-            push = self._push
-            if push is not None and push.session_key == session_key:
-                # Su push ya abierto (retirado a medias) se corta ya, sin esperar a turn_timeout.
-                async with self._lock:
-                    await self._cut_push(push.turn_id, "cancelled")
-            self._abort_run(run_id)
-            await self._orchestrator.abort(session_key)
+    async def _paint_start(self, turn: Turn) -> None:
+        if turn.ended:
             return
-        if not self._config.push_enabled:
-            return  # el push entero se descarta; su fin no encuentra push abierto
-        while True:
-            # Un turno del usuario vive hasta que sale su audio: no se abre un push encima.
-            # asyncio.wait (no await): nuestra cancelación se propaga, la del turno no.
-            while self._user_task is not None and not self._user_task.done():
-                await asyncio.wait({self._user_task})
-            # Abrirlo, bajo el lock: un `send` (start_user_turn) o un corte lo ven entero,
-            # registrado y con su turn_start ya en cola, nunca a medias (#202).
-            async with self._lock:
-                if self._closing:
-                    # Cerrándose (let_go ya abortó sus runs y restrict deja pasar el par,
-                    # A-r2-1): un push abierto ahora sería un turno vacío, solo para cerrarlo.
-                    return
-                if self._user_task is not None and not self._user_task.done():
-                    continue  # un turno que se estaba sustituyendo: el usuario gana
-                if self._push is not None and self._push.session_key != session_key:
-                    # C-r8-1: push de otra conversación con uno abierto: se descarta entero
-                    # (su texto y su fin irían al push abierto y lo cortarían).
-                    logger.info(f"[{self._client_id}] push de otra conversación: descartado")
-                    self._abort_run(run_id)
-                    # En la clave propia se para también en OpenClaw: con su run fuera de
-                    # _active_runs, un `send` no lo abortaría y se plegaría en él (#219).
-                    if self._may_abort(session_key):
-                        await self._orchestrator.abort(session_key)
-                    return
-                if self._push is not None:
-                    # #84: los `agent start` intermedios (tool use, varios pasos) no abren
-                    # otro turno; tampoco el de un push que se está cortando.
-                    self._push.progress_at = time.monotonic()
-                    logger.debug(
-                        f"[{self._client_id}] push_turn_start ignorado: ya hay un push "
-                        f"abierto ({self._push.turn_id})"
-                    )
-                    return
-                turn = self._new_turn("push", session_key)
-                turn.run_id = run_id
-                turn.conversation_id = self._conversation.id_for_key(session_key)
-                self._push = turn  # antes de cualquier await
-                self._push_text.reset()
-                if not await self._open(turn):
-                    # Sin turn_start no hay push: se deshace, el resto de su run se descarta
-                    # (su `agent start` intermedio no lo reabriría, #84) y, en nuestra
-                    # session_key, se aborta en OpenClaw (no sigue corriendo para nadie).
-                    if self._push is turn:
-                        self._push = None
-                    self._abort_run(run_id)
-                    if self._may_abort(session_key):
-                        await self._orchestrator.abort(session_key)
-                    return
-                break
-        gateway_stats.turn_started("push")
-        early = self._take_early_phase(run_id)
-        if early is not None:  # #254: la fase que su run contó antes de abrirse
-            await self._offer_progress(turn, Progress(early))
-        if not self._wants_audio:
+        if not await self._open(turn):
+            # Sin turn_start no hay turno en esta sesión: lo que llegue de él se descarta.
+            self._forget(turn)
+            return
+        source = turn.channel
+        if (
+            not self._wants_audio
+            or turn.halted
+            or self._closing
+            or turn.silent
+            or source is None
+            or source.audio_session is not self
+        ):
+            return
+        if turn.origin == "user":
+            # El TTS se conecta a la vez (auditoría 3.0, E-2): un fogar-speaker colgado no
+            # retrasa el texto; solo el `turn_end`, que espera a la voz como antes.
+            turn.pending = _PendingTts(
+                lambda: self._connect_tts(turn), self._config.tts_voice or "", self._client_id
+            )
             return
         tts = await self._connect_tts(turn)
         if tts is None:
@@ -910,122 +883,73 @@ class TurnController:
         turn.tts = tts
         await tts.start(self._config.tts_voice or "")
 
-    async def _push_chat(self, payload: dict) -> None:
-        push = self._push
-        phase = chat_status_phase(payload)
-        run_id = payload.get("runId")
-        if phase is not None and (
-            push is None or push.ended or _other_run(push.run_id, run_id)
-        ):
-            # #254: fase de arranque de un run cuyo push aún no se abrió (llega antes de su
-            # `agent start`): se guarda para cuando se abra.
-            self._note_early_phase(run_id, phase)
+    async def _paint_event(self, turn: Turn, event: ChannelEvent) -> None:
+        if turn.ended or not turn.opened:
             return
-        if push is None or push.ended:
-            return  # #109: nada fuera de un turn_start/turn_end
-        push.progress_at = time.monotonic()
-        if phase is not None:  # #254: una fase de arranque, sin texto
-            await self._offer_progress(push, Progress(phase))
-            return
-        # #241: `final` lleva el texto completo sin deltaText (OpenClaw 2026.10.5).
-        delta = self._push_text.feed(payload)
-        if not delta:
-            return
-        if self._wants_text:
-            try:
-                await self._sender.send_json(
-                    {"type": "token", "turn_id": push.turn_id, "text": delta}
-                )
-                push.progress.text_arrived()  # solo si este cliente ve el token
-            except Exception as e:  # noqa: BLE001 — frontera: envío a un cliente que puede haberse ido
-                self._log_send_failed("token del push", e)
-        if push.tts is not None:
-            await push.tts.feed(delta)
+        turn.progress_at = time.monotonic()
+        if isinstance(event, ChannelToken):
+            await self._paint_token(turn, event.text)
+        elif isinstance(event, ChannelToolCall):
+            # El progreso (solo el nombre) no depende de tool_calls_enabled (#254).
+            await self._offer_tool_progress(turn, event.tool_call)
+            if self._config.tool_calls_enabled:
+                try:
+                    await self._sender.send_json(_tool_call_message(turn.turn_id, event.tool_call))
+                except Exception as e:  # noqa: BLE001 — frontera: envío a un cliente que puede haberse ido
+                    self._send_failed("tool_call", e)
+        elif isinstance(event, ChannelProgress):
+            await self._offer_progress(turn, event.progress)
+        elif isinstance(event, ChannelError):
+            await self._send_turn_error(turn, event.code)
 
-    async def _push_tool(self, data: dict) -> None:
-        push = self._push
-        if push is None or push.ended:
-            return
-        push.progress_at = time.monotonic()
-        tool_call = ToolCallEvent.from_session_tool_payload(data)
-        if tool_call is None:
-            return
-        await self._offer_tool_progress(push, tool_call)
-        if not self._config.tool_calls_enabled:
+    async def _paint_token(self, turn: Turn, text: str) -> None:
+        if self._wants_text and not self.client_gone:
+            try:
+                await self._sender.send_json({"type": "token", "turn_id": turn.turn_id, "text": text})
+                turn.progress.text_arrived()  # solo si este cliente ve el token
+            except Exception as e:  # noqa: BLE001 — frontera: envío a un cliente que puede haberse ido
+                self._send_failed("token", e)
+        if self.client_gone:
+            return  # G-18: nadie a quien sonárselo
+        if turn.pending is not None:
+            await turn.pending.feed(text)
+        elif turn.tts is not None:
+            await turn.tts.feed(text)
+
+    async def _paint_end(self, turn: Turn, reason: EndReason) -> None:
+        """El fin del turno del canal en esta sesión: si terminó solo, su audio termina de
+        sonar antes del turn_end (decisión 1: solo espera esta sesión); si lo cortaron, el
+        turn_end sale ya (A-r2-2) y su TTS se suelta."""
+        if turn.ended:
             return
         try:
-            await self._sender.send_json(_tool_call_message(push.turn_id, tool_call))
-        except Exception as e:  # noqa: BLE001 — frontera: envío a un cliente que puede haberse ido
-            self._log_send_failed("tool_call del push", e)
+            if _drains(turn, reason):
+                await self._finish_tts(turn)
+            elif turn.pending is not None and turn.pending.tts is not None:
+                await turn.pending.tts.end()  # el servidor TTS sabe que no hay más
+        except Exception:
+            await self._end(turn, reason)
+            raise
+        # Cancelado aquí (close_all cancela el worker), su turn_end lo manda el cierre.
+        await self._end(turn, reason)
 
-    def _push_fallback(self, data: dict, run_id: str | None) -> None:
-        """#397: un `fallback_step` del run del push abierto: su razón, para clasificar su error."""
-        push = self._push
-        if push is not None and not push.ended and not _other_run(push.run_id, run_id):
-            push.fallback_reason = fallback_reason(data, push.fallback_reason)
-
-    async def _push_end(self, *, failure: dict | None = None) -> None:
-        """Fin del agente (`end`, o `error` #300 con su `data`): su audio termina de sonar y se
-        cierra. Si falló, antes su TURN_ERROR con el código clasificado (#397)."""
-        push = self._push
-        if push is None or push.ended:
-            # #84: un fin sin push abierto (huérfano o ya cerrado) no emite nada.
-            logger.debug(f"[{self._client_id}] push_turn_end ignorado: no hay push abierto")
-            return
-        push.finishing = True
-        if failure is not None:
-            code = classify_failure(failure, fallback_reason=push.fallback_reason)
-            logger.warning(f"[{self._client_id}] push {push.turn_id} falló en OpenClaw: {code}")
-            gateway_stats.turn_error(code)
-            await self._send_turn_error(push, code)
-        if push.tts is not None:
-            await push.tts.finish()
-        await self._end(push, "done" if failure is None else "error")
-
-    async def _push_timed_out(self) -> None:
-        """#286: un push sin progreso en TURN_TIMEOUT_S se cierra como el turno normal."""
-        # Bajo el lock, como todo corte (G-08): un `send` que llegue mientras tanto espera, y
-        # el chat.abort del push sale antes que su chat.send. Se decide dentro: si un `send`
-        # o un barge-in lo cortaron mientras se esperaba el lock, no hubo timeout.
-        async with self._lock:
-            push = self._push
-            if push is None or push.finishing or push.ended:
-                return
-            logger.warning(
-                f"[{self._client_id}] push {push.turn_id} sin progreso en "
-                f"TURN_TIMEOUT_S={settings.TURN_TIMEOUT_S}s — se cierra."
-            )
-            gateway_stats.turn_error("turn_timeout")
-            await self._send_turn_error(push, "turn_timeout")
-            await self._cut_push(push.turn_id, "timeout")
-
-    async def _cut_push(self, expected: str | None, reason: EndReason) -> str | None:
-        """Corta el push abierto (7e): para su audio y su TTS, lo aborta en OpenClaw si corre
-        en nuestra session_key y lo cierra. Con `expected`, solo ese push. Devuelve su
-        turn_id, o None si no había."""
-        push = self._push
-        if push is None or push.ended:
-            return None
-        if expected is not None and expected != push.turn_id:
-            return None
-        # Antes del abort: nada más de su run llega al cliente, ni lo que el worker tiene en
-        # cola ni lo que venga (también si su session_key no es la nuestra y no se aborta en
-        # OpenClaw). abort() ve el run ya con lápida y no espera su `aborted`.
-        self._abort_run(push.run_id)
-        await self._end(push, reason, abort=True)
-        return push.turn_id
+    async def _finish_tts(self, turn: Turn) -> None:
+        if turn.pending is not None:
+            pending = turn.pending
+            tts = pending.tts if self.client_gone else await pending.connected()
+            if tts is not None and not turn.ended:
+                await tts.end()  # el servidor TTS sabe que no hay más
+                if not self.client_gone:  # G-18: nadie a quien sonárselo
+                    await tts.drain()
+        elif turn.tts is not None:
+            await turn.tts.finish()
 
     # ── Progreso (#254) ───────────────────────────────────────────────────
 
     def _progress_open(self, turn: Turn) -> bool:
         """Este turno cuenta progreso ahora: el cliente lo pidió, su turn_start salió, y ni
         terminó ni se está cancelando (#254)."""
-        return (
-            self._wants_progress
-            and turn.opened
-            and not turn.ended
-            and turn.cancel_reason is None
-        )
+        return self._wants_progress and turn.opened and not turn.halted
 
     async def _offer_tool_progress(self, turn: Turn, tool_call: ToolCallEvent) -> None:
         """El progreso de un evento de herramienta. Un evento raro (deriva de OpenClaw) solo
@@ -1038,25 +962,6 @@ class TurnController:
             logger.debug(f"[{self._client_id}] progreso de herramienta descartado: {type(e).__name__}")
             return
         await self._offer_progress(turn, progress)
-
-    def _note_early_phase(self, run_id: object, phase: ProgressPhase) -> None:
-        """Guarda la última fase de arranque de un run sin push abierto (acotado: los últimos
-        `_EARLY_PHASE_RUNS` runs, `_EARLY_PHASE_TTL_S`)."""
-        if not self._wants_progress or not self._config.push_enabled or not isinstance(run_id, str):
-            return
-        early = self._early_phases
-        early.pop(run_id, None)
-        early[run_id] = (phase, time.monotonic())
-        while len(early) > _EARLY_PHASE_RUNS:
-            early.popitem(last=False)
-
-    def _take_early_phase(self, run_id: str | None) -> ProgressPhase | None:
-        if run_id is None:
-            return None
-        entry = self._early_phases.pop(run_id, None)
-        if entry is None or time.monotonic() - entry[1] > _EARLY_PHASE_TTL_S:
-            return None
-        return entry[0]
 
     async def _offer_progress(self, turn: Turn, progress: Progress) -> None:
         """Un estado nuevo del turno: sale ya, se aplaza (el ritmo) o no sale (repetido).
@@ -1079,7 +984,7 @@ class TurnController:
         try:
             while True:
                 await asyncio.sleep(delay)
-                if turn.ended or turn.cancel_reason is not None:
+                if turn.halted:
                     return
                 decision = turn.progress.flush()
                 if isinstance(decision, Progress):
@@ -1093,21 +998,19 @@ class TurnController:
                 turn.progress_flush = None
 
     async def _send_progress(self, turn: Turn, progress: Progress) -> None:
-        # Sin await entre mirar `ended` y encolar: `_end` lo marca antes de encolar turn_end,
+        # Sin await entre mirar `halted` y encolar: `_end` lo marca antes de encolar turn_end,
         # así que este turn_progress nunca sale detrás de él. Un turno ya cancelado (barge-in,
         # `cancel`, un `send` que lo sustituye) tampoco cuenta nada mientras se limpia.
-        if turn.ended or turn.cancel_reason is not None:
+        if turn.halted:
             return
         try:
             await self._sender.send_json(progress.message(turn.turn_id))
         except Exception as e:  # noqa: BLE001 — frontera: envío a un cliente que puede haberse ido
-            if isinstance(e, ClientGone):
-                self.client_gone = True
-            self._log_send_failed("turn_progress", e)
+            self._send_failed("turn_progress", e)
 
     # ── Comunes ───────────────────────────────────────────────────────────
 
-    def _new_turn(self, origin: TurnOrigin, session_key: str | None = None) -> Turn:
+    def _new_turn(self, origin: TurnOrigin) -> Turn:
         self._seq += 1
         now = time.monotonic()
         return Turn(
@@ -1116,10 +1019,9 @@ class TurnController:
             origin=origin,
             started_at=now,
             progress_at=now,
-            session_key=session_key,
         )
 
-    async def _open(self, turn: Turn, *, count: bool = True) -> bool:
+    async def _open(self, turn: Turn) -> bool:
         try:
             await self._sender.send_json(
                 {
@@ -1131,11 +1033,9 @@ class TurnController:
                 }
             )
         except Exception as e:  # noqa: BLE001 — frontera: envío a un cliente que puede haberse ido
-            self._log_send_failed("turn_start", e)
+            self._send_failed("turn_start", e)
             return False
         turn.opened = True
-        if count:
-            self._conversation.note_turn(turn.conversation_id)
         return True
 
     async def _connect_tts(self, turn: Turn) -> TurnTts | None:
@@ -1160,47 +1060,65 @@ class TurnController:
     def _note_client_gone(self) -> None:
         self.client_gone = True
 
-    async def _end(
-        self, turn: Turn, reason: EndReason, *, abort: bool = False, release: bool = True
-    ) -> bool:
+    def _forget(self, turn: Turn) -> None:
+        """Un turno que esta sesión nunca abrió: sin par, sin nada más."""
+        turn.ended = True
+        if turn in self._live:
+            self._live.remove(turn)
+        if turn.channel is not None and self._by_channel.get(turn.channel.id) is turn:
+            del self._by_channel[turn.channel.id]
+
+    async def _end(self, turn: Turn, reason: EndReason, *, release: bool = True) -> bool:
         """El único que envía un turn_end: exactamente uno por turno, quien llegue primero.
 
         Lo marca terminado y encola su turn_end sin ningún await entre medias (su audio deja
         de salir, y nada abre otro turno antes: A-1); después libera su TTS (con su evento
-        `push_tts`) y aborta el push en OpenClaw si se pide y es de nuestra session_key. Cada
-        paso termina aunque cancelen a quien cierra (#221, `Teardown`); esa cancelación se
-        relanza al final.
+        `push_tts`). Cada paso termina aunque cancelen a quien cierra (#221, `Teardown`); esa
+        cancelación se relanza al final.
         """
         if turn.ended:
             return False
-        turn.ended = True
+        opened = turn.opened
+        self._forget(turn)
         turn.end_reason = reason
         self.last_ended = turn
         if turn.progress_flush is not None:
             turn.progress_flush.cancel()  # no hace falta esperarla: ya ve `ended`
         logger.debug(f"[{self._client_id}] turno {turn.turn_id} ({turn.origin}) terminado: {reason}")
-        if self._push is turn:
-            self._push = None
-        if turn.opened:
+        if opened:
             try:
                 await self._sender.send_json(
                     {"type": "turn_end", "turn_id": turn.turn_id, "reason": reason}
                 )
             except Exception as e:  # noqa: BLE001 — frontera: envío a un cliente que puede haberse ido
-                self._log_send_failed("turn_end", e)
-        td = Teardown(f"[{self._client_id}] fin del turno {turn.turn_id}")
-        if release and turn.tts is not None:
-            await td.step(self._release_tts(turn.tts, reason), "TTS del turno")
-        if abort and turn.session_key is not None and self._may_abort(turn.session_key):
-            await td.step(self._orchestrator.abort(turn.session_key), "chat.abort del push")
-        td.raise_if_cancelled()
+                self._send_failed("turn_end", e)
+        if release:
+            td = Teardown(f"[{self._client_id}] fin del turno {turn.turn_id}")
+            await td.step(self._release_turn_tts(turn, reason), "TTS del turno")
+            td.raise_if_cancelled()
         return True
 
-    @staticmethod
-    async def _release_tts(tts: TurnTts, reason: EndReason) -> None:
-        if reason not in ("done", "error"):
-            await tts.drop(f"turno {reason}", logging.INFO)
-        await tts.release()
+    async def _cut(self, turn: Turn, reason: EndReason) -> None:
+        """El turn_end de un corte, en su propia tarea (A-r2-2), y después su TTS. Si el cierre
+        de la sesión la cancela (`_close_turns`), termina ya: la liberación del TTS sigue sola,
+        supervisada y acotada por PUSH_TTS_DRAIN_TIMEOUT_S, y nunca la retiene."""
+        if not await self._end(turn, reason, release=False):
+            return
+        release = asyncio.create_task(self._release_turn_tts(turn, reason), name="turn_cut_tts")
+        self._supervise(release)  # su fallo, al log por tipo (#221)
+        try:
+            await asyncio.wait({release})
+        except asyncio.CancelledError:
+            release.cancel()
+            raise
+
+    async def _release_turn_tts(self, turn: Turn, reason: EndReason) -> None:
+        if turn.tts is not None:
+            if reason not in _DRAINED:
+                await turn.tts.drop(f"turno {reason}", logging.INFO)
+            await turn.tts.release()
+        if turn.pending is not None:
+            await turn.pending.release()
 
     async def _send_turn_error(self, turn: Turn, code: str) -> None:
         try:
@@ -1214,79 +1132,87 @@ class TurnController:
                 }
             )
         except Exception as e:  # noqa: BLE001 — frontera: envío a un cliente que puede haberse ido
-            self._log_send_failed("TURN_ERROR", e)
+            self._send_failed("TURN_ERROR", e)
 
-    def _log_send_failed(self, what: str, e: BaseException) -> None:
+    def _send_failed(self, what: str, e: BaseException) -> None:
+        if isinstance(e, ClientGone):
+            self.client_gone = True
         log_send_failed(self._client_id, what, e)
 
     # ── Cierre ────────────────────────────────────────────────────────────
 
-    async def let_go(self, limit: float) -> None:
-        """La sesión pierde su conversación (M19: desplazada o revocada). Antes que su TTS o sus
-        turn_end, que nada suyo siga corriendo en OpenClaw en su clave: cancela el turno del
-        usuario hasta que su stream suelta la clave (su chat.abort sale al recibir la
-        cancelación, antes de cerrar su TTS) y aborta el push abierto y cualquier otro run
-        activo en ella. La espera del turno, acotada por `limit`; cada chat.abort, por el suyo.
-        Después la sesión cierra sus turnos como siempre (`close`)."""
-        self._closing = True
-        key = self._session_key()
-        task = self._user_task
-        if task is not None and not task.done():
-            self._mark_cancel(task, "closed")
-            task.cancel()
-            released = asyncio.ensure_future(self._turn_registry.wait_released(key))
-            try:
-                await asyncio.wait(
-                    {task, released}, timeout=limit, return_when=asyncio.FIRST_COMPLETED
-                )
-            finally:
-                released.cancel()
-            if task.done():  # G-r2-1: un send que no llegó a arrancar recibe igual su par
-                await self._end_unstarted(task, "closed")
-        runs = self._turn_registry.active_runs(key)
-        push = self._push
-        if push is not None and not push.ended:
-            self._abort_run(push.run_id)
-        for run_id in runs:
-            self._turn_registry.abort_run(run_id)
-        pushing_here = push is not None and not push.ended and push.session_key == key
-        if (runs or pushing_here) and self._may_abort(key):
-            await self._orchestrator.abort(key)
-
     def stop_intake(self) -> None:
-        """Desde ya, ni turnos nuevos (G-09) ni eventos de push."""
+        """Desde ya, ni turnos nuevos (G-09) ni turnos del canal."""
         self._closing = True
 
     async def close(self, td: Teardown, limit: float) -> None:
         """Pasos de close_all() para los turnos; cada uno acotado por `limit`.
 
-        7d / G-23: el turno en curso se cancela, nunca se drena; su propio finally envía su
-        turn_end con el socket aún abierto (G-10) y el aclose del stream manda chat.abort.
+        7d / G-23 / decisión 2: la sesión deja su canal; el turno en curso no se cancela ni se
+        aborta (sigue en el canal para las demás sesiones adjuntas, o se acaba solo), y cada
+        turno abierto aquí recibe su turn_end `closed` con el socket aún abierto (G-10). Lo
+        mismo en un cierre por política (4200, 4020) y en la desconexión.
         """
-        self._closing = True
-        task, turn = self._user_task, self._user_turn
-        if task is not None and not task.done():
-            self._mark_cancel(task, "closed")
-        await td.cancel(task, "turno activo", limit)
-        if task is not None and task.done():  # A-r3-1: un send que no llegó a arrancar, su par
-            await self._end_unstarted(task, "closed")
-        if task is not None and not task.done() and turn is not None and turn.task is task:
-            # Abandonado en el tope (TTS lento al limpiar): su finally enviaría turn_end
-            # después de session_end, a un sender cerrado. Se envía ahora.
-            await self._end(turn, "closed", release=False)
+        await self._close_turns(td, limit)
 
-        # El worker antes que el TTS o el audio del push que pueda estar moviendo.
-        await td.cancel(self._push_worker, "push worker", limit)
-        backlog = self._backlog
-        while not backlog.queue.empty():
-            backlog.queue.get_nowait()
-            backlog.queue.task_done()
-        backlog.pending = 0
-        backlog.since = None
-        push = self._push
-        if push is not None:
-            # Un push abierto (start sin su end) recibe igualmente su turn_end, tras su último
-            # frame de audio: nunca un turn_start solo.
-            if push.tts is not None:
-                await td.step(push.tts.release(), "cierre del TTS del push", limit)
-            await self._end(push, "closed", release=False)
+    async def _close_turns(self, td: Teardown, limit: float) -> None:
+        self._closing = True
+        channel, self._channel = self._channel, None
+        if channel is not None:
+            channel.unsubscribe(self)
+            self._backlog_peak = max(self._backlog_peak, channel.push_backlog()[1])
+            self._channels.drop_if_idle(channel.session_key, channel)
+        # El worker antes que el TTS o el audio que pueda estar moviendo.
+        await td.cancel(self._worker, "worker de turnos", limit)
+        # Lo que quedaba en su cola, en orden (#202: nunca dos turnos abiertos a la vez): un fin
+        # encolado sale con su motivo; el turn_start de un `send` aceptado sale (G-r2-1, A-r3-1)
+        # solo después de cerrar los anteriores; lo demás (eventos, pushes sin abrir) se descarta.
+        inbox = self._inbox
+        items = []
+        while not inbox.queue.empty():
+            items.append(inbox.queue.get_nowait())
+            inbox.queue.task_done()
+        inbox.pending = 0
+        inbox.since = None
+        for item in items:
+            kind = item[0]
+            if kind == "turn_end" and item[1].opened:
+                await self._close_one(td, item[1], item[2], limit)
+            elif kind == "leave":
+                for turn in list(self._live):
+                    if turn.conversation_id == item[1] and turn.opened:
+                        await self._close_one(td, turn, item[2], limit)
+            elif kind in ("turn_start", "refused") and not item[1].ended:
+                turn = item[1]
+                source = turn.channel
+                if turn.origin != "user" or (source is not None and source.by_session is not self):
+                    # Un push, o el turno de otra sesión, que este socket nunca mostró: nada.
+                    # Un `send` aceptado de esta sesión sí recibe su par (G-r2-1, A-r3-1).
+                    self._forget(turn)
+                    continue
+                for earlier in list(self._live):
+                    if earlier is not turn and earlier.opened:
+                        await self._close_one(td, earlier, "closed", limit)
+                await self._open(turn)
+        for turn in list(self._live):
+            # Su turn_end, tras soltar su TTS (su audio ya no sale); uno que nunca abrió no
+            # recibe nada (nunca un turn_end solo).
+            await self._close_one(td, turn, "closed", limit)
+        # Los turn_end de cortes en curso, bajo un mismo tope; lo que no acabe se cancela (no
+        # sobrevive a la sesión: están supervisadas, su resultado se recoge igual).
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + limit
+        for task in list(self._cuts):
+            await td.wait(task, "turn_end de un corte", max(0.0, deadline - loop.time()))
+        for task in list(self._cuts):
+            if not task.done():
+                task.cancel()
+
+    async def _close_one(self, td: Teardown, turn: Turn, reason: EndReason, limit: float) -> None:
+        if turn.ended:
+            return
+        if turn.tts is not None:
+            await td.step(turn.tts.release(), "cierre del TTS del push", limit)
+        if turn.pending is not None:
+            await td.step(turn.pending.release(), "cierre del TTS del turno", limit)
+        await self._end(turn, reason, release=False)

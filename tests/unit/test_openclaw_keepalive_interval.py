@@ -3,15 +3,16 @@ used to make the keepalive loop spin with asyncio.sleep(0) — a ping flood."""
 
 import pytest
 
+from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.models import GatewayInfo
-from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+from fogar_gateway.services.openclaw.registry import TurnRegistry
 
 
 def _client(tick_ms=None):
     turns = TurnRegistry()
-    client = OpenClawClient("h", 1, "t", turns, FrameDispatcher(turns, ClientRegistry()))
+    client = OpenClawClient("h", 1, "t", turns, FrameDispatcher(turns, ChannelHub()))
     if tick_ms is not None:
         client.gateway_info = GatewayInfo(
             default_agent_id="main",

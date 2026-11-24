@@ -10,8 +10,15 @@ export type Connection =
   | 'ready'
   | 'reconnecting' // se cayó: reintenta solo, con espera creciente
   | 'idle' // cerrada sin error (inactividad): se reabre al escribir
-  | 'elsewhere' // otra pestaña o ventana abrió la conversación: solo vuelve si lo pide la persona
-  | 'stopped' // no tiene arreglo reconectando (ver `notice`)
+  | 'stopped' // parada: no tiene arreglo reconectando, o se agotaron los reintentos (ver `notice`)
+
+/**
+ * Cuánto se reintenta solo (#344): si las caídas seguidas sin llegar a `ready` (1006, 1011, 1012…)
+ * duran ya esto, se deja de reintentar y la conversación se para con «Reintentar» a mano. Cubre un
+ * reinicio del gateway o de OpenClaw, o un portátil que despierta; un `ready` vuelve a contar.
+ */
+export const GIVE_UP_AFTER_MS = 120_000
+const GIVE_UP_TEXT = 'No llego al gateway tras varios intentos. Comprueba la conexión y reintenta.'
 
 export interface ChatSessionOptions {
   conversationId: string
@@ -53,6 +60,8 @@ export function createChatSession(options: ChatSessionOptions) {
   // Escrito con la conversación dormida: sale al llegar `ready` (su línea, por si no sale).
   let pending: { text: string; key: string } | null = null
   let disposed = false
+  // Desde cuándo falla sin llegar a `ready` (null: no está fallando).
+  let failingSince: number | null = null
 
   function connect(): void {
     if (disposed) return
@@ -96,6 +105,7 @@ export function createChatSession(options: ChatSessionOptions) {
       const m = msg as Extract<ServerMessage, { type: 'ready' }>
       state.connection = 'ready'
       state.failures = 0
+      failingSince = null
       // Un `restored` solo llega a quien estaba conectado al volver OpenClaw: al entrar, se parte de cero.
       state.orchestratorDown = false
       state.agent = m.conversation?.agent ?? m.agent
@@ -118,15 +128,24 @@ export function createChatSession(options: ChatSessionOptions) {
     if (disposed) return
     const action = closeAction(code)
     if (action === 'retry') {
-      state.connection = 'reconnecting'
       state.failures += 1
-      retry = setTimeout(connect, backoffMs(state.failures))
-      return
+      const now = Date.now()
+      failingSince ??= now
+      if (now - failingSince < GIVE_UP_AFTER_MS) {
+        state.connection = 'reconnecting'
+        retry = setTimeout(connect, backoffMs(state.failures))
+        return
+      }
     }
     if (pending) state.log.markUnsent(pending.key) // no se envió: que se vea
     pending = null
-    if (action === 'stop') state.notice = stopText(code)
-    state.connection = action === 'stop' ? 'stopped' : action
+    if (action === 'idle') {
+      state.connection = 'idle'
+      return
+    }
+    // `stop`, o los reintentos agotados (#344): solo vuelve con «Reintentar».
+    state.notice = action === 'stop' ? stopText(code) : GIVE_UP_TEXT
+    state.connection = 'stopped'
   }
 
   /** Manda un mensaje. Con la conversación dormida, la reabre y lo manda al entrar. */
@@ -150,10 +169,7 @@ export function createChatSession(options: ChatSessionOptions) {
     if (state.connection === 'ready' && state.log.turnOpen) ws?.send(JSON.stringify({ type: 'cancel' }))
   }
 
-  /**
-   * Empieza. Si la conversación estaba abierta en otra pestaña, esa recibe el 4102 («conversation
-   * opened elsewhere») y se queda con su aviso (no vuelve sola): nunca se echan una a otra.
-   */
+  /** Empieza. La conversación puede estar abierta a la vez en otras pestañas o aparatos (5.0). */
   function start(): void {
     connect()
   }
@@ -166,11 +182,12 @@ export function createChatSession(options: ChatSessionOptions) {
     state.log.dropReloaded(keys, pending?.key)
   }
 
-  /** «Seguir aquí» (o reintentar tras un `stopped`): vuelve a abrir la conversación, que se cierra en el otro sitio. */
-  function retake(): void {
+  /** «Reintentar» tras un `stopped`: vuelve a abrir la conversación y cuenta los fallos desde cero. */
+  function reconnect(): void {
     if (ws || disposed) return
     state.log = new ChatLog(options.conversationId)
     state.failures = 0
+    failingSince = null
     state.connection = 'connecting'
     connect()
   }
@@ -183,7 +200,7 @@ export function createChatSession(options: ChatSessionOptions) {
     socket?.close(1000)
   }
 
-  return { state, start, send, cancel, retake, historyReloaded, dispose }
+  return { state, start, send, cancel, reconnect, historyReloaded, dispose }
 }
 
 export type ChatSession = ReturnType<typeof createChatSession>

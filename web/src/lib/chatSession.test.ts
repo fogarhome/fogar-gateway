@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createChatSession } from './chatSession'
+import { backoffMs } from './chat'
+import { createChatSession, GIVE_UP_AFTER_MS } from './chatSession'
 
 // Un WebSocket de mentira: guarda lo enviado y deja simular lo que manda el gateway.
 class FakeSocket {
@@ -115,22 +116,72 @@ describe('createChatSession', () => {
     expect(s.state.log.lines[0]).toMatchObject({ role: 'assistant', origin: 'push', state: 'streaming' })
   })
 
-  it('«abierta en otro sitio» no reconecta sola; «seguir aquí» sí', () => {
+  it('parada, «Reintentar» vuelve a abrir la conversación desde cero', () => {
     const s = session()
     last().receive({ type: 'turn_start', turn_id: 't-1', turn_seq: 1, conversation: 'c1', origin: 'user' })
     last().receive({ type: 'turn_end', turn_id: 't-1', reason: 'closed' })
-    last().serverClose(4102, 'conversation opened elsewhere')
-    expect(s.state.connection).toBe('elsewhere')
+    last().serverClose(4100, 'conversation not found')
+    expect(s.state.connection).toBe('stopped')
     vi.advanceTimersByTime(120_000)
     expect(FakeSocket.all).toHaveLength(1)
     expect(s.send('hola')).toBe(false)
 
-    s.retake()
+    s.reconnect()
     expect(FakeSocket.all).toHaveLength(2)
     expect(s.state.log.lines).toEqual([]) // se vuelve a leer lo dicho
     last().open()
     last().receive(READY)
     expect(s.state.connection).toBe('ready')
+  })
+
+  it('reintenta solo mientras las caídas seguidas duran menos de dos minutos; después espera a «Reintentar» (#344)', () => {
+    const s = session()
+    s.send('¿Llegas?')
+    let sockets = 1
+    const t0 = Date.now()
+    // Un reinicio del gateway que tarda: 1006, 1011, 1012… cada reintento tras su espera (1 s, 2 s, 4 s… hasta 30 s).
+    last().serverClose(1006)
+    while (s.state.connection === 'reconnecting') {
+      expect(Date.now() - t0).toBeLessThan(GIVE_UP_AFTER_MS)
+      vi.advanceTimersByTime(backoffMs(s.state.failures))
+      sockets += 1
+      expect(FakeSocket.all).toHaveLength(sockets)
+      last().open() // abre, pero no llega a `ready`
+      last().serverClose([1006, 1011, 1012][sockets % 3]!)
+    }
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(GIVE_UP_AFTER_MS)
+    expect(sockets).toBeGreaterThan(5) // no se rinde tras unos pocos intentos rápidos
+    expect(s.state.connection).toBe('stopped')
+    expect(s.state.notice).toMatch(/tras varios intentos/)
+    vi.advanceTimersByTime(600_000)
+    expect(FakeSocket.all).toHaveLength(sockets) // nada más, solo
+    expect(s.send('hola')).toBe(false)
+
+    s.reconnect()
+    expect(s.state.failures).toBe(0)
+    expect(FakeSocket.all).toHaveLength(sockets + 1)
+    last().open()
+    last().receive(READY)
+    expect(s.state.connection).toBe('ready')
+    // «Reintentar» volvió a contar: otra caída reintenta solo.
+    last().serverClose(1006)
+    expect(s.state.connection).toBe('reconnecting')
+  })
+
+  it('un `ready` vuelve a contar el tiempo desde cero', () => {
+    const s = session()
+    for (let round = 0; round < 3; round++) {
+      // 1 + 2 + 4 + 8 + 16 + 30 + 30 + 30 s ≈ 2 min menos un poco, sin `ready`…
+      for (const wait of [1000, 2000, 4000, 8000, 16_000, 30_000, 30_000]) {
+        last().serverClose(1006)
+        expect(s.state.connection).toBe('reconnecting')
+        vi.advanceTimersByTime(wait)
+      }
+      last().open()
+      last().receive(READY) // …y entra: la cuenta empieza de nuevo
+      expect(s.state.connection).toBe('ready')
+      expect(s.state.failures).toBe(0)
+    }
   })
 
   it('tras una caída reintenta solo, con espera, y cierra el turno que quedó abierto', () => {
@@ -169,8 +220,8 @@ describe('createChatSession', () => {
     last().serverClose(1000)
     s.send('¿Hola?')
     last().open()
-    last().serverClose(4102)
-    expect(s.state.connection).toBe('elsewhere')
+    last().serverClose(4200)
+    expect(s.state.connection).toBe('stopped')
     expect(s.state.log.lines.at(-1)).toMatchObject({ text: '¿Hola?', unsent: true })
   })
 

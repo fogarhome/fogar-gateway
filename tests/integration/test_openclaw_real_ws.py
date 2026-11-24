@@ -12,9 +12,11 @@ import logging
 
 import pytest
 
+from fogar_gateway.services.channel import ChannelHub
+from fogar_gateway.services.conversations import ConversationIndex
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
-from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+from fogar_gateway.services.openclaw.registry import TurnRegistry
 from tests.fakes.bridge import keyed_conversation
 from tests.fakes.openclaw import MIB, FakeOpenClawServer
 
@@ -24,7 +26,7 @@ SK_B = "agent:main:client-b"
 
 def make_client(port, token="tok"):
     turns = TurnRegistry()
-    dispatcher = FrameDispatcher(turns, ClientRegistry())
+    dispatcher = FrameDispatcher(turns, ChannelHub())
     client = OpenClawClient("127.0.0.1", port, token, turns, dispatcher)
     return client, turns
 
@@ -112,7 +114,7 @@ async def test_clean_close_errors_pending_turns_fast_and_frees_session_key(serve
 
 async def test_listen_errors_use_stable_message_not_raw_exception():
     turns = TurnRegistry()
-    client = OpenClawClient("x", 1, "t", turns, FrameDispatcher(turns, ClientRegistry()))
+    client = OpenClawClient("x", 1, "t", turns, FrameDispatcher(turns, ChannelHub()))
 
     class Boom:
         def __aiter__(self):
@@ -218,7 +220,7 @@ async def test_1009_close_logs_code_but_no_frame_content(server, caplog):
 async def test_handler_error_logs_traceback_without_exception_message(caplog):
     caplog.set_level(logging.DEBUG, logger="fogar_gateway.services.openclaw.client")
     turns = TurnRegistry()
-    client = OpenClawClient("x", 1, "t", turns, FrameDispatcher(turns, ClientRegistry()))
+    client = OpenClawClient("x", 1, "t", turns, FrameDispatcher(turns, ChannelHub()))
 
     class Boom:
         def __aiter__(self):
@@ -313,6 +315,16 @@ async def test_drop_mid_turn_delivers_delta_then_disconnect_error(server):
         await client.close()
 
 
+def _route_pushes_to(client, fake) -> None:
+    """The pushes of client-a's conversation reach `fake` (5.0: through its channel, which
+    the dispatcher finds by the conversation index)."""
+    conversation = keyed_conversation("client-a")
+    hub = client._dispatcher._channels
+    hub.index = ConversationIndex()
+    hub.index.add(conversation)
+    hub.channel_for(conversation.session_key).enqueue_push = fake.enqueue_push
+
+
 async def test_push_reaches_registered_bridge_in_order(server):
     class FakeBridge:
         def __init__(self):
@@ -323,7 +335,7 @@ async def test_push_reaches_registered_bridge_in_order(server):
 
     client, _ = make_client(server.port)
     bridge = FakeBridge()
-    client._dispatcher._clients.register("client-a", bridge, keyed_conversation("client-a"))
+    _route_pushes_to(client, bridge)
     await client.connect()
     try:
         await server.push(SK_A, "hola")
@@ -462,7 +474,7 @@ async def test_abort_absorbs_its_aborted_frame(server):
 
     client, turns = make_client(server.port)
     bridge = FakeBridge()
-    client._dispatcher._clients.register("client-a", bridge, keyed_conversation("client-a"))
+    _route_pushes_to(client, bridge)
     await client.connect()
     try:
         await server.push(SK_A, "aviso", end=False)

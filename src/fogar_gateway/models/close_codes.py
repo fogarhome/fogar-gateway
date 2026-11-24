@@ -14,15 +14,18 @@ ningún sitio de cierre lleva un número ni un texto propio, ni llama a `close()
   no lo conozca hace ya lo correcto.
 
 `reconnect` dice qué debe hacer el cliente: `backoff` (reconectar solo, con espera creciente),
-`on_input` (reabrir cuando haga falta, p. ej. al escribir), `never_auto` (solo si lo pide la
-persona; reconectar solo echaría a otra sesión) o `fix` (no reintentar igual: hay que cambiar
-algo, la clave o el handshake). La copia del panel web (`web/src/lib/closeCodes.ts`) la compara
-un test con esta tabla.
+`on_input` (reabrir cuando haga falta, p. ej. al escribir) o `fix` (no reintentar igual: hay que
+cambiar algo, la clave o el handshake). La copia del panel web (`web/src/lib/closeCodes.ts`) la
+compara un test con esta tabla.
+
+Códigos retirados (`RETIRED_CODES`): fuera de la tabla activa y nunca se reutilizan, para que un
+cliente viejo no los confunda con otra cosa. 4102 («conversation opened elsewhere», M19) se
+retiró en la 5.0 (#406): una conversación puede estar abierta en varias sesiones a la vez.
 """
 
 from typing import Any, Literal, NamedTuple
 
-Reconnect = Literal["backoff", "on_input", "never_auto", "fix"]
+Reconnect = Literal["backoff", "on_input", "fix"]
 
 # RFC 6455 §5.5: el cuerpo de un control frame cabe en 125 bytes, 2 del código.
 MAX_REASON_BYTES = 123
@@ -65,7 +68,7 @@ class Close:
     # --- 41xx: conversación ---
     CONVERSATION_NOT_FOUND = CloseFrame(4100, "conversation not found", "fix")
     CONVERSATION_AGENT_MISMATCH = CloseFrame(4101, "conversation agent mismatch", "fix")
-    CONVERSATION_OPENED_ELSEWHERE = CloseFrame(4102, "conversation opened elsewhere", "never_auto")
+    # 4102 («conversation opened elsewhere») está retirado: ver RETIRED_CODES.
 
     # --- 42xx: sesión ---
     # El cliente se borró, se desactivó o se rotó su clave con la sesión abierta.
@@ -74,6 +77,11 @@ class Close:
     # --- 49xx: pasajeros, se reintentan con espera ---
     HANDSHAKE_TIMEOUT = CloseFrame(4900, "handshake timeout", "backoff")
 
+
+# Códigos que el gateway mandó alguna vez y ya no manda: reservados, nunca se reutilizan.
+RETIRED_CODES: dict[int, str] = {
+    4102: "conversation opened elsewhere",  # M19 → retirado en la 5.0 (#406)
+}
 
 ALL_CLOSES: dict[str, CloseFrame] = {
     name: value for name, value in vars(Close).items() if isinstance(value, CloseFrame)

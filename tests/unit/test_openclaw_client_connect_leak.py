@@ -7,9 +7,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from websockets.exceptions import ConnectionClosed
 
+from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
-from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+from fogar_gateway.services.openclaw.registry import TurnRegistry
 
 
 class FakeOCSocket:
@@ -56,7 +57,7 @@ async def test_connect_closes_socket_when_challenge_fails():
     fake_ws = FakeOCSocket(fail_at="challenge")
 
     turn_reg = TurnRegistry()
-    dispatcher = FrameDispatcher(turn_registry=turn_reg, client_registry=ClientRegistry())
+    dispatcher = FrameDispatcher(turn_registry=turn_reg, channels=ChannelHub())
 
     async def fake_connect(uri, **kwargs):
         return fake_ws
@@ -80,7 +81,7 @@ async def test_connect_cancelled_during_handshake_closes_socket():
         port=1,
         token="x",
         turn_registry=turn_reg,
-        dispatcher=FrameDispatcher(turn_registry=turn_reg, client_registry=ClientRegistry()),
+        dispatcher=FrameDispatcher(turn_registry=turn_reg, channels=ChannelHub()),
     )
 
     async def fake_connect(uri, **kwargs):

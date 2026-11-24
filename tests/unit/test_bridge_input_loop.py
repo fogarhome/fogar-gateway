@@ -97,9 +97,11 @@ async def test_send_message_dispatches_to_orchestrator(make_loop_bridge):
     )
     await bridge._client_input_loop()
     await asyncio.sleep(0.01)
-    # the disconnect that ends the loop also ends the new turn (G-18)
+    # 5.0 (decision 2): the disconnect no longer ends the channel's turn; the session's
+    # close does, with the session's own turn_end (`closed`).
+    await bridge.close_all()
     assert await _turns(bridge) == [("turn_start", "t-1"), ("turn_end", "t-1")]
-    await _stop(bridge)
+    assert bridge.turns.last_ended.end_reason == "closed"
 
 
 async def test_plain_text_is_invalid_message_in_text_mode(make_loop_bridge):
@@ -163,6 +165,7 @@ async def test_send_cancels_previous_active_turn(make_loop_bridge):
     await asyncio.sleep(0.01)
 
     assert first_task.cancelled(), "El turn anterior debe cancelarse al llegar un send nuevo"
+    await bridge.close_all()  # 5.0 (decision 2): the disconnect leaves t-2 to the close
     assert await _turns(bridge) == [
         ("turn_start", "t-1"), ("turn_end", "t-1"), ("turn_start", "t-2"), ("turn_end", "t-2"),
     ]  # fmt: skip
@@ -226,6 +229,7 @@ async def test_second_send_cancels_first_active_turn(make_loop_bridge):
     )
     assert bridge.turns.user_task is not first_task
     await asyncio.sleep(0.01)
+    await bridge.close_all()  # 5.0 (decision 2): the disconnect leaves t-2 to the close
     assert await _turns(bridge) == [
         ("turn_start", "t-1"), ("turn_end", "t-1"), ("turn_start", "t-2"), ("turn_end", "t-2"),
     ]  # fmt: skip

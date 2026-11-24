@@ -629,7 +629,9 @@ src/fogar_gateway/
 │                            status, version, servicio systemd (install/start/stop/restart), logs y migrate
 └── services/
     ├── bridge.py            FogarBridge — coordinador de sesión WS
-    ├── turns.py             TurnController — los turnos de una sesión (user y push), su TTS y su fin
+    ├── channel.py           ConversationChannel / ChannelHub — el canal de cada conversación: dueño de sus
+    │                        runs en OpenClaw, reparte cada turno a todas las sesiones adjuntas
+    ├── turns.py             TurnController — la parte de una sesión en el canal: sus pares de turno, su TTS
     ├── conversations.py     conversaciones: reglas del día, tabla, índice
     ├── pairing.py           PairingStore — códigos de emparejamiento en memoria
     ├── db_client.py         DbClient — lee ClientRecord de SQLite local (sin caché)

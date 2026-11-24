@@ -3,6 +3,9 @@
 Cada test mira lo que recibe el cliente por su WebSocket (`ready.conversation`,
 `turn_start.conversation`/`origin`, `turn_end.reason`, cierres 4xxx) y, cuando importa, en qué
 sesión de OpenClaw acabó cada turno (`openclaw.sessions`).
+
+Desde la 5.0 (#406) una conversación puede estar abierta en varias sesiones a la vez: cada una
+recibe su par de cada turno de su canal, y el 4102 se retiró.
 """
 
 import asyncio
@@ -19,7 +22,7 @@ from fogar_gateway.db.models import ClientRecord, ConversationRecord, UserRecord
 from fogar_gateway.services import conversations as conv_mod
 from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.conversations import ConversationService, session_key_for
-from tests.integration.conftest import CLIENT_ID
+from tests.integration.conftest import CLIENT_ID, VALID_KEY
 from tests.integration.harness.conftest import assert_turns_paired, of_type
 
 
@@ -82,17 +85,107 @@ async def test_ready_and_turns_carry_the_default_conversation_of_the_day(harness
     assert end["reason"] == "done"
 
 
-async def test_same_conversation_in_a_second_session_closes_the_first(harness, clock):
-    """Una conversación, una sesión: la tele que reconecta antes de que caiga su socket viejo."""
+async def test_second_session_does_not_close_first(harness, clock):
+    """5.0 (#406): la tele que reconecta antes de que caiga su socket viejo, o dos pestañas en la
+    misma conversación: ninguna se cierra, las dos reciben `ready` y las dos siguen hablando."""
     old = await harness.connect()
     new = await harness.connect()
     assert new.ready["conversation"] == old.ready["conversation"]  # la del día, la misma
 
-    closed = await closed_by_gateway(old)
-    assert closed.rcvd is not None
-    assert (closed.rcvd.code, closed.rcvd.reason) == (4102, "conversation opened elsewhere")
-    msgs = await run_turn(new, "sigo aquí")  # la nueva sigue viva
-    assert of_type(msgs, "turn_start")[0]["conversation"] == new.ready["conversation"]["id"]
+    await old.collect(timeout=0.5)  # nada de 4102: el socket viejo sigue abierto
+    for client in (old, new):
+        msgs = await run_turn(client, "sigo aquí", ends=1)
+        assert of_type(msgs, "turn_start")[0]["conversation"] == old.ready["conversation"]["id"]
+    for client in (old, new):
+        await client.collect(lambda m: len(of_type(m, "turn_end")) >= 2)
+        assert_turns_paired(client.messages)
+
+
+async def test_both_sessions_see_the_turn(harness, clock):
+    """Cada sesión adjunta recibe su propio par (su turn_id) del turno del canal, con su texto."""
+    a = await harness.connect()
+    b = await harness.connect()
+    await run_turn(a, "hola")
+    await b.collect(lambda m: bool(of_type(m, "turn_end")))
+    for client in (a, b):
+        (start,) = of_type(client.messages, "turn_start")
+        assert (start["conversation"], start["origin"]) == (a.ready["conversation"]["id"], "user")
+        assert [t["text"] for t in of_type(client.messages, "token")] == ["reply-hola"]
+        assert [e["reason"] for e in of_type(client.messages, "turn_end")] == ["done"]
+        assert_turns_paired(client.messages)
+    assert said(harness, harness.session_key(a)) == ["hola"]  # un solo chat.send
+
+
+async def test_late_session_gets_accumulated_text(harness, clock):
+    """Una sesión que entra a mitad de un turno recibe su turn_start y, en un `token`, lo que el
+    turno llevaba dicho; después, lo que sigue."""
+    first = await harness.connect()
+    await first.send({"type": "send", "text": "partial_hold"})
+    await first.collect(lambda m: bool(of_type(m, "token")))
+
+    late = await harness.connect()
+    await late.collect(lambda m: bool(of_type(m, "token")))
+    harness.openclaw.release.set()
+    for client in (first, late):
+        await client.collect(lambda m: bool(of_type(m, "turn_end")))
+        assert [e["reason"] for e in of_type(client.messages, "turn_end")] == ["done"]
+        assert_turns_paired(client.messages)
+    assert [t["text"] for t in of_type(first.messages, "token")] == ["reply-partial ", "fin"]
+    assert [t["text"] for t in of_type(late.messages, "token")] == ["reply-partial ", "fin"]
+    assert of_type(late.messages, "turn_start")[0]["origin"] == "user"
+
+
+async def test_closing_sender_keeps_turn_for_other(harness, clock):
+    """Review Focus 1 de la 2a: dos pestañas en la misma conversación y la que envió se cierra a
+    mitad de su turno. La otra lo sigue viendo hasta su turn_end, el run no se aborta y nadie
+    recibe dos turn_end."""
+    sender = await harness.connect()
+    other = await harness.connect()
+    await sender.send({"type": "send", "text": "partial_hold"})
+    for client in (sender, other):
+        await client.collect(lambda m: bool(of_type(m, "token")))
+
+    await sender.ws.close()
+    await asyncio.sleep(0.2)  # el gateway cierra la sesión que se fue
+    harness.openclaw.release.set()
+    await other.collect(lambda m: bool(of_type(m, "turn_end")))
+
+    assert [t["text"] for t in of_type(other.messages, "token")] == ["reply-partial ", "fin"]
+    assert [e["reason"] for e in of_type(other.messages, "turn_end")] == ["done"]
+    assert_turns_paired(other.messages)
+    # El que se fue: su turn_start y, como mucho, el turn_end de ese mismo turno (el socket lo
+    # cerró él: el `closed` puede no llegarle), nunca dos.
+    (start,) = of_type(sender.messages, "turn_start")
+    ends = of_type(sender.messages, "turn_end")
+    assert len(ends) <= 1 and all(e["turn_id"] == start["turn_id"] for e in ends)
+    key = harness.session_key(other)
+    assert [m for m, sk in harness.openclaw.calls if sk == key] == ["chat.send"]  # sin chat.abort
+
+
+async def test_a_day_move_leaves_the_old_turn_to_the_others(harness, clock):
+    """Decisión 6: una sesión que pasa a la conversación de hoy con un turno abierto en la de
+    ayer cierra el suyo (`replaced`) y deja el canal; el turno sigue para la otra sesión."""
+    mover = await harness.connect()
+    stayer = await harness.connect(handshake={"conversation": mover.ready["conversation"]["id"]})
+    yesterday = mover.ready["conversation"]["id"]
+    await mover.send({"type": "send", "text": "partial_hold"})
+    for client in (mover, stayer):
+        await client.collect(lambda m: bool(of_type(m, "token")))
+
+    clock.now = datetime(2026, 11, 15, 5, 30)  # pasado el corte de las 5:00
+    msgs = await run_turn(mover, "hoy", ends=2)
+    replaced, done = of_type(msgs, "turn_end")
+    assert (replaced["reason"], done["reason"]) == ("replaced", "done")
+    assert of_type(msgs, "turn_start")[0]["conversation"] != yesterday
+    assert_turns_paired(mover.messages)
+
+    harness.openclaw.release.set()
+    await stayer.collect(lambda m: bool(of_type(m, "turn_end")))
+    assert [e["reason"] for e in of_type(stayer.messages, "turn_end")] == ["done"]
+    assert [t["text"] for t in of_type(stayer.messages, "token")] == ["reply-partial ", "fin"]
+    assert [m for m, sk in harness.openclaw.calls if sk == session_key_for("main", yesterday)] == [
+        "chat.send"
+    ]
 
 
 async def test_day_cutoff_moves_a_long_lived_session_at_its_next_turn(harness, clock):
@@ -110,12 +203,24 @@ async def test_day_cutoff_moves_a_long_lived_session_at_its_next_turn(harness, c
     assert said(harness, session_key_for("main", today)) == ["dos"]
     assert_turns_paired(client.messages)
 
-    # Un recordatorio de la conversación de ayer sigue llegando a la tele, que ya está en la de hoy.
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="push to an unattached conversation: notification device, 5.0 PR 2c (decisión 7)",
+)
+async def test_yesterdays_reminder_reaches_the_tv_in_todays_conversation(harness, clock):
+    """Lo que debe pasar: un recordatorio de la conversación de ayer llega a la tele aunque ya
+    esté en la de hoy (con `turn_start.conversation` = la de ayer)."""
+    client = await harness.connect()
+    yesterday = client.ready["conversation"]["id"]
+    await run_turn(client, "uno")
+    clock.now = datetime(2026, 11, 15, 5, 30)  # pasado el corte de las 5:00
+    await run_turn(client, "dos")
+
     await harness.push("se te olvidó algo", session_key=session_key_for("main", yesterday))
-    await client.collect(lambda m: len(of_type(m, "turn_end")) == 3)
-    push = of_type(client.messages, "turn_start")[-1]
-    assert (push["conversation"], push["origin"]) == (yesterday, "push")
-    assert_turns_paired(client.messages)
+    await client.collect(lambda m: len(of_type(m, "turn_start")) >= 3, timeout=1.0)
+    push_start = of_type(client.messages, "turn_start")[2]
+    assert (push_start["origin"], push_start["conversation"]) == ("push", yesterday)
 
 
 async def test_push_of_a_conversation_reaches_the_session_that_has_it_open(harness, clock):
@@ -134,26 +239,30 @@ async def test_push_of_a_conversation_reaches_the_session_that_has_it_open(harne
     assert of_type(a.messages, "turn_start")[0]["conversation"] == a.ready["conversation"]["id"]
 
 
-async def test_a_displaced_session_ends_its_turn_and_lets_go_before_the_new_one_talks(harness):
-    """La vieja recibe el turn_end (`closed`) de su turno abierto antes del 4102, y su
-    chat.abort sale antes del primer chat.send de la nueva, que llega entero."""
-    old = await harness.connect()
-    await old.send({"type": "send", "text": "wait-old"})  # el orquestador se queda esperando
-    await harness.openclaw.wait_held(1)
-    await old.collect(lambda m: bool(of_type(m, "turn_start")))
-
-    new = await harness.connect()  # la misma conversación del día
-    closed = await closed_by_gateway(old)
-    assert (closed.rcvd.code, closed.rcvd.reason) == (4102, "conversation opened elsewhere")
-    assert [e["reason"] for e in of_type(old.messages, "turn_end")] == ["closed"]
-    assert_turns_paired(old.messages)
-
-    msgs = await run_turn(new, "hola")
-    assert [t["text"] for t in of_type(msgs, "token")] == ["reply-hola"]
-    key = harness.session_key(new)
-    assert [m for m, sk in harness.openclaw.calls if sk == key] == [
-        "chat.send", "chat.abort", "chat.send"
-    ]
+@pytest.mark.xfail(
+    strict=True,
+    reason="Decisión 8 de la 5.0 PR 2: hasta la 2b.3, /v1 sigue en stream_response con su propio "
+    "registro por clave y choca con el canal vivo de la conversación (409 turn_in_progress o el "
+    "aborto antes de enviar del canal); la 2b.3 lo manda por el canal.",
+)
+async def test_v1_talks_in_a_conversation_with_a_live_channel(harness, clock):
+    client = await harness.connect()
+    await client.send({"type": "send", "text": "partial_hold"})
+    await client.collect(lambda m: bool(of_type(m, "token")))
+    body = {"model": "fogar-gateway", "messages": [{"role": "user", "content": "hola"}]}
+    try:
+        async with httpx.AsyncClient(
+            base_url=f"http://127.0.0.1:{harness.port}",
+            headers={"authorization": f"Bearer {VALID_KEY}"},
+            timeout=5,
+        ) as http:
+            res = await http.post("/v1/chat/completions", json=body)
+        assert res.status_code == 200, res.text
+        assert res.json()["choices"][0]["message"]["content"] == "reply-hola"
+    finally:
+        harness.openclaw.release.set()
+    await client.collect(lambda m: bool(of_type(m, "turn_end")))
+    assert [e["reason"] for e in of_type(client.messages, "turn_end")] == ["done"]
 
 
 async def test_a_new_session_that_fails_its_health_check_leaves_the_live_one_alone(harness):

@@ -24,6 +24,7 @@ from fogar_gateway.cli.verify import (
     verify_openclaw,
 )
 from fogar_gateway.core.config import settings
+from fogar_gateway.services.channel import ChannelHub
 from tests.fakes.elevenlabs_stt import FakeElevenLabsStt
 from tests.fakes.elevenlabs_tts import FakeElevenLabsTts
 from tests.fakes.fogar_upstreams import FakeTranscriber, FakeTts
@@ -125,11 +126,11 @@ async def _pair_gateway(server) -> None:
     """El gateway (con el DeviceStore por defecto) se empareja y guarda su token de dispositivo."""
     from fogar_gateway.services.openclaw.client import OpenClawClient, OrchestratorPairingRequired
     from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
-    from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+    from fogar_gateway.services.openclaw.registry import TurnRegistry
 
     def make():
         turns = TurnRegistry()
-        return OpenClawClient("127.0.0.1", server.port, TOKEN, turns, FrameDispatcher(turns, ClientRegistry()))
+        return OpenClawClient("127.0.0.1", server.port, TOKEN, turns, FrameDispatcher(turns, ChannelHub()))
 
     with pytest.raises(OrchestratorPairingRequired):
         await make().connect()

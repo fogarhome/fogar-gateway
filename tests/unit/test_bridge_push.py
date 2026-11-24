@@ -13,7 +13,15 @@ import pytest
 
 from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
-from tests.fakes.bridge import push, push_reply, sent, wait_until
+from tests.fakes.bridge import (
+    enqueue_push,
+    fixed_conversation,
+    push,
+    push_reply,
+    sent,
+    tokens,
+    wait_until,
+)
 
 SK = "agent:main:hab_sito"
 
@@ -118,77 +126,41 @@ async def test_push_disabled_client_receives_nothing(make_push_bridge):
 
 
 async def test_push_of_a_retired_agent_is_dropped_and_aborted(make_push_bridge):
-    """C-r7-1: sesión en main y allowed_agents=["main"]: el push de otro agente (conversación
-    de otro día) no llega al cliente y se aborta en OpenClaw."""
-    bridge, _ = make_push_bridge(output_mode=("text",), config=ClientConfig(allowed_agents=["Main"]))
-    await push(bridge, *push_reply("hola", sk="agent:x:hab_sito"))
+    """C-r7-1: sesión en una conversación del agente x y allowed_agents=["main"]: su push no
+    llega al cliente y se aborta en OpenClaw. (5.0: el push va al canal de su conversación;
+    uno de otra conversación ya no llega a esta sesión, decisión 7.)"""
+    sk = "agent:x:hab_sito"
+    bridge, _ = make_push_bridge(
+        output_mode=("text",), config=ClientConfig(allowed_agents=["Main"]),
+        conversation=fixed_conversation("hab_sito", agent="x"),
+    )
+    await push(bridge, *push_reply("hola", sk=sk))
     assert await sent(bridge) == []
-    bridge.orchestrator.abort.assert_awaited_with("agent:x:hab_sito")
-    await push(bridge, *push_reply("hola", sk=SK))  # el suyo sí
-    assert [m["type"] for m in await sent(bridge)] == ["turn_start", "token", "turn_end"]
-
+    bridge.orchestrator.abort.assert_awaited_with(sk)
 
 
 async def test_an_open_push_of_a_retired_agent_is_cut_at_its_next_start(make_push_bridge):
     """C-r7-1: push de x ya abierto, la revalidación quita x y llega su `agent start`
     intermedio: turn_end `cancelled` enseguida, sin esperar a un turn_timeout falso."""
-    bridge, _ = make_push_bridge(output_mode=("text",))
     sk = "agent:x:hab_sito"
+    bridge, _ = make_push_bridge(
+        output_mode=("text",), conversation=fixed_conversation("hab_sito", agent="x")
+    )
     await push(bridge, *push_reply("hola", sk=sk, end=False))
     bridge.turns.allowed_agents = ["main"]  # lo que deja la revalidación
     await asyncio.wait_for(push(bridge, ("turn_start", sk)), 1)
     assert _turn_frames(await sent(bridge)) == [
-        {"type": "turn_start", "turn_id": "t-1", "turn_seq": 1, "conversation": None, "origin": "push"},
+        {"type": "turn_start", "turn_id": "t-1", "turn_seq": 1, "conversation": "conv-1", "origin": "push"},
         {"type": "turn_end", "turn_id": "t-1", "reason": "cancelled"},
     ]
     bridge.orchestrator.abort.assert_awaited_with(sk)
 
-async def test_push_of_another_conversation_while_one_is_open_is_dropped(make_push_bridge):
-    """C-r8-1: push A abierto y llega un push B de otra conversación (otro día, otro agente):
-    B se descarta entero y A llega completo con un solo turn_end; luego B se abre bien."""
-    bridge, _ = make_push_bridge(output_mode=("text",))
-    sk_b = "agent:main:hab_sito:ayer"
-
-    def ev(kind, arg, run):
-        bridge.enqueue_push(kind, arg, run)
-
-    ev("turn_start", SK, "ra")
-    ev("chat", {"sessionKey": SK, "runId": "ra", "deltaText": "uno "}, "ra")
-    ev("turn_start", sk_b, "rb")
-    ev("chat", {"sessionKey": sk_b, "runId": "rb", "deltaText": "intruso"}, "rb")
-    ev("turn_end", sk_b, "rb")
-    ev("chat", {"sessionKey": SK, "runId": "ra", "deltaText": "dos"}, "ra")
-    ev("turn_end", SK, "ra")
-    await bridge.push_idle()
-    msgs = await sent(bridge)
-    assert [(m["type"], m.get("text")) for m in msgs] == [
-        ("turn_start", None), ("token", "uno "), ("token", "dos"), ("turn_end", None)
-    ]
-    assert msgs[-1]["reason"] == "done"
-    ev("turn_start", sk_b, "rb2")
-    ev("chat", {"sessionKey": sk_b, "runId": "rb2", "deltaText": "hola"}, "rb2")
-    ev("turn_end", sk_b, "rb2")
-    await bridge.push_idle()
-    assert [m["type"] for m in (await sent(bridge))[4:]] == ["turn_start", "token", "turn_end"]
-    bridge.orchestrator.abort.assert_not_awaited()  # otra conversación: no es nuestra para abortar
-
-
-async def test_own_conversation_push_dropped_under_another_is_aborted(make_push_bridge):
-    """R-1 (revisión de C-r8-1): push abierto de otra conversación y llega uno de la propia:
-    se descarta y se para en OpenClaw, para que un `send` no se pliegue en su run (#219)."""
-    bridge, _ = make_push_bridge(output_mode=("text",))
-    sk_other = "agent:main:hab_sito:ayer"
-    bridge.enqueue_push("turn_start", sk_other, "ra")
-    bridge.enqueue_push("turn_start", SK, "rb")
-    bridge.enqueue_push("turn_end", sk_other, "ra")
-    await bridge.push_idle()
-    bridge.orchestrator.abort.assert_awaited_once_with(SK)
-    assert [m["type"] for m in await sent(bridge)] == ["turn_start", "turn_end"]
-
 
 async def test_revalidation_refreshes_allowed_agents_for_pushes(make_push_bridge, monkeypatch):
     """C-r7-1: la revalidación guarda el `allowed_agents` vigente; el push lo consulta sin leer
-    la BD."""
+    la BD. (5.0: lo consulta el canal con `agent_allowed`; una sesión en una conversación de
+    un agente retirado la cierra la propia revalidación con 4020, así que aquí la sesión sigue
+    en main y se mira la consulta.)"""
     from fogar_gateway.core.config import settings
     from fogar_gateway.services import bridge as bridge_module
 
@@ -202,9 +174,10 @@ async def test_revalidation_refreshes_allowed_agents_for_pushes(make_push_bridge
     await wait_until(lambda: bridge.turns.allowed_agents == ["main"])
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
-    await push(bridge, *push_reply("hola", sk="agent:x:hab_sito"))
-    assert await sent(bridge) == []
-    bridge.orchestrator.abort.assert_awaited_with("agent:x:hab_sito")
+    assert not bridge.turns.agent_allowed("agent:x:hab_sito")
+    assert bridge.turns.agent_allowed("agent:main:hab_sito")
+    await push(bridge, *push_reply("hola", sk=SK))  # the push of its own conversation, yes
+    assert [m["type"] for m in await sent(bridge)] == ["turn_start", "token", "turn_end"]
 
 _TOOL = {"phase": "start", "name": "exec", "toolCallId": "call-1", "args": {"command": "ls"}}
 
@@ -264,6 +237,7 @@ async def test_multiple_push_starts_and_ends_collapse_to_single_pair(make_push_b
     ]
     # the next push is t-2: the intermediate starts consumed no turn_seq
     await push(bridge, ("turn_start", SK))
+    await sent(bridge)
     assert ws.of("turn_start")[-1]["turn_id"] == "t-2"
     await bridge.close_all()
 
@@ -357,7 +331,7 @@ async def test_cut_while_the_push_drains_its_audio_sends_one_turn_end(make_push_
     bridge, _ = make_push_bridge(output_mode=("audio", "text"), tts=provider)
     await push(bridge, ("turn_start", SK))
 
-    bridge.enqueue_push("turn_end", SK)
+    enqueue_push(bridge, "turn_end", SK)
     await wait_until(lambda: stream.end.await_count == 1)
     await asyncio.sleep(0.02)  # ya espera al audio
     assert await bridge.turns.cancel("cancelled") == (True, "t-1")
@@ -366,7 +340,9 @@ async def test_cut_while_the_push_drains_its_audio_sends_one_turn_end(make_push_
     assert [m for m in await sent(bridge) if m.get("type") == "turn_end"] == [
         {"type": "turn_end", "turn_id": "t-1", "reason": "cancelled"}
     ]
-    bridge.orchestrator.abort.assert_awaited_once_with(SK)
+    # 5.0 (decision 1): OpenClaw already ended that run and the channel closed its push;
+    # only this session's audio was left, so nothing is aborted.
+    bridge.orchestrator.abort.assert_not_awaited()
     assert bridge.turns.last_ended.end_reason == "cancelled"
     assert bridge.turns.snapshot(0.0)["turn"]["kind"] == "idle"
 
@@ -382,7 +358,7 @@ async def test_cut_while_push_tts_connects_closes_that_tts(make_push_bridge):
 
     provider.connect = AsyncMock(side_effect=_connect)
     bridge, _ = make_push_bridge(output_mode=("audio", "text"), tts=provider)
-    bridge.enqueue_push("turn_start", SK)
+    enqueue_push(bridge, "turn_start", SK)
     await wait_until(lambda: provider.connect.await_count == 1)
     assert await bridge.turns.cancel("cancelled") == (True, "t-1")
     go.set()
@@ -423,12 +399,12 @@ async def test_queued_events_of_a_cut_push_never_reopen_it(make_push_bridge, mon
     )
     for kind, arg in (("turn_start", SK), ("chat", {"deltaText": "a"}), ("turn_start", SK),
                       ("chat", {"deltaText": "b"}), ("turn_end", SK)):  # fmt: skip
-        bridge.enqueue_push(kind, arg, run_id="run-1")
+        enqueue_push(bridge, kind, arg, run_id="run-1")
     await asyncio.wait_for(feeding.wait(), 2)  # the worker is stuck on "a"
 
     assert await bridge.turns.cancel("interrupted") == (True, "t-1")
-    bridge.enqueue_push("turn_start", SK, run_id="run-2")  # a new run: a new push
-    bridge.enqueue_push("chat", {"deltaText": "c"}, run_id="run-2")
+    enqueue_push(bridge, "turn_start", SK, run_id="run-2")  # a new run: a new push
+    enqueue_push(bridge, "chat", {"deltaText": "c"}, run_id="run-2")
     await asyncio.wait_for(bridge.push_idle(), 2)
 
     msgs = [m for m in await sent(bridge) if isinstance(m, dict)]
@@ -442,18 +418,10 @@ async def test_queued_events_of_a_cut_push_never_reopen_it(make_push_bridge, mon
     await bridge.close_all()
 
 
-async def test_push_on_another_agent_session_is_cut_without_abort(make_push_bridge):
-    """7e: chat.abort only on our own session_key."""
-    bridge, _ = make_push_bridge(output_mode=("text",))
-    await push(bridge, ("turn_start", "agent:otro:hab_sito"))
-    assert await bridge.turns.cancel("cancelled") == (True, "t-1")
-    bridge.orchestrator.abort.assert_not_awaited()
-
-
 async def test_close_all_while_a_push_waits_for_the_user_turn_ends_promptly(make_push_bridge):
     bridge, _ = make_push_bridge(output_mode=("text",))
-    await bridge.turns._lock.acquire()  # a turn being replaced holds the lock
-    bridge.enqueue_push("turn_start", SK)
+    await bridge.channel._lock.acquire()  # a turn being replaced holds the lock
+    enqueue_push(bridge, "turn_start", SK)
     await asyncio.sleep(0.02)
     await asyncio.wait_for(bridge.close_all(), 2)
     assert [m for m in await sent(bridge) if m.get("type") == "turn_start"] == []
@@ -476,13 +444,16 @@ async def test_a_queued_push_run_is_aborted_before_the_user_s_chat_send(make_pus
     tombstoned and aborted first, and the user's turn gets its own reply."""
     import json
 
+    from fogar_gateway.services.channel import ChannelHub
     from fogar_gateway.services.openclaw.client import OpenClawClient
     from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
     from tests.fakes.openclaw import SendOnlyOpenClawWS
 
     turns, clients = TurnRegistry(), ClientRegistry()
-    dispatcher = FrameDispatcher(turns, clients)
+    hub = ChannelHub(index=clients.index, turn_registry=turns)
+    dispatcher = FrameDispatcher(turns, hub)
     client = OpenClawClient("127.0.0.1", 1, "tok", turns, dispatcher)
+    hub.orchestrator = client
 
     def answer(frame):
         if frame.get("method") == "chat.abort":
@@ -495,7 +466,7 @@ async def test_a_queued_push_run_is_aborted_before_the_user_s_chat_send(make_pus
     client._ws = ws = SendOnlyOpenClawWS(answer)
     bridge, _ = make_push_bridge(
         output_mode=("text",), orchestrator=client, turn_registry=turns, client_registry=clients,
-        register=True,
+        register=True, channel_hub=hub,
     )  # fmt: skip
 
     def event(name, payload):
@@ -523,15 +494,23 @@ async def test_a_queued_push_run_is_aborted_before_the_user_s_chat_send(make_pus
     await bridge.close_all()
 
 
-async def test_a_push_whose_turn_start_fails_is_aborted(make_push_bridge):
-    """Review 5: no turn_start, no push — and on our key, no run left going in OpenClaw."""
+async def test_a_push_whose_turn_start_fails_leaves_no_turn_and_the_next_send_aborts_it(
+    make_push_bridge,
+):
+    """Review 5, 5.0: no turn_start, no push in this session. The push is the channel's, and
+    a session that failed to show it does not abort it (decision 2); the next `send` cuts and
+    aborts it before its chat.send, so no run is left going under it."""
     from tests.fakes.bridge import GoneSender
 
     turns = TurnRegistry()
     bridge, _ = make_push_bridge(output_mode=("text",), sender=GoneSender(), turn_registry=turns)
-    await push(bridge, ("turn_start", SK))
-    bridge.enqueue_push("turn_start", SK, run_id="run-p")
+    enqueue_push(bridge, "turn_start", SK, run_id="run-p")
     await bridge.push_idle()
+    assert bridge.turns.snapshot(0.0)["turn"]["kind"] == "idle"
+    bridge.orchestrator.abort.assert_not_awaited()
+
+    bridge.orchestrator.stream_response = tokens("ok")
+    await bridge.turns.start_user_turn("hola")
     bridge.orchestrator.abort.assert_awaited_with(SK)
     assert turns.is_run_aborted("run-p")
-    assert bridge.turns.snapshot(0.0)["turn"]["kind"] == "idle"
+    await bridge.close_all()

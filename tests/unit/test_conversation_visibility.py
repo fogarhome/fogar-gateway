@@ -8,13 +8,13 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from fogar_gateway.db.models import ClientRecord, MembershipRecord, UserRecord
 from fogar_gateway.services.auth import hash_key
+from fogar_gateway.services.channel import ConversationChannel
 from fogar_gateway.services.conversations import (
     Conversation,
     ConversationNotFound,
     ConversationService,
     session_key_for,
 )
-from fogar_gateway.services.openclaw.registry import ClientRegistry
 
 HOME = "home"
 
@@ -74,8 +74,12 @@ async def test_the_list_is_filtered_by_who_looks(service):
     assert ids(await service.list_rows(visible_to=(HOME, None))) == {home.id}
 
 
-def _bridge(user_id):
-    return SimpleNamespace(client=SimpleNamespace(user_id=user_id))
+def _session(conversation, user_id):
+    """A session attached to `conversation` (only what `ConversationChannel.subscribe` reads)."""
+    return SimpleNamespace(
+        client=SimpleNamespace(id=f"dev-{user_id}", user_id=user_id),
+        conversation_id=conversation.id,
+    )
 
 
 def _conv(cid, client, owner=None):
@@ -84,14 +88,13 @@ def _conv(cid, client, owner=None):
 
 
 def test_a_private_push_never_reaches_a_home_device_or_someone_else():
-    reg = ClientRegistry()
-    tv, mac = _bridge(None), _bridge("sito")
-    reg.register("tv", tv, _conv("hogar", "tv"))
-    reg.register("mac", mac, _conv("priv", "mac", "sito"))
-    assert reg.route(session_key_for("main", "priv")) is mac
-    assert reg.route(session_key_for("main", "hogar")) is tv
+    """5.0 (#406): the push reaches the sessions attached to its conversation's channel. A
+    session only opens conversations visible to it (`visible_to`, the handshake); the channel
+    refuses a private conversation's non-owner anyway (the safety net `ClientRegistry.route`
+    used to be)."""
+    hogar, priv = _conv("hogar", "tv"), _conv("priv", "mac", "sito")
+    assert ConversationChannel(priv).subscribe(_session(priv, "sito"))
+    assert ConversationChannel(hogar).subscribe(_session(hogar, None))
     # Aunque algo saliera mal y la tele tuviera abierta una privada: no le llega.
-    reg.register("tv", tv, _conv("priv2", "tv", "sito"))
-    assert reg.route(session_key_for("main", "priv2")) is None
-    reg.register("ana", _bridge("ana"), _conv("priv3", "ana", "sito"))
-    assert reg.route(session_key_for("main", "priv3")) is None
+    assert not ConversationChannel(priv).subscribe(_session(priv, None))
+    assert not ConversationChannel(priv).subscribe(_session(priv, "ana"))

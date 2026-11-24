@@ -1,7 +1,8 @@
 """Turn lifecycle in FogarBridge (#215, #201).
 
 G-08 (#201) cancel race, G-09 turn created during close_all, G-10 one turn_end per
-turn on every path, G-11 turn_seq wraparound, G-18 gone client cancels its turn.
+turn on every path, G-11 turn_seq wraparound, G-18 a gone client stops receiving (5.0: it no longer aborts
+the channel's turn, decision 2).
 The M6 exit-gate mutants live with their topic: the `_closed` guard of close_all in
 test_bridge_close_all.py, the `>=` boundary of barge_in_min_chars in test_bridge_barge_in.py.
 """
@@ -17,6 +18,7 @@ from fogar_gateway.services.protocol import OrchestratorEvent
 from tests.fakes.bridge import (
     RecWS,
     blocking,
+    enqueue_push,
     push,
     push_reply,
     run_turn,
@@ -312,7 +314,10 @@ async def test_disconnected_client_cancels_its_turn_instead_of_draining(make_bri
     assert closed.is_set(), "the orchestrator stream was left open"
 
 
-async def test_client_gone_during_a_turn_cancels_the_orchestrator_stream(make_bridge):
+async def test_a_gone_client_does_not_abort_the_channel_turn(make_bridge):
+    """Decision 2 of the 5.0 PR 2 plan (G-18 inverted): the turn belongs to the channel, so a
+    client that is gone stops receiving it but never cancels its run; its own turn ends
+    `closed` when the session closes (here its private hub then ends the run)."""
     failing_ws = AsyncMock()
     failing_ws.send_json = AsyncMock(side_effect=RuntimeError("socket closed"))
     failing_ws.send_bytes = AsyncMock(side_effect=RuntimeError("socket closed"))
@@ -331,10 +336,10 @@ async def test_client_gone_during_a_turn_cancels_the_orchestrator_stream(make_br
     bridge.orchestrator.stream_response = s
     turn = await start_turn(bridge)
     try:
-        await asyncio.wait_for(asyncio.shield(turn), timeout=2.0)
-    except TimeoutError:
-        turn.cancel()
-        raise AssertionError("the turn kept running for a client that is gone") from None
+        await wait_until(lambda: bridge.turns.client_gone)
+        await asyncio.sleep(0.1)
+        assert not turn.done() and not closed.is_set(), "a gone client aborted the channel's run"
+        await asyncio.wait_for(bridge.close_all(), 3.0)
     finally:
         await sender.aclose(1.0)
     assert closed.is_set()
@@ -499,7 +504,7 @@ async def test_a_send_during_the_push_timeout_cut_waits_for_its_abort(make_bridg
         yield OrchestratorEvent(type="token", content="hola")
 
     bridge.orchestrator.stream_response = user_stream
-    bridge.enqueue_push("turn_start", bridge._session_key())
+    enqueue_push(bridge, "turn_start", bridge._session_key())
     await asyncio.wait_for(closing.wait(), 2)  # the timeout cut is releasing the push TTS
 
     starter = asyncio.create_task(bridge.turns.start_user_turn("hola"))
@@ -516,8 +521,9 @@ async def test_a_send_during_the_push_timeout_cut_waits_for_its_abort(make_bridg
 
 
 async def test_a_second_cancellation_during_tts_release_still_closes_the_stream(make_bridge):
-    """#221: a barge-in cancels the turn; close_all cancels it again while its TTS is being
-    released. The stream is still closed, and the cancellation still ends the task."""
+    """#221: a barge-in cuts the turn; close_all cancels the session's worker while that
+    turn's TTS is being released. The stream is still closed, and one turn_end goes out.
+    (5.0: the release is the session's, not the channel task's: decision 1.)"""
     cancelling = asyncio.Event()
     stream = AsyncMock()
 
@@ -531,20 +537,19 @@ async def test_a_second_cancellation_during_tts_release_still_closes_the_stream(
             raise
 
     stream.get_audio_stream = audio
-    bridge, _ = make_bridge(output_mode=("audio", "text"), tts=_audio_provider(stream))
+    bridge, ws = make_bridge(output_mode=("audio", "text"), tts=_audio_provider(stream))
     started = asyncio.Event()
     bridge.orchestrator.stream_response = blocking(started)
     task = await start_turn(bridge)
     await asyncio.wait_for(started.wait(), 2)
 
-    task.cancel()  # barge-in
+    assert (await bridge.turns.cancel("interrupted"))[0]  # barge-in
     await asyncio.wait_for(cancelling.wait(), 2)  # the release waits for the audio
-    task.cancel()  # close_all
-    await asyncio.wait({task}, timeout=2)
+    await asyncio.wait_for(bridge.close_all(), 2)  # close_all
 
     assert task.cancelled()
     stream.close.assert_awaited_once()
-    assert [m["turn_id"] for m in (await sent(bridge)) if m["type"] == "turn_end"] == ["t-1"]
+    assert [m["turn_id"] for m in ws.of("turn_end")] == ["t-1"]
 
 
 class _YieldingSender:
@@ -580,7 +585,7 @@ async def test_a_send_while_a_push_opens_never_leaves_two_turns_open(make_bridge
     ws = RecWS()
     bridge, _ = make_bridge(ws, client_id="hab_sito", sender=_YieldingSender(QueuedSender(ws)))
     bridge.orchestrator.stream_response = tokens("hola")
-    bridge.enqueue_push("turn_start", bridge._session_key())
+    enqueue_push(bridge, "turn_start", bridge._session_key())
     await asyncio.sleep(0.003)  # the worker is writing the push's turn_start
     await bridge.turns.start_user_turn("hola")
     await asyncio.wait_for(bridge.turns.user_task, 2)
@@ -618,10 +623,10 @@ async def test_a_push_cut_while_its_timeout_waits_for_the_lock_reports_no_timeou
     bridge, ws = make_bridge(client_id="hab_sito")
     bridge.orchestrator.stream_response = tokens("hola")
     await push(bridge, ("turn_start", bridge._session_key()))
-    await bridge.turns._lock.acquire()  # a turn being replaced holds the lock
+    await bridge.channel._lock.acquire()  # a turn being replaced holds the lock
     starter = asyncio.create_task(bridge.turns.start_user_turn("hola"))  # first in line
     await asyncio.sleep(0.25)  # the push's budget runs out meanwhile: the worker queues too
-    bridge.turns._lock.release()
+    bridge.channel._lock.release()
     await asyncio.wait_for(starter, 2)
     await asyncio.wait_for(bridge.turns.user_task, 2)
     await bridge.push_idle()
@@ -635,9 +640,9 @@ async def test_a_push_cut_while_its_timeout_waits_for_the_lock_reports_no_timeou
 
 
 async def test_cancelling_a_cut_still_releases_the_push_tts(make_bridge):
-    """Review 8: the cutter is cancelled while the push TTS is being dropped; the stream
-    is still closed, its push_tts recorded and its turn_end sent, then the cancellation
-    propagates."""
+    """Review 8: the push is cut and the session is closed (its worker cancelled) while the
+    push TTS is being dropped; the stream is still closed, its push_tts recorded and its
+    turn_end sent. (5.0, decision 1: the cut returns without waiting for the TTS.)"""
     cancelling = asyncio.Event()
     stream = AsyncMock()
 
@@ -653,13 +658,10 @@ async def test_cancelling_a_cut_still_releases_the_push_tts(make_bridge):
     stream.get_audio_stream = audio
     bridge, ws = make_bridge(client_id="hab_sito", output_mode=("audio", "text"), tts=_audio_provider(stream))
     await push(bridge, ("turn_start", bridge._session_key()))
-    cutter = asyncio.create_task(bridge.turns.cancel("cancelled"))
+    assert await asyncio.wait_for(bridge.turns.cancel("cancelled"), 2) == (True, "t-1")
     await asyncio.wait_for(cancelling.wait(), 2)
-    cutter.cancel()
-    await asyncio.wait({cutter}, timeout=2)
+    await asyncio.wait_for(bridge.close_all(), 2)
 
-    assert cutter.cancelled()
     stream.close.assert_awaited_once()
     assert [c for c in bridge.tracker.record.await_args_list if c.args[0] == "push_tts"]
-    assert [m["turn_id"] for m in (await sent(bridge)) if m["type"] == "turn_end"] == ["t-1"]
-    await bridge.close_all()
+    assert [m["turn_id"] for m in ws.of("turn_end")] == ["t-1"]

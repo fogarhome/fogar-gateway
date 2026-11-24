@@ -9,6 +9,7 @@ import stat
 
 import pytest
 
+from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.openclaw import client as client_mod
 from fogar_gateway.services.openclaw.client import (
     ORCHESTRATOR_DEVICE_IDENTITY_REQUIRED_ERROR,
@@ -23,7 +24,7 @@ from fogar_gateway.services.openclaw.device import DeviceStore, StoredDeviceToke
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.models import GatewayInfo
 from fogar_gateway.services.openclaw.reconnecting import ReconnectingOpenClawClient
-from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+from fogar_gateway.services.openclaw.registry import TurnRegistry
 from tests.fakes.openclaw import FakeOpenClawServer
 
 SHARED = "shared-SECRET-token"
@@ -38,7 +39,7 @@ def store(tmp_path):
 def make_client(port: int, store: DeviceStore, token: str = SHARED, **kw) -> OpenClawClient:
     turns = TurnRegistry()
     return OpenClawClient(
-        "127.0.0.1", port, token, turns, FrameDispatcher(turns, ClientRegistry()),
+        "127.0.0.1", port, token, turns, FrameDispatcher(turns, ChannelHub()),
         device_store=store, **kw,
     )
 
