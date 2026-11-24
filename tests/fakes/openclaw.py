@@ -183,6 +183,8 @@ class FakeOpenClawServer:
         port=0, remote=False, challenge_nonce=True, queue=False,
     ):
         self.queue = queue
+        # Modo `queue`: lo que tarda el ack de un `chat.send` (para probar lo que pasa antes).
+        self.ack_delay = 0.0
         # `steer=True`: un `chat.send` con otro run de `chat.send` en marcha en su clave se
         # pliega en él (ver `_chat_send`). Se puede activar en mitad de un test.
         self.steer = False
@@ -629,6 +631,8 @@ class FakeOpenClawServer:
         queued = self.queued.setdefault(sk, [])
         queued.append(run_id)
         try:
+            if self.ack_delay:
+                await asyncio.sleep(self.ack_delay)
             await ws.send(self._res(rid, {"runId": run_id, "status": "started"}))
             async with lane:
                 queued.remove(run_id)

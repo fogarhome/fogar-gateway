@@ -1326,6 +1326,15 @@ not live.
   before the ack (a `/v1` client gone, a WebSocket session closing) leaves the ack to the
   channel, which tombstones and `chat.abort`s that run by its `runId` when it arrives; frames
   held for it until then are dropped, never handed to a push.
+- **Second and third review rounds (2026-11-24):** «send now» cuts once (what is open when it
+  is read; the send itself carries no second `chat.abort`). A client `cancel` read right after
+  a `send` stops that message only when nothing is ahead of it (no open turn, no unfinished
+  run of the channel): before its `chat.send` it is not sent; in `chat.send` its run is
+  aborted by `runId` on the ack and never announced — **OpenClaw still has it in
+  `chat.history`** (the user message was appended), only no session ever saw it. With
+  something ahead the cancel stops that and the message stays queued. Whether "a /v1 message
+  is ahead" (the session's waiting sends then stay) is decided by a counter of `/v1` messages
+  waiting or running in the channel: approximate in the moments one starts or ends.
 
 ## Change log of this file
 

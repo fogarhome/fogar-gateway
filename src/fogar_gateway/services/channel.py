@@ -929,6 +929,12 @@ class ConversationChannel:
             self._hub.drop_if_idle(self.session_key, self)
 
     @property
+    def nothing_ahead(self) -> bool:
+        """No open turn and no unfinished run of the channel's own: a message sent now is the
+        next thing to start (what a client `cancel` stops, like `cancel_head`)."""
+        return self.current_turn is None and not self._runs
+
+    @property
     def exclusive_pending(self) -> bool:
         """A /v1 message waits for its turn or has its run going: a session's sends wait
         behind it (2b.3)."""

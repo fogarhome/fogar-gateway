@@ -693,3 +693,34 @@ async def test_a_cancel_while_a_send_waits_for_its_ack_aborts_it_unannounced():
     assert subscriber.got == [] and not channel._runs and channel._held == []
     assert await asyncio.wait_for(channel.send_user_message(subscriber, "otra"), 2) is not None
     await hub.aclose(1.0)
+
+
+@pytest.mark.parametrize("ack_after_cancel", [False, True], ids=["ack-before", "ack-after"])
+async def test_a_cancel_with_a_turn_ahead_keeps_the_just_sent_message(session, openclaw, ack_after_cancel):
+    """Third review round: a `cancel` read right after a `send` with another device's turn
+    open stops that turn; the just-sent message survives like any queued one (pending →
+    delivered → its turn), whether its ack came before the cancel or after it."""
+    tv, tv_ws = session("tv")
+    mac, mac_ws = session("mac")
+    await mac.turns.start_user_turn("hold-a")
+    await openclaw.wait_running(SK)
+    if ack_after_cancel:
+        openclaw.ack_delay = 0.3
+    tv.turns.submit_send("b")
+    if ack_after_cancel:
+        await wait_until(lambda: [m for m, sk in openclaw.calls if sk == SK].count("chat.send") == 2)
+        assert tv.channel._acks == 1  # in chat.send, no ack yet
+    else:
+        await wait_until(lambda: [s for _, t, s, _ in messages(tv_ws)] == ["delivered", "pending"])
+    tv.turns.cancel_sends()  # what the bridge does for a client `cancel`
+    await tv.turns.cancel("cancelled")
+
+    await turns_ended(tv_ws, 2)
+    await settle(tv, mac)
+    assert [r for _, _, r in pairs(tv_ws) if r not in ("user", "push")] == ["cancelled", "done"]
+    states = [(text, state) for _, text, state, _ in messages(tv_ws) if text == "b"]
+    assert states[-1] == ("b", "delivered") and ("b", "withdrawn") not in states
+    assert texts(tv_ws, "t-2") == "reply-b"
+    assert len(openclaw.aborts) == 1  # only the turn that was open
+    assert_paired(tv_ws)
+    assert_paired(mac_ws)

@@ -723,12 +723,16 @@ class TurnController:
             self._send_task = self._spawn(self._send_loop(), "turn_sends")
 
     def cancel_sends(self) -> None:
-        """Un `cancel` del cliente (N2) cubre también sus `send` aún sin respuesta de OpenClaw:
-        el que está en `chat.send` (su run se aborta con su ack, sin anunciarse) y, si no hay
-        un mensaje de /v1 delante, los que aún esperan su turno aquí (no salen). Detrás de /v1
-        los que esperan siguen (el `cancel` para el turno de /v1 y ellos salen después)."""
+        """Un `cancel` del cliente (N2) para «lo que iba a empezar»: sus `send` aún sin
+        respuesta de OpenClaw, solo si nada va delante de ellos (sin turno abierto ni run sin
+        terminar en el canal, `nothing_ahead`): el que está en `chat.send` se aborta con su ack
+        sin anunciarse; los que esperan aquí no salen. Con algo delante, el `cancel` para eso y
+        sus mensajes siguen y quedan pendientes como cualquier otro (da igual si su ack ya
+        llegó). Detrás de /v1 (aproximado: `exclusive_pending`) los que esperan siguen."""
         channel = self._channel
-        behind_v1 = channel is not None and channel.exclusive_pending
+        if channel is None or not channel.nothing_ahead:
+            return
+        behind_v1 = channel.exclusive_pending
         current = self._sending
         if current is not None and (current.sending or not behind_v1):
             current.cut = True
