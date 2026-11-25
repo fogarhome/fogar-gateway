@@ -1256,7 +1256,9 @@ fake's copies of the sequences above (`tests/unit/test_channel_runs.py`), not li
   `queued: true` without `state`) or is the `inFlightRun` (`{runId}` or a bare id: **its shape
   was not seen live**, read defensively). The rest, or all of them when the read fails or has no
   readable `pendingInputs`, end with `orchestrator_disconnected` (each its own pair: delivered,
-  turn_start, TURN_ERROR, turn_end). Without a reconnection within `RECONNECT_GRACE_S` (15 s,
+  turn_start, TURN_ERROR, turn_end). (Since 2026-11-25 the unlisted ones are re-read for a
+  while instead: see "How the gateway reacts (2026-11-25, after the two restarts)".) Without a
+  reconnection within `RECONNECT_GRACE_S` (15 s then, 45 s now,
   `services/channel.py`) they end the same way. A frame of an unconfirmed run confirms it. Items
   the channel does not know (another client's, a /v1 one) are ignored. Only counts and ids are
   logged.
@@ -1476,7 +1478,7 @@ Setup: run A was generating, and B was pending under `steer`.
 
 **Before closing**, OpenClaw sends:
 
-- a `shutdown` event;
+- a `shutdown` event (`{reason, restartExpectedMs?}`);
 - for B, `chat` `state: "aborted"`, `stopReason: "restart"`, `seq: 1`, with no lifecycle `end`;
 - no terminal event for A (only one more lifecycle `model`).
 
@@ -1499,16 +1501,48 @@ for about 15 s.
 2. **B runs with its original `runId`**, as a queued run (`seq gap`, `final` without
    `message`), although it had been reported `aborted` with `stopReason: "restart"`.
 
-Consequences for the gateway (not yet handled):
+**A second restart the same day** (sessions kept attached, `chat.history` read every second):
 
-- **`aborted` + `stopReason: "restart"` does not mean withdrawn.** The message is answered after
-  the restart. But the gateway announced it `withdrawn` and remembers its `runId` as finished, so
-  its late frames are dropped and its answer reaches no client. It should treat that stop like a
-  drop: keep the message unconfirmed and reconcile it on reconnect. Whether B was still in
-  `pendingInputs` after the restart was not read.
-- **A's recovery run has a `runId` nobody sent**, so it reaches clients as a push of the
-  conversation, after A already failed with `orchestrator_disconnected`. Not observed through the
-  gateway: the test sessions had left before it started.
+- **No `aborted` for B this time**: B stayed `pending` through the drop. So both orders happen.
+- **Down about 22 s**, longer than the gateway's `RECONNECT_GRACE_S` (15 s then): B failed with
+  `orchestrator_disconnected` before the reconnection, then ran in OpenClaw anyway and answered,
+  unseen. The gateway's `chat.abort` of B at the reconnection was a no-op: OpenClaw had not
+  restored B yet.
+- **`pendingInputs` right after the reconnection: empty, and no `inFlightRun`.** About 13 s later
+  it listed the recovery input (`state: "queued"`), with `inFlightRun` already naming B although B
+  had not started. Then B was listed (`state: "queued"`, its own `runId`), ran, and the list
+  emptied.
+- **The recovery input's `runId` in `pendingInputs` is not the `runId` of the run that executed
+  it.** `runId == idempotencyKey` holds for `chat.send`, not for OpenClaw's recovery runs.
+- **A's recovery run reached clients as a push** of the conversation (`origin: "push"`, the
+  whole reply), after A had failed with `orchestrator_disconnected`. Its audio, as for any push,
+  goes only to the notify device.
+- **`shutdown` payload** (read in the source): `{reason, restartExpectedMs?}`, sent before the
+  socket closes with 1012. `restartExpectedMs` is only set on some paths.
+
+### How the gateway reacts (2026-11-25, after the two restarts)
+
+`services/channel.py`; tested against the fake with both live sequences, then live.
+
+- **`RECONNECT_GRACE_S` is 45 s** (15 s before): the restarts measured 15 s and 22 s without
+  connections.
+- **At the reconnection, a queued run that `pendingInputs` does not list no longer fails at
+  once.** The channel re-reads `chat.history` every `RECOVERY_POLL_S` (3 s), up to
+  `RECOVERY_WINDOW_S` (30 s) after the reconnection; an unreadable answer is retried too. The run
+  is confirmed when it is listed, is the `inFlightRun`, sends any frame, or OpenClaw re-appends
+  its user `session.message` (`idempotencyKey` `"<runId>:user"`). Only when the window closes
+  does it fail, with its pair and `orchestrator_disconnected`, and get aborted by `runId`.
+- **`chat` `aborted` with `stopReason: "restart"`** for a queued run without a turn is no longer
+  `withdrawn`: the run stays unconfirmed, as after a drop. Any other `aborted` still withdraws it.
+- **The `shutdown` event is not used**: a crash or a kill sends none.
+- **Costs:** after a plain network drop where OpenClaw really lost a queued message, its failure
+  comes up to 30 s later than before. A `/v1` request waits for calm behind unconfirmed runs, so
+  during that window it waits too (capped at `TURN_TIMEOUT_S`, 120 s by default).
+- **Residual risk:** when the window closes, the gateway's `chat.abort` of the failed run may
+  still be a no-op if OpenClaw restores it even later; that run would then answer unseen.
+- **A's recovery run** stays a push (its `runId` is nobody's): clients see A's
+  `orchestrator_disconnected` and then the whole answer as a push. Linking it to A would be a
+  guess.
 
 ### Events seen and not handled
 
@@ -1543,6 +1577,13 @@ Each is logged once at INFO as possible drift, and is harmless:
 
 ## Change log of this file
 
+- **2026-11-25**: "Live check of 5.0" gains a second restart and how the gateway now reacts:
+  - `pendingInputs` is empty at the reconnection and lists the queued message again ~13 s
+    later;
+  - a recovery input's `runId` is not its run's;
+  - `RECONNECT_GRACE_S` goes to 45 s;
+  - unlisted runs are re-read for up to `RECOVERY_WINDOW_S` (30 s);
+  - `aborted` with `stopReason: "restart"` no longer withdraws.
 - **2026-11-25**: added "Live check of 5.0" (server 2026.11.7 `e31bbf0`, observed live on
   green-house against the `next/5.0` gateway).
   - Confirmed:

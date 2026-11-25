@@ -30,6 +30,9 @@ def _no_push_reply_wait(monkeypatch):
     """Un push sin texto se cierra en el acto, como antes: la espera de su respuesta en un
     `session.message` (cron, PUSH_REPLY_GRACE_S) solo la prueban los tests que la piden."""
     monkeypatch.setattr("fogar_gateway.services.channel.PUSH_REPLY_GRACE_S", 0.0)
+    # Igual con la ventana en la que OpenClaw restaura su cola tras reiniciarse: con 0, lo que
+    # `pendingInputs` no lista al reconectar falla en el acto (RECOVERY_WINDOW_S).
+    monkeypatch.setattr("fogar_gateway.services.channel.RECOVERY_WINDOW_S", 0.0)
 
 
 @pytest.fixture(autouse=True)

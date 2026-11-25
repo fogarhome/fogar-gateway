@@ -755,3 +755,135 @@ async def test_a_promised_abort_keeps_an_unattended_channel_alive(monkeypatch):
     await channel.push_idle()
     assert channel.idle
     await hub.aclose(1.0)
+
+
+# ── OpenClaw restarted: its queue comes back a few seconds after it reconnects ──
+
+
+@pytest.fixture
+def recovery(monkeypatch):
+    """A recovery window (tests run with 0: `tests/conftest.py`), short for the tests."""
+    monkeypatch.setattr("fogar_gateway.services.channel.RECOVERY_WINDOW_S", 2.0)
+    monkeypatch.setattr("fogar_gateway.services.channel.RECOVERY_POLL_S", 0.02)
+
+
+def aborted_by_restart(run_id):
+    """What OpenClaw 2026.11.7 sends a queued run as it shuts down (live, 2026-11-25)."""
+    return _event("chat", {"runId": run_id, "seq": 1, "state": "aborted", "stopReason": "restart"})
+
+
+async def _dropped_with_b_waiting(channel, subscriber, dispatcher):
+    await _a_running_and_b_pending(channel, subscriber, dispatcher)
+    dispatcher.connection_lost("orchestrator_disconnected")
+    await channel.push_idle()
+    assert subscriber.got == [("error", "orchestrator_disconnected"), ("end", "error")]
+    assert channel._runs["r2"].unconfirmed
+    subscriber.got.clear()
+
+
+async def test_queue_restored_after_the_reconnect_keeps_the_message(recovery):
+    """Live sequence of a restart: at reconnect `pendingInputs` is empty; a few seconds later
+    OpenClaw lists B again (its own runId) and runs it. B stays `pending` meanwhile, nothing
+    fails nor is aborted, and it gets its own turn when it runs."""
+    orchestrator = _Orchestrator(history=_history())
+    hub, channel, subscriber, dispatcher = _channel(orchestrator)
+    await _dropped_with_b_waiting(channel, subscriber, dispatcher)
+
+    hub.reconnected()
+    await wait_until(lambda: len(orchestrator.reads) >= 2)  # read empty, read again
+    await channel.push_idle()
+    assert subscriber.got == [] and channel._runs["r2"].unconfirmed
+    orchestrator.history = _history("r2")
+    await wait_until(lambda: not channel._runs["r2"].unconfirmed)
+
+    await feed(dispatcher, channel, seq_gap("r2"), delta("r2", "b"), final("r2"))
+    assert subscriber.got == [
+        ("message", "r2", "delivered"), ("start", "user", "r2"), ("token", "b"), ("end", "done"),
+    ]  # fmt: skip
+    assert "r2" not in orchestrator.aborted
+    await hub.aclose(1.0)
+
+
+async def test_queue_never_restored_fails_when_the_window_closes(recovery, monkeypatch):
+    """Still not listed when RECOVERY_WINDOW_S ends: B fails with its pair and is aborted by
+    its runId, as before the window existed (only later)."""
+    monkeypatch.setattr("fogar_gateway.services.channel.RECOVERY_WINDOW_S", 0.2)
+    orchestrator = _Orchestrator(history=_history())
+    hub, channel, subscriber, dispatcher = _channel(orchestrator)
+    await _dropped_with_b_waiting(channel, subscriber, dispatcher)
+
+    hub.reconnected()
+    await wait_until(lambda: "r2" not in channel._runs)
+    await channel.push_idle()
+    assert subscriber.got == [
+        ("message", "r2", "delivered"), ("start", "user", "r2"), ("error", "orchestrator_disconnected"),
+        ("end", "error"),
+    ]  # fmt: skip
+    await wait_until(lambda: "r2" in orchestrator.aborted)
+    await hub.aclose(1.0)
+
+
+async def test_a_session_message_of_the_run_confirms_it(recovery):
+    """OpenClaw re-appends B's user message as it restores it: that alone confirms B, before
+    any re-read lists it."""
+    orchestrator = _Orchestrator(history=_history())
+    hub, channel, subscriber, dispatcher = _channel(orchestrator)
+    await _dropped_with_b_waiting(channel, subscriber, dispatcher)
+    hub.reconnected()
+    await wait_until(lambda: orchestrator.reads)
+    await feed(dispatcher, channel, session_message("m-b", run_id="r2"))
+    assert not channel._runs["r2"].unconfirmed
+    assert subscriber.got == []
+    await hub.aclose(1.0)
+
+
+async def test_aborted_by_a_restart_is_not_withdrawn(recovery):
+    """OpenClaw shutting down sends the queued B `aborted` with `stopReason: restart`, then
+    runs it again with its runId once back: B is not `withdrawn`; it waits unconfirmed and
+    gets its turn."""
+    orchestrator = _Orchestrator(history=_history("r2"))
+    hub, channel, subscriber, dispatcher = _channel(orchestrator)
+    await _a_running_and_b_pending(channel, subscriber, dispatcher)
+    await feed(dispatcher, channel, aborted_by_restart("r2"))
+    assert subscriber.got == [] and channel._runs["r2"].unconfirmed
+
+    dispatcher.connection_lost("orchestrator_disconnected")
+    await channel.push_idle()
+    assert subscriber.got == [("error", "orchestrator_disconnected"), ("end", "error")]
+    subscriber.got.clear()
+    hub.reconnected()
+    await wait_until(lambda: not channel._runs["r2"].unconfirmed)
+    await feed(dispatcher, channel, seq_gap("r2"), delta("r2", "b"), final("r2"))
+    assert subscriber.got == [
+        ("message", "r2", "delivered"), ("start", "user", "r2"), ("token", "b"), ("end", "done"),
+    ]  # fmt: skip
+    assert "r2" not in orchestrator.aborted
+    await hub.aclose(1.0)
+
+
+async def test_a_plain_aborted_still_withdraws():
+    """Any other `aborted` of a queued run (someone else's `chat.abort`) is `withdrawn`, as
+    before."""
+    hub, channel, subscriber, dispatcher = _channel(_Orchestrator())
+    await _a_running_and_b_pending(channel, subscriber, dispatcher)
+    await feed(dispatcher, channel, _event("chat", {"runId": "r2", "seq": 1, "state": "aborted", "stopReason": "rpc"}))
+    assert subscriber.got == [("message", "r2", "withdrawn")]
+    await hub.aclose(1.0)
+
+
+async def test_a_confirmed_queue_leaves_no_deadline_behind(recovery, caplog):
+    """Once the restored run is confirmed and done, the window's end fails nothing and logs no
+    warning (live, 2026-11-25: a stale deadline warned 30 s after B had answered)."""
+    import logging
+
+    orchestrator = _Orchestrator(history=_history())
+    hub, channel, subscriber, dispatcher = _channel(orchestrator)
+    await _dropped_with_b_waiting(channel, subscriber, dispatcher)
+    hub.reconnected()
+    await wait_until(lambda: len(orchestrator.reads) >= 2)
+    orchestrator.history = _history("r2")
+    await wait_until(lambda: not channel._runs["r2"].unconfirmed)
+    with caplog.at_level(logging.WARNING, logger="fogar_gateway.services.channel"):
+        await wait_until(lambda: channel._lost_deadline is None)
+    assert "no confirmó" not in caplog.text
+    await hub.aclose(1.0)
