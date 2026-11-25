@@ -21,8 +21,9 @@ from fogar_gateway.main import app
 from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.openclaw.models import GatewayInfo
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
-from fogar_gateway.services.protocol import OrchestratorEvent, OrchestratorProtocol
+from fogar_gateway.services.protocol import OrchestratorProtocol
 from fogar_gateway.services.reconnection import ConnectionState, ServiceStatus
+from tests.fakes.orchestrator import OrchestratorEvent, wire_stream_orchestrator
 
 # ---------------------------------------------------------------------------
 # Datos de test estándar
@@ -161,7 +162,6 @@ def make_mock_orchestrator(tokens: list[str] = None) -> OrchestratorProtocol:
     mock.connect = AsyncMock()
     mock.close = AsyncMock()
     mock.ping = AsyncMock(return_value=True)
-    mock.abort = AsyncMock()
     # Lecturas de OpenClaw (M19): sin sesiones.
     mock.request = AsyncMock(return_value={"sessions": [], "hasMore": False})
     mock.trigger_reconnect = MagicMock(return_value=True)
@@ -237,6 +237,7 @@ def client(mock_services, mock_registry, seed_client, monkeypatch):
     with TestClient(
         app, client=("127.0.0.1", 50000), headers={"x-real-ip": "127.0.0.1"}
     ) as c:
+        wire_stream_orchestrator(mock_registry, app.state.channel_hub)
         yield c
 
 
@@ -246,6 +247,7 @@ def client_untrusted(mock_services, mock_registry, seed_client, monkeypatch):
     (203.0.113.5 es TEST-NET-3, RFC 5737 — rango reservado para documentación)."""
     _configure_app_mocks(mock_registry, monkeypatch)
     with TestClient(app, client=("203.0.113.5", 54321)) as c:
+        wire_stream_orchestrator(mock_registry, app.state.channel_hub)
         yield c
 
 

@@ -9,7 +9,7 @@ from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.main import app
 from fogar_gateway.services.auth import hash_key
-from fogar_gateway.services.protocol import OrchestratorEvent
+from tests.fakes.orchestrator import OrchestratorEvent
 from tests.integration.conftest import CLIENT_ID, default_conversation_key
 
 
@@ -371,28 +371,6 @@ def test_streaming_turn_timeout_is_terminal_error(client, mock_orchestrator):
     }
     assert payloads[-1]["choices"][0]["finish_reason"] == "error"
     assert body.rstrip().endswith("data: [DONE]")  # #217: [DONE] también ante error
-
-
-def test_non_streaming_turn_conflict_returns_409(client, mock_orchestrator):
-    """Issue #99: a rejected duplicate-session_key turn must map to HTTP 409,
-    distinguishable from a generic orchestrator failure (502)."""
-    from fogar_gateway.services.openclaw.registry import TURN_IN_PROGRESS_ERROR
-
-    async def _conflict_stream(*args, **kwargs):
-        yield OrchestratorEvent(type="error", content=TURN_IN_PROGRESS_ERROR)
-
-    mock_orchestrator.stream_response = _conflict_stream
-
-    r = client.post(
-        "/v1/chat/completions",
-        json={
-            "model": "openclaw",
-            "messages": [{"role": "user", "content": "Hola"}],
-            "stream": False,
-        },
-    )
-
-    assert r.status_code == 409, f"Esperado 409, recibido {r.status_code}: {r.text}"
 
 
 def test_streaming_done_delivered_when_tracker_close_raises(client, mock_orchestrator, monkeypatch):
@@ -794,11 +772,8 @@ def test_non_runtime_error_message_never_reaches_logs_stream_and_non_stream(
     marker = "SECRET-USER-TEXT"
     caplog.set_level(logging.DEBUG)
 
-    async def _boom(*args, **kwargs):
-        raise ValueError(marker)
-        yield  # pragma: no cover
-
-    mock_orchestrator.stream_response = _boom
+    # 5.0 PR 2b.3: /v1 goes through the channel; an unexpected failure is its `chat.send`'s.
+    mock_orchestrator.send.side_effect = ValueError(marker)
     r = client.post("/v1/chat/completions", json={**BODY, "model": "openclaw"})
     assert r.status_code == 502
     with client.stream(

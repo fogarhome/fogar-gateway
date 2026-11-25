@@ -1,7 +1,6 @@
 import asyncio
-import contextlib
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import Callable
 
 from fogar_gateway.services.openclaw.client import (
     ORCHESTRATOR_ERROR,
@@ -10,7 +9,7 @@ from fogar_gateway.services.openclaw.client import (
     OrchestratorRequestError,
 )
 from fogar_gateway.services.openclaw.models import GatewayInfo
-from fogar_gateway.services.protocol import OrchestratorEvent
+from fogar_gateway.services.orchestration import OrchestratorError
 from fogar_gateway.services.reconnection import (
     ConnectionState,
     ServiceHealth,
@@ -71,6 +70,9 @@ class ReconnectingOpenClawClient:
         self._closed = False  # G-52: tras close() nada vuelve a lanzar la reconexión
         # Register disconnect callback so the inner client notifies us on unexpected drops.
         self._client.on_disconnect = self._handle_disconnect
+        # 5.0 PR 2b.2: called (synchronously, it must not block) after every successful
+        # connect once wired; main.py hooks the channels' `pendingInputs` re-read to it.
+        self.on_connected: Callable[[], None] | None = None
 
     def get_name(self) -> str:
         return self._name
@@ -80,6 +82,7 @@ class ReconnectingOpenClawClient:
             self.gateway_info = await self._client.connect()
             self._health.mark_connected()
             self._wake.set()  # a loop sleeping in its backoff ends instead of lingering
+            self._notify_connected()
         except Exception as e:  # noqa: BLE001 — frontera: el fallo arranca el reintento
             # Type/stable code only (#228): the text can carry OpenClaw-provided content.
             self._last_error = describe_error(e)
@@ -105,45 +108,30 @@ class ReconnectingOpenClawClient:
             return False
         return await self._client.ping()
 
-    async def abort(self, session_key: str) -> None:
+    async def send(self, text: str, session_key: str, *, queue_mode: str | None = None) -> str:
+        """`OpenClawClient.send`; sin conexión, `orchestrator_unavailable`. Raises
+        OrchestratorError (a stable code), never anything else."""
+        if self.state != ConnectionState.CONNECTED:
+            self._ensure_loop()
+            raise OrchestratorError(ORCHESTRATOR_UNAVAILABLE_ERROR)
+        try:
+            return await self._client.send(text, session_key, queue_mode=queue_mode)
+        except OrchestratorError:
+            raise
+        except Exception as e:  # noqa: BLE001 — frontera: el envío cede orchestrator_error
+            logger.warning("[%s] send error (%s)", self._name, type(e).__name__)
+            logger.debug("[%s] send traceback (no message): %s", self._name, traceback_no_message(e))
+            raise OrchestratorError(ORCHESTRATOR_ERROR) from None
+
+    async def abort_run(self, session_key: str, run_id: str) -> None:
         if self.state == ConnectionState.CONNECTED:
-            await self._client.abort(session_key)
+            await self._client.abort_run(session_key, run_id)
 
     async def request(self, method: str, params: dict, timeout: float = 10.0) -> dict:
         """Petición de lectura (`OpenClawClient.request`); sin conexión, `orchestrator_unavailable`."""
         if self.state != ConnectionState.CONNECTED:
             raise OrchestratorRequestError(ORCHESTRATOR_UNAVAILABLE_ERROR)
         return await self._client.request(method, params, timeout)
-
-    async def stream_response(
-        self,
-        text: str,
-        session_key: str,
-    ) -> AsyncGenerator[OrchestratorEvent, None]:
-        if self.state != ConnectionState.CONNECTED:
-            self._ensure_loop()
-            yield OrchestratorEvent(type="error", content=ORCHESTRATOR_UNAVAILABLE_ERROR)
-            return
-        try:
-            # aclosing() here (not just around the outer generator in
-            # call_orchestrator) guarantees the inner OpenClawClient.stream_response()
-            # generator — which holds `finally: self._turn_registry.unregister(...)` —
-            # gets a synchronous GeneratorExit when this generator is closed early,
-            # instead of being abandoned for the asyncgen GC finalizer to eventually
-            # close (issue #150, one layer removed from the #99/#147 fix).
-            async with contextlib.aclosing(
-                self._client.stream_response(text=text, session_key=session_key)
-            ) as inner:
-                async for event in inner:
-                    yield event
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 — frontera: el turno cede orchestrator_error
-            logger.warning("[%s] stream_response error (%s)", self._name, type(e).__name__)
-            logger.debug(
-                "[%s] stream_response traceback (no message): %s", self._name, traceback_no_message(e)
-            )
-            yield OrchestratorEvent(type="error", content=ORCHESTRATOR_ERROR)
 
     def status(self) -> ServiceStatus:
         return self._health.status()
@@ -182,7 +170,7 @@ class ReconnectingOpenClawClient:
                 return  # a direct connect() already recovered the service: nothing to do
             self.gateway_info = await self._client.connect()
 
-        await reconnect_with_backoff(
+        reconnected = await reconnect_with_backoff(
             attempt,
             self._health,
             initial_backoff=self._initial_backoff,
@@ -191,3 +179,15 @@ class ReconnectingOpenClawClient:
             label=self._name,
             wake=self._wake,
         )
+        if reconnected:
+            self._notify_connected()
+
+    def _notify_connected(self) -> None:
+        hook = self.on_connected
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception as e:  # noqa: BLE001 — frontera: hook externo; la conexión ya está hecha
+            logger.warning("[%s] on_connected hook failed (%s)", self._name, describe_error(e))
+            logger.debug("[%s] on_connected: %s", self._name, traceback_no_message(e))

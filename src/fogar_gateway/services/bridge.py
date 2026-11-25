@@ -95,8 +95,6 @@ class FogarBridge:
         self._stt: SpeechToTextProvider = speech.stt
         self.tracker: PipelineTracker = tracker
         self._client_registry = client_registry
-        # Máximo de la cola de turno (#219) y runs de OpenClaw: lápidas y activos (#285).
-        self._turn_registry = turn_registry
         # La conversación de la sesión (M19): su sessionKey y su cambio de día.
         self.conversation = conversation
         conversation.bind(self._spawn_background)
@@ -105,7 +103,6 @@ class FogarBridge:
         # ilegible): uno por sesión.
         self._policy_close: asyncio.Task | None = None
         # Máximo de la cola de turno de las conversaciones que la sesión ya dejó (#219).
-        self._turn_queue_peak = 0
         self.transcriber: SttSession | None = None
 
         self.tasks: list[asyncio.Task] = []
@@ -205,12 +202,6 @@ class FogarBridge:
         cambio de canal lo hace `TurnController` en ese mismo `send` (decisión 6: deja el de
         ayer, donde su turno sigue para los demás, y se adjunta al de hoy)."""
         self._client_registry.index.add(new)
-        # El máximo de la cola de turno es por clave (#219), así que lo es del canal, no de esta
-        # sesión: con varias sesiones en una conversación, la primera que lo lee se lo lleva.
-        # Solo es una métrica de session_end; se deja así.
-        self._turn_queue_peak = max(
-            self._turn_queue_peak, self._turn_registry.pop_peak(old.session_key)
-        )
 
     def snapshot(self) -> dict[str, Any]:
         """Estado vivo de la sesión para /admin/state (#219): solo números, estados e
@@ -218,7 +209,6 @@ class FogarBridge:
         desde el SessionRecord (aquí van a None)."""
         now = time.monotonic()
         turns = self.turns.snapshot(now)
-        depth, peak = self._turn_registry.depth(self._session_key())
         return {
             "session_id": self.tracker.session_id,
             "client_id": self.client_id,
@@ -231,7 +221,6 @@ class FogarBridge:
             "turn": turns["turn"],
             "turn_count": self.tracker.turn_count,
             "sender": self._sender.queue_stats(),
-            "turn_queue": {"depth": depth, "peak": peak},
             "push_backlog": turns["push_backlog"],
             "last_activity_s": (
                 round(now - self._last_client_activity, 3) if self._last_client_activity else None
@@ -258,7 +247,6 @@ class FogarBridge:
             "turn_in_flight": bool(self._turn_in_flight_at_close),
             "sender_peak_msgs": 0,
             "sender_peak_bytes": 0,
-            "turn_queue_peak": 0,
             "push_backlog_peak": self.turns.push_backlog_peak,
         }
         # Una métrica nunca debe impedir el cierre.
@@ -268,12 +256,6 @@ class FogarBridge:
             meta["sender_peak_bytes"] = int(q["peak_bytes"])
         except Exception as e:  # noqa: BLE001 — una métrica nunca impide el cierre
             logger.debug(f"[{self.client_id}] sender_peak no disponible: {type(e).__name__}")
-        try:
-            meta["turn_queue_peak"] = max(
-                self._turn_queue_peak, self._turn_registry.pop_peak(self._session_key())
-            )
-        except Exception as e:  # noqa: BLE001 — una métrica nunca impide el cierre
-            logger.debug(f"[{self.client_id}] turn_queue_peak no disponible: {type(e).__name__}")
         return meta
 
     async def close_all(
@@ -374,9 +356,6 @@ class FogarBridge:
             tts_live = False
 
         return {
-            "barge_in": bool(self.config.barge_in_enabled)
-            and transcriber_live
-            and self._stt.capabilities.partials,
             "tts": tts_live,
             "transcriber": transcriber_live,
         }
@@ -755,20 +734,42 @@ class FogarBridge:
                             await self.transcriber.send_end()
 
                     elif json_msg.get("type") == "cancel":
-                        # Cliente cancela el turn activo (o el push que suena) sin lanzar uno nuevo
+                        # Para el turno de la conversación (o el push que suena), lo iniciara
+                        # quien lo iniciara, sin lanzar uno nuevo (C3)
+                        # N2: también sus `send` aún sin respuesta de OpenClaw.
+                        self.turns.cancel_sends()
                         await self.turns.cancel("cancelled")
 
                     elif json_msg.get("type") == "send":
-                        # Cliente confirma/edita la transcripción y la envía al orquestador
+                        # Cliente confirma/edita la transcripción y la envía al orquestador:
+                        # entra en la cola de OpenClaw; `interrupt` corta antes el turno activo
                         raw_text = json_msg.get("text", "")
-                        if not isinstance(raw_text, str):
+                        interrupt = json_msg.get("interrupt", False)
+                        if not isinstance(raw_text, str) or not isinstance(interrupt, bool):
                             await self._send_invalid_message()
                         else:
                             # G-r3-1: sin surrogates sueltos, que OpenClaw guardaría tal cual.
                             text = without_lone_surrogates(raw_text).strip()
                             if text:
-                                logger.info(f"[{self.client_id}] send recibido: len={len(text)}")
-                                await self.turns.start_user_turn(text)
+                                logger.info(
+                                    f"[{self.client_id}] send recibido: len={len(text)}"
+                                    f"{' interrupt' if interrupt else ''}"
+                                )
+                                # 2b.3: el bucle no espera al envío (puede esperar detrás
+                                # del turno de /v1); un `interrupt` corta ya lo que está
+                                # abierto y el envío ya no corta nada más (N1).
+                                if interrupt:
+                                    await self.turns.interrupt_now()
+                                self.turns.submit_send(text)
+
+                    elif json_msg.get("type") == "withdraw":
+                        # Quita un mensaje pendiente de la conversación (2b): si ya no lo está,
+                        # no pasa nada (otra sesión lo quitó, o ya le tocó su turno)
+                        message_id = json_msg.get("message_id")
+                        if not isinstance(message_id, str) or not message_id:
+                            await self._send_invalid_message()
+                        elif not await self.turns.withdraw(message_id):
+                            logger.debug(f"[{self.client_id}] withdraw ignorado: no está pendiente")
 
         except WebSocketDisconnect as e:
             logger.info(f"[{self.client_id}] Cliente físico desconectado.")
@@ -861,8 +862,10 @@ class FogarBridge:
     async def _on_transcription(self, text: str, is_final: bool):
         """Callback dispatched by TranscriberClient on every transcription event.
 
-        Partials: trigger barge-in if text is substantial and a turn is active.
-        Finals: cancel any running turn, notify the client, start a new turn.
+        Neither a partial nor a final cuts anything (5.0, #406: speaking never cuts; pausing
+        or silencing the voice is the client's local decision, and cutting is always explicit,
+        `cancel` or a `send` with `interrupt`). Both go to the client; the final waits for
+        the client's `send`, which joins the conversation's queue like any message.
         All client_ws sends are guarded — the client may disconnect at any time.
         """
         if not is_final:
@@ -873,25 +876,9 @@ class FogarBridge:
                 self._log_send_failed("transcription_partial", e)
                 return
             await self.tracker.record("transcription_partial", text_len=len(text))
-
-            # Barge-in: interrupt active turn if enabled and partial is substantial enough
-            if self.config.barge_in_enabled and len(text) >= self.config.barge_in_min_chars:
-                # The turn or the push open now: one the worker opens after the cancel stays.
-                # Su turn_end lleva `reason: "interrupted"` (M19: ya no hay mensaje aparte).
-                # Solo lo suyo (own_only): un cliente de voz no corta el turno de otra sesión.
-                cancelled, _ = await self.turns.cancel("interrupted", own_only=True)
-                if cancelled:
-                    logger.info(
-                        f"[{self.client_id}] Barge-in: turno cancelado por parcial len={len(text)}"
-                    )
-                    await self.tracker.record("barge_in")
             return  # partials never reach the orchestrator
 
         await self.tracker.record("transcription_final", text_len=len(text))
-
-        # Final: cancel any running turn (not a push: the `send` that follows cuts it),
-        # notify client. El orquestador se llama cuando el cliente envíe {"type": "send"}.
-        await self.turns.cancel("interrupted", push=False, own_only=True)
         logger.debug(f"[{self.client_id}] Transcripción final: '{text[:40]}'")
         try:
             await self._sender.send_json({"type": "transcription", "text": text})

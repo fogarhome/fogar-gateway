@@ -605,7 +605,7 @@ class ElevenLabsSttSession:
 
 class ElevenLabsSttProvider(ProbedProvider):
     name = "elevenlabs"
-    capabilities = SttCapabilities(partials=True, warmup_s=2.5)
+    capabilities = SttCapabilities(warmup_s=2.5)
 
     state = health_attr("state")
     on_state_change = health_attr("on_state_change")

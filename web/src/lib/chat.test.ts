@@ -156,6 +156,15 @@ describe('ChatLog al volver a leer lo dicho', () => {
     expect(log.lines.map((l) => l.ask)).toEqual([undefined, undefined, undefined, u1, u2])
   })
 
+  it('el turno de un mensaje de otro aparato no responde a lo tuyo (5.0: turn_start.by)', () => {
+    const log = new ChatLog('c1')
+    const u1 = log.addUser('uno')
+    log.sent(u1)
+    log.apply(start('t-1', { by: { device_id: 'tele', name: 'Tele', self: false } }))
+    log.apply(start('t-2', { by: { device_id: 'web', name: 'Web', self: true } }))
+    expect(log.lines.map((l) => l.ask)).toEqual([undefined, undefined, u1])
+  })
+
   it('lo enviado sin turn_start todavía no cuenta como leído: OpenClaw quizá aún no lo tiene', () => {
     const log = new ChatLog('c1')
     log.sent(log.addUser('recién enviado'))

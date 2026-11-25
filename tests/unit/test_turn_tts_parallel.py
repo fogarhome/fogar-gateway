@@ -70,7 +70,7 @@ async def test_cancel_while_tts_connects_cancels_the_connect(make_bridge):
 
     await start_turn(bridge)
     await asyncio.sleep(0.05)  # el texto ya salió; el turno de la sesión espera a la voz
-    assert (await bridge.turns.cancel("interrupted"))[0]  # barge-in
+    assert (await bridge.turns.cancel("cancelled"))[0]
     await asyncio.wait_for(bridge.turns.idle(), 2)  # no esperó a que el TTS conectase
     release.set()
     await asyncio.sleep(0.01)

@@ -7,7 +7,15 @@ import { reconnectClass, type Reconnect } from './closeCodes'
 /** Lo que el gateway manda en una sesión de texto (`output_mode: ["text", "status"]`) que el chat usa. */
 export type ServerMessage =
   | { type: 'ready'; session_id: string; agent: string; conversation?: { id: string; agent: string } }
-  | { type: 'turn_start'; turn_id: string; turn_seq: number; conversation?: string | null; origin?: 'user' | 'push' }
+  | {
+      type: 'turn_start'
+      turn_id: string
+      turn_seq: number
+      conversation?: string | null
+      origin?: 'user' | 'push'
+      /** Quién lo inició (5.0): su aparato, y si es este; `null` en un push. */
+      by?: { device_id: string; name: string; self: boolean } | null
+    }
   | { type: 'token'; turn_id: string; text: string }
   | { type: 'turn_progress'; turn_id: string; phase: string; tool?: string | null }
   | { type: 'turn_end'; turn_id: string; reason?: string }
@@ -119,8 +127,9 @@ export class ChatLog {
         const old = this.turn(m.turn_id)
         if (old) old.key = `${old.key}-${++this.seq}`
         const other = m.conversation && m.conversation !== this.conversationId ? m.conversation : null
-        // Responde a tu mensaje más viejo aún sin respuesta (un push no responde a nada).
-        const ask = m.origin === 'push' ? undefined : this.awaiting.shift()
+        // Responde a tu mensaje más viejo aún sin respuesta (un push no responde a nada, ni el
+        // turno de un mensaje de otro aparato: `by.self` falso, 5.0).
+        const ask = m.origin === 'push' || m.by?.self === false ? undefined : this.awaiting.shift()
         this.lines.push({
           key: `t-${m.turn_id}`,
           role: 'assistant',
@@ -192,7 +201,7 @@ export class ChatLog {
 
 const REASON: Record<string, string> = {
   cancelled: 'La paraste aquí.',
-  interrupted: 'Se interrumpió: hablaste encima.',
+  interrupted: 'Se interrumpió: se envió otro mensaje ya.',
   replaced: 'Se cortó: la sustituyó tu siguiente mensaje.',
   timeout: 'Se cortó: OpenClaw dejó de responder.',
   closed: 'Se cortó: se cerró la conexión.',

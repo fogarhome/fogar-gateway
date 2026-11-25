@@ -3,7 +3,7 @@
 La puerta de entrada de Fogar en casa. Un solo servicio que reconoce cada aparato del hogar, lo conecta con el asistente y con la voz, y se administra desde el navegador o la terminal.
 
 - **Aparatos**: Fogar TV, el cliente de voz (Mac y Android), la app de iPhone y Home Assistant. Un aparato nuevo **descubre el gateway y se empareja con un código de 6 cifras**, sin copiar claves.
-- **Asistente**: los turnos de voz y texto van a [OpenClaw](docs/openclaw-protocol.md), que elige el agente y sus herramientas. El gateway lleva el turno de principio a fin: streaming, interrupciones (barge-in) y avisos que llegan sin preguntar (push).
+- **Asistente**: los turnos de voz y texto van a [OpenClaw](docs/openclaw-protocol.md), que elige el agente y sus herramientas. El gateway lleva el turno de principio a fin: streaming, cola de mensajes, «parar» y «enviar ahora», y avisos que llegan sin preguntar (push). Hablar encima no corta nada: pausar o callar la voz lo decide el cliente (5.0).
 - **Voz**: transcripción (STT) y síntesis (TTS) con los servicios propios de Fogar, con ElevenLabs o desactivadas. Sin voz, el texto sigue funcionando.
 - **Personas** (4.0): cada persona de casa entra con su cuenta. Lo que habla desde sus dispositivos es suyo; lo que se habla desde la tele o los altavoces es del hogar. Dueño, administradores y miembros, como en Home Assistant.
 - **Administración**: un panel web en `/` (estado en vivo, conversaciones y chat con Fogar, sesiones, clientes y personas) y la CLI `fogar-gw` (diagnóstico, configuración, servicio, logs, emparejamiento y personas).
@@ -211,11 +211,12 @@ Auth (4.0): `X-Admin-Token` = `ADMIN_TOKEN` (la CLI, en la máquina del gateway)
 - `HANDSHAKE_MAX_BYTES` mide **caracteres**, no bytes (con caracteres multibyte el tope real puede ser hasta 4x mayor). El tope de 1 MiB por mensaje WebSocket lo pone `fogar-gw serve`: con `uvicorn` a mano rige el de uvicorn (16 MiB).
 - Con Bearer válido, `model` selecciona el agente (sin distinguir mayúsculas) y se aplican `default_agent`/`allowed_agents` del cliente (violación → `403`; un `model` que no es un id de agente válido, con `:` o espacios, es `403 agent_not_available` aunque OpenClaw no esté conectado). Sin `model`, la cascada: `default_agent` del cliente, `DEFAULT_AGENT`, el agente por defecto de OpenClaw y `main`.
 - Con Bearer, cada petición va a la **conversación por defecto del día** del cliente para ese agente (M19), como un cliente WebSocket que no elige conversación. El origen de confianza sin Bearer no tiene ficha de cliente: conserva su sesión `agent:{agente}:ha` y no sale en `/admin/conversations`.
+- **Desde 5.0, `/v1` pasa por el canal de su conversación** (como un mensaje del WebSocket): las sesiones que tengan abierta esa conversación ven su mensaje y su turno (con Home Assistant como origen, sin audio). Su respuesta es siempre la de su propio run: si hay un turno en marcha en la conversación, la petición espera a que termine (y lo que llegue mientras corre el suyo espera detrás), así que dos peticiones a la vez ya no reciben `409 turn_in_progress`: la segunda espera a la primera. Esa espera tiene tope: si en `TURN_TIMEOUT_S` la conversación no queda libre, `502 turn_timeout` sin enviar nada. Si otro aparato para su turno (`cancel` o un `send` con `interrupt`, que se atienden en el acto aunque ese aparato tenga envíos esperando), `502 turn_cancelled`; si OpenClaw incorpora su mensaje a un turno que empezó a la vez (un push), `502 turn_absorbed`, nunca una respuesta vacía.
 
 | Endpoint | Método | Descripción |
 |----------|--------|-------------|
 | `/v1/models` | GET | Devuelve el alias `fogar-gateway` y los agentes del roster de OpenClaw (filtrados por `allowed_agents`) para un llamante con Bearer; un origen confiable sin Bearer (el chat ignora `model` y usa el agente por defecto) y un gateway sin roster, solo el alias |
-| `/v1/chat/completions` | POST | Chat completion; soporta `stream: true/false`. Si el último mensaje `user` falta o solo tiene espacios → `400 empty_message`, sin llamar a OpenClaw. Si el cliente corta antes de la respuesta (con o sin stream), el turno se aborta en OpenClaw |
+| `/v1/chat/completions` | POST | Chat completion; soporta `stream: true/false`. Si el último mensaje `user` falta o solo tiene espacios → `400 empty_message`, sin llamar a OpenClaw. Si el cliente corta antes de la respuesta (con o sin stream), su run (solo ese) se aborta en OpenClaw |
 
 ---
 
@@ -223,15 +224,17 @@ Auth (4.0): `X-Admin-Token` = `ADMIN_TOKEN` (la CLI, en la máquina del gateway)
 
 El cliente envía un handshake JSON como primer mensaje. Si es válido, el gateway responde con `ready` y la sesión comienza.
 
-**Cada turno de respuesta:**
+**Cada mensaje y su turno de respuesta (5.0):**
 ```
-← {"type":"turn_start","turn_id":"t-1","turn_seq":1,"conversation":"<id>","origin":"user"}
+→ {"type":"send","text":"Hola"}
+← {"type":"message","id":"<runId>","conversation":"<id>","text":"Hola","from":{"source":"device","device_id":"<id>","name":"<nombre>","self":true},"state":"delivered"}
+← {"type":"turn_start","turn_id":"t-1","turn_seq":1,"conversation":"<id>","origin":"user","by":{"device_id":"<id>","name":"<nombre>","self":true}}
 ← {"type":"token","turn_id":"t-1","text":"Hola,"}
 ← [0xA1][0x00][0x01][PCM16 24kHz...]   ← audio binario con header
 ← {"type":"turn_end","turn_id":"t-1","reason":"done"}
 ```
 
-Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la referencia completa incluyendo barge-in, transcripción, push turns y manejo de errores.
+Un `send` con un turno en curso no lo corta: queda `pending` en la cola de OpenClaw (`"interrupt": true` corta y envía; `withdraw` quita un pendiente; `cancel` para el turno para todas las sesiones de la conversación). Hablar encima no corta nada: el barge-in lo decide el cliente. Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la referencia completa incluyendo interrupciones, transcripción, push turns y manejo de errores.
 
 ---
 
@@ -302,7 +305,7 @@ En vez de crear el cliente y copiar su clave a mano, el cliente puede darse de a
 
 ```bash
 fogar-gw pair --type screen --name tele --agent j-assistant --allowed-agent j-assistant \
-  --set tts_voice=ef_dora --set barge_in_enabled:=false
+  --set tts_voice=ef_dora --set push_enabled:=false
 ```
 
 1. Enseña un código de 6 cifras (`482 913`), el nombre del gateway y a qué hora caduca (10 minutos).
@@ -643,7 +646,7 @@ src/fogar_gateway/
     ├── transcriber_reconnecting.py ReconnectingTranscriberClient — uno por sesión de audio, backoff en background
     ├── tts_client.py                WebSocket → fogar-speaker, protocolo puro, creado por turno
     ├── tts_reconnecting.py          ReconnectingTTSClient — singleton, backoff perezoso por turno
-    ├── orchestration.py     call_orchestrator() — helper compartido WS+HTTP
+    ├── orchestration.py     OrchestratorError (códigos estables)
     ├── pipeline_tracker.py  PipelineTracker — latencias por turno
     ├── session_registry.py  SessionRegistry — observabilidad de sesiones
     ├── speech/              Proveedores STT/TTS: ports.py, factory.py, fogar.py, elevenlabs/, off.py (voz desactivada)

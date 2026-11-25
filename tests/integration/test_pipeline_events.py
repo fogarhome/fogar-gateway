@@ -61,6 +61,7 @@ def test_pipeline_events_not_forwarded_without_status(client):
         ws.send_json(HANDSHAKE_TEXT_ONLY)
         ws.receive_json()  # ready
         ws.send_json({"type": "send", "text": "hola"})
+        assert ws.receive_json()["type"] == "message"  # 5.0 PR 2b: its echo
         turn_start = ws.receive_json()  # turn_start
         assert turn_start["type"] == "turn_start"
         msg = ws.receive_json()  # token

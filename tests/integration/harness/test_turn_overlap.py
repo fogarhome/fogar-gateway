@@ -15,9 +15,7 @@ worker FIFO, así que un push "fin" posterior llega al cliente detrás de cualqu
 
 
 from fogar_gateway.core.config import settings
-from tests.integration.harness.conftest import assert_turns_paired, interrupted, of_type, turn_ended
-
-AUDIO_FRAME = b"\x00" * 3200  # 50 ms de PCM Float32 a 16 kHz
+from tests.integration.harness.conftest import assert_turns_paired, cancelled, of_type, turn_ended
 
 
 def tokens(messages, turn_id):
@@ -42,22 +40,23 @@ def assert_one_turn_at_a_time(messages):
             open_turn = None
 
 
-async def _barge_in(harness, text):
-    """Turno `text` que el orquestador deja en cola y que el usuario interrumpe hablando."""
-    harness.transcriber.on_audio = [("espera un momento", False)]
-    client = await harness.connect(input_mode="audio", output_mode=("text",))
+async def _cancelled(harness, text):
+    """Turno `text` que el orquestador deja en espera y que el usuario corta con `cancel`
+    (5.0, #406: hablar ya no corta nada; cortar es siempre explícito)."""
+    client = await harness.connect(output_mode=("text",))
     await client.send({"type": "send", "text": text})
     await harness.openclaw.wait_held(1)
-    await client.send_audio(AUDIO_FRAME)
-    await client.collect(lambda m: bool(interrupted(m)))
+    await client.collect(lambda m: bool(of_type(m, "turn_start")))
+    await client.send({"type": "cancel"})
+    await client.collect(lambda m: bool(cancelled(m)))
     return client
 
 
-async def test_late_reply_of_an_interrupted_turn_does_not_leak_into_the_next(harness):
-    client = await _barge_in(harness, "wait")
+async def test_late_reply_of_a_cancelled_turn_does_not_leak_into_the_next(harness):
+    client = await _cancelled(harness, "wait")
     await client.send({"type": "send", "text": "wait again"})
     await harness.openclaw.wait_held(2)  # el turno nuevo ya espera su respuesta
-    await harness.openclaw.finish_next()  # llega tarde la respuesta del interrumpido
+    await harness.openclaw.finish_next()  # llega tarde la respuesta del cortado
     await harness.openclaw.finish_next()  # y después la del turno nuevo
     await client.collect(lambda m: len(of_type(m, "turn_end")) >= 2)  # t-2 cerrado
     await harness.push("fin")
@@ -70,14 +69,14 @@ async def test_late_reply_of_an_interrupted_turn_does_not_leak_into_the_next(har
     assert_turns_paired(msgs)
 
 
-async def test_an_interrupted_turn_does_not_come_back_as_a_push(harness):
-    client = await _barge_in(harness, "wait")
-    await harness.openclaw.finish_next()  # el run interrumpido termina igualmente
+async def test_a_cancelled_turn_does_not_come_back_as_a_push(harness):
+    client = await _cancelled(harness, "wait")
+    await harness.openclaw.finish_next()  # el run cortado termina igualmente
     await harness.push("fin")
     msgs = await client.collect(fin_arrived)
 
     starts = of_type(msgs, "turn_start")
-    assert len(starts) == 2, f"G-15: turno fantasma tras interrupted: {starts[1:-1]}"
+    assert len(starts) == 2, f"G-15: turno fantasma tras el corte: {starts[1:-1]}"
     assert not [t for t in of_type(msgs, "token") if t["text"] == "reply-wait"]
     assert_turns_paired(msgs)
 

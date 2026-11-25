@@ -16,7 +16,7 @@ from fogar_gateway.services.bridge import FogarBridge
 from fogar_gateway.services.conversations import Conversation, SessionConversation
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
 from fogar_gateway.services.outbound import ClientGone, QueuedSender
-from fogar_gateway.services.protocol import OrchestratorEvent
+from tests.fakes.orchestrator import OrchestratorEvent, wire_stream_orchestrator
 from tests.fakes.speech import speech_providers
 
 
@@ -36,8 +36,14 @@ class RecWS:
     async def receive(self):
         return await self.inbox.get()
 
-    def types(self):
-        return [m["type"] for m in self.sent if isinstance(m, dict)]
+    def types(self, messages: bool = False):
+        """The types of the JSON messages sent, in order. The `message` echo of each user
+        message (5.0 PR 2b) only with `messages=True`: most tests look at the turns."""
+        return [
+            m["type"]
+            for m in self.sent
+            if isinstance(m, dict) and (messages or m["type"] != "message")
+        ]
 
     def of(self, type_):
         return [m for m in self.sent if isinstance(m, dict) and m["type"] == type_]
@@ -87,6 +93,8 @@ def make_bridge(
     if "sender" not in kwargs:  # not setdefault: it would start a writer task nobody closes
         kwargs["sender"] = QueuedSender(ws)
     bridge = FogarBridge(**kwargs)
+    # 5.0 PR 2b: the channel sends and reads frames; a mock's `stream_response` plays them.
+    wire_stream_orchestrator(bridge.channel_hub.orchestrator, bridge.channel_hub)
     bridge.transcriber = transcriber
     if register:
         kwargs["client_registry"].register(bridge.client_id, bridge, bridge.conversation.current)
@@ -130,8 +138,9 @@ async def sent(bridge) -> list:
     return bridge.client_ws.sent
 
 
-async def start_turn(bridge, text: str = "x") -> asyncio.Task:
-    """Start a user turn as a `send` does (replacing the one in flight); return its task."""
+async def start_turn(bridge, text: str = "x") -> asyncio.Future:
+    """Start a user turn as a `send` does (5.0 PR 2b: queued behind the one in flight); return
+    a future done once its run ends."""
     await bridge.turns.start_user_turn(text)
     task = bridge.turns.user_task
     assert task is not None, "the turn did not start"

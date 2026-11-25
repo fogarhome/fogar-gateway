@@ -87,7 +87,6 @@ def test_create_imported_client_key_is_kept(http):
         {"name": "x", "tts_speed": -1.0},
         {"name": "x", "silence_timeout_s": 0},
         {"name": "x", "silence_timeout_s": -2},
-        {"name": "x", "barge_in_min_chars": -1},
         {"name": "x", "stt_vad_thold": -0.5},
     ],
 )
@@ -117,8 +116,6 @@ def test_create_nan_inf_return_422(http, literal):
         {"tts_voice": None},
         {"tts_speed": None},
         {"tts_speed": 0},
-        {"barge_in_enabled": None},
-        {"barge_in_min_chars": None},
         {"silence_timeout_s": None},
         {"silence_timeout_s": -1},
         {"push_enabled": None},

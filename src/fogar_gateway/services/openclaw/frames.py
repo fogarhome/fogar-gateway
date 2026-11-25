@@ -60,20 +60,30 @@ def health(req_id: str) -> dict:
 # ── Chat ──────────────────────────────────────────────────────────
 
 
-def chat_send(req_id: str, session_key: str, message: str, idempotency_key: str) -> dict:
-    return _req(
-        "chat.send",
-        req_id,
-        {
-            "sessionKey": session_key,
-            "message": message,
-            "idempotencyKey": idempotency_key,
-        },
-    )
+def chat_send(
+    req_id: str,
+    session_key: str,
+    message: str,
+    idempotency_key: str,
+    *,
+    queue_mode: str | None = None,
+) -> dict:
+    """`queue_mode` (`queueMode`, `ChatSendParamsSchema`) only when given: read in OpenClaw's
+    source, not tried live (docs/openclaw-protocol.md, «C3 queue behaviour»)."""
+    params = {
+        "sessionKey": session_key,
+        "message": message,
+        "idempotencyKey": idempotency_key,
+    }
+    if queue_mode is not None:
+        params["queueMode"] = queue_mode
+    return _req("chat.send", req_id, params)
 
 
-def chat_abort(req_id: str, session_key: str) -> dict:
-    return _req("chat.abort", req_id, {"sessionKey": session_key})
+def chat_abort(req_id: str, session_key: str, run_id: str) -> dict:
+    """Only that run (a queued one too). The gateway never aborts a whole key (5.0, #406):
+    that would also take the messages waiting in OpenClaw's queue."""
+    return _req("chat.abort", req_id, {"sessionKey": session_key, "runId": run_id})
 
 
 # ── Lectura (sessions.list, chat.history; M19) ────────────────────

@@ -32,8 +32,6 @@ const cliente: ClientResponse = {
   stt_vad_thold: 0.5,
   tts_voice: 'v',
   tts_speed: 1,
-  barge_in_enabled: true,
-  barge_in_min_chars: 3,
   output_mode: null,
   silence_timeout_s: 10,
   push_enabled: false,

@@ -280,7 +280,7 @@ async def test_cut_mid_phrase_withholds_the_truncated_final():
             # One incomplete per phrase: the final's own complete=false is not reported twice.
             w._callbacks.on_incomplete.assert_awaited_once_with("phrase_interrupted")
             assert st["audio"][2] >= 20  # the reconnect did not wait: the tail got through
-            w._callbacks.on_transcription.assert_not_awaited()  # nor its partials (barge-in)
+            w._callbacks.on_transcription.assert_not_awaited()  # nor its partials
 
             await _until(lambda: st["conns"] == 3 and w._client._is_ready)  # quiet reopen
             await _phrase(w, 5)

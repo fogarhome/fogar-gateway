@@ -15,8 +15,6 @@ const cliente: ClientResponse = {
   stt_vad_thold: 0,
   tts_voice: 'af_heart',
   tts_speed: 1,
-  barge_in_enabled: true,
-  barge_in_min_chars: 5,
   output_mode: ['audio', 'text'],
   silence_timeout_s: 2,
   push_enabled: true,
@@ -32,8 +30,8 @@ describe('clientForm', () => {
     expect(diff(cliente, f)).toEqual({ name: 'Tele', tts_speed: 1.5, output_mode: ['text'] })
   })
   it('valida como el gateway', () => {
-    const f = { ...toForm(cliente), name: '', output_mode: [], tts_speed: '0', barge_in_min_chars: '2,5' }
-    expect(Object.keys(validate(f)).sort()).toEqual(['barge_in_min_chars', 'name', 'tts_speed'])
+    const f = { ...toForm(cliente), name: '', output_mode: [], tts_speed: '0', silence_timeout_s: '0' }
+    expect(Object.keys(validate(f)).sort()).toEqual(['name', 'silence_timeout_s', 'tts_speed'])
   })
   it('sin formatos marcados manda null (los dice el aparato)', () => {
     expect(diff(cliente, { ...toForm(cliente), output_mode: [] })).toEqual({ output_mode: null })

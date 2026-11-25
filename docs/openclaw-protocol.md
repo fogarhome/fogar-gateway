@@ -224,7 +224,7 @@ package (read on the server by the maintainer; summarized here):
 
 **Deliberate gateway decision:** the gateway emits a text tail only for `final`. On
 `aborted` and `error` it does **not** emit any tail from `message`: after an `aborted` the
-client has already cut the reply (barge-in or cancel), and speaking more text after the user
+client has already cut the reply (`cancel` or a `send` with `interrupt`), and speaking more text after the user
 interrupted would be wrong; an `error` may omit `message` on purpose. Pinned by a test.
 
 How the gateway responds (`src/fogar_gateway/services/openclaw/chat_text.py`, used by
@@ -321,9 +321,11 @@ Read in the npm package `openclaw@2026.10.5` (`server-chat`, `builtin-openclaw`,
   `item` (or `tool`) `start` with no push open could open one; an `end` also marked the run
   ended for the active-run tracking.
 
-How the gateway reacts now: only `stream:"lifecycle"` opens (`start`) or ends (`end`/`error`) a
-push; an `agent` event of any other stream only records that its run is still active. A frame
-without `stream` (not sent by 2026.10.5) keeps the old reading, as lifecycle.
+How the gateway reacts now: only `stream:"lifecycle"` ends (`end`/`error`) a push; an `item`
+`end` or a `tool` `start` opens or ends nothing. A frame without `stream` (not sent by 2026.10.5)
+keeps the old reading, as lifecycle. Since 5.0 PR 2b.2 a push also opens on its run's first
+`run_status`, lifecycle `model`/`fallback_step`, `chat` status/delta or `session.tool`, not only
+on lifecycle `start` (see "How the gateway reacts (5.0 PR 2b.2)").
 
 ---
 
@@ -572,7 +574,7 @@ them to a log. What it does instead:
 | `chat` `state:"error"`, or a push's `agent` `phase:"error"` | the code classified from structural fields (#397, below), else `orchestrator_error` | WARNING with that code only |
 | Not connected / reconnecting | `orchestrator_unavailable` | — |
 | Connection ends mid-turn | `orchestrator_disconnected` (#213) | type / close codes only |
-| `turn_timeout`, `turn_overflow`, `turn_in_progress` | same literals (unchanged) | — |
+| `turn_timeout`, `turn_overflow`, `turn_in_progress` | same literals (unchanged; since 5.0 PR 2b.3 only `turn_timeout` is still sent, and `/v1` adds `turn_cancelled` and `turn_absorbed`) | — |
 | Unexpected exception wrapping the stream | `orchestrator_error` | type only; traceback without message at DEBUG |
 
 Handshake (`connect()`): a rejected `hello`, a first frame that is not `connect.challenge`, or
@@ -619,9 +621,10 @@ Full notes in the team's Obsidian vault (observations of 2026-10 on OpenClaw and
   and later sends its own `final` (OpenClaw appears to fold the message into the running run;
   not verified, no text recorded). Confirmed on 2026.11.7 (it is `steer`, the default queue
   mode): see "C3 queue behaviour and failure fields".
-- Events the gateway ignores today: `agent` streams `run_status`, `assistant`, `thinking`, `item`, `plan`,
-  `usage`; `sessions.changed`, `session.message` (since 4.0.1 deliberately, without the
-  "unhandled … possible protocol drift" log: see "`session.message`" below).
+- Events the gateway ignores today: `agent` streams `assistant`, `thinking`, `item`, `plan`,
+  `usage`; `sessions.changed`; a `session.message` of any role but `user`. Since 5.0 PR 2b.2 a
+  `run_status` opens the turn or push of its run, and a `user` `session.message` goes to its
+  conversation's channel (see "How the gateway reacts (5.0 PR 2b.2)").
 
 ### `session.message` (server 2026.11.7, read in the package source)
 
@@ -630,9 +633,10 @@ Full notes in the team's Obsidian vault (observations of 2026-10 on OpenClaw and
 - Payload fields: `sessionKey`, `agentId`, `message` (an object with `role`: `user`, `assistant`,
   `system`, `developer`, `tool` or `toolResult`, plus its content), `messageId`, `messageSeq`,
   `runId` when it belongs to a run, and a session snapshot. It carries user text: never log it.
-- The gateway ignores it: the turn's text already arrives as `chat`. It is a candidate source for
-  E2 (what OpenClaw does ends up in the conversation's history, including messages from other
-  channels) without a plugin.
+- Until 5.0 PR 2b.1 the gateway ignored it (the turn's text already arrives as `chat`). Since
+  2b.2 it reads only a `user` one, for its ids and `steer`'s mark (see "How the gateway reacts
+  (5.0 PR 2b.2)"), never its content. Still a candidate source for E2 (what OpenClaw does ends
+  up in the conversation's history, including messages from other channels) without a plugin.
 
 **Breaking for fogar-gateway as of v1.21.0:** `stream_response()` ends a turn on the first
 `chat` `final` of its `sessionKey` and its queue receives every `chat` event of that key,
@@ -655,8 +659,8 @@ No server change; this records how the gateway reacts. Frames are still routed b
   without `runId` are delivered as they come. `chat.abort`'s own short registration takes
   every frame of the key (its answer is caught by id, not through the dispatcher).
 - **Aborted runs are tombstoned** (`RUN_ABORT_TOMBSTONE_S`, 300 s; run ids are never reused)
-  on every abort path: a turn that ends without its terminal `chat` (barge-in, a replacing
-  `send`, `cancel`, the client gone, `turn_timeout`, `turn_overflow`) tombstones its run;
+  on every abort path: a turn that ends without its terminal `chat` (a `send` with
+  `interrupt`, `cancel`, the client gone, `turn_timeout`, `turn_overflow`) tombstones its run;
   if its ack had not arrived yet, the late ack does it. The answer to `chat.abort`
   (`{ok, aborted: true, runIds}`) tombstones the runs it names, and a push the gateway cuts
   or times out has the `runId` of its `agent start` tombstoned too, before its `chat.abort`
@@ -1176,7 +1180,202 @@ the open push). Codes: `auth`/`auth_permanent`/`session_expired`, `auth_invalid_
 explicitly requested agent, as `resolve_agent` does; the handshake keeps its 4020/4021 closes and
 `/v1` its 403).
 
+### How the gateway reacts (5.0 PR 2b.1, 2026-11-24)
+
+`src/fogar_gateway/services/channel.py` (`ConversationChannel`), `services/openclaw/client.py`
+(`send`, `abort_run`), `services/openclaw/dispatcher.py`:
+
+- **No abort before `chat.send`.** A WebSocket message is a plain `chat.send` (no `queueMode`:
+  the per-message param is still untried live); during a turn it waits in OpenClaw's queue. The
+  ack's `runId` is the message's id. Only `cancel`, a `send` with `interrupt` and `withdraw`
+  abort, each with `chat.abort {sessionKey, runId}` (only that run; the gateway tombstones it
+  first, so its `aborted`/lifecycle `end` are dropped). The WebSocket path never aborts the
+  whole key: a push without `runId` is only cut on the gateway's side (WARNING, nothing sent),
+  because `chat.abort` of the key would also take the queued messages. `/v1`
+  (`stream_response`, until 2b.3) still sends a whole-key `chat.abort` when it gives up.
+  (Since 2b.3 nothing does: see "5.0 PR 2b.3".)
+- **A run opens its turn on its first event**, not on lifecycle `start`: `chat` status, delta,
+  tool or an `error`, a `final` that carries text, `agent` lifecycle `start`/`model`/
+  `fallback_step` or a `run_status`. The `seq gap` `agent` `stream:"error"` opens nothing (it
+  only shows the run alive). A `final` without `message` closes the turn with the text the
+  deltas already brought (`ChatTextTracker`).
+- **Origin before the ack:** while a `chat.send` of the channel waits for its ack, frames of a
+  `runId` nobody knows yet are held by the channel (every `agent` stream too: a `run_status`
+  or a lifecycle `model` may be the run's first event); the ack says whose they are, and what
+  is still unowned is a push, through the same filters as any push (#112, #130). A send
+  cancelled or failed before its ack releases what was held. (Lifecycle `start` still opens a
+  push for a run the channel does not know: removing that rule is 2b.2.)
+- **Not yet (2b.2):** a steered run (`session.message` `steerTargetRunId`) is only recognised by
+  its `final` `seq: 1` without `message` and without prior events: the message turns
+  `delivered` and no turn opens; `session.message` is still ignored, and `pendingInputs` is not
+  re-read on reconnect. (Done in 2b.2, next section.)
+
+### How the gateway reacts (5.0 PR 2b.2, 2026-11-24)
+
+`services/channel.py`, `services/openclaw/dispatcher.py` (`push_route`),
+`services/openclaw/reconnecting.py` (`on_connected`). No server change; tested against the
+fake's copies of the sequences above (`tests/unit/test_channel_runs.py`), not live.
+
+- **`session.message` is read**, only `role:"user"` and only its ids: it goes to its key's
+  channel, in order with the frames (held with them while a `chat.send` waits for its ack).
+  Copies of one message are not dropped as duplicates: each updates what is known by OpenClaw's
+  `messageId` (`oc_message_id` in the code; `__openclaw.id` when `messageId` is missing). The
+  link to the `chat.send` (`idempotencyKey` `"<runId>:user"`, read from `message`,
+  `message.__openclaw` or the payload) is remembered per `oc_message_id`, because `steer`'s mark
+  (`message.__openclaw.steerTargetRunId`) may come on a copy without it. A mark naming another
+  run makes the message's run **absorbed**: its message turns `delivered` for every session
+  (once), it never opens a turn of its own, and the active turn keeps its sender and audio. Its
+  `final` `seq: 1` without `message` then just ends it; if that `final` never comes, it ends with
+  the turn that absorbed it. The content is never read or logged.
+- **The terminal of a run that never opened its turn** (a queued or absorbed message): a `final`
+  without text opens nothing (its message `delivered` if it was pending: absorbed, or empty); a
+  `final` with text (the reply to a `/queue …` command) opens, emits it and closes at once; an
+  `aborted` opens nothing (`withdrawn` if pending); a `chat` `error` **or an `agent` lifecycle
+  `error`** opens and closes with its `TURN_ERROR` (classified, #397), so a failing pending
+  message does not vanish (a later `chat` `error` of the same run is dropped). With its turn
+  open, a run still waits for its `chat` `error` (with `errorKind`) after a lifecycle `error`.
+  What would open a turn waits while another turn is open (one at a time); what opens nothing
+  happens at once.
+- **A push opens on its run's first event**, not only on lifecycle `start`: a `chat` status or
+  delta, a `session.tool` start/result, an `agent` lifecycle `start`/`model`/`fallback_step` or
+  a `run_status` (`push_route` is the single mapping, also for frames released after an ack). A
+  terminal `chat` never opens one (#109), the `seq gap` `agent` `stream:"error"` opens nothing
+  (DEBUG only), nor do `item`/`tool`/`assistant`… streams. Once lifecycle `end`/`error` closed a
+  push, a late `run_status`/`model`/phase/delta of its run opens nothing; only a new lifecycle
+  `start` of it does (#84). Still: tombstones (#285), #112 (no push opens while a /v1 turn holds
+  the key; for the openers other than `start` it is checked when the channel's worker handles
+  them), #130 S3b, startup phases of a run kept while another push is open (#254). During a user
+  turn a push's opener waits for that turn to end.
+- **Reconnect and `pendingInputs`.** When the connection drops, a run with its turn open (or with
+  frames already waiting for one) ends at once with `orchestrator_disconnected`, as before; an
+  absorbed one just ends; one still in OpenClaw's queue without a turn is kept **unconfirmed**
+  (its message stays `pending`). When `ReconnectingOpenClawClient` connects again it calls
+  `on_connected` → `ChannelHub.reconnected`: every channel with subscribers or unconfirmed runs
+  reads `chat.history` (`{sessionKey, limit: 1}`, a `READ_METHODS` read) and keeps pending the
+  unconfirmed runs whose `runId` is in `pendingInputs.items[]` with `state:"queued"` (or
+  `queued: true` without `state`) or is the `inFlightRun` (`{runId}` or a bare id: **its shape
+  was not seen live**, read defensively). The rest, or all of them when the read fails or has no
+  readable `pendingInputs`, end with `orchestrator_disconnected` (each its own pair: delivered,
+  turn_start, TURN_ERROR, turn_end). Without a reconnection within `RECONNECT_GRACE_S` (15 s,
+  `services/channel.py`) they end the same way. A frame of an unconfirmed run confirms it. Items
+  the channel does not know (another client's, a /v1 one) are ignored. Only counts and ids are
+  logged.
+- **An open push's frames are not held behind a slow ack:** a frame of the open push's run
+  (known not to be the sender's) goes straight to the push, so its #286 clock keeps seeing
+  progress while a `chat.send` waits for its ack; one with an earlier frame of its run still
+  held waits behind it (order first), and its arrival still counts as the push's progress.
+- **Runs failed after a drop are aborted:** each one the reconnection (or `RECONNECT_GRACE_S`)
+  fails, and each one whose open turn the drop itself failed, is tombstoned and `chat.abort`ed by
+  its `runId`: at once when connected, on the next reconnection otherwise, so it does not go on
+  running (tools, side effects) after its client was told it failed. A channel with an abort
+  still promised for the next reconnection is not idle (it is not forgotten). The reconnection
+  is handled by each channel's worker, behind the drop.
+- **#112 is now partly checked in the channel's worker:** for push openers other than
+  lifecycle `start`, "a /v1 turn holds the key" is read when the worker handles the frame, so
+  a frame of a /v1 run handled after /v1 unregistered may open a push. 2b.3 moves /v1 into the
+  channel and reworks this (next section).
+- **Withdraw vs. steer race (inherent):** OpenClaw tells that it absorbed B only afterwards (its
+  `session.message`). A `withdraw` of B in between finds it pending, aborts it (OpenClaw has
+  nothing left to abort) and announces `withdrawn`, while B's answer arrives inside A's turn.
+
+### How the gateway reacts (5.0 PR 2b.3, 2026-11-24)
+
+`src/fogar_gateway/api/openai_routes.py`, `services/channel.py` (`send_exclusive`). No server
+change; tested against the fake in `steer` mode (`tests/integration/harness/test_v1_channel.py`),
+not live.
+
+- **`/v1` goes through its conversation's channel.** Its run is one of the channel's runs (a
+  `RunInfo` like a WebSocket message's), so its frames reach the channel by `runId`
+  (`take_frame`); `stream_response`, the per-key turn registration in `TurnRegistry`
+  (`register`/`deliver_by_session`/`blocks_push`) and the dispatcher's `/v1` paths (including
+  the separate `fallback_step` path, #397) are gone. `TurnRegistry` keeps only the tombstones
+  (#285).
+- **`queueMode` untested live; the gateway waits instead.** `/v1` (Home Assistant) must get the
+  answer of its own run, never a reply folded by `steer` into someone else's run, nor someone
+  else's message folded into its own. The per-message `queueMode: "followup"` would say that to
+  OpenClaw, but it was only read in the source, never tried: `chat.send` still carries no
+  `queueMode`. The channel guarantees it instead: a `/v1` message takes the channel's send lock,
+  waits until the channel is calm (no open turn, no unfinished run of the channel's own —
+  queued, running or absorbed —, no `chat.send` waiting for its ack, nothing deferred or still
+  queued for the channel's worker), sends, and keeps the lock until its run ends. WebSocket
+  sends and other `/v1` messages that arrive meanwhile wait behind it in arrival order (their
+  `message` goes out once they are sent): a WebSocket message sent during `/v1`'s run would be
+  steered into it and change `/v1`'s answer. Residual risk: a push (a run nobody sent) that
+  starts after `/v1`'s `chat.send` is OpenClaw's to order; the gateway cannot hold it back.
+- **Subscribers see it like any message:** its `message` (`from.source: "device"`, the caller's
+  client id and name; the trusted-origin caller without a client row uses `device_id: "ha"`,
+  name `Home Assistant`, on a channel of its own key `agent:{agent}:ha` that no session can
+  attach to) and its turn (`turn_start.by` = that device), with no audio for anyone. The turn
+  counts in its conversation on the `chat.send` ack, as before.
+- **Ending:** the run's terminal ends it as for any channel run (`final`, `error` classified
+  #397, `turn_timeout` after `TURN_TIMEOUT_S` without progress, `orchestrator_disconnected`).
+  A Home Assistant client that leaves (or a timeout) aborts only its run, `chat.abort
+  {sessionKey, runId}` (tombstoned first); the whole-key `chat.abort` is gone from the
+  gateway. A client `cancel` from a WebSocket session stops `/v1`'s turn like any other:
+  `/v1` answers 502 `turn_cancelled`. Two `/v1` requests on one conversation no longer get
+  409 `turn_in_progress`: the second waits for the first.
+- **Review fixes (2026-11-24):** a WebSocket session never stops reading while its `send`
+  waits behind `/v1` (its sends go out from a per-session task, in order), so its `cancel`
+  stops `/v1`'s turn at once and a `send` with `interrupt` cuts it at once (`chat.abort` by
+  `runId`) before going out. The wait for calm (lock included) is capped at `TURN_TIMEOUT_S`
+  → `turn_timeout`, nothing sent. A `/v1` run that ends without ever opening its own turn —
+  `steer` folded it into a run that started after its `chat.send`, e.g. a push; OpenClaw only
+  says so afterwards (`steerTargetRunId`, or the `final` `seq: 1` without `message`) — is
+  answered 502 `turn_absorbed`, never an empty 200; cutting such an absorbed run neither
+  announces `withdrawn` nor aborts anything. `chat.send` is shielded: a sender that leaves
+  before the ack (a `/v1` client gone, a WebSocket session closing) leaves the ack to the
+  channel, which tombstones and `chat.abort`s that run by its `runId` when it arrives; frames
+  held for it until then are dropped, never handed to a push.
+- **Second and third review rounds (2026-11-24):** «send now» cuts once (what is open when it
+  is read; the send itself carries no second `chat.abort`). A client `cancel` read right after
+  a `send` stops that message only when nothing is ahead of it (no open turn, no unfinished
+  run of the channel): before its `chat.send` it is not sent; in `chat.send` its run is
+  aborted by `runId` on the ack and never announced — **OpenClaw still has it in
+  `chat.history`** (the user message was appended), only no session ever saw it. With
+  something ahead the cancel stops that and the message stays queued. Whether "a /v1 message
+  is ahead" (the session's waiting sends then stay) is decided by a counter of `/v1` messages
+  waiting or running in the channel: approximate in the moments one starts or ends.
+
+### How the gateway reacts (5.0 PR 2b, final review, 2026-11-25)
+
+- **Between two turns** the next queued run is still `pending` for the gateway until its first
+  event, though OpenClaw is already running it: a client `cancel` (or a `send` with
+  `interrupt`) with no turn open now aborts that head run by `runId`, pending or delivered,
+  and its `message` becomes `withdrawn`. `withdraw` still takes only pending messages.
+- **A channel's own runs are remembered once they end** (`TurnRegistry.finish_run`, as long as
+  a tombstone): the dispatcher drops their late frames (a `run_status`, a stray delta) before
+  routing, so they never open a push, even after the channel was dropped (a trusted-origin
+  `/v1` channel nobody subscribes to is dropped as soon as its run ends).
+- **`TURN_QUEUE_MAX`:** a run whose frames do not fit (held before its ack, or waiting for the
+  open turn) fails with `TURN_ERROR internal_error` and is aborted by `runId`; a frame that ends
+  a run or a push is never dropped.
+- **Untested idea (not relied on):** the live capture shows the `chat.send` user message's
+  `idempotencyKey` as `"<runId>:user"`, so OpenClaw may be using the `idempotencyKey` the
+  gateway sends as the run's `runId`. If a live check confirms that `runId == idempotencyKey`
+  for every `chat.send` (queued and steered ones included), the gateway would know a message's
+  run before the ack and the held-frames logic (decision 3: frames of unknown runs held while a
+  `chat.send` waits for its ack) could be simplified or removed.
+
 ## Change log of this file
+
+- **2026-11-25**: "C3 queue behaviour" gains the final review of 5.0 PR 2b (#406): stopping
+  between turns takes the next run, finished own runs are remembered against ghost pushes,
+  `TURN_QUEUE_MAX` overflow fails the run, and the untested `runId == idempotencyKey` idea.
+
+- **2026-11-24**: "C3 queue behaviour" gains how the gateway reacts in 5.0 PR 2b.3 (#406): `/v1`
+  goes through the conversation's channel and waits for calm instead of sending `queueMode`
+  (untested live); no whole-key `chat.abort` left; `turn_in_progress` no longer sent. Review
+  fixes: `turn_absorbed`, the calm wait capped at `TURN_TIMEOUT_S`, a `chat.send` whose sender
+  left is aborted by `runId` once acked.
+
+- **2026-11-24**: "C3 queue behaviour" gains how the gateway reacts in 5.0 PR 2b.2 (#406): a
+  `user` `session.message` is read (ids and `steerTargetRunId`, updated by `messageId`), absorbed
+  runs, the exact terminals of a run that never opened, a push opens on its first event,
+  `pendingInputs` re-read on reconnect (the `inFlightRun` shape is unverified).
+
+- **2026-11-24**: "C3 queue behaviour" gains how the gateway reacts in 5.0 PR 2b.1 (#406): no
+  abort before `chat.send`, `chat.abort` by `runId`, a run opens on its first event, frames
+  held until the ack.
 
 - **2026-11-23**: "Failure fields over the WebSocket" gains how the gateway classifies them (#397).
 

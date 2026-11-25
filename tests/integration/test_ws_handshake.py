@@ -270,12 +270,10 @@ def test_ready_carries_requested_and_live_capabilities_when_audio(client, monkey
 
     assert "capabilities" not in ready
     assert ready["requested_capabilities"] == {
-        "barge_in": True,
         "tts": True,
         "transcriber": True,
     }
     assert ready["live_capabilities"] == {
-        "barge_in": True,
         "tts": False,
         "transcriber": True,
     }
@@ -299,12 +297,10 @@ def test_ready_uses_both_sections_for_text_only_handshake(client):
 
     assert ready["type"] == "ready"
     assert ready["requested_capabilities"] == {
-        "barge_in": True,
         "tts": False,
         "transcriber": False,
     }
     assert ready["live_capabilities"] == {
-        "barge_in": False,
         "tts": False,
         "transcriber": False,
     }

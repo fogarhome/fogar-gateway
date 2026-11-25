@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -18,11 +19,15 @@ from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
 from fogar_gateway.core.network import is_trusted_origin, resolve_client_ip
 from fogar_gateway.core.session_key import make_session_key
 from fogar_gateway.models.schemas import Client, ClientConfig
-from fogar_gateway.services.conversations import ConversationClientMissing, note_turn_safely
+from fogar_gateway.services.channel import ChannelEvent, ChannelToken, ConversationChannel
+from fogar_gateway.services.conversations import (
+    Conversation,
+    ConversationClientMissing,
+    note_turn_safely,
+)
 from fogar_gateway.services.db_client import db_client
 from fogar_gateway.services.openclaw.client import _traceback_no_message
-from fogar_gateway.services.openclaw.registry import TURN_IN_PROGRESS_ERROR
-from fogar_gateway.services.orchestration import OrchestratorError, call_orchestrator
+from fogar_gateway.services.orchestration import OrchestratorError
 from fogar_gateway.services.pipeline_tracker import PipelineTracker
 from fogar_gateway.services.reconnection import describe_error
 from fogar_gateway.services.session_registry import SessionStatus
@@ -34,6 +39,16 @@ router = APIRouter(prefix="/v1")
 
 # Cada cuánto mira /v1 sin stream si el cliente sigue ahí (D-r6-1).
 _DISCONNECT_POLL_S = 0.25
+
+# El origen de confianza sin Bearer no tiene ficha de cliente (ni conversación): su canal es el
+# de su clave `agent:{agente}:ha`, y su mensaje sale con este origen (5.0 PR 2b.3). Nadie se
+# adjunta a ese canal (ninguna conversación tiene esa clave), así que nadie lo ve.
+TRUSTED_ORIGIN_ID = "ha"
+TRUSTED_ORIGIN_NAME = "Home Assistant"
+
+# Solo /v1 (5.0 PR 2b.3): otro aparato paró su turno (`cancel`), o el canal se cerró, antes
+# de que terminara su respuesta.
+TURN_CANCELLED_ERROR = "turn_cancelled"
 
 
 def _log_unexpected_error(exc: BaseException) -> None:
@@ -192,6 +207,7 @@ async def chat_completions(
         # M19: like any client that does not pick a conversation, the caller talks in its
         # default conversation (one per client, agent and day).
         client_id = caller.client.id
+        by_name = caller.client.name
         conversations = request.app.state.conversations
         try:
             conversation = await conversations.default_for(client_id, resolved_agent)
@@ -201,13 +217,24 @@ async def chat_completions(
         except Exception as e:  # noqa: BLE001 — frontera: sin conversación no hay turno (502 estable)
             _log_unexpected_error(e)
             return JSONResponse({"error": "internal_error"}, status_code=502)
-        session_key = conversation.session_key
         conversation_id: str | None = conversation.id
     else:
-        # Legacy trusted-origin path: no client row, so no conversation; it keeps its key.
-        client_id = "ha"
+        # Legacy trusted-origin path: no client row, so no conversation; it keeps its key, and
+        # its channel is that key's alone (nobody attaches to it).
+        client_id = TRUSTED_ORIGIN_ID
+        by_name = TRUSTED_ORIGIN_NAME
         session_key = make_session_key(resolved_agent, client_id)
+        conversation = Conversation(
+            id=f"{TRUSTED_ORIGIN_ID}:{session_key}",
+            client_id=client_id,
+            agent=resolved_agent.lower(),
+            session_key=session_key,
+            kind="default",
+        )
         conversation_id = None
+    # 5.0 PR 2b.3: the turn goes through the conversation's channel, like a WebSocket message,
+    # but alone: it waits until the channel is calm and its answer is its own run's.
+    hub = request.app.state.channel_hub
 
     async def _count_turn() -> None:
         """El turno cuenta en su conversación en cuanto OpenClaw acepta su chat.send (aunque
@@ -218,6 +245,30 @@ async def chat_completions(
     tracker = _make_http_tracker(f"http:{completion_id}", session_registry, client_id)
     session_registry.register(tracker)
 
+    async def _turn(on_token: Callable[[str], None]) -> None:
+        """The /v1 turn through the channel. Raises OrchestratorError with a stable code."""
+
+        def sink(event: ChannelEvent) -> None:
+            if isinstance(event, ChannelToken):
+                on_token(event.text)
+
+        # Resolved right before the call, with no await in between: a channel fetched earlier
+        # could have been dropped as idle by another request meanwhile (2b.3 review M2);
+        # `send_exclusive` pins it before its first await.
+        channel: ConversationChannel = hub.get_or_create(conversation)
+        outcome = await channel.send_exclusive(
+            text,
+            by_client_id=client_id,
+            by_name=by_name,
+            sink=sink,
+            tracker=tracker,
+            on_accepted=_count_turn,
+        )
+        if outcome.error is not None:
+            raise OrchestratorError(outcome.error)
+        if outcome.cut:
+            raise OrchestratorError(TURN_CANCELLED_ERROR)
+
     if stream:
 
         async def generate():
@@ -225,27 +276,20 @@ async def chat_completions(
             orchestrator_error: Exception | None = None
             error_message = ""
 
-            async def _on_token(t: str):
+            def _on_token(t: str) -> None:
                 chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
                     "choices": [{"delta": {"content": t}, "index": 0, "finish_reason": None}],
                 }
-                await queue.put(f"data: {json.dumps(chunk)}\n\n")
+                queue.put_nowait(f"data: {json.dumps(chunk)}\n\n")
 
             async def _run():
                 nonlocal orchestrator_error, error_message
                 # G-26 (#221): solo un turno terminado es `completed`; cancelado, `error`.
                 status: SessionStatus = "error"
                 try:
-                    await call_orchestrator(
-                        orchestrator,
-                        text,
-                        session_key,
-                        tracker=tracker,
-                        on_token=_on_token,
-                        on_accepted=_count_turn,
-                    )
+                    await _turn(_on_token)
                 except OrchestratorError as e:
                     # Stable code (orchestrator_error, turn_timeout...): safe to relay (#228).
                     logger.error("HTTP orchestrator error (%s)", e)
@@ -278,6 +322,7 @@ async def chat_completions(
                     yield item
             finally:
                 if not task.done():
+                    # El cliente se fue: el turno se corta (solo su run, por su runId).
                     task.cancel()
                     # asyncio.wait no relanza la cancelación esperada de `task`; una ajena
                     # (cancelan a quien cierra el stream) sí se propaga (#221).
@@ -318,26 +363,14 @@ async def chat_completions(
         )
 
     tokens: list[str] = []
-
-    async def _on_token(t: str):
-        tokens.append(t)
-
     orchestrator_error: Exception | None = None
     status: SessionStatus = "error"  # G-26 (#221): una cancelación no es un éxito
     disconnected = False
-    turn = asyncio.create_task(
-        call_orchestrator(
-            orchestrator,
-            text,
-            session_key,
-            tracker=tracker,
-            on_token=_on_token,
-            on_accepted=_count_turn,
-        )
-    )
+    turn = asyncio.create_task(_turn(tokens.append))
     try:
         # D-r6-1: como en la rama de stream, si el cliente se va, el turno se cancela (y con
-        # él, chat.abort); si no, su sessionKey seguiría ocupada hasta TURN_TIMEOUT_S.
+        # él, solo su run en OpenClaw); si no, la conversación seguiría ocupada hasta
+        # TURN_TIMEOUT_S.
         while not turn.done():
             await asyncio.wait({turn}, timeout=_DISCONNECT_POLL_S)
             if not turn.done() and await request.is_disconnected():
@@ -370,8 +403,6 @@ async def chat_completions(
         logger.info("HTTP client disconnected; turn aborted")
         return JSONResponse({"error": "client_disconnected"}, status_code=499)
     if orchestrator_error:
-        if str(orchestrator_error) == TURN_IN_PROGRESS_ERROR:
-            return JSONResponse({"error": str(orchestrator_error)}, status_code=409)
         return JSONResponse({"error": str(orchestrator_error)}, status_code=502)
 
     content = "".join(tokens)

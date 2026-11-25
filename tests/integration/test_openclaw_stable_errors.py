@@ -22,8 +22,9 @@ from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.reconnecting import ReconnectingOpenClawClient
 from fogar_gateway.services.openclaw.registry import TurnRegistry
-from fogar_gateway.services.protocol import OrchestratorEvent
+from fogar_gateway.services.orchestration import OrchestratorError
 from fogar_gateway.services.reconnection import ConnectionState
+from tests.integration.test_openclaw_real_ws import run_turn as run_channel_turn
 
 MARK = "SECRET-INTERNAL"
 SK = "agent:main:client-a"
@@ -96,12 +97,15 @@ class Server:
 
 def make_client(port):
     turns = TurnRegistry()
-    client = OpenClawClient("127.0.0.1", port, "tok", turns, FrameDispatcher(turns, ChannelHub()))
+    hub = ChannelHub(turn_registry=turns)
+    client = OpenClawClient("127.0.0.1", port, "tok", turns, FrameDispatcher(turns, hub))
+    hub.orchestrator = client
     return client
 
 
 async def run_turn(client):
-    return [e async for e in client.stream_response("hola", session_key=SK)]
+    """A turn through its conversation's channel (5.0 PR 2b.3: /v1's path)."""
+    return await run_channel_turn(client, SK, "hola")
 
 
 def assert_clean(caplog, *texts):
@@ -210,26 +214,22 @@ async def test_send_failure_gives_stable_error_not_exception_text(caplog):
     assert_clean(caplog, events)
 
 
-# ── ReconnectingOpenClawClient.stream_response ────────────────────────────────
+# ── ReconnectingOpenClawClient.send ───────────────────────────────────────────
 
 
-async def test_reconnecting_stream_exception_gives_stable_error(caplog):
+async def test_reconnecting_send_exception_gives_stable_error(caplog):
     caplog.set_level(logging.DEBUG, logger="fogar_gateway")
     inner = AsyncMock(spec=OpenClawClient)
     inner.on_disconnect = None
     inner.gateway_info = None
-
-    async def boom(*a, **k):
-        raise ValueError(MARK)
-        yield  # pragma: no cover
-
-    inner.stream_response = boom
+    inner.send.side_effect = ValueError(MARK)
     roc = ReconnectingOpenClawClient(inner, "test")
     roc._health.state = ConnectionState.CONNECTED
-    events = [e async for e in roc.stream_response("hi", session_key=SK)]
-    assert events == [OrchestratorEvent(type="error", content="orchestrator_error")]
+    with pytest.raises(OrchestratorError) as raised:
+        await roc.send("hi", SK)
+    assert str(raised.value) == "orchestrator_error"
     assert "ValueError" in caplog.text
-    assert_clean(caplog, events)
+    assert_clean(caplog, str(raised.value))
 
 
 # ── connect: motivo estable, last_error estable, log sin texto ────────────────

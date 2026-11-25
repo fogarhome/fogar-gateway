@@ -251,7 +251,7 @@ def test_removing_a_client_retires_it_and_keeps_its_conversations(
 def test_v1_follows_the_daily_default_conversation(
     client_untrusted, mock_orchestrator, db_engine, monkeypatch
 ):
-    from fogar_gateway.services.protocol import OrchestratorEvent
+    from tests.fakes.orchestrator import OrchestratorEvent
 
     keys = []
 
@@ -281,16 +281,14 @@ def test_v1_follows_the_daily_default_conversation(
 
 
 def test_v1_counts_a_turn_only_once_it_started(client_untrusted, mock_orchestrator, db_engine):
-    from fogar_gateway.services.protocol import OrchestratorEvent
+    from fogar_gateway.services.orchestration import OrchestratorError
 
-    async def busy(text, session_key=None):
-        yield OrchestratorEvent(type="error", content="turn_in_progress")
-
-    mock_orchestrator.stream_response = busy
+    # 5.0 PR 2b.3: OpenClaw refuses the `chat.send` (no ack): the turn never started.
+    mock_orchestrator.send.side_effect = OrchestratorError("orchestrator_error")
     body = {"messages": [{"role": "user", "content": "hola"}]}
     headers = {"authorization": f"Bearer {VALID_KEY}"}
     r = client_untrusted.post("/v1/chat/completions", json=body, headers=headers)
-    assert (r.status_code, r.json()) == (409, {"error": "turn_in_progress"})
+    assert (r.status_code, r.json()) == (502, {"error": "orchestrator_error"})
     with Session(db_engine) as s:
         (row,) = s.exec(select(ConversationRecord)).all()
     assert row.turn_count == 0 and row.last_turn_at is None
@@ -300,7 +298,7 @@ def test_v1_counts_the_turn_once_openclaw_accepted_it(
     client_untrusted, mock_orchestrator, db_engine
 ):
     """Aceptado el chat.send, el turno cuenta aunque luego falle (o el cliente se vaya)."""
-    from fogar_gateway.services.protocol import OrchestratorEvent
+    from tests.fakes.orchestrator import OrchestratorEvent
 
     async def accepted_then_dropped(text, session_key=None):
         yield OrchestratorEvent(type="status", content="accepted")
@@ -319,7 +317,7 @@ def test_v1_counts_the_turn_once_openclaw_accepted_it(
 def test_v1_streaming_closes_its_session_and_counts_the_turn(
     client_untrusted, mock_orchestrator, db_engine, admin_headers
 ):
-    from fogar_gateway.services.protocol import OrchestratorEvent
+    from tests.fakes.orchestrator import OrchestratorEvent
 
     async def stream(text, session_key=None):
         yield OrchestratorEvent(type="status", content="accepted")
@@ -357,7 +355,7 @@ def test_v1_legacy_trusted_origin_keeps_its_key_and_uses_default_agent(
 ):
     """Sin Bearer no hay ficha de cliente, ni conversación: conserva `agent:{agent}:ha`, y su
     agente sale de la cascada, con DEFAULT_AGENT (#245)."""
-    from fogar_gateway.services.protocol import OrchestratorEvent
+    from tests.fakes.orchestrator import OrchestratorEvent
 
     keys = []
 

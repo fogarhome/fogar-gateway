@@ -148,7 +148,8 @@ async def test_receiving_message_updates_last_client_activity(make_loop_bridge):
 
 
 async def test_send_cancels_previous_active_turn(make_loop_bridge):
-    """En modo texto, un segundo {type:send} debe cancelar el turn en vuelo."""
+    """En modo texto, un segundo {type:send} con `interrupt` debe cancelar el turn en vuelo
+    (5.0 PR 2b: sin él, espera en la cola; tests/unit/test_channel_queue.py)."""
     bridge, ws, _ = make_loop_bridge(input_mode="text")
     bridge.transcriber = None
     first_task = await start_turn(bridge, "primero")
@@ -156,7 +157,7 @@ async def test_send_cancels_previous_active_turn(make_loop_bridge):
 
     ws.receive = AsyncMock(
         side_effect=[
-            {"type": "websocket.message", "text": json.dumps({"type": "send", "text": "nuevo mensaje"})},
+            {"type": "websocket.message", "text": json.dumps({"type": "send", "text": "nuevo mensaje", "interrupt": True})},
             {"type": "websocket.disconnect"},
         ]
     )
@@ -208,7 +209,8 @@ async def test_cancel_message_with_no_active_turn_is_harmless(make_loop_bridge):
 
 
 async def test_second_send_cancels_first_active_turn(make_loop_bridge):
-    """Un segundo {type:'send'} debe cancelar el turn en vuelo antes de crear uno nuevo."""
+    """Un segundo {type:'send'} con `interrupt` debe cancelar el turn en vuelo antes de crear
+    uno nuevo (5.0 PR 2b)."""
     bridge, ws, _ = make_loop_bridge(input_mode="audio")
 
     # Un turn en vuelo que bloquea indefinidamente
@@ -217,7 +219,7 @@ async def test_second_send_cancels_first_active_turn(make_loop_bridge):
 
     ws.receive = AsyncMock(
         side_effect=[
-            {"type": "websocket.message", "text": json.dumps({"type": "send", "text": "segundo"})},
+            {"type": "websocket.message", "text": json.dumps({"type": "send", "text": "segundo", "interrupt": True})},
             {"type": "websocket.disconnect"},
         ]
     )

@@ -9,14 +9,16 @@ conexión multiplexada.
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
 
 import pytest
 
-from fogar_gateway.services.channel import ChannelHub
+from fogar_gateway.services.channel import ChannelError, ChannelHub, ChannelToken
 from fogar_gateway.services.conversations import ConversationIndex
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.registry import TurnRegistry
+from fogar_gateway.services.orchestration import OrchestratorError
 from tests.fakes.bridge import keyed_conversation
 from tests.fakes.openclaw import MIB, FakeOpenClawServer
 
@@ -26,13 +28,58 @@ SK_B = "agent:main:client-b"
 
 def make_client(port, token="tok"):
     turns = TurnRegistry()
-    dispatcher = FrameDispatcher(turns, ChannelHub())
+    hub = ChannelHub(turn_registry=turns)
+    dispatcher = FrameDispatcher(turns, hub)
     client = OpenClawClient("127.0.0.1", port, token, turns, dispatcher)
+    hub.orchestrator = client
     return client, turns
 
 
+@dataclass
+class Event:
+    type: str  # token | error | status
+    content: str
+
+
+def _hub(client) -> ChannelHub:
+    inner = getattr(client, "_client", client)  # ReconnectingOpenClawClient → its client
+    return inner._dispatcher._channels
+
+
 async def run_turn(client, sk, text):
-    return [e async for e in client.stream_response(text, session_key=sk)]
+    """A turn through its key's channel, as /v1 runs it since 5.0 PR 2b.3 (`send_exclusive`):
+    the tokens and errors of its own run, then `done` if it ended well."""
+    _, agent, client_id = sk.split(":")
+    channel = _hub(client).get_or_create(keyed_conversation(client_id, agent))
+    events: list[Event] = []
+
+    def sink(event) -> None:
+        if isinstance(event, ChannelToken):
+            events.append(Event("token", event.text))
+        elif isinstance(event, ChannelError):
+            events.append(Event("error", event.code))
+
+    outcome = await channel.send_exclusive(text, by_client_id=client_id, by_name=client_id, sink=sink)
+    if outcome.error is not None:
+        if outcome.error not in errors(events):
+            events.append(Event("error", outcome.error))
+    elif not outcome.cut:
+        events.append(Event("status", "done"))
+    return events
+
+
+async def _sent(server, sk, n=1):
+    """Wait until `n` `chat.send` of `sk` reached the server."""
+    for _ in range(250):
+        if [m for m, key in server.calls if key == sk].count("chat.send") >= n:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"no chat.send for {sk}")
+
+
+def _no_turn(client, sk) -> bool:
+    channel = _hub(client).get(sk)
+    return channel is None or not channel.user_turn_running()
 
 
 def tokens(events):
@@ -54,10 +101,7 @@ async def _two_sessions(server, text_a, text_b, release_after=None):
     client, turns = make_client(server.port)
     await client.connect()
     task_b = asyncio.create_task(run_turn(client, SK_B, text_b))
-    for _ in range(100):
-        await asyncio.sleep(0.02)
-        if turns.get_queue_by_session(SK_B) is not None:
-            break
+    await _sent(server, SK_B)
     events_a = await asyncio.wait_for(run_turn(client, SK_A, text_a), 5)
     return events_a, task_b, client, turns
 
@@ -96,17 +140,13 @@ async def test_clean_close_errors_pending_turns_fast_and_frees_session_key(serve
     client, turns = make_client(server.port)
     await client.connect()
     task_b = asyncio.create_task(run_turn(client, SK_B, "hold"))
-    for _ in range(100):
-        await asyncio.sleep(0.02)
-        if turns.get_queue_by_session(SK_B) is not None:
-            break
+    await _sent(server, SK_B)
     try:
         events_a = await asyncio.wait_for(run_turn(client, SK_A, "close"), 3)
         events_b = await asyncio.wait_for(task_b, 3)
         assert errors(events_a) == ["orchestrator_disconnected"]
         assert errors(events_b) == ["orchestrator_disconnected"]
-        assert turns.get_queue_by_session(SK_B) is None
-        assert turns.get_queue_by_session(SK_A) is None
+        assert _no_turn(client, SK_B) and _no_turn(client, SK_A)
     finally:
         server.release.set()
         await client.close()
@@ -124,9 +164,11 @@ async def test_listen_errors_use_stable_message_not_raw_exception():
             raise RuntimeError("secret internal detail")
 
     client._ws = Boom()
-    q = turns.register("r", SK_A)
+    ack = asyncio.get_running_loop().create_future()
+    client._send_futures["r"] = ack  # a chat.send waiting for its ack
     await client._listen()
-    assert q.get_nowait() == ("error", "orchestrator_disconnected")
+    with pytest.raises(OrchestratorError, match=r"^orchestrator_disconnected$"):
+        ack.result()
 
 
 # ── G-05 ──────────────────────────────────────────────────────────
@@ -239,22 +281,26 @@ async def test_handler_error_logs_traceback_without_exception_message(caplog):
 # ── Reconexión tras cierre limpio (hueco de cobertura de #226) ────
 
 
-async def test_clean_close_fires_on_disconnect_after_error_all_and_new_connection_is_clean(server):
+async def test_clean_close_fires_on_disconnect_after_connection_lost_and_new_connection_is_clean(
+    server,
+):
     from fogar_gateway.services.openclaw.reconnecting import ReconnectingOpenClawClient
     from fogar_gateway.services.reconnection import ConnectionState
 
     client, turns = make_client(server.port)
     order = []
-    real_error_all = turns.error_all
-    turns.error_all = lambda msg: (order.append(("error_all", msg)), real_error_all(msg))[1]
+    dispatcher = client._dispatcher
+    real_lost = dispatcher.connection_lost
+    dispatcher.connection_lost = lambda msg: (order.append(("connection_lost", msg)), real_lost(msg))[1]
     roc = ReconnectingOpenClawClient(client, "oc", initial_backoff=0.05, max_backoff=0.1)
+    _hub(client).orchestrator = roc
     real_on_disc = client.on_disconnect
     client.on_disconnect = lambda: (order.append(("on_disconnect", None)), real_on_disc())[1]
     await roc.connect()
     try:
         events = await asyncio.wait_for(run_turn(roc, SK_A, "close"), 3)
         assert errors(events) == ["orchestrator_disconnected"]
-        assert order[:2] == [("error_all", "orchestrator_disconnected"), ("on_disconnect", None)]
+        assert order[:2] == [("connection_lost", "orchestrator_disconnected"), ("on_disconnect", None)]
         for _ in range(100):
             if roc.state == ConnectionState.CONNECTED and server.connections == 2:
                 break
@@ -264,9 +310,9 @@ async def test_clean_close_fires_on_disconnect_after_error_all_and_new_connectio
         events = await asyncio.wait_for(run_turn(roc, SK_A, "ok"), 3)
         assert errors(events) == [] and tokens(events) == "reply-ok"
         await asyncio.sleep(0.1)
-        assert [o for o in order[calls_before:] if o[0] == "error_all"] == []
-        assert [o for o in order if o[0] == "error_all"] == [
-            ("error_all", "orchestrator_disconnected")
+        assert [o for o in order[calls_before:] if o[0] == "connection_lost"] == []
+        assert [o for o in order if o[0] == "connection_lost"] == [
+            ("connection_lost", "orchestrator_disconnected")
         ]
     finally:
         await roc.close()
@@ -296,7 +342,7 @@ async def test_agent_error_after_ack_ends_turn_with_stable_error(server, caplog)
     try:
         events = await asyncio.wait_for(run_turn(client, SK_A, "agent_error"), 3)
         assert errors(events) == ["orchestrator_error"] and tokens(events) == ""
-        assert turns.get_queue_by_session(SK_A) is None
+        assert _no_turn(client, SK_A)
         assert "No API key" not in caplog.text
         assert "SECRET-OC-TOKEN" not in caplog.text
     finally:
@@ -310,7 +356,7 @@ async def test_drop_mid_turn_delivers_delta_then_disconnect_error(server):
         events = await asyncio.wait_for(run_turn(client, SK_A, "drop"), 5)
         assert tokens(events) == "reply-drop"
         assert errors(events) == ["orchestrator_disconnected"]
-        assert turns.get_queue_by_session(SK_A) is None
+        assert _no_turn(client, SK_A)
     finally:
         await client.close()
 
@@ -354,7 +400,7 @@ async def test_push_without_open_connection_raises(server):
         await server.push(SK_A, "x")
 
 
-# ── Cableado de ChatTextTracker en `stream_response` (tramas de producción) ──
+# ── Cableado de ChatTextTracker en el canal (tramas de producción) ──
 # Los casos del tracker viven en tests/unit/test_chat_text.py.
 
 TEXT = "SECRETREPLY"
@@ -364,13 +410,17 @@ def _msg(text):
     return {"role": "assistant", "content": [{"type": "text", "text": text}], "timestamp": 1}
 
 
+RUN = "run-scripted"  # 2026.10.5: every `chat` event carries its run's `runId` (#219)
+
+
 def _ev(sk, **kw):
-    return json.dumps({"type": "event", "event": "chat", "payload": {"sessionKey": sk, **kw}})
+    payload = {"sessionKey": sk, "runId": RUN, **kw}
+    return json.dumps({"type": "event", "event": "chat", "payload": payload})
 
 
 def _binary(sk, **kw):
     """Trama binaria con los surrogates crudos en UTF-8 (sin escapes)."""
-    frame = {"type": "event", "event": "chat", "payload": {"sessionKey": sk, **kw}}
+    frame = {"type": "event", "event": "chat", "payload": {"sessionKey": sk, "runId": RUN, **kw}}
     return json.dumps(frame, ensure_ascii=False).encode("utf-8", "surrogatepass")
 
 
@@ -386,9 +436,9 @@ def _final(sk, text, seq=11):
 
 
 class Scripted2026_10_5(FakeOpenClawServer):
-    async def _chat_send(self, ws, rid, params):
+    async def _chat_send(self, ws, rid, params, run_id=None):
         sk, scenario = params["sessionKey"], params["message"]
-        await ws.send(self._res(rid, {"status": "started"}))
+        await ws.send(self._res(rid, {"runId": RUN, "status": "started"}))
         if scenario == "captured":
             for phase, seq in (
                 ("preparing_workspace", 1),
@@ -461,7 +511,7 @@ async def test_diverging_final_emits_full_final_and_warns_without_content(script
     assert "Voy a buscar" not in caplog.text
 
 
-# ── 7e: chat.abort se queda con su propio `aborted` (G-14) ──
+# ── 7e: el `aborted` de un run abortado no llega a nadie (G-14) ──
 
 
 async def test_abort_absorbs_its_aborted_frame(server):
@@ -482,9 +532,13 @@ async def test_abort_absorbs_its_aborted_frame(server):
             if len(bridge.calls) >= 2:
                 break
             await asyncio.sleep(0.02)
-        await asyncio.wait_for(client.abort(SK_A), 2)
+        # 5.0: only by its runId, tombstoned first (as the channel does): its `aborted` and
+        # lifecycle `end` are dropped by the dispatcher.
+        turns.abort_run("run-1")
+        await asyncio.wait_for(client.abort_run(SK_A, "run-1"), 2)
+        await asyncio.sleep(0.05)
 
-        assert turns.get_queue_by_session(SK_A) is None
+        assert server.aborts == [{"sessionKey": SK_A, "runId": "run-1"}]
         assert not [p for k, p in bridge.calls if k == "chat" and p.get("state") == "aborted"]
         events = await asyncio.wait_for(run_turn(client, SK_A, "hola"), 5)
         assert tokens(events) == "reply-hola" and not errors(events)
@@ -498,7 +552,7 @@ async def test_abort_absorbs_its_aborted_frame(server):
 
 
 async def test_aborted_turn_frames_never_reach_the_next_turn(server):
-    """A turn cancelled mid-run (barge-in) is aborted; the reply of its run that was
+    """A turn cancelled mid-run (`cancel`) is aborted; the reply of its run that was
     already on its way is dropped instead of closing the next turn (G-14)."""
     client, turns = make_client(server.port)
     await client.connect()

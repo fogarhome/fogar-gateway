@@ -41,8 +41,7 @@ async def test_shutdown_with_a_turn_in_flight_closes_1012_without_hanging(harnes
     """Reinicio con un turno en vuelo: uvicorn cierra con 1012, el gateway cancela el
     turno y termina de apagarse enseguida (sin esperar al orquestador)."""
     client = await harness.connect()
-    await client.send({"type": "send", "text": "wait for me"})
-    await harness.openclaw.wait_held(1)
+    await client.send({"type": "send", "text": "hold"})  # 5.0 PR 2b: abierto con su `start`
     await client.collect(lambda m: bool(of_type(m, "turn_start")))
 
     start = time.monotonic()

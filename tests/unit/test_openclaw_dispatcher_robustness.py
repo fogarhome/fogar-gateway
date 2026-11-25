@@ -14,21 +14,18 @@ def make():
     return FrameDispatcher(turns, ChannelHub()), turns
 
 
-async def test_res_ok_false_ends_turn_with_error_frame():
+async def test_a_stray_res_is_tolerated_and_a_late_abort_answer_tombstones_its_runs():
+    """Every request gets its `res` by id in OpenClawClient (5.0 PR 2b.3: no turn queue per
+    key); one that reaches the dispatcher came late. Odd ones are dropped; a late `chat.abort`
+    answer still tombstones the runs it names (#285)."""
     dispatcher, turns = make()
-    q = turns.register("req-1", SK)
     await dispatcher.dispatch({"type": "res", "id": "req-1", "ok": False, "error": {"code": "x"}})
-    kind, data = q.get_nowait()
-    assert kind == "done" and data["ok"] is False
-
-
-async def test_res_ok_true_with_other_status_does_not_end_turn():
-    dispatcher, turns = make()
-    q = turns.register("req-1", SK)
-    accepted = {"type": "res", "id": "req-1", "ok": True, "payload": {"status": "accepted"}}
-    await dispatcher.dispatch(accepted)
     await dispatcher.dispatch({"type": "res", "id": "req-1", "ok": True, "payload": None})
-    assert q.empty()
+    await dispatcher.dispatch({"type": "res", "id": "req-2", "ok": True, "payload": {"status": "accepted"}})
+    assert not turns.is_run_aborted("run-1")
+    late = {"ok": True, "aborted": True, "runIds": ["run-1"]}
+    await dispatcher.dispatch({"type": "res", "id": "abort-1", "ok": True, "payload": late})
+    assert turns.is_run_aborted("run-1")
 
 
 @pytest.mark.parametrize("event", ["chat", "agent", "session.tool"])

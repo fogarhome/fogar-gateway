@@ -31,15 +31,54 @@ Delivery rules:
 No user text in logs: token text is counted, never logged, and `ChannelTurn` keeps it out of
 its `repr`.
 
-The OpenClaw side (5.0 PR 2a.2): the channel is the only owner of its conversation's runs.
-It moved here from `TurnController` (services/turns.py) as it was: the send lock and the
-order under it (G-08, #201), the user turn's task (`stream_response` with its
-TURN_TIMEOUT_S), the push worker (FIFO, TURN_TIMEOUT_S idle budget per push, #286), the
-tombstones of aborted runs (#285), the startup phases of a push not yet open (#254), the
-push's `ChatTextTracker` (#241) and the conversation's turn count (`note_turn`, once per
-channel turn). A subscriber leaving never cancels the channel's task nor aborts its run
-(decision 2 of the 5.0 PR 2 plan: G-18 inverted); the channel ends its turn on OpenClaw's
-terminal (or its timeout) without waiting for anyone's audio (decision 1).
+The OpenClaw side: the channel is the only owner of its conversation's runs (5.0 PR 2a.2),
+and since 5.0 PR 2b it uses OpenClaw's own queue (`messages.queue`; docs/openclaw-protocol.md,
+«C3 queue behaviour»):
+
+- `send_user_message` never aborts before a `chat.send`. The send lock keeps the order in
+  which messages reach the channel (two devices sending at once go to OpenClaw in arrival
+  order). OpenClaw acks with the run's `runId`, which is also the message's id on the wire.
+  The message goes to every subscriber (`on_message`): `pending` if the channel has an open
+  turn or another unfinished run of its own, else `delivered`; a pending one becomes
+  `delivered` when its own run opens, or `withdrawn` (`withdraw`, any subscriber) while it
+  still waits. Only `cancel`, a `send` that interrupts and `withdraw` abort, each by its
+  `runId` (`abort_run`): never the whole key.
+- The run table (`RunInfo`, decision 5): the channel's own runs, `queued` until their first
+  event, `running` with their turn open, then `done`. A run's frames come from the dispatcher
+  (`take_frame`); its turn opens on its first event (`chat` status/delta/tool, `agent`
+  lifecycle `start`/`model`/`fallback_step` or `run_status`), not only on `start`, which a run
+  drained from the queue never gets; it ends on its terminal `chat` (`final`, keeping the
+  streamed text when the `final` carries no `message`; `aborted`; `error`, classified #397).
+- Steer (2b.2): a `user` `session.message` (`take_session_message`) links OpenClaw's message id
+  to its `chat.send` run (`idempotencyKey` `"<runId>:user"`); a copy marked
+  `steerTargetRunId` makes that run `absorbed`: its message `delivered`, no turn of its own.
+  A run that never opened ends exactly as decision 4 says (`_run_terminal`).
+- Reconnect (2b.2): a queued run without a turn survives a drop `unconfirmed` until the
+  reconnection re-reads `pendingInputs` (`reconcile_pending`) or `RECONNECT_GRACE_S` passes.
+- Origin before the ack (decision 3): while a `chat.send` waits for its ack, frames of a run
+  nobody knows yet are held; the ack says whose they are, and what is still nobody's is a push.
+  A push opens on its run's first event too (`push_route`), not only on lifecycle `start`.
+- One turn open at a time: a run whose first event arrives while another turn is open waits
+  (its frames deferred, in order) until that turn ends; so does a push opening while a user
+  turn is open.
+- TURN_TIMEOUT_S without progress (decision 2): for the open turn's run and, with no turn
+  open, for the first run still waiting to open (its clock starts when nothing is ahead of it);
+  for the push, its own budget (#286).
+- /v1 (2b.3, `send_exclusive`): a Home Assistant message never steers nor is steered into.
+  It takes the send lock, waits until the channel is calm (no open turn, no unfinished run of
+  its own, no ack in flight, nothing deferred or queued for the worker), sends, and keeps the
+  lock until its run ends: WebSocket sends arriving meanwhile wait behind it, in arrival
+  order. Its message and turn reach the subscribers like any other (origin: its device; no
+  audio); a sink collects its answer; its caller leaving aborts only its run.
+
+Every frame of the key goes through one ordered worker (the push worker: FIFO, #130 S3a), so
+a push and the channel's own runs never overtake each other. It also keeps the tombstones of
+aborted runs (#285), the startup phases of a push not yet open (#254), the push's
+`ChatTextTracker` (#241) and the conversation's turn count (`note_turn`, once per channel
+turn). A subscriber leaving never aborts a run (decision 2 of the 5.0 PR 2 plan: G-18
+inverted); the channel ends its turn on OpenClaw's terminal (or its timeout) without waiting
+for anyone's audio (decision 1). User text (a message, a token) goes to subscribers only,
+never to logs (`text_len`).
 """
 
 from __future__ import annotations
@@ -48,7 +87,7 @@ import asyncio
 import logging
 import time
 import weakref
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from functools import partial
@@ -57,7 +96,8 @@ from uuid import uuid4
 
 from fogar_gateway.core.config import settings
 from fogar_gateway.services import orchestration
-from fogar_gateway.services.openclaw.chat_text import ChatTextTracker
+from fogar_gateway.services.openclaw.chat_text import ChatTextTracker, extract_message_text
+from fogar_gateway.services.openclaw.dispatcher import push_route
 from fogar_gateway.services.openclaw.failures import classify_failure, fallback_reason
 from fogar_gateway.services.openclaw.models import ToolCallEvent
 from fogar_gateway.services.openclaw.registry import TurnRegistry
@@ -79,6 +119,132 @@ logger = logging.getLogger(__name__)
 # Fases de arranque de runs cuyo push aún no se abrió (#254): las de los últimos runs, un rato.
 _EARLY_PHASE_RUNS = 8
 _EARLY_PHASE_TTL_S = 30.0
+# Runs propios ya terminados que se recuerdan: sus frames tardíos (el lifecycle `end` tras el
+# `final`) siguen siendo suyos y se descartan, nunca llegan como push.
+_DONE_RUNS = 64
+_TERMINAL_CHAT = ("final", "aborted", "error")
+# What a run fails with when its frames overflow TURN_QUEUE_MAX (final 2b review, m3): an
+# internal bound of the gateway, nothing the client can act on; `turn_overflow` stays retired.
+OVERFLOW_CODE = "internal_error"
+# Pushes cerrados por su lifecycle `end`/`error`, recordados: un evento tardío de su run (un
+# `run_status`, una fase) no abre otro push; solo un lifecycle `start` nuevo (#84).
+_ENDED_PUSH_RUNS = 64
+# `session.message` de usuario vistos: id de OpenClaw (`oc_message_id`) → runId de su
+# `chat.send`. La marca de `steer` llega en una copia repetida que puede no traer el enlace.
+_OC_MESSAGES = 64
+# Tras una caída de OpenClaw, lo que un run en cola (sin turno) espera a que la reconexión
+# relea `pendingInputs` y diga si sigue en la cola; si no llega a tiempo, falla
+# (`orchestrator_disconnected`), como un run en marcha.
+RECONNECT_GRACE_S = 15.0
+_DISCONNECTED = "orchestrator_disconnected"
+_UNAVAILABLE = "orchestrator_unavailable"
+TURN_TIMEOUT = "turn_timeout"
+# Solo /v1 (2b.3): su run terminó sin abrir turno propio (`steer` lo plegó en otro run).
+TURN_ABSORBED = "turn_absorbed"
+
+MessageState = Literal["pending", "delivered", "withdrawn"]
+# `absorbed`: OpenClaw (`steer`) metió su mensaje en el run activo; no tendrá turno propio.
+RunState = Literal["queued", "running", "absorbed", "done"]
+
+
+def _as_dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _str_run_id(payload: dict) -> str | None:
+    run_id = payload.get("runId")
+    return run_id if isinstance(run_id, str) and run_id else None
+
+
+def _final_has_text(payload: dict) -> bool:
+    delta = payload.get("deltaText")
+    return (isinstance(delta, str) and bool(delta)) or bool(
+        extract_message_text(payload.get("message"))
+    )
+
+
+def _ends_run(event: str, payload: dict) -> bool:
+    """A frame that ends its run: a terminal `chat`, or an `agent` lifecycle `end`/`error`."""
+    if event == "chat":
+        return payload.get("state") in _TERMINAL_CHAT
+    return (
+        event == "agent"
+        and payload.get("stream") in (None, "lifecycle")
+        and _as_dict(payload.get("data")).get("phase") in ("end", "error")
+    )
+
+
+def _ends_push(kind: str, arg: Any) -> bool:
+    """A push item (`push_route`) that ends the push: lifecycle `end`/`error` or a terminal
+    `chat`."""
+    if kind in ("turn_end", "turn_error"):
+        return True
+    return kind == "chat" and _as_dict(arg).get("state") in _TERMINAL_CHAT
+
+
+def _lifecycle_error(event: str, payload: dict) -> bool:
+    return (
+        event == "agent"
+        and payload.get("stream") in (None, "lifecycle")
+        and _as_dict(payload.get("data")).get("phase") == "error"
+    )
+
+
+def _run_of_idempotency(value: object) -> str | None:
+    """`"<runId>:user"` (the `idempotencyKey` of a `chat.send`'s user message) → runId."""
+    if isinstance(value, str) and value.endswith(":user") and len(value) > len(":user"):
+        return value[: -len(":user")]
+    return None
+
+
+def pending_run_ids(history: object) -> set[str] | None:
+    """The runIds `chat.history` says are still waiting or running on the key: every
+    `pendingInputs.items[]` in `state:"queued"` (its `runId` is the `chat.send`'s) and the
+    `inFlightRun`. None when the answer has no readable `pendingInputs` (the shape was seen
+    live once, 2026.11.7; read defensively): then nothing is proven."""
+    if not isinstance(history, dict):
+        return None
+    pending = history.get("pendingInputs")
+    items = pending.get("items") if isinstance(pending, dict) else None
+    if not isinstance(items, list):
+        return None
+    ids: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        state = item.get("state")
+        queued = state == "queued" or (state is None and item.get("queued") is True)
+        run_id = item.get("runId")
+        if queued and isinstance(run_id, str) and run_id:
+            ids.add(run_id)
+    in_flight = history.get("inFlightRun")
+    run_id = in_flight.get("runId") if isinstance(in_flight, dict) else in_flight
+    if isinstance(run_id, str) and run_id:
+        ids.add(run_id)
+    return ids
+
+
+def _opens_run(event: str, payload: dict) -> bool:
+    """Whether a frame of a run opens its turn (its first event, C3): a `chat` status, delta
+    or tool, an `error`, a `final` that carries text, an `agent` lifecycle `start`/`model`/
+    `fallback_step` or a `run_status`. A `final` without text (an absorbed or empty run), an
+    `aborted` and the other `agent` streams open nothing."""
+    if event == "session.tool":
+        return True
+    if event == "chat":
+        state = payload.get("state")
+        if state == "aborted":
+            return False
+        if state == "final":
+            return _final_has_text(payload)
+        return True
+    if event == "agent":
+        stream = payload.get("stream")
+        if stream == "run_status":
+            return True
+        if stream in (None, "lifecycle"):
+            return _as_dict(payload.get("data")).get("phase") in ("start", "model", "fallback_step")
+    return False
 
 
 def _other_run(open_run: str | None, run_id: object) -> bool:
@@ -127,6 +293,24 @@ class ChannelSubscriber(Protocol):
 
     def on_turn_end(self, turn: ChannelTurn, reason: EndReason) -> None: ...
 
+    def on_message(self, message: ChannelMessage) -> None:
+        """A user message of the conversation and its state (2b): every subscriber, the
+        sender too. It carries user text: to the client only, never to logs."""
+        ...
+
+
+@dataclass(frozen=True)
+class ChannelMessage:
+    """A user message OpenClaw accepted (its `chat.send` acked) and its state, for every
+    subscriber. `id` is its run's `runId` (the wire's `message.id`)."""
+
+    id: str
+    conversation_id: str
+    text: str = field(repr=False)  # user text: clients only, never logs
+    by_client_id: str
+    by_name: str = field(repr=False)
+    state: MessageState
+
 
 @dataclass(frozen=True)
 class ChannelToken:
@@ -164,6 +348,7 @@ class ChannelTurn:
     origin: TurnOrigin
     by_client_id: str | None  # the durable origin: the sender's client (None for a push)
     run_id: str | None = None  # OpenClaw's runId, once known (push: its `agent start`)
+    by_name: str | None = field(default=None, repr=False)  # the sender's client name
     ended: bool = False
     end_reason: EndReason | None = None
     cancel_reason: EndReason | None = None  # quien la cancela dice por qué (G-08)
@@ -178,6 +363,8 @@ class ChannelTurn:
     # Who plays the turn's audio: the sender (user turn) or, in 2a, the most recently attached
     # subscriber that wants audio and push (push; 2c replaces it by the notification device).
     _audio: weakref.ref[ChannelSubscriber] | None = field(default=None, repr=False)
+    # 2b.3: who collects the turn's events outside the subscribers (a /v1 request's answer).
+    _sink: Callable[[ChannelEvent], None] | None = field(default=None, repr=False)
     _text: list[str] = field(default_factory=list, init=False, repr=False)
 
     @property
@@ -199,24 +386,111 @@ class ChannelTurn:
 class _SenderTracker:
     """The sender's pipeline tracker, only while the sender is still subscribed: a session
     that left gets no `llm_*` events (nothing logged after its session_end, nothing sent to
-    its closed socket)."""
+    its closed socket). Without a sender (a /v1 message, 2b.3) it records while its caller
+    waits for the run, and the caller `flush`es it before closing the tracker."""
 
     def __init__(
-        self, channel: ConversationChannel, sender: ChannelSubscriber, tracker: PipelineTracker
+        self,
+        channel: ConversationChannel,
+        sender: ChannelSubscriber | None,
+        tracker: PipelineTracker,
     ) -> None:
         self._channel = channel
-        self._sender = weakref.ref(sender)
+        self._sender = weakref.ref(sender) if sender is not None else None
         self._tracker = tracker
+        self._soon: deque[tuple[str, dict[str, Any]]] = deque()
+        self._task: asyncio.Task | None = None
+
+    def _live(self) -> bool:
+        if self._sender is None:
+            return True
+        sender = self._sender()
+        return sender is not None and self._channel.is_subscribed(sender)
 
     async def record(self, stage: str, **meta: Any) -> Any:
-        sender = self._sender()
-        if sender is None or not self._channel.is_subscribed(sender):
+        if not self._live():
             return None
         return await self._tracker.record(stage, **meta)
+
+    def start_turn(self) -> None:
+        if self._live():
+            self._tracker.start_turn()
+
+    def record_soon(self, stage: str, **meta: Any) -> None:
+        """Record without waiting, in order (the channel handles its runs' frames
+        synchronously): one supervised task drains them."""
+        self._soon.append((stage, meta))
+        if self._task is None or self._task.done():
+            self._task = self._channel._hub.spawn(self._drain(), "llm_events")
+
+    async def _drain(self) -> None:
+        while self._soon:
+            stage, meta = self._soon.popleft()
+            await self.record(stage, **meta)
+
+    async def flush(self) -> None:
+        """Wait until every event recorded so far is written (before the tracker closes)."""
+        task = self._task
+        if task is not None and not task.done():
+            await asyncio.wait({task})
+
+
+@dataclass(eq=False)
+class RunInfo:
+    """One of the channel's own runs (a `chat.send` it made; decision 5). Ids and states;
+    the message text only for the subscribers (never in logs, never in its `repr`)."""
+
+    run_id: str  # OpenClaw's runId from the ack: also the message's id on the wire
+    by_client_id: str
+    by_name: str = field(repr=False)
+    text: str = field(repr=False)
+    finished: asyncio.Future[None] = field(repr=False)  # done once the run is `done`
+    state: RunState = "queued"
+    message: MessageState = "pending"
+    turn: ChannelTurn | None = None  # its channel turn, once its first event opened it
+    progress_at: float = field(default_factory=time.monotonic)
+    fallback_reason: str | None = None  # the last `fallback_step` failure reason (#397)
+    tokens: int = 0
+    absorbed_into: str | None = None  # `absorbed`: the run `steer` folded it into
+    # Tras una caída de OpenClaw, en cola sin confirmar: espera a `pendingInputs` (2b.2).
+    unconfirmed: bool = False
+    chat_text: ChatTextTracker = field(default_factory=ChatTextTracker, repr=False)
+    recorder: _SenderTracker | None = field(default=None, repr=False)
+    # 2b.3, a /v1 message: who collects its turn's events (`send_exclusive`), and whether the
+    # channel counts its turn when it opens (/v1 counts it on the ack, `on_accepted`).
+    sink: Callable[[ChannelEvent], None] | None = field(default=None, repr=False)
+    counts_turn: bool = True
+    error_code: str | None = None  # the stable code its turn ended with, if it failed
+    # Decision 5: only a weak reference to the sender; the live session is resolved on use.
+    _sender: weakref.ref[ChannelSubscriber] | None = field(default=None, repr=False)
+
+    @property
+    def by_session(self) -> ChannelSubscriber | None:
+        return self._sender() if self._sender is not None else None
+
+
+@dataclass(eq=False)
+class SendTicket:
+    """One `send` of a session on its way to the channel (2b.3 review N2). `cut`: a client
+    `cancel` read after it covers it (it is not sent, or its run is aborted on its ack, never
+    announced); `sending`: it is past the send lock, in `chat.send`."""
+
+    cut: bool = False
+    sending: bool = False
 
 
 class ChannelBusy(RuntimeError):
     """`open_turn` with a turn still open: a conversation has one open turn at a time."""
+
+
+@dataclass(frozen=True)
+class ExclusiveOutcome:
+    """How a `send_exclusive` message (a /v1 request, 2b.3) ended: `error`, the stable code
+    its turn failed with (or why it was never sent); `cut`, someone else stopped it (a client
+    `cancel`, the channel closing). Neither: its run ended normally."""
+
+    error: str | None = None
+    cut: bool = False
 
 
 @dataclass(eq=False)
@@ -246,19 +520,48 @@ class ConversationChannel:
         self._started: list[_Subscription] = []  # those that got the open turn's start
         self._hub = hub if hub is not None else ChannelHub()
         self._tag = f"conv {conversation.id}"  # log prefix: ids only, never text
-        # Serializa cancelar/arrancar (G-08, #201): un turno nuevo no arranca hasta que el
-        # anterior terminó, y el abort de un push cortado sale antes del chat.send del usuario.
+        # Serializa los envíos (y el corte de un `send` que interrumpe): llegan a OpenClaw en
+        # el orden en que llegan al canal (G-08, #201; C3: dos aparatos a la vez, en orden).
         self._lock = asyncio.Lock()
-        self._user_task: asyncio.Task | None = None
-        self._user_turn: ChannelTurn | None = None
+        # Quienes tienen o esperan el lock (un lock recién soltado aún no es de quien espera:
+        # `idle` no puede fiarse de `locked()`).
+        self._senders = 0
+        self._exclusive = 0  # mensajes de /v1 esperando o con su run en marcha (2b.3)
+        # Los runs propios sin terminar, en el orden de sus acks (decisión 5).
+        self._runs: dict[str, RunInfo] = {}
+        self._done_runs: OrderedDict[str, None] = OrderedDict()
+        # `chat.send` sin ack todavía, y los frames de runs que nadie conoce mientras tanto
+        # (decisión 3): el ack dice de quién son.
+        self._acks = 0
+        self._held: list[tuple[str, dict]] = []
+        # Lo que espera a que se cierre el turno abierto (un turno a la vez), en orden.
+        self._deferred: deque[tuple[str, Any, str | None]] = deque()
+        self._deferred_runs: set[str] = set()
+        # TURN_QUEUE_MAX (final 2b review, m3): runs whose frames did not fit and that fail
+        # with `internal_error`; runs unknown yet whose held frames did not fit (see the ack).
+        self._overflowed: set[str] = set()
+        self._held_dropped: set[str] = set()
+        self._defer_push = False
+        self._replaying = False
         self._push: ChannelTurn | None = None
+        self._ended_push_runs: OrderedDict[str, None] = OrderedDict()
+        # `session.message` (2b.2): oc_message_id → runId de su `chat.send`.
+        self._oc_messages: OrderedDict[str, str] = OrderedDict()
+        # Tras una caída: hasta cuándo esperan los runs sin confirmar, y con qué código fallan.
+        self._lost_deadline: float | None = None
+        self._lost_code = _DISCONNECTED
+        # Runs dados por fallidos sin conexión: se abortan (por runId) al reconectar.
+        self._abort_on_reconnect: set[str] = set()
         self._push_text = ChatTextTracker()  # #241: texto ya emitido en la respuesta del push
         # #254: runId → (última fase de arranque, cuándo) de runs sin push abierto todavía.
         self._early_phases: OrderedDict[str, tuple[ProgressPhase, float]] = OrderedDict()
-        # Worker de push (#130 S3a): el dispatcher encola sin esperar desde el bucle de
-        # OpenClaw; un solo worker por canal conserva el orden start → deltas → tool → end.
+        # Worker (#130 S3a): el dispatcher encola sin esperar desde el bucle de OpenClaw; un
+        # solo worker por canal conserva el orden de todos los frames de la clave.
         self._push_worker: asyncio.Task | None = None
         self._backlog = _PushBacklog()
+        # 2b.3: los mensajes de /v1 que esperan a que el canal quede en calma
+        # (`send_exclusive`); se despiertan cada vez que algo termina.
+        self._quiet_waiters: list[asyncio.Future[None]] = []
         # Una vez puesto no vuelve atrás (el hub lo cierra o lo olvida): ni turnos ni avisos.
         self._closed = False
 
@@ -282,8 +585,9 @@ class ConversationChannel:
         return next((s for s in self._subscriptions if s.subscriber is subscriber), None)
 
     def subscribe(self, subscriber: ChannelSubscriber) -> bool:
-        """Attach a session. With a turn open, it gets `on_turn_start` for it. False if it was
-        already subscribed or belongs to another conversation."""
+        """Attach a session. With a turn open, it gets `on_turn_start` for it; then the
+        messages still pending (2b). False if it was already subscribed or belongs to another
+        conversation."""
         # Whether the device may see the conversation (`Conversation.visible_to`) is checked by
         # the caller (`TurnController.attach`, 2a.3); here, the conversation id and the
         # private-owner safety net.
@@ -313,8 +617,11 @@ class ConversationChannel:
         )
         turn = self.current_turn
         if turn is not None and turn.cancel_reason is None:
-            # Uno que se está sustituyendo o cortando no se le enseña a quien llega.
+            # Uno que se está cortando no se le enseña a quien llega.
             self._start(turn, subscription)
+        for info in list(self._runs.values()):
+            if info.message == "pending" and subscription.active:
+                self._tell(subscription, self._message(info))
         return True
 
     def unsubscribe(self, subscriber: ChannelSubscriber) -> bool:
@@ -342,21 +649,30 @@ class ConversationChannel:
         sender: ChannelSubscriber | None = None,
         run_id: str | None = None,
         audio_to: ChannelSubscriber | None = None,
+        by_client_id: str | None = None,
+        by_name: str | None = None,
+        sink: Callable[[ChannelEvent], None] | None = None,
     ) -> ChannelTurn:
         """Open the channel's turn and give every subscriber its `on_turn_start`. Raises
         `ChannelBusy` while another turn is open (end it first). `audio_to` (default: the
-        sender) is who plays its audio."""
+        sender) is who plays its audio; `by_client_id`/`by_name` (default: the sender's) say
+        who sent it, also once that session is gone; `sink` also gets every event of the turn
+        (a /v1 request's answer, 2b.3)."""
         if self.current_turn is not None:
             raise ChannelBusy(self.conversation.id)
         audio = audio_to if audio_to is not None else sender
+        if by_client_id is None and sender is not None:
+            by_client_id, by_name = sender.client.id, sender.client.name
         turn = ChannelTurn(
             id=uuid4().hex,
             conversation_id=self.conversation.id,
             origin=origin,
-            by_client_id=sender.client.id if sender is not None else None,
+            by_client_id=by_client_id,
             run_id=run_id,
+            by_name=by_name,
             _sender=weakref.ref(sender) if sender is not None else None,
             _audio=weakref.ref(audio) if audio is not None else None,
+            _sink=sink,
         )
         self.current_turn = turn
         self._started = []
@@ -388,6 +704,15 @@ class ConversationChannel:
             return False
         if isinstance(event, ChannelToken):
             turn._text.append(event.text)
+        sink = turn._sink
+        if sink is not None:
+            try:
+                sink(event)
+            except Exception as exc:  # noqa: BLE001 — boundary: a broken /v1 collector must not stop the fan-out
+                logger.warning(
+                    "Channel sink failed: conversation=%s turn=%s error=%s",
+                    self.conversation.id, turn.id, describe_error(exc),
+                )
         for subscription in list(self._started):
             if turn is not self.current_turn:
                 break  # a callback ended it
@@ -400,7 +725,7 @@ class ConversationChannel:
     def end_turn(self, turn: ChannelTurn, reason: EndReason) -> bool:
         """End the channel's open turn: one `on_turn_end` per subscriber that got its start and
         is still subscribed. Idempotent; False (turn untouched) if `turn` is not this
-        channel's open turn."""
+        channel's open turn. What waited for the turn to close goes on right after."""
         if turn is not self.current_turn:
             logger.debug(
                 "Channel turn end ignored: conversation=%s turn=%s (not the open turn)",
@@ -421,33 +746,40 @@ class ConversationChannel:
                     subscription, "on_turn_end",
                     partial(subscription.subscriber.on_turn_end, turn, reason),
                 )
+        self._settle_absorbed(turn.run_id)
+        self._touch_head()
+        self._replay()
+        self._wake_quiet()
         return True
 
     @property
     def idle(self) -> bool:
-        """Nothing keeps the channel alive: no subscribers, no open turn, no user turn's task
-        still running and no push event waiting for the worker."""
-        task = self._user_task
+        """Nothing keeps the channel alive: no subscribers, no open turn, no run of its own
+        unfinished (queued, running or waiting for its ack), nobody sending or waiting to send
+        (the send lock, a /v1 message waiting for calm), nothing waiting for the worker and no
+        `chat.abort` promised for the next reconnection (`_abort_on_reconnect`)."""
         return (
             not self._subscriptions
             and self.current_turn is None
-            and (task is None or task.done())
+            and not self._runs
+            and self._acks == 0
+            and self._senders == 0
+            and not self._quiet_waiters
+            and not self._held
             and self._backlog.pending == 0
+            and not self._deferred
+            and not self._abort_on_reconnect
         )
 
     # -- state for the sessions (watchdogs, /admin/state) ------------------------------
 
-    @property
-    def user_task(self) -> asyncio.Task | None:
-        """The task running the channel's user turn, if one was started (done or not)."""
-        return self._user_task
-
     def user_turn_running(self) -> bool:
-        task = self._user_task
-        return task is not None and not task.done()
+        """A message of this channel is still in flight: waiting for its ack, queued in
+        OpenClaw or with its reply running."""
+        return bool(self._runs) or self._acks > 0
 
     def push_backlog(self) -> tuple[int, int, float | None]:
-        """(pending, peak, since) of the push worker's queue (#219: numbers only)."""
+        """(pending, peak, since) of the worker's queue (#219: numbers only)."""
         backlog = self._backlog
         return backlog.pending, backlog.peak, backlog.since
 
@@ -460,182 +792,588 @@ class ConversationChannel:
         if note is not None:
             note(self.conversation.id)
 
-    # -- user turn ---------------------------------------------------------------------
+    # -- messages (2b) -----------------------------------------------------------------
+
+    def _message(self, info: RunInfo) -> ChannelMessage:
+        return ChannelMessage(
+            id=info.run_id,
+            conversation_id=self.conversation.id,
+            text=info.text,
+            by_client_id=info.by_client_id,
+            by_name=info.by_name,
+            state=info.message,
+        )
+
+    def _announce(self, info: RunInfo, state: MessageState) -> None:
+        """The message's new state, to every subscriber (the sender too)."""
+        info.message = state
+        message = self._message(info)
+        logger.debug(
+            "Channel message: conversation=%s id=%s state=%s text_len=%d subscribers=%d",
+            self.conversation.id, info.run_id, state, len(info.text), len(self._subscriptions),
+        )
+        for subscription in list(self._subscriptions):
+            if subscription.active:
+                self._tell(subscription, message)
+
+    def _tell(self, subscription: _Subscription, message: ChannelMessage) -> None:
+        on_message = getattr(subscription.subscriber, "on_message", None)
+        if on_message is not None:
+            self._call(subscription, "on_message", partial(on_message, message))
+
+    # -- sending (2b: OpenClaw's queue) ------------------------------------------------
 
     async def send_user_message(
-        self, sender: ChannelSubscriber, text: str, *, interrupt: bool = False
-    ) -> ChannelTurn | None:
-        """Sustituye el turno en curso (normal o push) por uno nuevo para `text`, de `sender`.
+        self,
+        sender: ChannelSubscriber,
+        text: str,
+        *,
+        interrupt: bool = False,
+        ticket: SendTicket | None = None,
+    ) -> RunInfo | str | None:
+        """Send `text` from `sender` to OpenClaw (`chat.send`), never aborting anything first:
+        during a turn it waits in OpenClaw's queue. With `interrupt` («send now»), the active
+        run alone is aborted first (its turn ends `interrupted` for everyone) and the queue is
+        left as it is. Behind a /v1 message (`send_exclusive`) it waits, in arrival order, until
+        that message's run has ended: OpenClaw's `steer` would fold it into /v1's run.
 
-        Today's order under the lock (G-08, #201): the user turn in flight is cancelled
-        (`replaced`), the open push is cut, any other run active on the key is aborted, and
-        only then the new turn opens (every subscriber gets its `on_turn_start`) and its task
-        starts. `interrupt` is not used yet (5.0 PR 2b). None if nothing started: the channel
-        is closing, `sender` left while waiting (G-09), or `sender` may not use this agent: the
-        channel is left untouched (no replace, no cut, no abort) and the session answers its
-        `send` alone (#397, `TurnController.start_user_turn`)."""
-        del interrupt  # 2b
+        Returns the accepted message's `RunInfo` (its turn opens with its run's first event);
+        a stable error code if OpenClaw did not take it (the session answers its `send` alone,
+        `TurnController.start_user_turn`); or None if nothing was sent: the channel is closing,
+        `sender` left while waiting (G-09), `sender` may not use this agent (#397: the
+        channel is left untouched), or a `cancel` cut its `ticket` (before the `chat.send`,
+        or before its ack: then its run is aborted by its runId and never announced)."""
         if self._closed:
             return None
         if not sender.agent_allowed(self.session_key):
             return None
-        tracker = sender.tracker
-        async with self._lock:
-            if self._closed:
-                return None
-            await self._replace_user_turn("replaced")
-            # Dentro del lock: el abort del push termina antes de que salga el chat.send.
-            await self._cut_push(None, "replaced")
-            await self._abort_other_runs()
-            if self._closed or not self.is_subscribed(sender):
-                return None  # close_all() pudo empezar durante la espera
-            turn = self.open_turn("user", sender=sender)
-            self._user_turn = turn
-            recorder = _SenderTracker(self, sender, tracker) if tracker is not None else None
-            task = asyncio.create_task(
-                self._run_user_turn(turn, text, tracker, recorder), name="turn"
-            )
-            self._hub.supervise(task)
-            task.add_done_callback(self._after_user_task)
-            self._user_task = task
-            return turn
+        self._senders += 1
+        try:
+            async with self._lock:
+                if interrupt and not self._closed and self.is_subscribed(sender):
+                    await self._interrupt()
+                if self._closed or not self.is_subscribed(sender):
+                    return None  # close_all() pudo empezar durante la espera
+                if ticket is not None:
+                    if ticket.cut:
+                        return None  # un `cancel` lo cubrió antes de salir
+                    ticket.sending = True
+                return await self._chat_send(
+                    text,
+                    sender=sender,
+                    by_client_id=sender.client.id,
+                    by_name=sender.client.name,
+                    tracker=sender.tracker,
+                    ticket=ticket,
+                )
+        finally:
+            self._senders -= 1
 
-    def _after_user_task(self, _task: asyncio.Task) -> None:
+    async def send_exclusive(
+        self,
+        text: str,
+        *,
+        by_client_id: str,
+        by_name: str,
+        sink: Callable[[ChannelEvent], None],
+        tracker: PipelineTracker | None = None,
+        on_accepted: Callable[[], Coroutine[Any, Any, None]] | None = None,
+    ) -> ExclusiveOutcome:
+        """A message whose answer must be its own run's (a /v1 request, 5.0 PR 2b.3): it never
+        steers into another run, nor lets another message steer into its own.
+
+        `queueMode` is untried live, so the channel guarantees it instead: holding the send
+        lock (WebSocket sends and other /v1 messages queue behind it, in arrival order), it
+        waits until the channel is calm (no open turn, no unfinished run of its own, no ack in
+        flight, nothing deferred or waiting for the worker), sends, and keeps the lock until its
+        run has ended. Its message and its turn reach the subscribers like any other (origin
+        `by_client_id`/`by_name`; nobody plays its audio); `sink` gets its turn's events (the
+        answer). `on_accepted` runs once OpenClaw acked it (/v1 counts its turn there).
+
+        Cancelling the caller (the HTTP client left) cuts only its own run: its turn ends
+        `cancelled` for every subscriber and `chat.abort` goes by its `runId`, never the key;
+        so does a failing `on_accepted`. If it cannot be sent within `TURN_TIMEOUT_S` (the lock
+        and the calm), it gives up with `turn_timeout`. A run that ends without ever opening
+        its own turn (`steer` folded it into a run that started after its `chat.send`, e.g. a
+        push) is `turn_absorbed`: its answer went to someone else's turn."""
+        self._senders += 1
+        self._exclusive += 1
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + settings.TURN_TIMEOUT_S
+        try:
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await self._lock.acquire()
+            except TimeoutError:
+                logger.warning(f"[{self._tag}] /v1 sin turno en TURN_TIMEOUT_S: no se envía")
+                return ExclusiveOutcome(error=TURN_TIMEOUT)
+            try:
+                try:
+                    async with asyncio.timeout_at(deadline):
+                        await self._until_quiet()
+                except TimeoutError:
+                    logger.warning(f"[{self._tag}] /v1 sin calma en TURN_TIMEOUT_S: no se envía")
+                    return ExclusiveOutcome(error=TURN_TIMEOUT)
+                if self._closed:
+                    return ExclusiveOutcome(error=_UNAVAILABLE)
+                result = await self._chat_send(
+                    text,
+                    sender=None,
+                    by_client_id=by_client_id,
+                    by_name=by_name,
+                    tracker=tracker,
+                    sink=sink,
+                    counts_turn=False,
+                )
+                if isinstance(result, str):
+                    return ExclusiveOutcome(error=result)
+                if result is None:
+                    return ExclusiveOutcome(error=_UNAVAILABLE)
+                info = result
+                try:
+                    if on_accepted is not None:
+                        await on_accepted()
+                    await asyncio.wait({info.finished})
+                except BaseException:
+                    # Quien espera se va (o su `on_accepted` falló): su run no sigue solo.
+                    await self._cut_own(info)
+                    raise
+                if info.recorder is not None:
+                    await info.recorder.flush()
+                if info.finished.cancelled():
+                    return ExclusiveOutcome(error=info.error_code, cut=info.error_code is None)
+                if info.error_code is None and info.turn is None:
+                    logger.warning(f"[{self._tag}] run {info.run_id} de /v1 absorbido: sin respuesta propia")
+                    return ExclusiveOutcome(error=TURN_ABSORBED)
+                return ExclusiveOutcome(error=info.error_code)
+            finally:
+                self._lock.release()
+        finally:
+            self._senders -= 1
+            self._exclusive -= 1
+            # Nadie más lo va a mirar si no tiene suscriptores (el de un origen de confianza).
+            self._hub.drop_if_idle(self.session_key, self)
+
+    @property
+    def nothing_ahead(self) -> bool:
+        """No open turn and no unfinished run of the channel's own: a message sent now is the
+        next thing to start (what a client `cancel` stops, like `cancel_head`)."""
+        return self.current_turn is None and not self._runs
+
+    @property
+    def exclusive_pending(self) -> bool:
+        """A /v1 message waits for its turn or has its run going: a session's sends wait
+        behind it (2b.3)."""
+        return self._exclusive > 0
+
+    async def interrupt_now(self) -> None:
+        """«Enviar ahora» de una sesión cuyo envío aún espera su turno (detrás de /v1, p. ej.):
+        el turno abierto del canal (o el mensaje entregado que aún no empezó) se corta ya,
+        sin esperar al lock de envío (2b.3); el envío sale después, en su orden."""
+        if not self._closed:
+            await self._interrupt()
+
+    def _orphan_ack(self, sending: asyncio.Future[str]) -> None:
+        """The ack of a `chat.send` whose sender left (I3): its run is tombstoned and
+        aborted by its runId, and what was held for it is dropped; the rest is released."""
+        self._acks -= 1
+        run_id: str | None = None
+        if not sending.cancelled() and sending.exception() is None:
+            run_id = sending.result()
+        if run_id is not None:
+            logger.info(f"[{self._tag}] ack de un envío abandonado: chat.abort de su run {run_id}")
+            self._abort_run(run_id)
+            self._held = [(e, p) for e, p in self._held if _str_run_id(p) != run_id]
+            self._hub.spawn(self._abort(run_id), "chat_abort")
+        self._release_held()
+        self._wake_quiet()
         self._hub.drop_if_idle(self.session_key, self)
 
-    async def _replace_user_turn(self, reason: EndReason) -> None:
-        """Cancela el turno del usuario en curso con `reason`, bajo el lock de quien llama.
-        G-r2-1: también uno cuya tarea aún no corrió recibe su fin (cada suscriptor, su par)."""
-        turn, task = self._user_turn, self._user_task
-        if turn is None or turn.ended:
+    def _quiet(self) -> bool:
+        """Nothing in the channel could steer a new message into another run, or be steered
+        into it: no open turn, no unfinished run of its own, no ack in flight, nothing held,
+        deferred or waiting for the worker."""
+        return (
+            self.current_turn is None
+            and not self._runs
+            and self._acks == 0
+            and not self._held
+            and not self._deferred
+            and self._backlog.pending == 0
+        )
+
+    async def _until_quiet(self) -> None:
+        loop = asyncio.get_running_loop()
+        while not self._closed and not self._quiet():
+            waiter: asyncio.Future[None] = loop.create_future()
+            self._quiet_waiters.append(waiter)
+            try:
+                await waiter
+            finally:
+                if waiter in self._quiet_waiters:
+                    self._quiet_waiters.remove(waiter)
+
+    def _wake_quiet(self) -> None:
+        """Something ended: whoever waits for calm looks again (`_until_quiet`)."""
+        waiters, self._quiet_waiters = self._quiet_waiters, []
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+    async def _cut_own(self, info: RunInfo) -> None:
+        """The caller of `send_exclusive` left: its run (only it) is aborted by its `runId`.
+        With its turn open, the turn ends `cancelled` for everyone; before it opened, its
+        message is `withdrawn`."""
+        if info.state == "done":
             return
-        self._mark_cancel(turn, reason)
-        if task is not None and not task.done():
-            await self._cancel_and_wait(task)
-        self.end_turn(turn, reason)  # no-op si su tarea ya lo cerró
+        if info.state == "absorbed":
+            # Su mensaje ya se entregó dentro de otro turno: ni `withdrawn` ni abort (ese run
+            # es de otro); solo deja de esperarse.
+            self._finish(info, cut=True)
+            return
+        turn = info.turn
+        if turn is not None and turn is self.current_turn:
+            await self.cancel("cancelled", expected=turn)
+            return
+        logger.info(f"[{self._tag}] run {info.run_id} de /v1 cortado: chat.abort")
+        self._abort_run(info.run_id)
+        if turn is None and info.message != "withdrawn":
+            self._announce(info, "withdrawn")
+        self._finish(info, cut=True)
+        await self._abort_step(info.run_id, "chat.abort de un run de /v1")
+
+    async def _chat_send(
+        self,
+        text: str,
+        *,
+        sender: ChannelSubscriber | None,
+        by_client_id: str,
+        by_name: str,
+        tracker: PipelineTracker | None,
+        sink: Callable[[ChannelEvent], None] | None = None,
+        counts_turn: bool = True,
+        ticket: SendTicket | None = None,
+    ) -> RunInfo | str | None:
+        """The `chat.send` itself, with the send lock held: its ack registers the run and
+        announces its message (`pending` behind an open turn or another run, else
+        `delivered`). A stable code if OpenClaw did not take it; None if the channel closed
+        while waiting for the ack (the run is aborted)."""
+        recorder = _SenderTracker(self, sender, tracker) if tracker is not None else None
+        code: str | None = None
+        run_id = ""
+        accepted = False
+        self._acks += 1
+        orphaned = False
+        sending = asyncio.ensure_future(self.orchestrator.send(text, self.session_key))
+        try:
+            run_id = await asyncio.shield(sending)
+            accepted = True
+        except asyncio.CancelledError:
+            # Quien envía se va antes del ack (/v1 que se desconecta, un close_all): el
+            # `chat.send` ya salió. Su ack, cuando llegue, entierra y aborta ese run; hasta
+            # entonces lo retenido sigue retenido (sus frames no son un push).
+            orphaned = True
+            sending.add_done_callback(self._orphan_ack)
+            raise
+        except orchestration.OrchestratorError as e:
+            code = str(e)  # siempre un código estable (#228)
+        except Exception as e:  # noqa: BLE001 — frontera: un envío roto no cierra el canal
+            # Solo el tipo: el mensaje puede llevar texto del usuario.
+            logger.error(f"[{self._tag}] chat.send falló: {type(e).__name__}")
+            logger.debug(f"[{self._tag}] chat.send: {traceback_no_message(e)}")
+            code = "internal_error"
+        finally:
+            if not orphaned:
+                self._acks -= 1
+                if not accepted:
+                    # Sin run propio (un fallo): lo retenido no espera más; lo que no es de
+                    # nadie va al push.
+                    self._release_held()
+        if code is not None:
+            logger.error(f"[{self._tag}] Orchestrator error: {code}")
+            if tracker is not None:
+                tracker.start_turn()
+            gateway_stats.turn_started("normal")
+            gateway_stats.turn_error(code)
+            return code
+        if self._closed:
+            # El canal se cerró mientras se esperaba el ack: el run no se registra (nadie
+            # resolvería su `finished`); se aborta, solo él, y lo retenido se suelta.
+            logger.info(f"[{self._tag}] ack de un canal ya cerrado: chat.abort de su run")
+            self._abort_run(run_id)
+            self._held.clear()
+            await self._abort_step(run_id, "chat.abort de un run tras el cierre")
+            return None
+        if ticket is not None and ticket.cut:
+            # Un `cancel` del cliente llegó mientras se esperaba el ack (N2): el run no se
+            # registra ni se anuncia; se entierra y se aborta (solo él), y lo suyo retenido se
+            # descarta.
+            logger.info(f"[{self._tag}] envío cancelado antes de su ack: chat.abort de {run_id}")
+            self._abort_run(run_id)
+            self._held = [(e, p) for e, p in self._held if _str_run_id(p) != run_id]
+            self._release_held()
+            await self._abort_step(run_id, "chat.abort de un envío cancelado")
+            return None
+        ahead = self.current_turn is not None or bool(self._runs)
+        info = RunInfo(
+            run_id=run_id,
+            by_client_id=by_client_id,
+            by_name=by_name,
+            text=text,
+            finished=asyncio.get_running_loop().create_future(),
+            recorder=recorder,
+            sink=sink,
+            counts_turn=counts_turn,
+            _sender=weakref.ref(sender) if sender is not None else None,
+        )
+        self._runs[run_id] = info
+        logger.debug(
+            f"[{self._tag}] mensaje aceptado: run={run_id} "
+            f"{'pendiente' if ahead else 'entregado'} text_len={len(text)}"
+        )
+        overflowed = run_id in self._held_dropped
+        if overflowed:
+            # Parte de lo suyo retenido no cupo (TURN_QUEUE_MAX): no se pinta a medias.
+            self._held_dropped.discard(run_id)
+            self._held = [(e, p) for e, p in self._held if _str_run_id(p) != run_id]
+        self._announce(info, "pending" if ahead else "delivered")
+        self._release_held()
+        if overflowed:
+            self._overflow_run(run_id)
+        self._wake()
+        return info
+
+    async def _interrupt(self) -> None:
+        """«Enviar ahora»: aborta el run activo (solo ese, por su runId) y su turno termina
+        `interrupted` para todos; la cola de OpenClaw queda como está."""
+        turn = self.current_turn
+        if turn is not None:
+            await self.cancel("interrupted", expected=turn)
+        else:
+            await self.cancel_head("interrupted")
 
     async def cancel(
-        self, reason: EndReason, *, push: bool = True, expected: ChannelTurn | None = None
+        self, reason: EndReason, *, expected: ChannelTurn | None = None
     ) -> ChannelTurn | None:
-        """Cancela el turno abierto (o `expected`, si sigue abierto): el del usuario o, con
-        `push`, el push. G-08 (#201): el objetivo se captura al entrar y las llamadas se
-        serializan; dos llamadas a la vez lo cancelan una vez. Devuelve el turno cancelado."""
+        """Para el turno abierto (o `expected`, si sigue abierto), lo haya iniciado quien lo
+        haya iniciado: su run (solo ese) se aborta en OpenClaw y su turno termina con `reason`
+        para todos (también un push). Dos llamadas a la vez lo cancelan una vez
+        (G-08: el cambio de estado es síncrono). Devuelve el turno cancelado."""
         turn = expected if expected is not None else self.current_turn
-        if turn is None or turn.ended or (turn.origin == "push" and not push):
+        if turn is None or turn.ended or turn is not self.current_turn:
             return None
-        async with self._lock:
-            if turn is not self.current_turn:  # otro lo canceló mientras esperábamos el lock
-                return None
-            if turn.origin == "user":
-                await self._replace_user_turn(reason)
-                return turn
+        if turn.origin == "push":
             return await self._cut_push(turn, reason)
+        run_id = turn.run_id
+        info = self._runs.get(run_id) if run_id is not None else None
+        # Antes del abort: nada más de su run llega (#285), tampoco su `aborted`.
+        self._abort_run(run_id)
+        self._mark_cancel(turn, reason)
+        if info is not None:
+            self._finish(info, cut=True)
+        self.end_turn(turn, reason)
+        await self._abort_step(run_id, "chat.abort del turno")
+        return turn
+
+    async def cancel_head(self, reason: EndReason) -> bool:
+        """Sin turno abierto: el siguiente run propio, cuyo turno aún no se abrió (nada va
+        delante), se aborta y su mensaje queda `withdrawn` para todos (no llegó a tener turno).
+        Vale entregado o aún `pending`: entre dos turnos OpenClaw ya lo está corriendo aunque
+        su primer evento no haya llegado (revisión final de la 2b, m1). `withdraw` sigue
+        siendo solo para los pendientes."""
+        head = self._head()
+        if head is None or head.message == "withdrawn":
+            return False
+        logger.info(f"[{self._tag}] run {head.run_id} sin empezar: chat.abort ({reason})")
+        self._abort_run(head.run_id)
+        self._announce(head, "withdrawn")
+        self._finish(head, cut=True)
+        await self._abort_step(head.run_id, "chat.abort del run sin empezar")
+        return True
+
+    async def withdraw(self, message_id: str) -> bool:
+        """Quita un mensaje que aún espera su turno (`pending`), lo envíe quien lo envíe:
+        `chat.abort` de su runId (solo ese) y `withdrawn` para todos. False (nada cambia) si
+        no está pendiente: ya entregado, ya quitado, de otra conversación o desconocido."""
+        info = self._runs.get(message_id)
+        if info is None or info.turn is not None or info.message != "pending":
+            return False
+        logger.info(f"[{self._tag}] mensaje {message_id} quitado de la cola")
+        self._abort_run(message_id)
+        self._announce(info, "withdrawn")
+        self._finish(info, cut=True)
+        await self._abort_step(message_id, "chat.abort de un pendiente")
+        return True
 
     def _mark_cancel(self, turn: ChannelTurn, reason: EndReason) -> None:
         # Desde aquí el turno ya no cuenta progreso ni suena (#254, A-2): los suscriptores lo
-        # ven en `cancel_reason` mientras su tarea se limpia.
+        # ven en `cancel_reason` mientras su sesión lo cierra.
         if turn.cancel_reason is None:
             turn.cancel_reason = reason
 
-    async def _cancel_and_wait(self, task: asyncio.Task) -> None:
-        # Sin tope: el turno nuevo no arranca hasta que el viejo terminó. Si cancelan a quien
-        # llama, se termina de esperar y se relanza (#221); solo esa cancelación: una heredada
-        # (cancelling() > 0) no debe tumbar el STT en un barge-in.
-        td = Teardown(f"[{self._tag}] cancelar turno")
-        await td.cancel(task, "turno anterior")
-        if self._user_task is task:
-            self._user_task = None
+    async def _abort_step(self, run_id: str | None, what: str) -> None:
+        # Termina aunque cancelen a quien llama (#221); esa cancelación se relanza después.
+        td = Teardown(f"[{self._tag}] {what}")
+        await td.step(self._abort(run_id), what)
         td.raise_if_cancelled()
 
-    async def _abort_other_runs(self) -> None:
-        """Ningún otro run activo en la session_key cuando sale el chat.send del usuario:
-        OpenClaw lo plegaría en ese run (docs/openclaw-protocol.md, #219) y la respuesta
-        llegaría con otro runId. Pasa con un push que no llegó a abrirse (aún en la cola del
-        worker) o que nadie veía. Lápida y chat.abort, bajo el lock de quien llama."""
-        runs = self._turn_registry.active_runs(self.session_key)
-        if not runs:
+    async def _abort(self, run_id: str | None) -> None:
+        """`chat.abort` de un run (solo ese). Sin runId (un push sin él) no se aborta nada:
+        abortar la clave entera se llevaría también los mensajes en la cola (2b); el turno ya
+        se cerró aquí."""
+        if run_id is None:
+            logger.warning(f"[{self._tag}] turno cortado sin runId: no se aborta nada en OpenClaw")
             return
-        for run_id in runs:
-            self._turn_registry.abort_run(run_id)
-        logger.info(
-            f"[{self._tag}] {len(runs)} run(s) de OpenClaw activos en la sesión: "
-            f"chat.abort antes del send"
+        await self.orchestrator.abort_run(self.session_key, run_id)
+
+    def _spawn_abort(self, run_id: str | None) -> None:
+        if run_id is None:
+            logger.warning(f"[{self._tag}] turno cortado sin runId: no se aborta nada en OpenClaw")
+            return
+        self._hub.spawn(self._abort(run_id), "chat_abort")
+
+    # -- frames from the dispatcher ----------------------------------------------------
+
+    def take_frame(self, event: str, payload: dict, *, hold: bool = False) -> bool:
+        """A frame (`chat`, `agent`, `session.tool`) of this channel's key. True if the channel
+        took it: a frame of one of its own runs (queued for the worker) or, with `hold`, of a
+        run nobody knows while a `chat.send` of this channel waits for its ack (held until the
+        ack names its run; decision 3). False: not the channel's (a push)."""
+        run_id = _str_run_id(payload)
+        if run_id is None or self._closed:
+            return False
+        if run_id in self._runs or run_id in self._done_runs:
+            self._enqueue(("run", (event, payload), run_id))
+            return True
+        if hold and self._acks > 0:
+            push = self._push
+            if push is not None and not push.ended:
+                # El push abierto no es de nadie que espere su ack: sus frames no se retienen
+                # (retenidos, su tope #286 vencería sin que le faltara progreso; 2b.2).
+                if push.run_id == run_id and not any(
+                    _str_run_id(held) == run_id for _, held in self._held
+                ):
+                    return False
+                if push.run_id is None or push.run_id == run_id:
+                    # Retenido (detrás de uno suyo que ya espera, para no adelantarlo): su
+                    # llegada cuenta como progreso del push (#286).
+                    push.progress_at = time.monotonic()
+            if len(self._held) >= settings.TURN_QUEUE_MAX and not _ends_run(event, payload):
+                # m3: si resulta ser de un run propio, el ack lo hace fallar (`internal_error`);
+                # el fin de un run nunca se descarta (sin él su turno no se cerraría).
+                logger.warning(f"[{self._tag}] demasiados frames retenidos: se descarta uno")
+                self._held_dropped.add(run_id)
+            else:
+                self._held.append((event, payload))
+            return True
+        return False
+
+    def _release_held(self) -> None:
+        """Tras un ack (o un `chat.send` fallido): lo retenido de un run ya conocido va a su
+        run; lo que sigue sin dueño y sin más acks pendientes, al push."""
+        held, self._held = self._held, []
+        for event, payload in held:
+            run_id = _str_run_id(payload)
+            if event == "session.message":
+                if self._acks > 0:
+                    self._held.append((event, payload))
+                else:
+                    self._enqueue(("smsg", payload, None))
+            elif run_id is not None and (run_id in self._runs or run_id in self._done_runs):
+                self._enqueue(("run", (event, payload), run_id))
+            elif self._acks > 0:
+                self._held.append((event, payload))
+            else:
+                self._forward_push(event, payload)
+        if self._acks == 0:
+            self._held_dropped.clear()  # lo que no fue de nadie era de un push
+
+    def _forward_push(self, event: str, payload: dict) -> None:
+        """Un frame que resultó no ser de un run propio: lo que el dispatcher habría hecho con
+        él como push (`push_route`). Un push abierto así cuenta su tope (#286) desde ahora, no
+        desde que llegó retenido."""
+        route = push_route(event, payload)
+        if route is None:
+            return
+        kind, arg = route
+        self.enqueue_push(kind, arg, _str_run_id(payload))
+
+    def take_session_message(self, payload: dict) -> None:
+        """A `user` `session.message` of this key (2b.2), from the dispatcher: to the worker,
+        in order with the runs' frames (a steered run's empty `final` comes after it). It
+        carries user text: never logged."""
+        if self._closed:
+            return
+        if self._acks > 0 and len(self._held) < settings.TURN_QUEUE_MAX:
+            # Puede ser del `chat.send` cuyo ack aún no llegó: espera con lo retenido, en orden.
+            self._held.append(("session.message", payload))
+            return
+        self._enqueue(("smsg", payload, None))
+
+    def fail_run(self, run_id: str, code: str, *, crashed: bool = False) -> None:
+        """One of the channel's runs failed outside OpenClaw's frames (a stable `code`): its
+        turn (opened if it had none) carries TURN_ERROR `code` and ends. `crashed`: an
+        unexpected failure, nobody waits for its audio. In order with its frames."""
+        self._enqueue(("fail", (code, crashed), run_id))
+
+    def connection_lost(self, code: str) -> None:
+        """The OpenClaw connection dropped: every run of this channel with its turn open (or
+        frames already waiting) ends with `code` (`orchestrator_disconnected`); one still in
+        OpenClaw's queue waits, unconfirmed, for the reconnection to say whether it is still
+        there (`reconcile_pending`), at most `RECONNECT_GRACE_S`."""
+        if self._runs or self._held:
+            self._enqueue(("lost", code, None))
+
+    @property
+    def needs_reconcile(self) -> bool:
+        """After a reconnection: whether to re-read `pendingInputs` (someone is attached, or
+        runs wait unconfirmed)."""
+        return not self._closed and (
+            bool(self._subscriptions) or any(i.unconfirmed for i in self._runs.values())
         )
-        await self.orchestrator.abort(self.session_key)
 
-    async def _run_user_turn(
-        self,
-        turn: ChannelTurn,
-        text: str,
-        tracker: PipelineTracker | None,
-        recorder: _SenderTracker | None,
-    ) -> None:
-        # Sus suscriptores vieron (o verán) su turn_start: le sigue su fin (G-10), pase lo que
-        # pase desde aquí.
-        reason: EndReason = "error"
+    def reconnected(self) -> None:
+        """OpenClaw is back (`ChannelHub.reconnected`): the worker decides, in order behind the
+        drop (`lost`) it may not have handled yet (`_on_reconnected`)."""
+        if not self._closed:
+            self._enqueue(("reconnected", None, None))
+
+    def _on_reconnected(self) -> None:
+        for run_id in sorted(self._abort_on_reconnect):
+            self._spawn_abort(run_id)
+        self._abort_on_reconnect.clear()
+        if self.needs_reconcile:
+            self._hub.spawn(self.reconcile_pending(), "pending_inputs")
+
+    async def reconcile_pending(self) -> None:
+        """OpenClaw is back (`ReconnectingOpenClawClient.on_connected`): re-read the key's
+        `chat.history` `pendingInputs` (a read method) and keep pending the unconfirmed runs it
+        still lists; the rest end with `orchestrator_disconnected`. Unreadable: nothing is
+        proven, they all end. Only ids and counts are logged."""
+        if self._closed:
+            return
+        alive: set[str] | None
         try:
-            if tracker is not None:
-                tracker.start_turn()
-            self._note_turn()
-            gateway_stats.turn_started("normal")
-            reason = await self._stream(turn, text, recorder)
-        except asyncio.CancelledError:
-            reason = turn.cancel_reason or "cancelled"
-            raise
-        except Exception as e:  # noqa: BLE001 — frontera: un turno roto no cierra el canal
-            # Solo el tipo: el mensaje puede llevar texto del usuario.
-            logger.error(f"[{self._tag}] Turno falló: {type(e).__name__}")
-            turn.crashed = True
-            gateway_stats.turn_error("internal_error")
-            self.emit(turn, ChannelError("internal_error"))
-        finally:
-            self.end_turn(turn, reason)
-
-    async def _stream(
-        self, turn: ChannelTurn, text: str, tracker: _SenderTracker | None
-    ) -> EndReason:
-        # Los suscriptores solo encolan (decisión 1): nadie frena el stream de los demás, y uno
-        # que se va no lo aborta (decisión 2: G-18 se invierte).
-        async def on_token(token_text: str) -> None:
-            self.emit(turn, ChannelToken(token_text))
-
-        async def on_tool_call(tool_call: ToolCallEvent) -> None:
-            self.emit(turn, ChannelToolCall(tool_call))
-
-        async def on_progress(phase: ProgressPhase) -> None:
-            self.emit(turn, ChannelProgress(Progress(phase)))
-
-        try:
-            await orchestration.call_orchestrator(
-                self.orchestrator,
-                text,
-                self.session_key,
-                tracker=tracker,
-                on_token=on_token,
-                on_tool_call=on_tool_call,
-                on_progress=on_progress,
+            history = await self.orchestrator.request(
+                "chat.history", {"sessionKey": self.session_key, "limit": 1}
             )
-            return "done"
-        except RuntimeError as e:
-            # Solo OrchestratorError lleva un código estable; cualquier otro texto de
-            # excepción puede llevar detalle interno y no sale del proceso (#238).
-            stable = isinstance(e, orchestration.OrchestratorError)
-            code = str(e) if stable else "internal_error"
-            logger.error(f"[{self._tag}] Orchestrator error: {code} ({type(e).__name__})")
-            gateway_stats.turn_error(code)
-            if not stable:
-                logger.debug(f"[{self._tag}] turno: {traceback_no_message(e)}")
-            self.emit(turn, ChannelError(code))
-            return "timeout" if code == "turn_timeout" else "error"
+            alive = pending_run_ids(history)
+        except Exception as e:  # noqa: BLE001 — frontera: sin lectura, nada demuestra que siga en cola
+            logger.warning(f"[{self._tag}] pendingInputs tras reconectar: {describe_error(e)}")
+            alive = None
+        self._enqueue(("reconcile", alive, None))
 
-    # -- push --------------------------------------------------------------------------
+    # -- the worker --------------------------------------------------------------------
 
     def enqueue_push(self, kind: str, arg: Any, run_id: str | None = None) -> None:
         """Encola un evento de push para el worker (#130 S3a). Síncrono, nunca bloquea: lo
-        llama el bucle de OpenClaw vía FrameDispatcher. `kind`: "turn_start" | "chat" |
-        "tool" | "fallback" | "turn_end" | "turn_error"; `arg`: la session_key (turn_start,
-        turn_end), el payload (chat/tool) o el `data` del `agent` (fallback/turn_error, #397);
+        llama el bucle de OpenClaw vía FrameDispatcher. `kind`: "turn_start" | "open" |
+        "chat" | "tool" | "fallback" | "turn_end" | "turn_error" (`push_route`); `arg`: la
+        session_key (turn_start, open, turn_end), el payload (chat/tool) o el `data` del `agent` (fallback/turn_error, #397);
         `run_id`: el runId del evento, si lo trae. No hace nada una vez cerrado el canal."""
+        self._enqueue((kind, arg, run_id))
+
+    def _enqueue(self, item: tuple[str, Any, str | None]) -> None:
         if self._closed:
             return
         if self._push_worker is None or self._push_worker.done():
@@ -645,11 +1383,593 @@ class ConversationChannel:
             backlog.since = time.monotonic()
         backlog.pending += 1
         backlog.peak = max(backlog.peak, backlog.pending)
-        backlog.queue.put_nowait((kind, arg, run_id))
+        backlog.queue.put_nowait(item)
+
+    def _wake(self) -> None:
+        """El worker recalcula sus topes (un run nuevo que vigilar), salvo si es él quien llama."""
+        worker = self._push_worker
+        if worker is not None and worker is asyncio.current_task():
+            return
+        if self._active_run() is not None:
+            self._enqueue(("tick", None, None))
 
     async def push_idle(self) -> None:
         """Espera a que el worker termine todo lo encolado (para tests)."""
         await self._backlog.queue.join()
+
+    async def _push_worker_loop(self) -> None:
+        queue = self._backlog.queue
+        while not self._closed:
+            budget = self._budget_left()
+            # Con eventos en cola el turno no está parado: solo se espera con tope si no hay.
+            if budget is not None and queue.empty():
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=max(0.0, budget))
+                except TimeoutError:
+                    self._safely("timeout", self._on_timeouts)
+                    if self._backlog.pending == 0:
+                        self._hub.drop_if_idle(self.session_key, self)
+                    continue
+            else:
+                item = await queue.get()
+            try:
+                self._handle(item)
+            except Exception as e:  # noqa: BLE001 — frontera: un evento roto no para el worker
+                self._log_push_failure(item[0], e)
+            finally:
+                backlog = self._backlog
+                backlog.pending = max(0, backlog.pending - 1)
+                if backlog.pending == 0:
+                    backlog.since = None
+                    self._wake_quiet()
+                queue.task_done()
+            if self._backlog.pending == 0:
+                self._hub.drop_if_idle(self.session_key, self)
+
+    def _safely(self, what: str, step: Callable[[], None]) -> None:
+        try:
+            step()
+        except Exception as e:  # noqa: BLE001 — frontera: un paso roto no para el worker
+            self._log_push_failure(what, e)
+
+    def _log_push_failure(self, what: str, e: Exception) -> None:
+        # Solo el tipo: el payload puede llevar texto del usuario.
+        logger.warning(f"[{self._tag}] push {what} falló: {type(e).__name__}")
+
+    def _handle(self, item: tuple[str, Any, str | None]) -> None:
+        kind, arg, run_id = item
+        if kind == "tick":
+            return
+        if self._must_defer(kind, arg, run_id):
+            self._defer(item)
+            return
+        if kind == "run" and run_id is not None:
+            self._run_frame(run_id, arg[0], arg[1])
+        elif kind == "fail" and run_id is not None:
+            self._run_fail(run_id, arg[0], arg[1])
+        elif kind == "lost":
+            self._lost(arg)
+        elif kind == "smsg":
+            self._session_message(arg)
+        elif kind == "reconcile":
+            self._reconcile(arg)
+        elif kind == "reconnected":
+            self._on_reconnected()
+        else:
+            self._push_item(kind, arg, run_id)
+
+    # -- one turn at a time: what waits for the open turn -------------------------------
+
+    def _must_defer(self, kind: str, arg: Any, run_id: str | None) -> bool:
+        if kind in ("run", "fail"):
+            info = self._runs.get(run_id) if run_id is not None else None
+            if info is None:
+                return False  # terminado o desconocido: su manejador lo descarta
+            if run_id in self._deferred_runs:
+                return True  # detrás de lo suyo que ya espera
+            if info.turn is not None or self.current_turn is None:
+                return False
+            if info.state == "absorbed":
+                return False  # no abrirá turno: su `final` vacío solo lo da por terminado
+            if kind == "fail":
+                return True
+            event, payload = arg
+            return _opens_run(event, payload) or _lifecycle_error(event, payload)
+        if kind in ("lost", "smsg", "reconcile", "reconnected"):
+            return False
+        if self._defer_push:
+            return True
+        current = self.current_turn
+        return current is not None and current.origin == "user" and self._push_opens(kind, arg, run_id)
+
+    def _push_opens(self, kind: str, arg: Any, run_id: str | None) -> bool:
+        """Este evento de push abriría un push (no hay ninguno abierto): su primer evento."""
+        if kind == "turn_start":
+            return True
+        if run_id is not None and run_id in self._ended_push_runs:
+            return False
+        if kind in ("open", "tool", "fallback"):
+            return True
+        return kind == "chat" and _as_dict(arg).get("state") not in _TERMINAL_CHAT
+
+    def _defer(self, item: tuple[str, Any, str | None]) -> None:
+        kind, arg, run_id = item
+        if run_id is not None and run_id in self._overflowed and kind == "run":
+            return  # ya falla por TURN_QUEUE_MAX: lo suyo no se pinta
+        if len(self._deferred) >= settings.TURN_QUEUE_MAX:
+            if kind in ("run", "fail") and run_id is not None and run_id in self._runs:
+                self._overflow_deferred_run(run_id)
+                return
+            if not _ends_push(kind, arg):
+                logger.warning(f"[{self._tag}] demasiados eventos en espera de turno: se descarta uno")
+                return
+            # El fin de un push nunca se descarta: sin él el push no se cerraría.
+        self._deferred.append(item)
+        self._mark_deferred(item)
+
+    def _overflow_deferred_run(self, run_id: str) -> None:
+        """m3: a run whose frames do not fit while it waits for the open turn fails, once: its
+        waiting frames are dropped and replaced by its failure (`internal_error`, kept past
+        the cap: one per run), and it is buried and aborted by its runId."""
+        if run_id in self._overflowed:
+            return
+        self._bury_overflowed(run_id)
+        self._deferred = deque(
+            i for i in self._deferred if not (i[0] in ("run", "fail") and i[2] == run_id)
+        )
+        item: tuple[str, Any, str | None] = ("fail", (OVERFLOW_CODE, False), run_id)
+        self._deferred.append(item)
+        self._mark_deferred(item)
+
+    def _overflow_run(self, run_id: str) -> None:
+        """m3: a run whose held frames did not fit fails with `internal_error` (in order behind
+        what was released of it) and is buried and aborted by its runId."""
+        if run_id in self._overflowed:
+            return
+        self._bury_overflowed(run_id)
+        self.fail_run(run_id, OVERFLOW_CODE)
+
+    def _bury_overflowed(self, run_id: str) -> None:
+        logger.warning(
+            f"[{self._tag}] run {run_id}: más de TURN_QUEUE_MAX eventos en espera; falla "
+            f"({OVERFLOW_CODE}) y chat.abort de ese run"
+        )
+        self._overflowed.add(run_id)
+        self._abort_run(run_id)
+        self._spawn_abort(run_id)
+
+    def _mark_deferred(self, item: tuple[str, Any, str | None]) -> None:
+        kind, _, run_id = item
+        if kind in ("run", "fail"):
+            if run_id is not None:
+                self._deferred_runs.add(run_id)
+        elif kind != "lost":
+            self._defer_push = True
+
+    def _replay(self) -> None:
+        """Con el turno cerrado, lo que esperaba sigue, en orden; lo que vuelve a encontrar un
+        turno abierto (lo abrió algo de lo anterior) espera otra vez, con lo que va detrás."""
+        if self._replaying or not self._deferred:
+            return
+        if self._closed:
+            self._deferred.clear()
+            return
+        self._replaying = True
+        try:
+            while self._deferred and self.current_turn is None:
+                items, self._deferred = self._deferred, deque()
+                self._deferred_runs.clear()
+                self._defer_push = False
+                while items:
+                    item = items.popleft()
+                    try:
+                        self._handle(item)
+                    except Exception as e:  # noqa: BLE001 — frontera: un evento roto no para el resto
+                        self._log_push_failure(item[0], e)
+                    if self._deferred:
+                        for rest in items:
+                            self._mark_deferred(rest)
+                        self._deferred.extend(items)
+                        break
+        finally:
+            self._replaying = False
+
+    # -- the channel's own runs ---------------------------------------------------------
+
+    def _head(self) -> RunInfo | None:
+        """Sin turno abierto, el primer run propio que aún no abrió el suyo (el siguiente)."""
+        if self.current_turn is not None:
+            return None
+        # Uno absorbido (`steer`) nunca tendrá turno propio: no es el siguiente.
+        return next((i for i in self._runs.values() if i.turn is None and i.state == "queued"), None)
+
+    def _active_run(self) -> RunInfo | None:
+        """El run cuyo tope de TURN_TIMEOUT_S corre: el del turno abierto, o el siguiente."""
+        turn = self.current_turn
+        if turn is not None:
+            if turn.origin != "user" or turn.run_id is None:
+                return None
+            return self._runs.get(turn.run_id)
+        head = self._head()
+        # Uno sin confirmar tras una caída espera a la reconexión (RECONNECT_GRACE_S), no a su tope.
+        return None if head is None or head.unconfirmed else head
+
+    def _touch_head(self) -> None:
+        """Nada va delante del siguiente run: su tope empieza ahora."""
+        head = self._head()
+        if head is not None:
+            head.progress_at = time.monotonic()
+            self._wake()
+
+    def _run_frame(self, run_id: str, event: str, payload: dict) -> None:
+        info = self._runs.get(run_id)
+        if info is None:
+            logger.debug(f"[{self._tag}] frame de un run terminado descartado")
+            return
+        info.progress_at = time.monotonic()
+        info.unconfirmed = False  # un frame suyo demuestra que sigue vivo
+        if event == "chat":
+            state = payload.get("state")
+            if state in _TERMINAL_CHAT:
+                self._run_terminal(info, state, payload)
+                return
+            phase = chat_status_phase(payload)
+            turn = self._open_run(info)
+            if phase is not None:  # #254: una fase de arranque, sin texto
+                self.emit(turn, ChannelProgress(Progress(phase)))
+                return
+            delta = info.chat_text.feed(payload)
+            if delta:
+                self._run_token(info, turn, delta)
+        elif event == "session.tool":
+            tool_call = ToolCallEvent.from_session_tool_payload(_as_dict(payload.get("data")))
+            if tool_call is not None:
+                self.emit(self._open_run(info), ChannelToolCall(tool_call))
+        elif event == "agent":
+            data = _as_dict(payload.get("data"))
+            if payload.get("stream") == "error" and data.get("reason") == "seq gap":
+                # 2026.11.7: el aviso de OpenClaw en lugar del `start` de un run sacado de la
+                # cola. No es un fallo: no abre nada.
+                logger.debug(f"[{self._tag}] run {run_id}: aviso seq gap")
+                return
+            if payload.get("stream") in (None, "lifecycle") and data.get("phase") == "fallback_step":
+                # #397: la razón del fallo de su run, para clasificar su error después.
+                info.fallback_reason = fallback_reason(data, info.fallback_reason)
+            if _lifecycle_error(event, payload):
+                self._run_lifecycle_error(info, data)
+            elif _opens_run(event, payload):
+                self._open_run(info)
+
+    def _open_run(self, info: RunInfo) -> ChannelTurn:
+        """El turno del run, abierto con su primer evento (C3): su mensaje pasa a `delivered`
+        (si esperaba) antes del turn_start."""
+        if info.turn is not None:
+            return info.turn
+        if info.message == "pending":
+            self._announce(info, "delivered")
+        turn = self.open_turn(
+            "user",
+            sender=info.by_session,
+            run_id=info.run_id,
+            by_client_id=info.by_client_id,
+            by_name=info.by_name,
+            sink=info.sink,
+        )
+        info.turn = turn
+        info.state = "running"
+        if info.counts_turn:
+            self._note_turn()
+        gateway_stats.turn_started("normal")
+        if info.recorder is not None:
+            # El pipeline del turno en la sesión que lo envió: desde que se abre (lo que
+            # esperó en la cola de OpenClaw no cuenta como latencia del modelo).
+            info.recorder.start_turn()
+            info.recorder.record_soon("llm_start")
+        return turn
+
+    def _run_token(self, info: RunInfo, turn: ChannelTurn, text: str) -> None:
+        info.tokens += 1
+        if info.tokens == 1 and info.recorder is not None:
+            info.recorder.record_soon("llm_first_token")  # antes que el token, como antes
+        self.emit(turn, ChannelToken(text))
+
+    def _run_terminal(self, info: RunInfo, state: str, payload: dict) -> None:
+        """El `chat` terminal del run: `final` (con la cola de texto que falte; sin `message`,
+        el texto ya llegó en los deltas), `aborted` o `error` (#300, #397).
+
+        Uno que nunca abrió su turno (decisión 4 de la 2b): un `final` sin texto (absorbido por
+        `steer`, o vacío) no abre nada y su mensaje queda `delivered`; un `final` con texto
+        (p. ej. la respuesta de un comando `/queue …`) abre, emite su texto y cierra en el
+        acto; `aborted` no abre nada (si era un pendiente, `withdrawn`); `error` abre y cierra
+        con su TURN_ERROR, para que un pendiente que falla no desaparezca en silencio."""
+        if info.turn is None:
+            if state == "final":
+                text = info.chat_text.feed(payload)
+                if not text:
+                    # Sin evento propio ni texto: absorbido por el run activo, o vacío.
+                    if info.message == "pending":
+                        self._announce(info, "delivered")
+                    self._finish(info)
+                    return
+                turn = self._open_run(info)
+                self._run_token(info, turn, text)
+                self._end_run(info, "done")
+                return
+            if state == "aborted":
+                if info.message == "pending":
+                    self._announce(info, "withdrawn")
+                self._finish(info)
+                return
+            if info.state == "absorbed":
+                # Su mensaje ya llegó dentro de otro turno: nada que abrir.
+                self._finish(info)
+                return
+            turn = self._open_run(info)
+            self._run_error(info, turn, classify_failure(payload, fallback_reason=info.fallback_reason))
+            return
+        turn = info.turn
+        if state == "final":
+            delta = info.chat_text.feed(payload)  # #241: lo que los deltas no trajeron
+            if delta:
+                self._run_token(info, turn, delta)
+            self._end_run(info, "done")
+        elif state == "aborted":
+            self._end_run(info, "cancelled")  # lo abortó otro (no el gateway: lápida)
+        else:
+            self._run_error(info, turn, classify_failure(payload, fallback_reason=info.fallback_reason))
+
+    def _run_lifecycle_error(self, info: RunInfo, data: dict) -> None:
+        """`agent` lifecycle `error` de un run propio (#300). Con su turno abierto, su `chat`
+        `error` llega detrás y lo cierra (con `errorKind`). Uno que nunca abrió su turno
+        (decisión 4) lo abre y lo cierra ya con su TURN_ERROR; su `chat` `error` tardío se
+        descarta (run terminado)."""
+        if info.turn is not None:
+            return
+        if info.state == "absorbed":
+            self._finish(info)
+            return
+        turn = self._open_run(info)
+        self._run_error(info, turn, classify_failure(data, fallback_reason=info.fallback_reason))
+
+    def _run_error(
+        self, info: RunInfo, turn: ChannelTurn, code: str, *, crashed: bool = False
+    ) -> None:
+        # Solo el código estable: nunca el texto de OpenClaw (#228, #397).
+        logger.error(f"[{self._tag}] Orchestrator error: {code}")
+        gateway_stats.turn_error(code)
+        info.error_code = code
+        if crashed:
+            turn.crashed = True
+        self.emit(turn, ChannelError(code))
+        self._end_run(info, "timeout" if code == "turn_timeout" else "error")
+
+    def _end_run(self, info: RunInfo, reason: EndReason) -> None:
+        turn = info.turn
+        if reason == "done" and info.recorder is not None:
+            info.recorder.record_soon("llm_done", token_count=info.tokens)
+        self._finish(info)
+        if turn is not None and not turn.ended:
+            self.end_turn(turn, reason)
+
+    def _finish(self, info: RunInfo, *, cut: bool = False) -> None:
+        """El run terminó. `cut`: lo cortó el gateway (cancel, interrupt, withdraw, cierre):
+        su `finished` queda cancelado, como antes la tarea del turno."""
+        if info.state == "done":
+            return
+        info.state = "done"
+        self._runs.pop(info.run_id, None)
+        self._deferred_runs.discard(info.run_id)
+        self._overflowed.discard(info.run_id)
+        # m5: a late frame of it is never a push, even once this channel is dropped.
+        self._turn_registry.finish_run(info.run_id)
+        self._done_runs[info.run_id] = None
+        while len(self._done_runs) > _DONE_RUNS:
+            self._done_runs.popitem(last=False)
+        if not info.finished.done():
+            if cut:
+                info.finished.cancel()
+            else:
+                info.finished.set_result(None)
+        self._touch_head()
+        self._wake_quiet()
+
+    def _run_fail(self, run_id: str, code: str, crashed: bool) -> None:
+        info = self._runs.get(run_id)
+        if info is None:
+            return
+        self._run_error(info, self._open_run(info), code, crashed=crashed)
+
+    def _lost(self, code: str) -> None:
+        """La conexión con OpenClaw cayó. Un run con su turno abierto (o con frames ya en
+        espera de turno) falla ya con `code`: lo que traía se perdió. Uno absorbido ya entregó
+        su mensaje: termina sin más. Uno aún en la cola de OpenClaw (sin turno) queda sin
+        confirmar hasta que la reconexión relea `pendingInputs` (`_reconcile`), como mucho
+        RECONNECT_GRACE_S; entonces falla si no sigue en la cola."""
+        self._held.clear()
+        runs = list(self._runs.values())
+        failing = [i for i in runs if i.turn is not None or i.run_id in self._deferred_runs]
+        waiting = [i for i in runs if i not in failing and i.state == "queued"]
+        for info in runs:
+            if info.state == "absorbed" and info not in failing:
+                self._finish(info)
+        for info in waiting:
+            info.unconfirmed = True
+        if waiting:
+            self._lost_code = code
+            if self._lost_deadline is None:
+                self._lost_deadline = time.monotonic() + RECONNECT_GRACE_S
+            logger.info(
+                f"[{self._tag}] OpenClaw caído: {len(waiting)} mensaje(s) en cola sin confirmar"
+            )
+        for info in failing:
+            # Su cliente sabrá que falló: que no siga corriendo en OpenClaw. Se entierra ya y se
+            # aborta por su runId al reconectar (`_on_reconnected`).
+            self._abort_run(info.run_id)
+            self._abort_on_reconnect.add(info.run_id)
+            self._handle(("fail", (code, False), info.run_id))
+
+    def _reconcile(self, alive: set[str] | None) -> None:
+        """Tras reconectar (`reconcile_pending`): los runs sin confirmar que `pendingInputs`
+        (o `inFlightRun`) aún lista siguen pendientes; los demás fallan con el código de la
+        caída. `alive` None: la lectura no demostró nada, fallan todos."""
+        unconfirmed = [i for i in self._runs.values() if i.unconfirmed]
+        if not unconfirmed:
+            logger.debug(f"[{self._tag}] pendingInputs releído: nada sin confirmar")
+            return
+        now = time.monotonic()
+        kept = 0
+        for info in unconfirmed:
+            if alive is not None and info.run_id in alive:
+                info.unconfirmed = False
+                info.progress_at = now
+                kept += 1
+        logger.info(
+            f"[{self._tag}] pendingInputs tras reconectar: {kept} sigue(n) en cola, "
+            f"{len(unconfirmed) - kept} falla(n)"
+        )
+        self._fail_unconfirmed(connected=True)
+        self._touch_head()
+
+    def _fail_unconfirmed(self, *, connected: bool) -> None:
+        """Los runs aún sin confirmar fallan, cada uno con su par y su TURN_ERROR. A quien se
+        le dijo que falló no le sigue corriendo en OpenClaw: cada uno se entierra (#285) y se
+        aborta por su runId; sin conexión (vence RECONNECT_GRACE_S), en la próxima
+        reconexión (`_on_reconnected`)."""
+        self._lost_deadline = None
+        for info in [i for i in self._runs.values() if i.unconfirmed]:
+            info.unconfirmed = False
+            self._abort_run(info.run_id)
+            if connected:
+                self._spawn_abort(info.run_id)
+            else:
+                self._abort_on_reconnect.add(info.run_id)
+            self._handle(("fail", (self._lost_code, False), info.run_id))
+
+    def _on_timeouts(self) -> None:
+        left = self._push_budget_left()
+        if left is not None and left <= 0:
+            self._push_timed_out()
+        deadline = self._lost_deadline
+        if deadline is not None and deadline <= time.monotonic():
+            logger.warning(
+                f"[{self._tag}] sin reconexión en RECONNECT_GRACE_S={RECONNECT_GRACE_S}s: "
+                "fallan los mensajes en cola sin confirmar"
+            )
+            self._fail_unconfirmed(connected=False)
+        info = self._active_run()
+        if info is not None and info.progress_at + settings.TURN_TIMEOUT_S <= time.monotonic():
+            self._run_timed_out(info)
+
+    def _budget_left(self) -> float | None:
+        """Segundos hasta el primer tope que vence (el del push, el del run activo)."""
+        budgets = []
+        push = self._push_budget_left()
+        if push is not None:
+            budgets.append(push)
+        info = self._active_run()
+        if info is not None:
+            budgets.append(info.progress_at + settings.TURN_TIMEOUT_S - time.monotonic())
+        if self._lost_deadline is not None:
+            budgets.append(self._lost_deadline - time.monotonic())
+        return min(budgets) if budgets else None
+
+    def _run_timed_out(self, info: RunInfo) -> None:
+        """Decisión 2: un run sin progreso en TURN_TIMEOUT_S se cierra con `turn_timeout` (con
+        su par también si nunca abrió) y se aborta en OpenClaw (solo ese run)."""
+        logger.warning(
+            f"[{self._tag}] run sin progreso en TURN_TIMEOUT_S={settings.TURN_TIMEOUT_S}s — "
+            "se cierra."
+        )
+        self._abort_run(info.run_id)
+        if info.turn is None and self.current_turn is not None:
+            self._finish(info)
+        else:
+            self._run_error(info, self._open_run(info), "turn_timeout")
+        self._spawn_abort(info.run_id)
+
+    # -- session.message: steered messages (2b.2) --------------------------------------
+
+    def _session_message(self, payload: dict) -> None:
+        """A `user` `session.message`. Copies of one message share OpenClaw's `messageId`
+        (`oc_message_id`) and are not discarded as duplicates: each updates what is known of
+        it. The link to its `chat.send` (`idempotencyKey` `"<runId>:user"`) may come on one
+        copy and `steer`'s mark (`__openclaw.steerTargetRunId`, the run that absorbed it) on
+        another, so the link is remembered by `oc_message_id`. A mark naming another run
+        makes the message's run `absorbed` (`_absorb`). Text never read, never logged."""
+        message = _as_dict(payload.get("message"))
+        meta = _as_dict(message.get("__openclaw"))
+        oc_message_id = payload.get("messageId", meta.get("id"))
+        run_id = (
+            _run_of_idempotency(message.get("idempotencyKey"))
+            or _run_of_idempotency(meta.get("idempotencyKey"))
+            or _run_of_idempotency(payload.get("idempotencyKey"))
+        )
+        if isinstance(oc_message_id, str) and oc_message_id:
+            known = self._oc_messages
+            if run_id is not None:
+                known.pop(oc_message_id, None)
+                known[oc_message_id] = run_id
+                while len(known) > _OC_MESSAGES:
+                    known.popitem(last=False)
+            else:
+                run_id = known.get(oc_message_id)
+        target = meta.get("steerTargetRunId")
+        if run_id is None or not isinstance(target, str) or not target or target == run_id:
+            return
+        info = self._runs.get(run_id)
+        if info is not None:
+            self._absorb(info, target)
+
+    def _absorb(self, info: RunInfo, target: str) -> None:
+        """`steer` folded this message into run `target`: it is `delivered` for everyone (once)
+        and will never open a turn of its own; its answer goes on inside `target`'s turn,
+        whose sender (and audio) does not change. Its empty `final` only ends it."""
+        if info.turn is not None or info.state != "queued":
+            return  # ya con turno propio, o ya absorbido/terminado
+        info.state = "absorbed"
+        info.absorbed_into = target
+        info.unconfirmed = False
+        logger.debug(f"[{self._tag}] run {info.run_id} absorbido (steer) por {target}")
+        if info.message == "pending":
+            self._announce(info, "delivered")
+        if self.current_turn is None or self.current_turn.run_id != target:
+            # El run que lo absorbió ya no está abierto aquí: nada más que esperar de él.
+            self._settle_absorbed(None)
+        self._touch_head()
+
+    def _settle_absorbed(self, ended_run: str | None) -> None:
+        """Al terminar un turno, los runs absorbidos por él (o por uno que ya no es de nadie
+        aquí) terminan: su `final` vacío ya no hace falta."""
+        for info in list(self._runs.values()):
+            if info.state != "absorbed":
+                continue
+            target = info.absorbed_into
+            open_target = self.current_turn is not None and self.current_turn.run_id == target
+            if target == ended_run or (target not in self._runs and not open_target):
+                self._finish(info)
+
+    # -- push --------------------------------------------------------------------------
+
+    def _push_item(self, kind: str, arg: Any, run_id: str | None) -> None:
+        if self._run_aborted(run_id):
+            # #285: lo que quedaba en cola de un run abortado no llega (ni abre push).
+            logger.debug(f"[{self._tag}] push {kind} de un run abortado descartado")
+        elif kind == "turn_start":
+            self._push_start(run_id)
+        elif kind == "open":
+            self._push_open(run_id)
+        elif kind == "chat":
+            self._push_chat(arg, run_id)
+        elif kind == "tool":
+            self._push_tool(arg, run_id)
+        elif kind == "fallback":
+            self._push_fallback(arg, run_id)
+        elif kind == "turn_end":
+            self._push_end()
+        elif kind == "turn_error":
+            self._push_end(failure=arg)
+        else:
+            logger.warning(f"[{self._tag}] push event desconocido: {kind!r}")
 
     def _push_budget_left(self) -> float | None:
         """Segundos que le quedan al push abierto sin progreso (#286); None si no aplica."""
@@ -658,64 +1978,11 @@ class ConversationChannel:
             return None
         return push.progress_at + settings.TURN_TIMEOUT_S - time.monotonic()
 
-    async def _push_worker_loop(self) -> None:
-        queue = self._backlog.queue
-        while not self._closed:
-            budget = self._push_budget_left()
-            # Con eventos en cola el push no está parado: solo se espera con tope si no hay.
-            if budget is not None and queue.empty():
-                try:
-                    kind, arg, run_id = await asyncio.wait_for(queue.get(), timeout=budget)
-                except TimeoutError:
-                    await self._run_push_step("timeout", self._push_timed_out())
-                    if self._backlog.pending == 0:
-                        self._hub.drop_if_idle(self.session_key, self)
-                    continue
-            else:
-                kind, arg, run_id = await queue.get()
-            try:
-                if self._run_aborted(run_id):
-                    # #285: lo que quedaba en cola de un run abortado no llega (ni abre push).
-                    logger.debug(f"[{self._tag}] push {kind} de un run abortado descartado")
-                elif kind == "turn_start":
-                    await self._push_start(run_id)
-                elif kind == "chat":
-                    self._push_chat(arg)
-                elif kind == "tool":
-                    self._push_tool(arg)
-                elif kind == "fallback":
-                    self._push_fallback(arg, run_id)
-                elif kind == "turn_end":
-                    self._push_end()
-                elif kind == "turn_error":
-                    self._push_end(failure=arg)
-                else:
-                    logger.warning(f"[{self._tag}] push event desconocido: {kind!r}")
-            except Exception as e:  # noqa: BLE001 — frontera: un evento roto no para el worker
-                self._log_push_failure(kind, e)
-            finally:
-                backlog = self._backlog
-                backlog.pending = max(0, backlog.pending - 1)
-                if backlog.pending == 0:
-                    backlog.since = None
-                queue.task_done()
-            if self._backlog.pending == 0:
-                self._hub.drop_if_idle(self.session_key, self)
-
-    async def _run_push_step(self, what: str, step: Coroutine[Any, Any, None]) -> None:
-        try:
-            await step
-        except Exception as e:  # noqa: BLE001 — frontera: un paso roto no para el worker
-            self._log_push_failure(what, e)
-
-    def _log_push_failure(self, what: str, e: Exception) -> None:
-        # Solo el tipo: el payload puede llevar texto del usuario.
-        logger.warning(f"[{self._tag}] push {what} falló: {type(e).__name__}")
-
     def _run_aborted(self, run_id: str | None) -> bool:
         return run_id is not None and self._turn_registry.is_run_aborted(run_id)
 
     def _abort_run(self, run_id: str | None) -> None:
+        """Lápida (#285): desde ya, nada de ese run llega (tampoco su `aborted`)."""
         if run_id is not None:
             self._turn_registry.abort_run(run_id)
 
@@ -728,48 +1995,61 @@ class ConversationChannel:
             if s.subscriber.wants_push and s.subscriber.agent_allowed(key)
         ]
 
-    async def _push_start(self, run_id: str | None = None) -> None:
+    def _open_push(self, run_id: str | None) -> ChannelTurn | None:
+        """El push abierto, o uno nuevo abierto con este primer evento de su run (2b.2: no
+        solo con lifecycle `start`, que un run sacado de la cola no trae). None si no se abre:
+        su run ya cerró su push (solo un `start` nuevo lo reabre, #84) o el agente no está
+        permitido. (#112, «un push no abre encima de un turno de /v1»: desde la 2b.3 el turno de
+        /v1 es un turno del canal, y un push espera a que se cierre como detrás de cualquier
+        otro, `_must_defer`.)"""
+        push = self._push
+        if push is not None and not push.ended:
+            return push
+        if run_id is not None and run_id in self._ended_push_runs:
+            logger.debug(f"[{self._tag}] evento tardío de un push ya cerrado: descartado")
+            return None
+        self._push_start(run_id)
+        push = self._push
+        return push if push is not None and not push.ended else None
+
+    def _push_open(self, run_id: str | None) -> None:
+        """`run_status` o lifecycle `model`: abre el push de su run si no hay uno abierto; si
+        lo hay, solo cuenta como progreso (#84, #286)."""
+        push = self._push
+        if push is not None and not push.ended:
+            push.progress_at = time.monotonic()
+            return
+        self._open_push(run_id)
+
+    def _push_start(self, run_id: str | None = None) -> None:
+        if run_id is not None:
+            self._ended_push_runs.pop(run_id, None)  # un `start` nuevo de su run lo reabre (#84)
         key = self.session_key
         subscribers = [s.subscriber for s in self._subscriptions]
         if subscribers and not any(s.agent_allowed(key) for s in subscribers):
             # C-r7-1: push de un agente retirado de allowed_agents de todos los adjuntos: no
             # llega a nadie y se para en OpenClaw.
             logger.info(f"[{self._tag}] push de un agente no permitido: descartado")
+            aborts = {run_id}
             push = self._push
             if push is not None:
                 # Su push ya abierto (retirado a medias) se corta ya, sin esperar a turn_timeout.
-                async with self._lock:
-                    await self._cut_push(push, "cancelled")
+                aborts.add(push.run_id)
+                self._end_push(push, "cancelled")
             self._abort_run(run_id)
-            await self.orchestrator.abort(key)
+            for aborted in aborts:
+                self._spawn_abort(aborted)
             return
-        while True:
-            # Un turno del usuario vive hasta que OpenClaw lo termina: no se abre un push
-            # encima (su audio lo espera cada suscriptor en su cola, decisión 1).
-            # asyncio.wait (no await): nuestra cancelación se propaga, la del turno no.
-            while self._user_task is not None and not self._user_task.done():
-                await asyncio.wait({self._user_task})
-            # Abrirlo, bajo el lock: un `send` o un corte lo ven entero, registrado y con su
-            # on_turn_start ya entregado, nunca a medias (#202).
-            async with self._lock:
-                if self._closed:
-                    return
-                if self._user_task is not None and not self._user_task.done():
-                    continue  # un turno que se estaba sustituyendo: el usuario gana
-                if self._push is not None:
-                    # #84: los `agent start` intermedios (tool use, varios pasos) no abren
-                    # otro turno; tampoco el de un push que se está cortando.
-                    self._push.progress_at = time.monotonic()
-                    logger.debug(
-                        f"[{self._tag}] push_turn_start ignorado: ya hay un push abierto"
-                    )
-                    return
-                audience = self._push_audience()
-                audio = next((s for s in reversed(audience) if s.wants_audio), None)
-                self._push_text.reset()
-                turn = self.open_turn("push", run_id=run_id, audio_to=audio)
-                self._push = turn
-                break
+        if self._push is not None:
+            # #84: los `agent start` intermedios (tool use, varios pasos) no abren otro turno.
+            self._push.progress_at = time.monotonic()
+            logger.debug(f"[{self._tag}] push_turn_start ignorado: ya hay un push abierto")
+            return
+        audience = self._push_audience()
+        audio = next((s for s in reversed(audience) if s.wants_audio), None)
+        self._push_text.reset()
+        turn = self.open_turn("push", run_id=run_id, audio_to=audio)
+        self._push = turn
         if audience:  # un push que alguien ve cuenta en la conversación
             self._note_turn()
             gateway_stats.turn_started("push")
@@ -777,19 +2057,24 @@ class ConversationChannel:
         if early is not None:  # #254: la fase que su run contó antes de abrirse
             self.emit(turn, ChannelProgress(Progress(early)))
 
-    def _push_chat(self, payload: dict) -> None:
+    def _push_chat(self, payload: dict, run_id: str | None = None) -> None:
         push = self._push
         phase = chat_status_phase(payload)
-        run_id = payload.get("runId")
-        if phase is not None and (
-            push is None or push.ended or _other_run(push.run_id, run_id)
-        ):
-            # #254: fase de arranque de un run cuyo push aún no se abrió (llega antes de su
-            # `agent start`): se guarda para cuando se abra.
+        run_id = run_id if run_id is not None else _str_run_id(payload)
+        if phase is not None and push is not None and not push.ended and _other_run(push.run_id, run_id):
+            # #254: fase de arranque de otro run con un push abierto: se guarda para cuando
+            # se abra el suyo.
             self._note_early_phase(run_id, phase)
             return
         if push is None or push.ended:
-            return  # #109: nada fuera de un turn_start/turn_end
+            if payload.get("state") in _TERMINAL_CHAT:
+                return  # #109: nada fuera de un turn_start/turn_end
+            # 2b.2: el primer evento de su run abre el push (sin esperar a un `start`).
+            push = self._open_push(run_id)
+            if push is None:
+                if phase is not None:
+                    self._note_early_phase(run_id, phase)
+                return
         push.progress_at = time.monotonic()
         if phase is not None:  # #254: una fase de arranque, sin texto
             self.emit(push, ChannelProgress(Progress(phase)))
@@ -799,9 +2084,9 @@ class ConversationChannel:
         if delta:
             self.emit(push, ChannelToken(delta))
 
-    def _push_tool(self, data: dict) -> None:
-        push = self._push
-        if push is None or push.ended:
+    def _push_tool(self, data: dict, run_id: str | None = None) -> None:
+        push = self._open_push(run_id)
+        if push is None:
             return
         push.progress_at = time.monotonic()
         tool_call = ToolCallEvent.from_session_tool_payload(data)
@@ -809,9 +2094,11 @@ class ConversationChannel:
             self.emit(push, ChannelToolCall(tool_call))
 
     def _push_fallback(self, data: dict, run_id: str | None) -> None:
-        """#397: un `fallback_step` del run del push abierto: su razón, para clasificar su error."""
-        push = self._push
-        if push is not None and not push.ended and not _other_run(push.run_id, run_id):
+        """#397: un `fallback_step` del run del push (abierto por él si no lo estaba): su
+        razón, para clasificar su error."""
+        push = self._open_push(run_id)
+        if push is not None and not _other_run(push.run_id, run_id):
+            push.progress_at = time.monotonic()
             push.fallback_reason = fallback_reason(data, push.fallback_reason)
 
     def _push_end(self, *, failure: dict | None = None) -> None:
@@ -829,42 +2116,46 @@ class ConversationChannel:
             gateway_stats.turn_error(code)
             self.emit(push, ChannelError(code))
         self._push = None
+        if push.run_id is not None:
+            # Lo que llegue tarde de su run (un `run_status`, una fase) no abre otro push.
+            self._ended_push_runs.pop(push.run_id, None)
+            self._ended_push_runs[push.run_id] = None
+            while len(self._ended_push_runs) > _ENDED_PUSH_RUNS:
+                self._ended_push_runs.popitem(last=False)
         self.end_turn(push, "done" if failure is None else "error")
 
-    async def _push_timed_out(self) -> None:
+    def _push_timed_out(self) -> None:
         """#286: un push sin progreso en TURN_TIMEOUT_S se cierra como el turno normal."""
-        # Bajo el lock, como todo corte (G-08): un `send` que llegue mientras tanto espera, y
-        # el chat.abort del push sale antes que su chat.send. Se decide dentro: si un `send`
-        # o un barge-in lo cortaron mientras se esperaba el lock, no hubo timeout.
-        async with self._lock:
-            push = self._push
-            if push is None or push.ended:
-                return
-            logger.warning(
-                f"[{self._tag}] push sin progreso en "
-                f"TURN_TIMEOUT_S={settings.TURN_TIMEOUT_S}s — se cierra."
-            )
-            gateway_stats.turn_error("turn_timeout")
-            self.emit(push, ChannelError("turn_timeout"))
-            await self._cut_push(push, "timeout")
+        push = self._push
+        if push is None or push.ended:
+            return
+        logger.warning(
+            f"[{self._tag}] push sin progreso en "
+            f"TURN_TIMEOUT_S={settings.TURN_TIMEOUT_S}s — se cierra."
+        )
+        gateway_stats.turn_error("turn_timeout")
+        self.emit(push, ChannelError("turn_timeout"))
+        self._end_push(push, "timeout")
+        self._spawn_abort(push.run_id)
+
+    def _end_push(self, push: ChannelTurn, reason: EndReason) -> None:
+        # Antes del abort: nada más de su run llega, ni lo que el worker tiene en cola ni lo
+        # que venga (#285).
+        self._abort_run(push.run_id)
+        self._mark_cancel(push, reason)
+        self._push = None
+        self.end_turn(push, reason)
 
     async def _cut_push(self, expected: ChannelTurn | None, reason: EndReason) -> ChannelTurn | None:
-        """Corta el push abierto (7e): lo cierra para todos y lo aborta en OpenClaw. Con
-        `expected`, solo ese push. Devuelve el push cortado, o None si no había."""
+        """Corta el push abierto (7e): lo cierra para todos y lo aborta en OpenClaw (solo su
+        run). Con `expected`, solo ese push. Devuelve el push cortado, o None si no había."""
         push = self._push
         if push is None or push.ended:
             return None
         if expected is not None and expected is not push:
             return None
-        # Antes del abort: nada más de su run llega, ni lo que el worker tiene en cola ni lo
-        # que venga. abort() ve el run ya con lápida y no espera su `aborted`.
-        self._abort_run(push.run_id)
-        self._mark_cancel(push, reason)
-        self._push = None
-        self.end_turn(push, reason)
-        td = Teardown(f"[{self._tag}] corte del push")
-        await td.step(self.orchestrator.abort(self.session_key), "chat.abort del push")
-        td.raise_if_cancelled()
+        self._end_push(push, reason)
+        await self._abort_step(push.run_id, "chat.abort del push")
         return push
 
     # -- progress (#254) ---------------------------------------------------------------
@@ -895,27 +2186,38 @@ class ConversationChannel:
     def _retire(self) -> None:
         """El hub lo olvida (inactivo): su worker, que solo espera eventos, se para."""
         self._closed = True
+        self._wake_quiet()
         worker = self._push_worker
         if worker is not None and not worker.done() and worker is not asyncio.current_task():
             worker.cancel()
 
     async def aclose(self, limit: float | None = None) -> None:
-        """Cierre del canal (apagado del gateway, o el hub privado de una sesión de tests):
-        su worker y su turno se cancelan y su turno abierto se cierra (`closed`). Cada paso
-        termina aunque cancelen a quien cierra (#221)."""
+        """Cierre del canal (apagado del gateway, o el hub privado de una sesión de tests): su
+        worker se cancela, el run de su turno abierto se aborta (solo ese) y el turno se cierra
+        (`closed`); sus demás runs se dan por terminados (siguen en la cola de OpenClaw). Cada
+        paso termina aunque cancelen a quien cierra (#221)."""
         self._closed = True
+        self._wake_quiet()
         async with Teardown(f"[{self._tag}] cierre del canal") as td:
             await td.cancel(self._push_worker, "push worker", limit)
-            turn = self._user_turn
-            if turn is not None and not turn.ended:
-                self._mark_cancel(turn, "closed")
-            await td.cancel(self._user_task, "turno activo", limit)
+            current = self.current_turn
+            if current is not None and current.origin == "user" and current.run_id is not None:
+                self._abort_run(current.run_id)
+                if self._hub.orchestrator is not None:
+                    await td.step(self._abort(current.run_id), "chat.abort del turno", limit)
             backlog = self._backlog
             while not backlog.queue.empty():
                 backlog.queue.get_nowait()
                 backlog.queue.task_done()
             backlog.pending = 0
             backlog.since = None
+            self._held.clear()
+            self._deferred.clear()
+            self._deferred_runs.clear()
+            for info in list(self._runs.values()):
+                if info.turn is not None:
+                    self._mark_cancel(info.turn, "closed")
+                self._finish(info, cut=True)
             current = self.current_turn
             if current is not None:
                 self._push = None
@@ -979,6 +2281,19 @@ class ChannelHub:
             return channel
         conversation = self.index.get(session_key) if self.index is not None else None
         return self.get_or_create(conversation) if conversation is not None else None
+
+    def connection_lost(self, code: str) -> None:
+        """The OpenClaw connection dropped: every live channel ends its unfinished runs."""
+        for channel in list(self._channels.values()):
+            channel.connection_lost(code)
+
+    def reconnected(self) -> None:
+        """OpenClaw is back (`ReconnectingOpenClawClient.on_connected`, 2b.2): every live
+        channel's worker aborts the runs it failed while disconnected and, with subscribers or
+        runs that wait unconfirmed since the drop, re-reads its `pendingInputs`
+        (`ConversationChannel.reconcile_pending`). Never blocks."""
+        for channel in list(self._channels.values()):
+            channel.reconnected()
 
     def drop_if_idle(self, session_key: str, channel: ConversationChannel | None = None) -> bool:
         """Forget the channel if nothing keeps it alive (`ConversationChannel.idle`). With

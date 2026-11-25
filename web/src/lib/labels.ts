@@ -83,8 +83,6 @@ export const TURN_ERROR: Record<string, string> = {
   orchestrator_agent_unavailable: 'Este agente ya no está disponible aquí',
   orchestrator_disconnected: 'OpenClaw se desconectó a mitad',
   turn_timeout: 'OpenClaw dejó de responder',
-  turn_overflow: 'El gateway no pudo seguir el ritmo de la respuesta',
-  turn_in_progress: 'Ya había un turno en marcha',
   internal_error: 'Error interno del gateway',
 }
 
@@ -126,7 +124,6 @@ export const STAGE: Record<string, string> = {
   tts_start: 'Empieza la voz',
   tts_first_chunk: 'Primer audio',
   tts_done: 'Voz terminada',
-  barge_in: 'Interrupción',
   client_slow: 'Cliente lento',
   session_revoked: 'Acceso retirado',
   agent_revoked: 'Agente retirado',

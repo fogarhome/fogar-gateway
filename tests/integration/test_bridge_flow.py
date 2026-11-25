@@ -7,7 +7,7 @@ recibe tokens del orchestrator.
 import pytest
 
 from fogar_gateway.core.config import settings
-from fogar_gateway.services.protocol import OrchestratorEvent
+from tests.fakes.orchestrator import OrchestratorEvent
 from tests.integration.conftest import VALID_KEY
 
 HANDSHAKE_TEXT = {
@@ -24,6 +24,9 @@ def test_text_message_produces_token(client):
         ws.send_json(HANDSHAKE_TEXT)
         ws.receive_json()  # ready
         ws.send_json({"type": "send", "text": "hola"})
+        message = ws.receive_json()  # 5.0 PR 2b: the echo of the message, first
+        assert (message["type"], message["text"], message["state"]) == ("message", "hola", "delivered")
+        assert message["from"]["self"] is True
         turn_start = ws.receive_json()
         assert turn_start["type"] == "turn_start"
         assert turn_start["turn_id"] == "t-1"
@@ -90,5 +93,5 @@ def test_session_with_voice_off_stays_open_in_text(voice_off, client):
         for turn_id in ("t-1", "t-2"):  # el segundo turno prueba que la sesión sigue abierta
             ws.send_json({"type": "send", "text": "hola"})
             msgs = _receive_until(ws, "turn_end")
-            assert [m["type"] for m in msgs] == ["turn_start", "token", "turn_end"]
+            assert [m["type"] for m in msgs] == ["message", "turn_start", "token", "turn_end"]
             assert msgs[-1]["turn_id"] == turn_id

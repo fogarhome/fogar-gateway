@@ -8,8 +8,8 @@ import pytest
 from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.openclaw.models import ToolCallEvent
 from fogar_gateway.services.outbound import ClientGone
-from fogar_gateway.services.protocol import OrchestratorEvent
 from tests.fakes.bridge import GoneSender, run_turn, sent
+from tests.fakes.orchestrator import OrchestratorEvent
 
 
 @pytest.fixture
@@ -126,28 +126,6 @@ async def test_audio_send_failure_does_not_propagate(make_bridge, error):
     b.orchestrator.stream_response = stream_with_token
 
     await run_turn(b, "test")  # must not raise
-
-
-async def test_turn_in_progress_error_event_sends_non_fatal_turn_error_frame(bridge):
-    """Issue #99: when the orchestrator rejects a duplicate session_key turn
-    (an 'error' event with TURN_IN_PROGRESS_ERROR content — see
-    OpenClawClient.stream_response), the existing generic RuntimeError
-    handling in pipe_tokens() must already surface it to the client as a
-    non-fatal TURN_ERROR frame, without closing the WS. No WS-specific
-    code should be needed for this issue — this test verifies that."""
-    from fogar_gateway.services.openclaw.registry import TURN_IN_PROGRESS_ERROR
-
-    bridge.orchestrator.stream_response = make_stream_with_event("error", TURN_IN_PROGRESS_ERROR)
-
-    await run_turn(bridge, "test")  # must not raise — session stays open
-    await sent(bridge)
-
-    error_msgs = bridge.client_ws.of("error")
-    assert len(error_msgs) == 1
-    assert error_msgs[0]["code"] == "TURN_ERROR"
-    assert error_msgs[0]["fatal"] is False
-    assert error_msgs[0]["message"] == TURN_IN_PROGRESS_ERROR
-    assert error_msgs[0]["turn_id"] == "t-1"
 
 
 async def test_tts_end_called_when_orchestrator_raises_non_runtime_error(make_bridge):

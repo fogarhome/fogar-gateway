@@ -345,7 +345,6 @@ async def gateway_websocket(websocket: WebSocket):
                     "input_mode": handshake.input_mode,
                     "output_mode": handshake.output_mode,
                     "requested_capabilities": {
-                        "barge_in": config.barge_in_enabled,
                         "tts": "audio" in handshake.output_mode,
                         "transcriber": handshake.input_mode == "audio",
                     },
