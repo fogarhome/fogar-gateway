@@ -25,7 +25,8 @@ BYTES_PER_S = 48000
 
 
 @pytest.fixture
-def paced(harness, monkeypatch):
+def paced(harness, home_notify_device, monkeypatch):
+    # 5.0 PR 2c.3: el audio de un push solo suena en el dispositivo de avisos (aquí, el cliente).
     monkeypatch.setattr(settings, "AUDIO_LEAD_S", LEAD)
     harness.tts.chunk = b"\x01\x00" * 2400  # 100 ms
     harness.tts.chunks_per_reply = CHUNKS

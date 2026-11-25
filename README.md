@@ -86,8 +86,9 @@ La privacidad es **dentro de Fogar**: OpenClaw, su panel y sus otros canales (Te
 | Endpoint | Método | Auth | Descripción |
 |----------|--------|------|-------------|
 | `/auth/login` | POST | usuario y contraseña | `{"username", "password", "device_name", "client_type"?, "capabilities"?}` → `201 {"client_id", "client_key", "user", "home"}`: este aparato pasa a ser un dispositivo personal y `client_key` es su token, la única vez que se ve. Errores: `401 invalid_credentials` (siempre el mismo), `403 insecure_transport`, `429 too_many_attempts` con `Retry-After` |
-| `/auth/me` | GET | Bearer | `{"user": {id, username, display_name, role}, "home", "device"}` |
-| `/auth/devices` | GET | Bearer | Mis dispositivos con sesión (`current` marca este) |
+| `/auth/me` | GET | Bearer | `{"user": {id, username, display_name, role}, "home", "device", "notify_client_id"}`; `notify_client_id` es su dispositivo de avisos (`null` = ninguno) |
+| `/auth/me` | PATCH | Bearer | `{"notify_client_id": id \| null}`: elige su dispositivo de avisos, solo uno de sus aparatos personales activos (un aviso privado nunca suena en un aparato del hogar ni de otra persona); `null` lo quita. Responde como `GET`. `422 invalid_notify_device` si no vale |
+| `/auth/devices` | GET | Bearer | Mis dispositivos con sesión (`current` marca este; `is_active` falso si un administrador lo desactivó; `push_enabled` y `output_mode`, lo que necesita para sonar un aviso) |
 | `/auth/devices/{id}` | DELETE | Bearer | Retira uno de los míos: su token deja de valer y sus sesiones se cierran ya (4200) |
 | `/auth/logout` | POST | Bearer | Retira el dispositivo de esta petición |
 
@@ -127,7 +128,7 @@ Las personas se gestionan desde la web (Personas) o con `fogar-gw users`. **Si e
 | `/admin/users/{id}` | PATCH | `display_name`, `role`, `agent` (`null` vuelve al de lo común), `is_active`. Desactivar corta ya sus dispositivos |
 | `/admin/users/{id}/password` | PUT | Contraseña nueva (`{"password"}`); las sesiones abiertas siguen |
 | `/admin/users/{id}` | DELETE | Borra a la persona, sus dispositivos y sus conversaciones privadas del gateway (en OpenClaw quedan hasta que se limpie su agente) |
-| `/admin/home` | GET, PATCH | El hogar: `name` y `agent`, el de lo común (`null` = la cascada de siempre) |
+| `/admin/home` | GET, PATCH | El hogar: `name`, `agent`, el de lo común (`null` = la cascada de siempre), y `notify_client_id`, su dispositivo de avisos: cualquier aparato activo del hogar, del hogar o personal (`null` = ninguno; `422 invalid_notify_device` si no vale). Retirar un aparato lo quita de donde estuviera elegido; desactivarlo, no |
 | `/admin/access` | GET | Vías para llegar al gateway (`public`, `tailscale_https`, `tailscale`, `lan`), cada una con su estado (`ok`, `protegida`, `otro_gateway`, `inalcanzable`, `sin_verificar`) y la recomendada; `{"docker": bool, "routes": [...]}`, en caché 15 s |
 
 En `/admin/users`, siempre queda un dueño activo (`409 last_owner`) y solo un dueño o la máquina tocan a un dueño o dan ese rol (`403 owner_only`). Los tres endpoints `*/status` comparten la forma `{"name", "state", "connected_at", "reconnect_attempts", "last_error"}`; los de transcriber y TTS añaden `provider` y, con ElevenLabs, `counters`.
@@ -234,7 +235,9 @@ El cliente envía un handshake JSON como primer mensaje. Si es válido, el gatew
 ← {"type":"turn_end","turn_id":"t-1","reason":"done"}
 ```
 
-Un `send` con un turno en curso no lo corta: queda `pending` en la cola de OpenClaw (`"interrupt": true` corta y envía; `withdraw` quita un pendiente; `cancel` para el turno para todas las sesiones de la conversación). Hablar encima no corta nada: el barge-in lo decide el cliente. Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la referencia completa incluyendo interrupciones, transcripción, push turns y manejo de errores.
+Un `send` con un turno en curso no lo corta: queda `pending` en la cola de OpenClaw (`"interrupt": true` corta y envía; `withdraw` quita un pendiente; `cancel` para el turno para todas las sesiones de la conversación). Hablar encima no corta nada: el barge-in lo decide el cliente. Un aviso (push) se lee en todas las sesiones que tienen abierta su conversación y suena solo en su dispositivo de avisos (el de su dueña si es privada, el del hogar si es común; si no tiene ninguna sesión en ella, le llega igual, en cola detrás de su turno); sin dispositivo de avisos elegido, no suena en ningún sitio. Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la referencia completa incluyendo interrupciones, transcripción, push turns y manejo de errores.
+
+**Dónde suenan los avisos.** Se elige en la web: cada persona, el suyo en «Mis dispositivos» («Avisos en…», uno de sus aparatos personales activos); un dueño o administrador, el del hogar en «Personas» («Avisos del hogar en…», cualquier aparato activo del hogar). Mientras no hay uno elegido, la web avisa «Elige dónde suenan los avisos». Al actualizar a la 5.0 no hay ninguno: hasta elegirlo, los recordatorios solo se leen en las sesiones que tienen abierta su conversación (y siguen en el historial de OpenClaw). También por la API: `PATCH /auth/me` y `PATCH /admin/home`.
 
 ---
 
@@ -655,7 +658,7 @@ src/fogar_gateway/
         ├── device.py        identidad de dispositivo (Ed25519, firma v3) y token de dispositivo
         ├── reconnecting.py  ReconnectingOpenClawClient — backoff + DEGRADED
         ├── dispatcher.py    FrameDispatcher — enruta frames a turn/client registry
-        ├── registry.py      TurnRegistry + ClientRegistry (sesiones vivas por conversación, reparto del push, broadcast_status)
+        ├── registry.py      TurnRegistry + ClientRegistry (sesiones vivas por cliente: revocación, la sesión del dispositivo de avisos, broadcast_status)
         └── models.py        GatewayInfo, OrchestratorAccess (permisos y emparejamiento)
 ```
 

@@ -115,6 +115,9 @@ def test_me_and_devices_with_the_token(http, users):
     assert {d["id"]: d["current"] for d in devices} == {
         first["client_id"]: True, second["client_id"]: False,
     }
+    # la web elige entre los activos y marca los que no pueden sonar un aviso (#407)
+    assert all(d["is_active"] and d["push_enabled"] for d in devices)
+    assert all(d["output_mode"] is None for d in devices)  # el login no lo fija
 
 
 @pytest.mark.parametrize(

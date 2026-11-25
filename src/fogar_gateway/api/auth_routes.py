@@ -8,15 +8,20 @@ cada petición busca el token en la BD, así que retirar el dispositivo lo corta
 
   POST   /auth/login               — usuario + contraseña → dispositivo personal y su token (una vez)
   POST   /auth/logout              — retira el dispositivo de esta petición
-  GET    /auth/me                  — quién soy: usuario, rol, hogar y este dispositivo
+  GET    /auth/me                  — quién soy: usuario, rol, hogar, este dispositivo y mi
+                                     dispositivo de avisos
+  PATCH  /auth/me                  — elige mi dispositivo de avisos: uno de mis aparatos
+                                     personales activos (`null` lo quita)
   GET    /auth/devices             — mis dispositivos con sesión
   DELETE /auth/devices/{id}        — retira uno de los míos
 
 Errores con código estable en `detail`: `insecure_transport` (403), `too_many_attempts` (429,
-con `Retry-After`), `invalid_credentials` (401), `not_authenticated` (401).
+con `Retry-After`), `invalid_credentials` (401), `not_authenticated` (401),
+`invalid_notify_device` (422).
 """
 
 import asyncio
+import json
 import logging
 import math
 from datetime import UTC, datetime
@@ -34,7 +39,7 @@ from fogar_gateway.api.deps import Caller, current_caller
 from fogar_gateway.core.logging import fingerprint_key
 from fogar_gateway.db.database import get_engine
 from fogar_gateway.db.models import ClientRecord, HomeRecord, MembershipRecord, UserRecord
-from fogar_gateway.models.admin_schemas import ClientCreate, LoginRequest
+from fogar_gateway.models.admin_schemas import ClientCreate, LoginRequest, MeUpdate
 from fogar_gateway.services.auth import (
     DUMMY_PASSWORD_HASH,
     LoginLimiter,
@@ -42,6 +47,7 @@ from fogar_gateway.services.auth import (
     new_key,
     verify_password,
 )
+from fogar_gateway.services.notify_device import INVALID_NOTIFY_DEVICE, personal_device_ok
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +69,10 @@ def _device_view(rec: ClientRecord, current_id: str | None = None) -> dict[str, 
         "client_type": rec.client_type,
         "created_at": rec.created_at,
         "last_seen_at": rec.last_seen_at,
+        "is_active": rec.is_active,  # un administrador puede desactivarlo sin retirarlo
+        # Lo que el dispositivo de avisos necesita para sonar (#407): la web marca el que no puede.
+        "push_enabled": rec.push_enabled,
+        "output_mode": json.loads(rec.output_mode) if rec.output_mode else None,
         "current": rec.id == current_id,
     }
 
@@ -129,16 +139,45 @@ def login(body: LoginRequest, request: Request) -> dict[str, Any]:
         }
 
 
-@router.get("/me")
-def me(caller: Caller = Depends(current_caller)) -> dict[str, Any]:
+def _me(caller: Caller) -> dict[str, Any]:
     with Session(get_engine()) as session:
         home = session.get(HomeRecord, caller.device.home_id)
         device = session.get(ClientRecord, caller.device.id)
+        # Leída aquí, no de `caller.membership`: un PATCH acaba de cambiarla.
+        membership = session.get(MembershipRecord, (caller.user.id, caller.device.home_id))
     return {
         "user": _user_view(caller.user, caller.membership),
         "home": {"id": home.id, "name": home.name} if home else None,
         "device": _device_view(device, caller.device.id) if device else None,
+        "notify_client_id": membership.notify_client_id if membership else None,
     }
+
+
+@router.get("/me")
+def me(caller: Caller = Depends(current_caller)) -> dict[str, Any]:
+    return _me(caller)
+
+
+@router.patch("/me")
+def update_me(body: MeUpdate, caller: Caller = Depends(current_caller)) -> dict[str, Any]:
+    """El dispositivo de avisos de la persona (#407): solo uno de sus aparatos personales activos;
+    un aviso privado nunca suena en un aparato del hogar ni de otra persona."""
+    patch = body.model_dump(exclude_unset=True)
+    if "notify_client_id" in patch:
+        notify = patch["notify_client_id"]
+        home_id = caller.device.home_id
+        with Session(get_engine()) as session:
+            if notify is not None and not personal_device_ok(
+                session, caller.user.id, home_id, notify
+            ):
+                raise HTTPException(status_code=422, detail=INVALID_NOTIFY_DEVICE)
+            membership = session.get(MembershipRecord, (caller.user.id, home_id))
+            if membership is None:  # dada de baja entre la auth y aquí
+                raise HTTPException(status_code=401, detail="not_authenticated")
+            membership.notify_client_id = notify
+            session.add(membership)
+            session.commit()
+    return _me(caller)
 
 
 @router.get("/devices")

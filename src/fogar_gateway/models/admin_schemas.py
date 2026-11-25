@@ -219,13 +219,28 @@ class UserUpdate(BaseModel):
     is_active: bool | None = None
 
 
+# El id de un dispositivo (un UUID). Que exista y valga lo comprueba el gateway
+# (services/notify_device.py).
+NotifyClientId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
+
+
 class HomeUpdate(BaseModel):
-    """`PATCH /admin/home`: `agent: null` vuelve a la cascada de siempre."""
+    """`PATCH /admin/home`: `agent: null` vuelve a la cascada de siempre; `notify_client_id`, el
+    dispositivo de avisos del hogar (`null` lo quita)."""
 
     model_config = ConfigDict(extra="forbid")
 
     name: _Name | None = None
     agent: AgentName | None = None
+    notify_client_id: NotifyClientId | None = None
+
+
+class MeUpdate(BaseModel):
+    """`PATCH /auth/me`: el dispositivo de avisos de la persona (`null` lo quita)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    notify_client_id: NotifyClientId | None = None
 
 
 class PasswordSet(BaseModel):

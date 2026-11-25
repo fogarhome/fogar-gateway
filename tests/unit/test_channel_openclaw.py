@@ -15,7 +15,14 @@ from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.conversations import ConversationIndex, SessionConversation
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
-from tests.fakes.bridge import blocking, keyed_conversation, sent, tokens, wait_until
+from tests.fakes.bridge import (
+    blocking,
+    keyed_conversation,
+    notify_device_is,
+    sent,
+    tokens,
+    wait_until,
+)
 from tests.fakes.orchestrator import OrchestratorEvent
 
 CONVERSATION = keyed_conversation("shared", id="conv-s")
@@ -182,9 +189,28 @@ async def test_push_skips_subscriber_with_push_disabled(session, hub):
     assert mac_ws.sent == []
 
 
-async def test_push_audio_goes_to_the_last_attached_audio_subscriber(session, hub):
-    """2a: the most recently attached session that wants audio plays the push (2c replaces
-    it by the notification device)."""
+async def test_push_audio_goes_to_the_notify_device_only(session, hub):
+    """5.0 PR 2c.3 (replaces 2a's «the most recently attached session with audio»): the push's
+    audio plays only on the conversation's notify device (here the first attached, `tv`); the
+    other attached session gets its text."""
+    tv_tts, _ = _tts()
+    mac_tts, _ = _tts()
+    registry = ClientRegistry(hub.index)
+    hub.sessions_of = lambda cid: [b.turns for b in registry.for_client(cid)]
+    hub.notify_device = notify_device_is("tv")
+    tv, tv_ws = session("tv", output_mode=("text", "audio"), tts=tv_tts, client_registry=registry, register=True)
+    mac, mac_ws = session("mac", output_mode=("text", "audio"), tts=mac_tts, client_registry=registry, register=True)
+    await push(tv.channel, ("turn_start", SK), ("chat", {"deltaText": "aviso"}), ("turn_end", SK))
+    await sent(tv), await sent(mac)
+
+    tv_tts.connect.assert_awaited_once()
+    mac_tts.connect.assert_not_awaited()
+    assert texts(tv_ws) == texts(mac_ws) == ["aviso"]
+
+
+async def test_push_without_notify_device_sounds_nowhere(session, hub):
+    """2c.3: with no notify device the attached sessions get the push's text, and nobody its
+    audio."""
     tv_tts, _ = _tts()
     mac_tts, _ = _tts()
     tv, tv_ws = session("tv", output_mode=("text", "audio"), tts=tv_tts)
@@ -192,8 +218,8 @@ async def test_push_audio_goes_to_the_last_attached_audio_subscriber(session, hu
     await push(tv.channel, ("turn_start", SK), ("chat", {"deltaText": "aviso"}), ("turn_end", SK))
     await sent(tv), await sent(mac)
 
-    mac_tts.connect.assert_awaited_once()
     tv_tts.connect.assert_not_awaited()
+    mac_tts.connect.assert_not_awaited()
     assert texts(tv_ws) == texts(mac_ws) == ["aviso"]
 
 

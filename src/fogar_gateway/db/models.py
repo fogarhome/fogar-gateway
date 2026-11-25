@@ -1,7 +1,7 @@
 import uuid
 from datetime import UTC, date, datetime
 
-from sqlalchemy import DDL, ForeignKeyConstraint, Index, UniqueConstraint, event
+from sqlalchemy import DDL, ForeignKey, ForeignKeyConstraint, Index, UniqueConstraint, event
 from sqlmodel import Field, SQLModel
 
 
@@ -16,13 +16,24 @@ DEFAULT_HOME_NAME = "Mi hogar"
 
 
 class HomeRecord(SQLModel, table=True):
-    """El hogar (M20). `agent`: el que atiende lo común; NULL = la cascada de siempre."""
+    """El hogar (M20). `agent`: el que atiende lo común; NULL = la cascada de siempre.
+    `notify_client_id` (5.0, #407): el dispositivo de avisos de lo común, cualquier aparato activo
+    del hogar; NULL = ninguno. Retirar el aparato lo pone a NULL (`retire_client`)."""
 
     __tablename__ = "homes"
 
     id: str = Field(default_factory=_gen_uuid, primary_key=True)
     name: str
     agent: str | None = Field(default=None)
+    # `use_alter`: `clients` apunta a `homes` y esto a `clients`; sin él SQLAlchemy no ordena el
+    # ciclo (en SQLite la restricción sigue en línea, dentro del CREATE TABLE).
+    notify_client_id: str | None = Field(
+        default=None,
+        sa_column_args=[ForeignKey(
+            "clients.id", ondelete="SET NULL", use_alter=True,
+            name="fk_homes_notify_client_id_clients",
+        )],
+    )
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -42,7 +53,8 @@ class UserRecord(SQLModel, table=True):
 
 class MembershipRecord(SQLModel, table=True):
     """Usuario ↔ hogar con su rol (`owner`, `admin`, `member`) y su agente (NULL = el del
-    hogar)."""
+    hogar). `notify_client_id` (5.0, #407): su dispositivo de avisos, solo uno de sus aparatos
+    personales activos (un aviso privado nunca llega a un aparato del hogar); NULL = ninguno."""
 
     __tablename__ = "memberships"
 
@@ -50,6 +62,12 @@ class MembershipRecord(SQLModel, table=True):
     home_id: str = Field(foreign_key="homes.id", primary_key=True, ondelete="CASCADE")
     role: str
     agent: str | None = Field(default=None)
+    notify_client_id: str | None = Field(
+        default=None,
+        sa_column_args=[ForeignKey(
+            "clients.id", ondelete="SET NULL", name="fk_memberships_notify_client_id_clients"
+        )],
+    )
 
 
 class ClientRecord(SQLModel, table=True):
@@ -124,8 +142,10 @@ class ConversationRecord(SQLModel, table=True):
 
 
 # El hogar existe siempre: lo crea la migración inicial y, para `create_all` (tests), este DDL.
+# Tras crear `clients`, no `homes`: con foreign_keys=ON, SQLite no deja escribir en `homes`
+# mientras no exista la tabla a la que apunta `notify_client_id` (y `clients` va detrás de `homes`).
 event.listen(
-    HomeRecord.__table__,  # type: ignore[attr-defined]
+    ClientRecord.__table__,  # type: ignore[attr-defined]
     "after_create",
     DDL(f"INSERT INTO homes (id, name, created_at) VALUES "
         f"('{DEFAULT_HOME_ID}', '{DEFAULT_HOME_NAME}', CURRENT_TIMESTAMP)"),

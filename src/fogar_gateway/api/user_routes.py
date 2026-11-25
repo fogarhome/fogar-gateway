@@ -9,8 +9,10 @@ administrador).
   PATCH  /admin/users/{id}             — nombre, rol, agente, activo
   PUT    /admin/users/{id}/password    — contraseña nueva (la recuperación de la CLI)
   DELETE /admin/users/{id}             — borra al usuario, sus dispositivos y sus conversaciones
-  GET    /admin/home                   — el hogar: nombre y agente de lo común
-  PATCH  /admin/home                   — cambia el nombre o el agente de lo común
+  GET    /admin/home                   — el hogar: nombre, agente de lo común y dispositivo de avisos
+  PATCH  /admin/home                   — cambia el nombre, el agente de lo común o el dispositivo de
+                                         avisos (cualquier aparato activo del hogar; si no, 422
+                                         `invalid_notify_device`)
 
 Cada usuario sale con su `effective_agent` (el suyo, el de lo común, `DEFAULT_AGENT`, el de
 OpenClaw o `main`) y `agent_shared`: lo atiende el mismo agente que a otra persona, así que su
@@ -48,6 +50,11 @@ from fogar_gateway.db.models import (
 )
 from fogar_gateway.models.admin_schemas import HomeUpdate, PasswordSet, UserCreate, UserUpdate
 from fogar_gateway.services.auth import hash_password
+from fogar_gateway.services.notify_device import (
+    INVALID_NOTIFY_DEVICE,
+    clear_notify_device,
+    home_device_ok,
+)
 
 router = APIRouter(prefix="/admin/users", dependencies=[Depends(require_admin)])
 
@@ -227,6 +234,8 @@ def _delete(user_id: str, principal: Principal) -> list[str]:
             _require_owner_level(principal)
         _keep_an_owner(session, user, m)
         devices = _device_ids(session, user_id)
+        for device_id in devices:  # la FK ya lo pondría a NULL; así no depende del PRAGMA
+            clear_notify_device(session, device_id)
         # ON DELETE CASCADE: sus conversaciones privadas, su pertenencia y sus dispositivos.
         session.delete(user)
         session.commit()
@@ -254,6 +263,13 @@ class HomeResponse(BaseModel):
     id: str
     name: str
     agent: str | None  # el de lo común; null = la cascada de siempre
+    notify_client_id: str | None = None  # el dispositivo de avisos; null = ninguno (#407)
+
+
+def _home_view(home: HomeRecord) -> HomeResponse:
+    return HomeResponse(
+        id=home.id, name=home.name, agent=home.agent, notify_client_id=home.notify_client_id
+    )
 
 
 @home_router.get("", response_model=HomeResponse)
@@ -262,7 +278,7 @@ def get_home() -> HomeResponse:
         home = session.get(HomeRecord, DEFAULT_HOME_ID)
     if home is None:
         raise HTTPException(status_code=404, detail="Home not found")
-    return HomeResponse(id=home.id, name=home.name, agent=home.agent)
+    return _home_view(home)
 
 
 @home_router.patch("", response_model=HomeResponse)
@@ -274,9 +290,12 @@ def update_home(body: HomeUpdate) -> HomeResponse:
         home = session.get(HomeRecord, DEFAULT_HOME_ID)
         if home is None:
             raise HTTPException(status_code=404, detail="Home not found")
+        notify = patch.get("notify_client_id")
+        if notify is not None and not home_device_ok(session, home.id, notify):
+            raise HTTPException(status_code=422, detail=INVALID_NOTIFY_DEVICE)
         for field, value in patch.items():
             setattr(home, field, value)
         session.add(home)
         session.commit()
         session.refresh(home)
-        return HomeResponse(id=home.id, name=home.name, agent=home.agent)
+        return _home_view(home)

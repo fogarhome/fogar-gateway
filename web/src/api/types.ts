@@ -257,6 +257,8 @@ export interface Home {
   id: string
   name: string
   agent: string | null
+  /** El dispositivo de avisos del hogar; `null`, ninguno. */
+  notify_client_id?: string | null
 }
 
 export interface MyDevice {
@@ -265,6 +267,21 @@ export interface MyDevice {
   client_type: string | null
   created_at: string
   last_seen_at: string | null
+  /** Falso si un administrador lo desactivó (sin retirarlo). */
+  is_active?: boolean
+  /** Recibe avisos (push); sin ellos no vale como dispositivo de avisos. */
+  push_enabled?: boolean
+  /** Lo que sabe reproducir (de su ficha); `null`, sin fijar. */
+  output_mode?: OutputMode[] | null
   /** Este navegador. */
   current: boolean
+}
+
+/** `GET`/`PATCH /auth/me`: quién soy y dónde suenan mis avisos. */
+export interface Me {
+  user: { id: string; username: string; display_name: string; role: UserRole }
+  home: { id: string; name: string } | null
+  device: MyDevice | null
+  /** Mi dispositivo de avisos (uno de mis aparatos personales); `null`, ninguno. */
+  notify_client_id: string | null
 }

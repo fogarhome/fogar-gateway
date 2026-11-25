@@ -19,6 +19,7 @@ from fogar_gateway.db.database import get_engine
 from fogar_gateway.db.models import ClientRecord, HomeRecord, MembershipRecord, UserRecord
 from fogar_gateway.models.schemas import Client, ClientConfig
 from fogar_gateway.services.auth import hash_key
+from fogar_gateway.services.notify_device import notify_client_for
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,16 @@ class DbClient:
                 update(ClientRecord).where(col(ClientRecord.id) == client_id).values(**values)
             )
             session.commit()
+
+    async def notify_device(self, home_id: str, owner_user_id: str | None) -> str | None:
+        """El dispositivo de avisos de una conversación de `home_id` (privada si trae
+        `owner_user_id`), si vale ahora (`notify_device.notify_client_for`; 5.0 PR 2c.3). En un
+        hilo, como el resto: nunca para el event loop."""
+        return await asyncio.to_thread(self._notify_device, home_id, owner_user_id)
+
+    def _notify_device(self, home_id: str, owner_user_id: str | None) -> str | None:
+        with Session(self._get_engine()) as session:
+            return notify_client_for(session, home_id, owner_user_id)
 
     async def revalidate(self, key_hash: str) -> tuple[Client, ClientConfig]:
         """Como `get_session`, desde el hash que ya guarda la sesión (la clave no se guarda)."""

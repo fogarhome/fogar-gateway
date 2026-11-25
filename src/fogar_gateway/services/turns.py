@@ -14,7 +14,8 @@ turno del canal a su manera, con las mismas reglas de siempre por socket:
 - Su propia numeración (`t-{n}`, `turn_seq` & 0xFFFF), su `output_mode`, sus `tool_calls`, su
   `push_enabled` (sin él no ve los push) y su `turn_progress` (#254) con su ritmo.
 - Un TTS por turno (`TurnTts`), solo en la sesión que suena: la que envió un turno del usuario
-  o, para un push, la que el canal elige (2a: la última adjunta con audio; 2c lo sustituye).
+  o, para un push, la del dispositivo de avisos de su conversación (5.0 PR 2c.3), si muestra
+  audio.
   Abrir, alimentar, terminar esperando el audio por inactividad, y liberar; las métricas
   (`tts_start`, `tts_first_chunk`, `tts_done`) son las mismas para los dos orígenes.
 
@@ -35,6 +36,15 @@ en la cola (`pending`) y su turno se abre cuando le toca. Cada mensaje aceptado 
 sesión como `message` (por su cola ordenada, con su estado: `pending`, `delivered`,
 `withdrawn`), también a quien lo envió; `turn_start` dice quién lo inició (`by`). Solo cortan
 `cancel`, un `send` con `interrupt` y `withdraw` (un pendiente).
+
+El dispositivo de avisos (5.0 PR 2c.3): la sesión del dispositivo de avisos de otra conversación
+recibe el push de esa conversación como invitada (`foreign`): ese turno y nada más, sin
+adjuntarse a su canal. Un turno por socket (#202) también entre canales: un turno de otra
+conversación que llega mientras otro sigue abierto aquí espera (`parked`, con lo suyo guardado)
+y sale, en orden, detrás de su `turn_end`; vale en los dos sentidos (el push ajeno detrás del
+turno propio, el turno propio detrás del push ajeno). `cancel` o un `send` con `interrupt`
+mientras se muestra un push ajeno cortan solo esa copia: la sesión no está en esa conversación,
+así que no lo para para nadie ni lo aborta (el `cancel` para todos es de las sesiones adjuntas).
 """
 
 import asyncio
@@ -115,6 +125,16 @@ class Turn:
     pending: "_PendingTts | None" = None  # user: su TTS mientras conecta (E-2)
     progress: TurnProgress = field(default_factory=TurnProgress)  # su `turn_progress` (#254)
     progress_flush: asyncio.Task | None = None  # el `turn_progress` aplazado por el ritmo
+    # 2c.3: un push de otra conversación que esta sesión recibe como invitada (es la del
+    # dispositivo de avisos): no está adjunta a su canal.
+    foreign: bool = False
+    # Su turn_end ya está en la cola (el canal lo cerró): no retiene a los que esperan.
+    end_queued: bool = False
+    # #202 entre canales (2c.3): espera, con lo suyo guardado aquí, a que se cierre el turno
+    # abierto de otra conversación en esta sesión; después sale en orden, detrás de su turn_end.
+    parked: bool = False
+    # Sin tope propio: lo acota TURN_TIMEOUT_S del turno por el que espera (sin progreso, se cierra).
+    held: list[tuple] = field(default_factory=list, repr=False)
 
     @property
     def halted(self) -> bool:
@@ -466,6 +486,9 @@ class TurnController:
         self._cuts: set[asyncio.Task] = set()  # turn_end de cortes en curso (on_turn_end)
         # Una vez puesto no vuelve atrás: ni turnos nuevos (G-09) ni turnos del canal.
         self._closing = False
+        # La sesión ya abrió su conversación (`attach`, en claim_conversation, justo antes de
+        # `ready`): antes no recibe ningún turno, tampoco un push como dispositivo de avisos.
+        self._claimed = False
         # El cliente se fue (desconexión o ClientGone): deja de enviar y de sonar (G-18).
         self.client_gone = False
         self.last_ended: Turn | None = None
@@ -496,6 +519,16 @@ class TurnController:
     def tracker(self) -> PipelineTracker:
         return self._tracker
 
+    @property
+    def claimed(self) -> bool:
+        """Pasó claim_conversation (va a recibir o ya recibió `ready`): puede recibir turnos."""
+        return self._claimed
+
+    @property
+    def closing(self) -> bool:
+        """La sesión se está cerrando: ya no recibe turnos (2c.3: tampoco un push ajeno)."""
+        return self._closing
+
     def agent_allowed(self, session_key: str) -> bool:
         allowed = self.allowed_agents
         parts = session_key.split(":")
@@ -504,19 +537,42 @@ class TurnController:
         return parts[1].lower() in {a.lower() for a in allowed}
 
     def on_turn_start(self, turn: ChannelTurn) -> None:
-        if self._closing:
-            return
+        if self._closing or not self._claimed:
+            return  # nada antes de `ready` (ni par: no hubo turn_start)
         if turn.origin == "push":
             if not self._config.push_enabled:
                 return  # el push entero se descarta para esta sesión
             channel = self._channel
-            if channel is not None and not self.agent_allowed(channel.session_key):
+            key = turn.session_key or (channel.session_key if channel is not None else None)
+            if key is not None and not self.agent_allowed(key):
                 # C-r7-1: push de un agente retirado de allowed_agents: no llega al cliente.
                 logger.info(f"[{self._client_id}] push de un agente no permitido: descartado")
+                return
+        channel = self._channel
+        foreign = channel is None or channel.conversation.id != turn.conversation_id
+        if foreign and turn.conversation is not None:
+            client = self._client
+            if not turn.conversation.visible_to(client.home_id, client.user_id):
+                # 2c.3, tercera defensa (tras `notify_client_for` y `_may_get_push`): un push
+                # que esta sesión no puede ver no le llega, ni su par.
+                logger.warning(f"[{self._client_id}] push ajeno no visible: descartado")
                 return
         local = self._new_turn(turn.origin)
         local.conversation_id = turn.conversation_id
         local.channel = turn
+        # 2c.3: el push de otra conversación para el dispositivo de avisos (invitada).
+        local.foreign = foreign
+        # #202: nunca encima del turno de otra conversación que sigue abierto aquí (ni de los
+        # que ya esperan): espera detrás, en orden.
+        local.parked = any(
+            t.parked
+            or (
+                not t.ended
+                and not t.end_queued
+                and t.conversation_id != local.conversation_id
+            )
+            for t in self._live
+        )
         self._by_channel[turn.id] = local
         self._live.append(local)
         self._put(("turn_start", local))
@@ -537,7 +593,9 @@ class TurnController:
         local = self._by_channel.get(turn.id)
         if local is None or local.ended:
             return
+        local.end_queued = True
         self._put(("turn_end", local, reason))
+        self._release_parked()
         if local.opened and not _drains(local, reason):
             # Un corte (un `send` que lo sustituye, su timeout, un agente retirado): su turn_end
             # sale ya (A-r2-2), sin esperar detrás de un worker ocupado con su TTS; lo que venga
@@ -570,6 +628,7 @@ class TurnController:
         await aquí dejaría que un turn_start del canal saliera antes que `ready`."""
         if self._closing or self._channel is not None:
             return
+        self._claimed = True  # antes de subscribe: su on_turn_start lo mira
         conversation = self._conversation.current
         client = self._client
         if not conversation.visible_to(client.home_id, client.user_id):
@@ -773,6 +832,7 @@ class TurnController:
         for turn in self._live:
             turn.silent = True
         await self._cut_finishing("interrupted")
+        await self._cut_foreign("interrupted")
         await channel.interrupt_now()
 
     async def start_user_turn(
@@ -799,6 +859,7 @@ class TurnController:
                 for turn in self._live:
                     turn.silent = True
                 await self._cut_finishing("interrupted")
+                await self._cut_foreign("interrupted")
             # El cambio de día se evalúa al empezar cada turno (services/conversations.py).
             await self._conversation.refresh()
             await self._follow_conversation()
@@ -862,7 +923,8 @@ class TurnController:
         el canal (su audio aún suena), se corta solo aquí y el turno abierto del canal sigue
         (se abrirá después, como antes); si es la copia del turno abierto del canal (o el
         socket aún no muestra nada), se cancela en el canal: el `cancel` del cliente para el
-        turno para todos (C3). La voz nunca llama aquí (5.0: hablar no corta nada; cortar
+        turno para todos (C3). Un push de otra conversación (2c.3, `foreign`) siempre es «lo
+        que muestra» sin ser de su canal: se corta solo aquí. La voz nunca llama aquí (5.0: hablar no corta nada; cortar
         es siempre explícito, `cancel` o `send` con `interrupt`). Devuelve (cancelado, su
         turn_id en esta sesión)."""
         channel = self._channel
@@ -889,6 +951,20 @@ class TurnController:
             await self._end(mine, reason)
         return True, mine.turn_id
 
+    async def _cut_foreign(self, reason: EndReason) -> None:
+        """Corta aquí el push de otra conversación que la sesión muestra (2c.3): solo su copia
+        (la sesión no está adjunta a su canal); el push sigue para quien lo tenga. Los que aún
+        esperan su turn_start se descartan sin par: la respuesta no espera detrás de ellos."""
+        for turn in list(self._live):
+            # Primero los que esperan, sin await: cerrar el abierto los soltaría (#202).
+            if turn.foreign and not turn.ended and not turn.opened:
+                turn.end_reason = reason
+                self._forget(turn)
+        for turn in list(self._live):
+            if turn.foreign and not turn.ended:
+                turn.cancel_reason = turn.cancel_reason or reason
+                await self._end(turn, reason)
+
     async def _cut_finishing(self, reason: EndReason) -> Turn | None:
         """Corta los turnos de la sesión cuyo turno del canal ya terminó solo y que siguen
         abiertos aquí porque su audio suena (7e, A-r2-2): su turn_end sale ya, sin esperar a
@@ -914,7 +990,27 @@ class TurnController:
         lo de turnos que la sesión ya vio (su fin)."""
         if self._closing and item[0] in ("turn_start", "message"):
             return
+        if item[0] in ("turn_start", "event", "turn_end") and item[1].parked:
+            item[1].held.append(item)  # #202 entre canales: sale cuando le toque
+            return
         self._enqueue(item)
+
+    def _release_parked(self) -> None:
+        """Los turnos que esperaban (#202, 2c.3) salen en orden, uno a uno: cada uno en cuanto
+        ningún otro turno de la sesión sigue abierto en su canal; lo suyo va a la cola detrás del
+        turn_end del anterior."""
+        while not self._closing:  # al cerrar, `_close_turns` se ocupa de lo que espera
+            parked = next((t for t in self._live if t.parked), None)
+            if parked is None:
+                return
+            if any(
+                not t.parked and not t.ended and not t.end_queued for t in self._live
+            ):
+                return
+            parked.parked = False
+            held, parked.held = parked.held, []
+            for item in held:
+                self._enqueue(item)
 
     def _enqueue(self, item: tuple) -> None:
         if self._worker is None or self._worker.done():
@@ -1208,10 +1304,18 @@ class TurnController:
     def _forget(self, turn: Turn) -> None:
         """Un turno que esta sesión nunca abrió: sin par, sin nada más."""
         turn.ended = True
+        turn.parked = False
+        turn.held.clear()
         if turn in self._live:
             self._live.remove(turn)
-        if turn.channel is not None and self._by_channel.get(turn.channel.id) is turn:
-            del self._by_channel[turn.channel.id]
+        source = turn.channel
+        if source is not None and self._by_channel.get(source.id) is turn:
+            del self._by_channel[source.id]
+        if turn.foreign and source is not None and source.session_key is not None:
+            # 2c.3: invitada de ese push; nada más de él llega aquí.
+            guest_of = self._channels.get(source.session_key)
+            if guest_of is not None:
+                guest_of.drop_guest(self)
 
     async def _end(self, turn: Turn, reason: EndReason, *, release: bool = True) -> bool:
         """El único que envía un turn_end: exactamente uno por turno, quien llegue primero.
@@ -1237,6 +1341,7 @@ class TurnController:
                 )
             except Exception as e:  # noqa: BLE001 — frontera: envío a un cliente que puede haberse ido
                 self._send_failed("turn_end", e)
+        self._release_parked()  # detrás de este turn_end, lo que esperaba (#202)
         if release:
             td = Teardown(f"[{self._client_id}] fin del turno {turn.turn_id}")
             await td.step(self._release_turn_tts(turn, reason), "TTS del turno")
@@ -1324,6 +1429,12 @@ class TurnController:
             inbox.queue.task_done()
         inbox.pending = 0
         inbox.since = None
+        for turn in self._live:
+            # Los que esperaban a otro turno (#202, 2c.3), en su orden, detrás de la cola.
+            if turn.parked:
+                turn.parked = False
+                items.extend(turn.held)
+                turn.held = []
         for item in items:
             kind = item[0]
             if kind == "turn_end" and item[1].opened:

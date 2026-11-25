@@ -21,7 +21,7 @@ from fogar_gateway.main import app
 from fogar_gateway.services.conversations import session_key_for
 from tests.fakes.fogar_upstreams import FakeTranscriber, FakeTts
 from tests.fakes.openclaw import FakeOpenClawServer
-from tests.integration.conftest import ADMIN_TOKEN, VALID_KEY
+from tests.integration.conftest import ADMIN_TOKEN, CLIENT_ID, VALID_KEY
 
 Message = dict | bytes
 
@@ -181,6 +181,31 @@ def assert_turns_paired(messages: list[Message]) -> None:
             assert tid in open_turns, f"turn_end sin turn_start abierto: {tid}"
             open_turns.discard(tid)
     assert not open_turns, f"turnos sin turn_end: {sorted(open_turns)}"
+
+
+def set_home_notify_device(db_engine, client_id: str | None) -> None:
+    """El dispositivo de avisos del hogar (5.0, #407) en la BD del gateway: los push de las
+    conversaciones comunes suenan en `client_id` (None: en ninguno). Crea el hogar si falta (las
+    BD de test se crean con `create_all`, sin la fila del hogar)."""
+    from sqlmodel import Session
+
+    from fogar_gateway.db.models import DEFAULT_HOME_ID, DEFAULT_HOME_NAME, HomeRecord
+
+    with Session(db_engine) as s:
+        home = s.get(HomeRecord, DEFAULT_HOME_ID) or HomeRecord(
+            id=DEFAULT_HOME_ID, name=DEFAULT_HOME_NAME
+        )
+        home.notify_client_id = client_id
+        s.add(home)
+        s.commit()
+
+
+@pytest.fixture
+def home_notify_device(db_engine, seed_client) -> str:
+    """El cliente de prueba es el dispositivo de avisos del hogar (2c.3: el audio de un push
+    solo suena ahí)."""
+    set_home_notify_device(db_engine, CLIENT_ID)
+    return CLIENT_ID
 
 
 @pytest.fixture

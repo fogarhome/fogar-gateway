@@ -67,6 +67,7 @@ def make_bridge(
     transcriber=None,
     register=False,
     attach=True,
+    notify=True,
     **overrides,
 ):
     """Return `(bridge, ws)`. Any `FogarBridge` argument can be overridden by name.
@@ -75,6 +76,10 @@ def make_bridge(
     `register=True` adds the bridge to its `client_registry`, as `routes.py` does. The bridge
     is attached to its conversation's channel (what `claim_conversation` does before `ready`);
     `attach=False` leaves it out.
+
+    5.0 PR 2c.3: with its own hub (no `channel_hub` given) and `notify=True`, the bridge's
+    client is its conversation's notify device (the push audio plays there, as before 2c);
+    `notify=False` leaves the conversation without one.
     """
     ws = ws if ws is not None else RecWS()
     kwargs = dict(
@@ -96,14 +101,41 @@ def make_bridge(
     # 5.0 PR 2b: the channel sends and reads frames; a mock's `stream_response` plays them.
     wire_stream_orchestrator(bridge.channel_hub.orchestrator, bridge.channel_hub)
     bridge.transcriber = transcriber
+    if bridge._own_hub:
+        registry = kwargs["client_registry"]
+
+        def _sessions_of(cid: str) -> list:
+            live = [b.turns for b in registry.for_client(cid)]
+            if not live and cid == bridge.client_id:
+                live = [bridge.turns]  # not registered (`register=False`): still the device's session
+            return live
+
+        bridge.channel_hub.sessions_of = _sessions_of
+        if notify:
+            bridge.channel_hub.notify_device = notify_device_is(client_id)
     if register:
         kwargs["client_registry"].register(bridge.client_id, bridge, bridge.conversation.current)
     if attach:
+        # As claim_conversation: its conversation is indexed (2c.3: a push has a notify device
+        # only on an indexed key), then the session attaches.
+        index = bridge.channel_hub.index
+        if index is not None and index.get(bridge.conversation.session_key) is None:
+            index.add(bridge.conversation.current)
         bridge.turns.attach()
     return bridge, ws
 
 
 CONVERSATION_ID = "conv-1"
+
+
+def notify_device_is(client_id: str | None):
+    """A `ChannelHub.notify_device` for tests: every conversation's notify device is
+    `client_id` (None: none)."""
+
+    async def _lookup(conversation) -> str | None:
+        return client_id
+
+    return _lookup
 
 
 def fixed_conversation(client_id: str = "u", agent: str = "main", **kwargs) -> SessionConversation:

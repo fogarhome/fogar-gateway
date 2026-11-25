@@ -139,6 +139,7 @@ class FogarBridge:
                 orchestrator=orchestrator,
                 turn_registry=turn_registry,
                 note_turn=lambda conversation_id: self.conversation.note_turn(conversation_id),
+                sessions_of=lambda cid: [b.turns for b in client_registry.for_client(cid)],
             )
         self.channel_hub = channel_hub
         self.turns = TurnController(
