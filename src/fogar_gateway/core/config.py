@@ -136,8 +136,9 @@ class Settings(BaseSettings):
     CLIENT_SEND_TIMEOUT_S: float = Field(default=10.0, gt=0)
 
     # Eventos de OpenClaw que una conversación retiene mientras espera el ack de un
-    # `send` o a que se cierre el turno abierto (issue #130 S3b, 5.0). Lo que pase del
-    # tope se descarta (con un aviso en el log) y el turno sigue.
+    # `send` o a que se cierre el turno abierto (issue #130 S3b, 5.0). El run que no cabe
+    # falla con TURN_ERROR "internal_error" y se aborta (solo él); el fin de un push nunca
+    # se descarta.
     TURN_QUEUE_MAX: int = Field(default=1000, gt=0)
 
 

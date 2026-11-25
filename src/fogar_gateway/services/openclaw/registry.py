@@ -14,6 +14,10 @@ logger = logging.getLogger(__name__)
 # frames already in flight when chat.abort went out and a run that keeps streaming for a
 # while after it.
 RUN_ABORT_TOMBSTONE_S = 300.0
+# The same memory for a run a conversation channel sent that already ended there (final 2b
+# review, m5): a late frame of it (a `run_status`, a stray delta) is dropped before routing,
+# so it never opens a push, even after its channel was dropped (`ChannelHub.drop_if_idle`).
+RUN_FINISHED_MEMORY_S = RUN_ABORT_TOMBSTONE_S
 
 
 class TurnRegistry:
@@ -27,10 +31,21 @@ class TurnRegistry:
     def __init__(self) -> None:
         # runId -> deadline; see RUN_ABORT_TOMBSTONE_S.
         self._aborted_runs: dict[str, float] = {}
+        # runId -> deadline; see RUN_FINISHED_MEMORY_S.
+        self._finished_runs: dict[str, float] = {}
 
     def abort_run(self, run_id: str) -> None:
         _prune(self._aborted_runs)
         self._aborted_runs[run_id] = time.monotonic() + RUN_ABORT_TOMBSTONE_S
+
+    def finish_run(self, run_id: str) -> None:
+        """A channel's own run ended there: its late frames are not a push (m5)."""
+        _prune(self._finished_runs)
+        self._finished_runs[run_id] = time.monotonic() + RUN_FINISHED_MEMORY_S
+
+    def is_run_finished(self, run_id: object) -> bool:
+        """True while frames of this run (a channel's own, already ended) must be dropped."""
+        return isinstance(run_id, str) and _alive(self._finished_runs, run_id)
 
     def note_abort_result(self, payload: object) -> None:
         """A `chat.abort` answer (`{ok, aborted, runIds}`) names the runs it aborted."""
@@ -44,15 +59,17 @@ class TurnRegistry:
 
     def is_run_aborted(self, run_id: object) -> bool:
         """True while frames of this run (aborted by the gateway) must be dropped."""
-        if not isinstance(run_id, str):
-            return False
-        deadline = self._aborted_runs.get(run_id)
-        if deadline is None:
-            return False
-        if deadline <= time.monotonic():
-            del self._aborted_runs[run_id]
-            return False
-        return True
+        return isinstance(run_id, str) and _alive(self._aborted_runs, run_id)
+
+
+def _alive(deadlines: dict[str, float], key: str) -> bool:
+    deadline = deadlines.get(key)
+    if deadline is None:
+        return False
+    if deadline <= time.monotonic():
+        del deadlines[key]
+        return False
+    return True
 
 
 def _prune(deadlines: dict[str, float]) -> None:

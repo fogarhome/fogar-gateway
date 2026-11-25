@@ -123,6 +123,9 @@ _EARLY_PHASE_TTL_S = 30.0
 # `final`) siguen siendo suyos y se descartan, nunca llegan como push.
 _DONE_RUNS = 64
 _TERMINAL_CHAT = ("final", "aborted", "error")
+# What a run fails with when its frames overflow TURN_QUEUE_MAX (final 2b review, m3): an
+# internal bound of the gateway, nothing the client can act on; `turn_overflow` stays retired.
+OVERFLOW_CODE = "internal_error"
 # Pushes cerrados por su lifecycle `end`/`error`, recordados: un evento tardío de su run (un
 # `run_status`, una fase) no abre otro push; solo un lifecycle `start` nuevo (#84).
 _ENDED_PUSH_RUNS = 64
@@ -158,6 +161,25 @@ def _final_has_text(payload: dict) -> bool:
     return (isinstance(delta, str) and bool(delta)) or bool(
         extract_message_text(payload.get("message"))
     )
+
+
+def _ends_run(event: str, payload: dict) -> bool:
+    """A frame that ends its run: a terminal `chat`, or an `agent` lifecycle `end`/`error`."""
+    if event == "chat":
+        return payload.get("state") in _TERMINAL_CHAT
+    return (
+        event == "agent"
+        and payload.get("stream") in (None, "lifecycle")
+        and _as_dict(payload.get("data")).get("phase") in ("end", "error")
+    )
+
+
+def _ends_push(kind: str, arg: Any) -> bool:
+    """A push item (`push_route`) that ends the push: lifecycle `end`/`error` or a terminal
+    `chat`."""
+    if kind in ("turn_end", "turn_error"):
+        return True
+    return kind == "chat" and _as_dict(arg).get("state") in _TERMINAL_CHAT
 
 
 def _lifecycle_error(event: str, payload: dict) -> bool:
@@ -515,6 +537,10 @@ class ConversationChannel:
         # Lo que espera a que se cierre el turno abierto (un turno a la vez), en orden.
         self._deferred: deque[tuple[str, Any, str | None]] = deque()
         self._deferred_runs: set[str] = set()
+        # TURN_QUEUE_MAX (final 2b review, m3): runs whose frames did not fit and that fail
+        # with `internal_error`; runs unknown yet whose held frames did not fit (see the ack).
+        self._overflowed: set[str] = set()
+        self._held_dropped: set[str] = set()
         self._defer_push = False
         self._replaying = False
         self._push: ChannelTurn | None = None
@@ -1105,8 +1131,15 @@ class ConversationChannel:
             f"[{self._tag}] mensaje aceptado: run={run_id} "
             f"{'pendiente' if ahead else 'entregado'} text_len={len(text)}"
         )
+        overflowed = run_id in self._held_dropped
+        if overflowed:
+            # Parte de lo suyo retenido no cupo (TURN_QUEUE_MAX): no se pinta a medias.
+            self._held_dropped.discard(run_id)
+            self._held = [(e, p) for e, p in self._held if _str_run_id(p) != run_id]
         self._announce(info, "pending" if ahead else "delivered")
         self._release_held()
+        if overflowed:
+            self._overflow_run(run_id)
         self._wake()
         return info
 
@@ -1143,10 +1176,13 @@ class ConversationChannel:
         return turn
 
     async def cancel_head(self, reason: EndReason) -> bool:
-        """Sin turno abierto: el mensaje entregado cuyo run aún no empezó (nada va delante) se
-        aborta, y su mensaje queda `withdrawn` para todos (no llegó a tener turno)."""
+        """Sin turno abierto: el siguiente run propio, cuyo turno aún no se abrió (nada va
+        delante), se aborta y su mensaje queda `withdrawn` para todos (no llegó a tener turno).
+        Vale entregado o aún `pending`: entre dos turnos OpenClaw ya lo está corriendo aunque
+        su primer evento no haya llegado (revisión final de la 2b, m1). `withdraw` sigue
+        siendo solo para los pendientes."""
         head = self._head()
-        if head is None or head.message != "delivered":
+        if head is None or head.message == "withdrawn":
             return False
         logger.info(f"[{self._tag}] run {head.run_id} sin empezar: chat.abort ({reason})")
         self._abort_run(head.run_id)
@@ -1222,8 +1258,11 @@ class ConversationChannel:
                     # Retenido (detrás de uno suyo que ya espera, para no adelantarlo): su
                     # llegada cuenta como progreso del push (#286).
                     push.progress_at = time.monotonic()
-            if len(self._held) >= settings.TURN_QUEUE_MAX:
+            if len(self._held) >= settings.TURN_QUEUE_MAX and not _ends_run(event, payload):
+                # m3: si resulta ser de un run propio, el ack lo hace fallar (`internal_error`);
+                # el fin de un run nunca se descarta (sin él su turno no se cerraría).
                 logger.warning(f"[{self._tag}] demasiados frames retenidos: se descarta uno")
+                self._held_dropped.add(run_id)
             else:
                 self._held.append((event, payload))
             return True
@@ -1246,6 +1285,8 @@ class ConversationChannel:
                 self._held.append((event, payload))
             else:
                 self._forward_push(event, payload)
+        if self._acks == 0:
+            self._held_dropped.clear()  # lo que no fue de nadie era de un push
 
     def _forward_push(self, event: str, payload: dict) -> None:
         """Un frame que resultó no ser de un run propio: lo que el dispatcher habría hecho con
@@ -1452,11 +1493,50 @@ class ConversationChannel:
         return kind == "chat" and _as_dict(arg).get("state") not in _TERMINAL_CHAT
 
     def _defer(self, item: tuple[str, Any, str | None]) -> None:
+        kind, arg, run_id = item
+        if run_id is not None and run_id in self._overflowed and kind == "run":
+            return  # ya falla por TURN_QUEUE_MAX: lo suyo no se pinta
         if len(self._deferred) >= settings.TURN_QUEUE_MAX:
-            logger.warning(f"[{self._tag}] demasiados eventos en espera de turno: se descarta uno")
-            return
+            if kind in ("run", "fail") and run_id is not None and run_id in self._runs:
+                self._overflow_deferred_run(run_id)
+                return
+            if not _ends_push(kind, arg):
+                logger.warning(f"[{self._tag}] demasiados eventos en espera de turno: se descarta uno")
+                return
+            # El fin de un push nunca se descarta: sin él el push no se cerraría.
         self._deferred.append(item)
         self._mark_deferred(item)
+
+    def _overflow_deferred_run(self, run_id: str) -> None:
+        """m3: a run whose frames do not fit while it waits for the open turn fails, once: its
+        waiting frames are dropped and replaced by its failure (`internal_error`, kept past
+        the cap: one per run), and it is buried and aborted by its runId."""
+        if run_id in self._overflowed:
+            return
+        self._bury_overflowed(run_id)
+        self._deferred = deque(
+            i for i in self._deferred if not (i[0] in ("run", "fail") and i[2] == run_id)
+        )
+        item: tuple[str, Any, str | None] = ("fail", (OVERFLOW_CODE, False), run_id)
+        self._deferred.append(item)
+        self._mark_deferred(item)
+
+    def _overflow_run(self, run_id: str) -> None:
+        """m3: a run whose held frames did not fit fails with `internal_error` (in order behind
+        what was released of it) and is buried and aborted by its runId."""
+        if run_id in self._overflowed:
+            return
+        self._bury_overflowed(run_id)
+        self.fail_run(run_id, OVERFLOW_CODE)
+
+    def _bury_overflowed(self, run_id: str) -> None:
+        logger.warning(
+            f"[{self._tag}] run {run_id}: más de TURN_QUEUE_MAX eventos en espera; falla "
+            f"({OVERFLOW_CODE}) y chat.abort de ese run"
+        )
+        self._overflowed.add(run_id)
+        self._abort_run(run_id)
+        self._spawn_abort(run_id)
 
     def _mark_deferred(self, item: tuple[str, Any, str | None]) -> None:
         kind, _, run_id = item
@@ -1679,6 +1759,9 @@ class ConversationChannel:
         info.state = "done"
         self._runs.pop(info.run_id, None)
         self._deferred_runs.discard(info.run_id)
+        self._overflowed.discard(info.run_id)
+        # m5: a late frame of it is never a push, even once this channel is dropped.
+        self._turn_registry.finish_run(info.run_id)
         self._done_runs[info.run_id] = None
         while len(self._done_runs) > _DONE_RUNS:
             self._done_runs.popitem(last=False)

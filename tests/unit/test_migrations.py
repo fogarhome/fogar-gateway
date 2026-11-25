@@ -189,22 +189,49 @@ def test_migration_drops_barge_in(tmp_path, monkeypatch):
                 "'v', 1, 0, 9, 7, 1, 0)"
             ))
             _insert_conversation(c, "c-tv", "tv")
+            # A person, their membership and a personal device with a private conversation.
+            c.execute(text(
+                "INSERT INTO users (id, username, display_name, password_hash, is_active, "
+                "created_at) VALUES ('u-ana', 'ana', 'Ana', 'h', 1, '2026-11-21')"
+            ))
+            c.execute(text(
+                "INSERT INTO memberships (user_id, home_id, role, agent) "
+                "VALUES ('u-ana', 'home', 'owner', 'ana')"
+            ))
+            c.execute(text(
+                "INSERT INTO clients (id, home_id, user_id, name, key_hash, is_active, created_at, "
+                "stt_language, stt_vad_thold, tts_voice, tts_speed, barge_in_enabled, "
+                "barge_in_min_chars, silence_timeout_s, push_enabled, "
+                "tool_calls_enabled) VALUES ('phone', 'home', 'u-ana', 'Móvil', 'k2', 1, "
+                "'2026-11-21', 'es', 0, 'v', 1, 1, 5, 2, 1, 0)"
+            ))
+            _insert_conversation(c, "c-phone", "phone", owner="u-ana")
         database.run_migrations()
         with engine.connect() as c:
             assert not barge & {col["name"] for col in inspect(c).get_columns("clients")}
-            row = c.execute(text("SELECT id, silence_timeout_s FROM clients")).one()
-            assert tuple(row) == ("tv", 7.0)
-            assert c.execute(text("SELECT id FROM conversations")).scalars().all() == ["c-tv"]
+            rows = c.execute(text("SELECT id, user_id, silence_timeout_s FROM clients ORDER BY id"))
+            assert [tuple(r) for r in rows] == [("phone", "u-ana", 2.0), ("tv", None, 7.0)]
+            assert c.execute(text("SELECT id, username FROM users")).all() == [("u-ana", "ana")]
+            assert c.execute(text("SELECT user_id, home_id, role, agent FROM memberships")).all() == [
+                ("u-ana", "home", "owner", "ana")
+            ]
+            convs = c.execute(text("SELECT id, owner_user_id FROM conversations ORDER BY id")).all()
+            assert convs == [("c-phone", "u-ana"), ("c-tv", None)]
             assert c.execute(text("PRAGMA foreign_key_check")).all() == []
         engine.dispose()
         command.downgrade(database._alembic_config(), "50a0e1f00002")
         with engine.connect() as c:
             assert barge <= {col["name"] for col in inspect(c).get_columns("clients")}
             row = c.execute(text(
-                "SELECT id, barge_in_enabled, barge_in_min_chars, silence_timeout_s FROM clients"
+                "SELECT id, barge_in_enabled, barge_in_min_chars, silence_timeout_s FROM clients "
+                "WHERE id = 'tv'"
             )).one()
             assert tuple(row) == ("tv", 1, 5, 7.0)
-            assert c.execute(text("SELECT id FROM conversations")).scalars().all() == ["c-tv"]
+            assert c.execute(text("SELECT user_id FROM clients WHERE id = 'phone'")).scalar() == "u-ana"
+            assert c.execute(text("SELECT COUNT(*) FROM memberships")).scalar() == 1
+            assert c.execute(text("SELECT id FROM conversations ORDER BY id")).scalars().all() == [
+                "c-phone", "c-tv"
+            ]
             assert c.execute(text("PRAGMA foreign_key_check")).all() == []
     finally:
         database.dispose_engine()

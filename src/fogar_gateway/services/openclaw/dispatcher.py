@@ -132,8 +132,14 @@ class FrameDispatcher:
         self._turns.note_abort_result(_as_dict(frame.get("payload")))
 
     def _of_aborted_run(self, payload: dict) -> bool:
-        if self._turns.is_run_aborted(payload.get("runId")):
+        run_id = payload.get("runId")
+        if self._turns.is_run_aborted(run_id):
             logger.debug("frame of an aborted run dropped (sk=%s)", payload.get("sessionKey"))
+            return True
+        if self._turns.is_run_finished(run_id):
+            # A channel's own run that already ended (m5): never a push, even once its
+            # channel is gone.
+            logger.debug("frame of a finished run dropped (sk=%s)", payload.get("sessionKey"))
             return True
         return False
 

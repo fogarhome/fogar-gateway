@@ -1336,7 +1336,31 @@ not live.
   is ahead" (the session's waiting sends then stay) is decided by a counter of `/v1` messages
   waiting or running in the channel: approximate in the moments one starts or ends.
 
+### How the gateway reacts (5.0 PR 2b, final review, 2026-11-25)
+
+- **Between two turns** the next queued run is still `pending` for the gateway until its first
+  event, though OpenClaw is already running it: a client `cancel` (or a `send` with
+  `interrupt`) with no turn open now aborts that head run by `runId`, pending or delivered,
+  and its `message` becomes `withdrawn`. `withdraw` still takes only pending messages.
+- **A channel's own runs are remembered once they end** (`TurnRegistry.finish_run`, as long as
+  a tombstone): the dispatcher drops their late frames (a `run_status`, a stray delta) before
+  routing, so they never open a push, even after the channel was dropped (a trusted-origin
+  `/v1` channel nobody subscribes to is dropped as soon as its run ends).
+- **`TURN_QUEUE_MAX`:** a run whose frames do not fit (held before its ack, or waiting for the
+  open turn) fails with `TURN_ERROR internal_error` and is aborted by `runId`; a frame that ends
+  a run or a push is never dropped.
+- **Untested idea (not relied on):** the live capture shows the `chat.send` user message's
+  `idempotencyKey` as `"<runId>:user"`, so OpenClaw may be using the `idempotencyKey` the
+  gateway sends as the run's `runId`. If a live check confirms that `runId == idempotencyKey`
+  for every `chat.send` (queued and steered ones included), the gateway would know a message's
+  run before the ack and the held-frames logic (decision 3: frames of unknown runs held while a
+  `chat.send` waits for its ack) could be simplified or removed.
+
 ## Change log of this file
+
+- **2026-11-25**: "C3 queue behaviour" gains the final review of 5.0 PR 2b (#406): stopping
+  between turns takes the next run, finished own runs are remembered against ghost pushes,
+  `TURN_QUEUE_MAX` overflow fails the run, and the untested `runId == idempotencyKey` idea.
 
 - **2026-11-24**: "C3 queue behaviour" gains how the gateway reacts in 5.0 PR 2b.3 (#406): `/v1`
   goes through the conversation's channel and waits for calm instead of sending `queueMode`
