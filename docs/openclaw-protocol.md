@@ -1354,10 +1354,199 @@ not live.
   gateway sends as the run's `runId`. If a live check confirms that `runId == idempotencyKey`
   for every `chat.send` (queued and steered ones included), the gateway would know a message's
   run before the ack and the held-frames logic (decision 3: frames of unknown runs held while a
-  `chat.send` waits for its ack) could be simplified or removed.
+  `chat.send` waits for its ack) could be simplified or removed. (Confirmed live on 2026-11-25
+  for the cases tried: see "Live check of 5.0", next section.)
+
+## Live check of 5.0 (2026-11-25, server 2026.11.7 `e31bbf0`)
+
+Observed live on green-house: OpenClaw 2026.11.7 (`e31bbf0`) on loopback with the shared token
+(`pairing=not_required`, so no device was paired); the `next/5.0` gateway (`13e1ab5`) on a
+throwaway base on port 8014, agent `e2e`, protocol-5 WebSocket clients and `/v1`. Raw frames were
+recorded by a second `OpenClawClient` (structure only: types, ids, states, lengths). No text or key
+recorded.
+
+### `runId` == `idempotencyKey` (confirmed)
+
+For every `chat.send` tried, the ack's `runId` was exactly the `idempotencyKey` sent:
+
+- a send to an idle session;
+- a send while another run was active, later absorbed by `steer`;
+- a send with `queueMode: "followup"`.
+
+The user `session.message` carries `"<runId>:user"`, in both `message.idempotencyKey` and
+`message.__openclaw.idempotencyKey`. Not tried: `/queue` commands, sends from other clients,
+cron runs (their user message has no `chat.send`).
+
+### `chat.history`: `inFlightRun` and `pendingInputs`
+
+- **`inFlightRun` arrives**, but only while a run of the key is active; an idle key's answer has
+  no `inFlightRun` key. Shape: `{runId, text, startedAt, events}`.
+  - `text` is the reply so far (agent text: never log it).
+  - `events` holds the run's latest `agent` events, each
+    `{runId, seq, stream, ts, data, sessionKey, agentId}`.
+  - The gateway's defensive read (`{runId}` object) matches.
+- **`pendingInputs.items[]`** is `{id, acceptedAt, state, message, runId}`.
+  - No `queued` field was seen.
+  - The item `id` is the `messageId` of that user message's later `session.message`.
+  - A message waiting under `steer` is listed too (`state: "queued"`) until it is absorbed.
+- **`queuedCount` stayed 0** while one item was `state: "queued"`, in both `steer` and
+  `followup`. Do not rely on it: read the items.
+
+### `steer` (the default): confirmed, with timing
+
+The sequence in "mode `steer`" above was reproduced with a single long model call (about 12 s,
+no tools) and B sent 3 s after A's `starting_model`:
+
+1. B's ack is `started`; `activeRunIds` is `[A, B]`.
+2. Nothing more about B until A's model call ends.
+3. Then B's user `session.message` arrives, again with `steerTargetRunId: A`.
+4. B's `final` arrives (`seq: 1`, no `message`).
+5. A makes a second model call (another lifecycle `model`) and its `final` carries the whole
+   reply.
+
+**B is absorbed only at a model-call boundary.** During one long generation it stays pending (in
+`pendingInputs`) for as long as the call lasts.
+
+Through the gateway: both sessions saw B `pending`, then `delivered` at the absorption. B had no
+turn of its own, and A's turn ended `done` in both sessions.
+
+### Per-message `queueMode: "followup"`: works (first live try)
+
+`chat.send` with `queueMode: "followup"`, on a session whose effective mode is `steer`, while
+run D was active:
+
+- **Accepted:** ack `started`, no error.
+- **Waited:** C sat in `pendingInputs` with `state: "queued"`.
+- **Ran as its own run after D's `final`, never absorbed:**
+  - user `session.message` `queued`, then `running`;
+  - `run_status`;
+  - `agent` `stream:"error"` `seq gap` in place of lifecycle `start`;
+  - its own deltas;
+  - a `final` without `message`.
+
+So the per-message parameter works on 2026.11.7. The gateway still never sends it: `/v1` waits
+for a calm channel instead (5.0 PR 2b.3), which also held live.
+
+### Cron reminders: the reply comes only as a `session.message` (affects push)
+
+- **`openclaw cron add --session-key K` does not run in K.**
+  - The run goes to `agent:<agent>:cron:<jobId>` and `…:cron:<jobId>:run:<uuid>` (isolated).
+  - Those keys are unindexed, so it reaches no client. That is expected.
+- **`--session session:K` runs in K.**
+  - Frames: `run_status`, lifecycle `start`/`model`/`finishing`/`end`, and a `chat` `final`
+    **without `message`**.
+  - **No `chat` delta and no `assistant` stream.**
+  - **The reply arrives only afterwards**, as a `session.message` `role: "assistant"`:
+    - `status: "done"`;
+    - `message.openclawAutomation` present;
+    - `__openclaw.idempotencyKey` `"cron-current-completion:cron:<jobId>:<ts>"`;
+    - **no `__openclaw.runId`**.
+- **Gateway effect, a bug to fix.**
+  - The push opens on the run's first event and closes on its `final` with **no `token`**: an
+    empty `turn_start`/`turn_end` `done`.
+  - The notify device's TTS opens with 0 characters, so **nothing sounds**.
+  - The gateway ignores `assistant` `session.message`.
+  - To show and speak a cron reminder, the push must take its text from that `session.message`,
+    which comes after the `final`; or from `chat.history`.
+- **Routing was right.**
+  - With the owner's notify device set, the push reached the session attached to the private
+    conversation (text) and the notify device as a guest. The guest was `foreign`, in another
+    conversation, and was the only one to open TTS.
+  - With none set, only the attached session got it, and no TTS opened anywhere.
+  - With nobody attached and no notify device, nothing was sent.
+  - A home device (itself the home's notify device) and another person's device got nothing in
+    every case.
+
+### OpenClaw restarted mid-turn (`systemctl --user restart`)
+
+Setup: run A was generating, and B was pending under `steer`.
+
+**Before closing**, OpenClaw sends:
+
+- a `shutdown` event;
+- for B, `chat` `state: "aborted"`, `stopReason: "restart"`, `seq: 1`, with no lifecycle `end`;
+- no terminal event for A (only one more lifecycle `model`).
+
+Then the socket closes with 1012. OpenClaw refused connections (`InvalidStatus`, then refused)
+for about 15 s.
+
+**Gateway:**
+
+- B turned `withdrawn` for both sessions (from that `aborted`).
+- A ended with `TURN_ERROR` `orchestrator_disconnected` and `turn_end` `error` in both sessions:
+  stable codes, as documented.
+- `status` went `reconnecting`, then `restored` after about 15 s.
+
+**After restarting, OpenClaw recovers on its own**, about 13 s after accepting connections:
+
+1. **A new run** (new `runId`) re-runs the interrupted A.
+   - It is driven by a synthetic user message: `senderIsOwner: false`,
+     `__openclaw.transport.channel`, `provenance`, and a fresh `idempotencyKey`, not A's.
+   - It produces the whole reply.
+2. **B runs with its original `runId`**, as a queued run (`seq gap`, `final` without
+   `message`), although it had been reported `aborted` with `stopReason: "restart"`.
+
+Consequences for the gateway (not yet handled):
+
+- **`aborted` + `stopReason: "restart"` does not mean withdrawn.** The message is answered after
+  the restart. But the gateway announced it `withdrawn` and remembers its `runId` as finished, so
+  its late frames are dropped and its answer reaches no client. It should treat that stop like a
+  drop: keep the message unconfirmed and reconcile it on reconnect. Whether B was still in
+  `pendingInputs` after the restart was not read.
+- **A's recovery run has a `runId` nobody sent**, so it reaches clients as a push of the
+  conversation, after A already failed with `orchestrator_disconnected`. Not observed through the
+  gateway: the test sessions had left before it started.
+
+### Events seen and not handled
+
+Each is logged once at INFO as possible drift, and is harmless:
+
+- `shutdown`
+- `cron`
+- `cron.inventory.changed`
+- `plugins.changed`
+- `chat.metadata.changed`
+- `skills.changed`
+- `node.runnerInventory.changed`
+- `node.presence`
+- `node.hostStats`
+- `presence`
+- `health`
+
+### Through the gateway: matched `docs/client-protocol.md`
+
+- **Two personal devices in one conversation:** each got every `message` (with `from.self`) and
+  its own `turn_start`/`turn_end` pair of every turn.
+- **`cancel` from the other device:** `turn_end` `cancelled` in both sessions.
+- **`send` with `interrupt`:** `interrupted` in both, then the new message `delivered` and its
+  own turn in both.
+- **`withdraw` from a session that did not send the message:** `withdrawn` in both, and the
+  running turn went on to `done`.
+- **`/v1` with a home device's Bearer while a WebSocket turn was running in its conversation:**
+  - It waited about 10 s, until that turn ended, and got only its own short reply.
+  - The WebSocket session saw its `message` directly `delivered`, never `pending`, and a turn
+    with `by` = the Home Assistant device.
+- **Opening another home device's conversation by id** from a home device worked.
 
 ## Change log of this file
 
+- **2026-11-25**: added "Live check of 5.0" (server 2026.11.7 `e31bbf0`, observed live on
+  green-house against the `next/5.0` gateway).
+  - Confirmed:
+    - `runId` == `idempotencyKey`;
+    - the shape of `inFlightRun` (only while a run is active);
+    - `pendingInputs` items (their `id` = the later `session.message` `messageId`;
+      `queuedCount` stays 0);
+    - `steer` absorbs only at a model-call boundary.
+  - First live try: the per-message `queueMode: "followup"` works.
+  - Cron runs bound to a session send no deltas; their reply comes only as an `assistant`
+    `session.message` after the `final`. The gateway shows an empty push, a bug.
+  - On restart, OpenClaw:
+    - aborts queued runs with `stopReason: "restart"`;
+    - then re-runs them with their original `runId`;
+    - re-runs the interrupted run under a new `runId`.
+
+  The gateway reports the queued message `withdrawn` and drops its answer.
 - **2026-11-25**: "C3 queue behaviour" gains the final review of 5.0 PR 2b (#406): stopping
   between turns takes the next run, finished own runs are remembered against ghost pushes,
   `TURN_QUEUE_MAX` overflow fails the run, and the untested `runId == idempotencyKey` idea.
