@@ -237,6 +237,76 @@ def test_migration_drops_barge_in(tmp_path, monkeypatch):
         database.dispose_engine()
 
 
+def test_migration_adds_notify_device(tmp_path, monkeypatch):
+    """#407 (Review Focus 5): una base de la PR 1/2b gana el dispositivo de avisos del hogar y de
+    cada persona sin perder clientes, personas ni conversaciones; la columna queda NULL (no se
+    rellena), su FK pone NULL al borrar el aparato y bajar de versión la quita."""
+    from alembic import command
+    from sqlalchemy import text
+
+    _point_at(monkeypatch, tmp_path / "notify.db")
+    command.upgrade(database._alembic_config(), "50a0e1f00003")
+    engine = database.get_engine()
+    try:
+        with engine.begin() as c:
+            assert "notify_client_id" not in {col["name"] for col in inspect(c).get_columns("homes")}
+            c.execute(text(
+                "INSERT INTO users (id, username, display_name, password_hash, is_active, "
+                "created_at) VALUES ('u-ana', 'ana', 'Ana', 'h', 1, '2026-11-21')"
+            ))
+            c.execute(text(
+                "INSERT INTO memberships (user_id, home_id, role, agent) "
+                "VALUES ('u-ana', 'home', 'owner', 'ana')"
+            ))
+            _insert_client(c, "tv")
+            _insert_client(c, "phone", user="u-ana")
+            _insert_conversation(c, "c-tv", "tv")
+            _insert_conversation(c, "c-phone", "phone", owner="u-ana")
+        database.run_migrations()
+        with engine.connect() as c:
+            for table in ("homes", "memberships"):
+                assert "notify_client_id" in {col["name"] for col in inspect(c).get_columns(table)}
+            assert c.execute(text("SELECT id, notify_client_id FROM homes")).all() == [
+                ("home", None)
+            ]
+            assert c.execute(text(
+                "SELECT user_id, role, agent, notify_client_id FROM memberships"
+            )).all() == [("u-ana", "owner", "ana", None)]
+            rows = c.execute(text("SELECT id, user_id FROM clients ORDER BY id")).all()
+            assert rows == [("phone", "u-ana"), ("tv", None)]
+            convs = c.execute(text("SELECT id, owner_user_id FROM conversations ORDER BY id")).all()
+            assert convs == [("c-phone", "u-ana"), ("c-tv", None)]
+            assert c.execute(text("PRAGMA foreign_key_check")).all() == []
+        # ON DELETE SET NULL (foreign_keys=ON, como en producción). Los aparatos se retiran, no se
+        # borran; uno sin conversaciones sí se puede borrar y la elección no queda colgando.
+        with engine.begin() as c:
+            _insert_client(c, "spare")
+            _insert_client(c, "spare-phone", user="u-ana")
+            c.execute(text("UPDATE homes SET notify_client_id = 'spare'"))
+            c.execute(text("UPDATE memberships SET notify_client_id = 'spare-phone'"))
+        with engine.begin() as c:
+            c.execute(text("DELETE FROM clients WHERE id IN ('spare', 'spare-phone')"))
+        with engine.connect() as c:
+            assert c.execute(text("SELECT notify_client_id FROM homes")).scalar() is None
+            assert c.execute(text("SELECT notify_client_id FROM memberships")).scalar() is None
+        engine.dispose()
+        command.downgrade(database._alembic_config(), "50a0e1f00003")
+        with engine.connect() as c:
+            for table in ("homes", "memberships"):
+                cols = {col["name"] for col in inspect(c).get_columns(table)}
+                assert "notify_client_id" not in cols
+            assert c.execute(text("SELECT COUNT(*) FROM memberships")).scalar() == 1
+            assert c.execute(text("SELECT id FROM clients ORDER BY id")).scalars().all() == [
+                "phone", "tv"
+            ]
+            assert c.execute(text("SELECT id FROM conversations ORDER BY id")).scalars().all() == [
+                "c-phone", "c-tv"
+            ]
+            assert c.execute(text("PRAGMA foreign_key_check")).all() == []
+    finally:
+        database.dispose_engine()
+
+
 def test_a_3x_database_is_refused_untouched(tmp_path, monkeypatch):
     """La 4.0 no convierte una BD 3.x (M20): error claro y el fichero sin tocar."""
     from sqlalchemy import text
