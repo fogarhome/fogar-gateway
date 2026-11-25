@@ -123,7 +123,7 @@ Content-Type: application/json
 | `403 {"detail": "insecure_transport"}` | Por HTTP desde la red de casa la contraseña iría en claro: el gateway solo la acepta por HTTPS, o por HTTP desde su propia máquina o la tailnet. Usa la URL `https://` del gateway |
 | `429 {"detail": "too_many_attempts"}` + `Retry-After` | Demasiados fallos seguidos (por IP o por cuenta): espera esos segundos |
 
-**El token no caduca ni se refresca:** vale hasta que se retira. `GET /auth/me` (con Bearer) dice quién eres y tu rol; `POST /auth/logout` retira este aparato (al cerrar sesión, **borra también lo que tengas en caché de esa persona**: un iPad puede ser compartido); `GET /auth/devices` y `DELETE /auth/devices/{id}`, los aparatos de la persona. Una contraseña nunca va en el handshake ni se guarda en el cliente.
+**El token no caduca ni se refresca:** vale hasta que se retira. `GET /auth/me` (con Bearer) dice quién eres y tu rol; `POST /auth/logout` retira este aparato (al cerrar sesión, **borra también lo que tengas en caché de esa persona**: un iPad puede ser compartido); `GET /auth/devices` y `DELETE /auth/devices/{id}`, los aparatos de la persona; `PATCH /auth/me` con `{"notify_client_id"}` elige su dispositivo de avisos, uno de sus aparatos personales activos (`422 invalid_notify_device` si no). Una contraseña nunca va en el handshake ni se guarda en el cliente.
 
 ### Cuando la clave deja de valer
 

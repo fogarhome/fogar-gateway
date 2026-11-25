@@ -86,7 +86,8 @@ La privacidad es **dentro de Fogar**: OpenClaw, su panel y sus otros canales (Te
 | Endpoint | Método | Auth | Descripción |
 |----------|--------|------|-------------|
 | `/auth/login` | POST | usuario y contraseña | `{"username", "password", "device_name", "client_type"?, "capabilities"?}` → `201 {"client_id", "client_key", "user", "home"}`: este aparato pasa a ser un dispositivo personal y `client_key` es su token, la única vez que se ve. Errores: `401 invalid_credentials` (siempre el mismo), `403 insecure_transport`, `429 too_many_attempts` con `Retry-After` |
-| `/auth/me` | GET | Bearer | `{"user": {id, username, display_name, role}, "home", "device"}` |
+| `/auth/me` | GET | Bearer | `{"user": {id, username, display_name, role}, "home", "device", "notify_client_id"}`; `notify_client_id` es su dispositivo de avisos (`null` = ninguno) |
+| `/auth/me` | PATCH | Bearer | `{"notify_client_id": id \| null}`: elige su dispositivo de avisos, solo uno de sus aparatos personales activos (un aviso privado nunca suena en un aparato del hogar ni de otra persona); `null` lo quita. Responde como `GET`. `422 invalid_notify_device` si no vale |
 | `/auth/devices` | GET | Bearer | Mis dispositivos con sesión (`current` marca este) |
 | `/auth/devices/{id}` | DELETE | Bearer | Retira uno de los míos: su token deja de valer y sus sesiones se cierran ya (4200) |
 | `/auth/logout` | POST | Bearer | Retira el dispositivo de esta petición |
@@ -127,7 +128,7 @@ Las personas se gestionan desde la web (Personas) o con `fogar-gw users`. **Si e
 | `/admin/users/{id}` | PATCH | `display_name`, `role`, `agent` (`null` vuelve al de lo común), `is_active`. Desactivar corta ya sus dispositivos |
 | `/admin/users/{id}/password` | PUT | Contraseña nueva (`{"password"}`); las sesiones abiertas siguen |
 | `/admin/users/{id}` | DELETE | Borra a la persona, sus dispositivos y sus conversaciones privadas del gateway (en OpenClaw quedan hasta que se limpie su agente) |
-| `/admin/home` | GET, PATCH | El hogar: `name` y `agent`, el de lo común (`null` = la cascada de siempre) |
+| `/admin/home` | GET, PATCH | El hogar: `name`, `agent`, el de lo común (`null` = la cascada de siempre), y `notify_client_id`, su dispositivo de avisos: cualquier aparato activo del hogar, del hogar o personal (`null` = ninguno; `422 invalid_notify_device` si no vale). Retirar un aparato lo quita de donde estuviera elegido; desactivarlo, no |
 | `/admin/access` | GET | Vías para llegar al gateway (`public`, `tailscale_https`, `tailscale`, `lan`), cada una con su estado (`ok`, `protegida`, `otro_gateway`, `inalcanzable`, `sin_verificar`) y la recomendada; `{"docker": bool, "routes": [...]}`, en caché 15 s |
 
 En `/admin/users`, siempre queda un dueño activo (`409 last_owner`) y solo un dueño o la máquina tocan a un dueño o dan ese rol (`403 owner_only`). Los tres endpoints `*/status` comparten la forma `{"name", "state", "connected_at", "reconnect_attempts", "last_error"}`; los de transcriber y TTS añaden `provider` y, con ElevenLabs, `counters`.

@@ -50,6 +50,7 @@ from fogar_gateway.models.admin_schemas import (
     ClientWithKey,
 )
 from fogar_gateway.services.auth import hash_key, new_key
+from fogar_gateway.services.notify_device import clear_notify_device
 from fogar_gateway.services.openclaw.models import OrchestratorAccess, access_texts
 from fogar_gateway.services.reconnection import ServiceStatus
 from fogar_gateway.services.stats import gateway_stats
@@ -193,7 +194,9 @@ def update_client(
 
 def retire_client(session: Session, rec: ClientRecord) -> None:
     """Retirar, no borrar (M20): sus conversaciones conservan hogar y dispositivo. La clave pasa
-    a un valor que nadie conoce. Sus sesiones vivas las corta `close_client_sessions`."""
+    a un valor que nadie conoce y deja de ser dispositivo de avisos donde estuviera elegido
+    (#407). Sus sesiones vivas las corta `close_client_sessions`."""
+    clear_notify_device(session, rec.id)
     rec.retired_at = datetime.now(UTC)
     rec.is_active = False
     rec.key_hash = hash_key(new_key())  # nadie conoce la clave: ya no vale

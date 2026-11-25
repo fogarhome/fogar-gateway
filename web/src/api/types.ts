@@ -257,6 +257,8 @@ export interface Home {
   id: string
   name: string
   agent: string | null
+  /** El dispositivo de avisos del hogar; `null`, ninguno. */
+  notify_client_id?: string | null
 }
 
 export interface MyDevice {

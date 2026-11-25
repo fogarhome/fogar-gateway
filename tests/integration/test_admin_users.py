@@ -213,7 +213,8 @@ def test_each_person_talks_to_their_agent_and_the_home_to_its_own(
     assert http.post("/admin/conversations", json={}, headers=sito).json()["agent"] == "main"
 
     r = http.patch("/admin/home", json={"agent": "A"}, headers=admin_headers)
-    assert r.status_code == 200 and r.json() == {"id": "home", "name": "Mi hogar", "agent": "a"}
+    assert r.status_code == 200 and r.json() == {"id": "home", "name": "Mi hogar", "agent": "a",
+                                           "notify_client_id": None}
     assert http.post("/admin/conversations", json={}, headers=sito).json()["agent"] == "a"
     with Session(db_engine) as s:
         tv = ClientRecord(name="Tele", key_hash="h-tv")
@@ -241,4 +242,4 @@ def test_home_patch_validates(http, admin_headers):
     assert http.patch("/admin/home", json={"name": None}, headers=admin_headers).status_code == 422
     assert http.patch("/admin/home", json={"x": 1}, headers=admin_headers).status_code == 422
     r = http.patch("/admin/home", json={"name": "Casa", "agent": None}, headers=admin_headers)
-    assert r.json() == {"id": "home", "name": "Casa", "agent": None}
+    assert r.json() == {"id": "home", "name": "Casa", "agent": None, "notify_client_id": None}
