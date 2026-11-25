@@ -116,6 +116,11 @@ def make_bridge(
     if register:
         kwargs["client_registry"].register(bridge.client_id, bridge, bridge.conversation.current)
     if attach:
+        # As claim_conversation: its conversation is indexed (2c.3: a push has a notify device
+        # only on an indexed key), then the session attaches.
+        index = bridge.channel_hub.index
+        if index is not None and index.get(bridge.conversation.session_key) is None:
+            index.add(bridge.conversation.current)
         bridge.turns.attach()
     return bridge, ws
 

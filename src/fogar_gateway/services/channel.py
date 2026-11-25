@@ -1507,10 +1507,12 @@ class ConversationChannel:
         ones behind it wait in the queue); the event loop never blocks. A failed or slow read
         is no notify device: the push still reaches the attached sessions, with no audio."""
         lookup = self._hub.notify_device
-        if lookup is None:
+        if lookup is None or not self._indexed():
             self._notify_client_id = None
             return
         try:
+            # Al vencer el tope, el hilo de la lectura sigue hasta acabar (no se puede cortar);
+            # su resultado se descarta.
             self._notify_client_id = await asyncio.wait_for(
                 lookup(self.conversation), timeout=NOTIFY_DEVICE_READ_TIMEOUT_S
             )
@@ -2091,6 +2093,13 @@ class ConversationChannel:
             and self.conversation.visible_to(client.home_id, client.user_id)
         )
 
+    def _indexed(self) -> bool:
+        """Its key is a Fogar conversation's (`ConversationIndex`): only then does a push have a
+        notify device. A live channel of an unindexed key (the /v1 trusted-origin `…:ha` key,
+        an owner-less stand-in) reaches its attached sessions only."""
+        index = self._hub.index
+        return index is not None and index.get(self.session_key) is not None
+
     def _push_audience(self) -> list[ChannelSubscriber]:
         """Los suscriptores que reciben un push (`_may_get_push`)."""
         return [s.subscriber for s in self._subscriptions if self._may_get_push(s.subscriber)]
@@ -2102,11 +2111,14 @@ class ConversationChannel:
         agent not allowed, conversation not visible to it, closing)."""
         client_id = self._notify_client_id
         sessions_of = self._hub.sessions_of
-        if client_id is None or sessions_of is None:
+        if client_id is None or sessions_of is None or not self._indexed():
             return None
         live = [
             s for s in sessions_of(client_id)
             if s.client.id == client_id
+            # Solo una sesión que ya abrió su conversación (claim_conversation, antes de
+            # `ready`): nada de un push antes de su `ready`.
+            and getattr(s, "claimed", False)
             and not getattr(s, "closing", False)
             and self._may_get_push(s)
         ]
@@ -2294,13 +2306,10 @@ class ConversationChannel:
 
     def _note_early_phase(self, run_id: object, phase: ProgressPhase) -> None:
         """Guarda la última fase de arranque de un run sin push abierto (acotado: los últimos
-        `_EARLY_PHASE_RUNS` runs, `_EARLY_PHASE_TTL_S`). Solo si alguien la vería."""
-        if not isinstance(run_id, str) or not (
-            self._notify_client_id is not None  # 2c.3: quizá la vea la sesión del dispositivo de avisos
-            or any(
-                s.subscriber.wants_progress for s in self._subscriptions if s.subscriber.wants_push
-            )
-        ):
+        `_EARLY_PHASE_RUNS` runs, `_EARLY_PHASE_TTL_S`)."""
+        # Siempre (acotado): quién verá el push (los adjuntos o la sesión del dispositivo de
+        # avisos, 2c.3) se sabe al abrirse, y lo recibe quien reciba su turno.
+        if not isinstance(run_id, str):
             return
         early = self._early_phases
         early.pop(run_id, None)

@@ -485,6 +485,9 @@ class TurnController:
         self._cuts: set[asyncio.Task] = set()  # turn_end de cortes en curso (on_turn_end)
         # Una vez puesto no vuelve atrás: ni turnos nuevos (G-09) ni turnos del canal.
         self._closing = False
+        # La sesión ya abrió su conversación (`attach`, en claim_conversation, justo antes de
+        # `ready`): antes no recibe ningún turno, tampoco un push como dispositivo de avisos.
+        self._claimed = False
         # El cliente se fue (desconexión o ClientGone): deja de enviar y de sonar (G-18).
         self.client_gone = False
         self.last_ended: Turn | None = None
@@ -516,6 +519,11 @@ class TurnController:
         return self._tracker
 
     @property
+    def claimed(self) -> bool:
+        """Pasó claim_conversation (va a recibir o ya recibió `ready`): puede recibir turnos."""
+        return self._claimed
+
+    @property
     def closing(self) -> bool:
         """La sesión se está cerrando: ya no recibe turnos (2c.3: tampoco un push ajeno)."""
         return self._closing
@@ -528,8 +536,8 @@ class TurnController:
         return parts[1].lower() in {a.lower() for a in allowed}
 
     def on_turn_start(self, turn: ChannelTurn) -> None:
-        if self._closing:
-            return
+        if self._closing or not self._claimed:
+            return  # nada antes de `ready` (ni par: no hubo turn_start)
         if turn.origin == "push":
             if not self._config.push_enabled:
                 return  # el push entero se descarta para esta sesión
@@ -611,6 +619,7 @@ class TurnController:
         await aquí dejaría que un turn_start del canal saliera antes que `ready`."""
         if self._closing or self._channel is not None:
             return
+        self._claimed = True  # antes de subscribe: su on_turn_start lo mira
         conversation = self._conversation.current
         client = self._client
         if not conversation.visible_to(client.home_id, client.user_id):
@@ -935,9 +944,15 @@ class TurnController:
 
     async def _cut_foreign(self, reason: EndReason) -> None:
         """Corta aquí el push de otra conversación que la sesión muestra (2c.3): solo su copia
-        (la sesión no está adjunta a su canal); el push sigue para quien lo tenga."""
+        (la sesión no está adjunta a su canal); el push sigue para quien lo tenga. Los que aún
+        esperan su turn_start se descartan sin par: la respuesta no espera detrás de ellos."""
         for turn in list(self._live):
-            if turn.foreign and turn.opened and not turn.ended:
+            # Primero los que esperan, sin await: cerrar el abierto los soltaría (#202).
+            if turn.foreign and not turn.ended and not turn.opened:
+                turn.end_reason = reason
+                self._forget(turn)
+        for turn in list(self._live):
+            if turn.foreign and not turn.ended:
                 turn.cancel_reason = turn.cancel_reason or reason
                 await self._end(turn, reason)
 

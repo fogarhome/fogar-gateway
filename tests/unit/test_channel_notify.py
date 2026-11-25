@@ -493,3 +493,93 @@ async def test_session_closing_with_a_foreign_push_waiting_never_shows_it(sessio
     assert_pairs(ws)
     await push_end(hub, HOME)  # nothing left to deliver it to
     assert turns(ws)[-1] == ("turn_end", "t-1", "closed", None)
+
+
+# ── review fixes (2c.3) ─────────────────────────────────────────────────────
+
+
+async def test_a_session_still_in_its_handshake_never_gets_a_push(session, hub):
+    """I1: a session of the notify device that is registered but has not claimed its
+    conversation yet (before `ready`) gets nothing, not even as the most recent one; the
+    push goes to the device's session that is ready."""
+    ready, ready_ws = session("tv", OTHER, output_mode=("text",))
+    early, early_ws = session("tv", OTHER, output_mode=("text",), attach=False)
+    assert hub.registry.get("tv") is early  # the most recent
+    hub.notify[HOME.id] = "tv"
+
+    await push(hub, HOME, "aviso")
+    await settle(ready, early)
+    assert early_ws.sent == []
+    assert texts(ready_ws) == ["aviso"]
+    assert_pairs(ready_ws)
+
+    ready.turns.stop_intake()  # closing: the only claimed one is gone
+    await push(hub, HOME, "otro")
+    await settle(early)
+    assert early_ws.sent == []
+
+
+async def test_interrupting_send_drops_foreign_pushes_still_waiting(session, hub):
+    """M1: «send now» cuts the foreign push on screen and drops the ones waiting behind it
+    (no pair: they never opened), so the reply does not wait behind them."""
+    third = keyed_conversation("third", id="conv-third")
+    hub.index.add(third)
+    speaker, ws = session("speaker", OTHER, output_mode=("text",))
+    hub.notify[HOME.id] = "speaker"
+    hub.notify[third.id] = "speaker"
+    await push(hub, HOME, "uno", end=False)
+    await push(hub, third, "dos", end=False)
+    await settle(speaker)
+    assert turns(ws) == [("turn_start", "t-1", "push", "conv-home")]
+
+    hub.orchestrator.stream_response = tokens("respuesta")
+    await speaker.turns.start_user_turn("ya", interrupt=True)
+    await asyncio.wait_for(speaker.turns.user_task, 2)
+    await settle(speaker)
+    assert [t for t in turns(ws) if t[0] == "turn_start"] == [
+        ("turn_start", "t-1", "push", "conv-home"),
+        ("turn_start", "t-3", "user", "conv-other"),
+    ]
+    assert ("turn_end", "t-1", "interrupted", None) in turns(ws)
+    assert texts(ws) == ["uno", "respuesta"]
+    assert_pairs(ws)
+    hub.orchestrator.abort_run.assert_not_awaited()  # cut locally only
+
+
+async def test_unindexed_key_push_never_goes_to_the_notify_device(session, hub):
+    """M2: a live channel on a key no conversation has (the /v1 trusted-origin `…:ha` key)
+    reaches only its attached sessions: no notify device, no guest."""
+    ha = Conversation(id="ha", client_id="ha", agent="main", session_key="agent:main:ha", kind="created")
+    hub.get_or_create(ha)  # live, not indexed
+    speaker, ws = session("speaker", OTHER, output_mode=("text", "audio"))
+    hub.notify["ha"] = "speaker"
+    await push(hub, ha, "de ha")
+    await settle(speaker)
+    assert ws.sent == []
+
+
+async def test_early_phase_reaches_the_notify_device_with_nobody_attached(session, hub):
+    """M4: a startup phase of a run, noted while nobody was known to see it (another push
+    open for no one, no notify device read yet), is kept and given to whoever gets its push
+    (here the notify device's session, as a guest)."""
+    speaker, ws = session("speaker", OTHER, output_mode=("text", "status"))
+    answers = iter([None, "speaker"])  # r1's read: none; r2's: the speaker
+
+    async def lookup(conversation):
+        return next(answers)
+
+    hub.notify_device = lookup
+    channel = hub.channel_for(HOME.session_key)
+    sk = HOME.session_key
+    channel.enqueue_push("turn_start", sk, "r1")  # open for nobody
+    channel.enqueue_push(
+        "chat", {"sessionKey": sk, "runId": "r2", "state": "status", "phase": "preparing_workspace"}, "r2"
+    )
+    channel.enqueue_push("turn_end", sk, "r1")
+    channel.enqueue_push("turn_start", sk, "r2")
+    channel.enqueue_push("turn_end", sk, "r2")
+    await channel.push_idle()
+    await settle(speaker)
+    assert turns(ws) == [("turn_start", "t-1", "push", "conv-home"), ("turn_end", "t-1", "done", None)]
+    assert [m["turn_id"] for m in ws.of("turn_progress")][:1] == ["t-1"]
+    assert_pairs(ws)
