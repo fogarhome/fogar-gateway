@@ -145,6 +145,10 @@ _OC_MESSAGES = 64
 # relea `pendingInputs` y diga si sigue en la cola; si no llega a tiempo, falla
 # (`orchestrator_disconnected`), como un run en marcha.
 RECONNECT_GRACE_S = 15.0
+# Un push que acaba sin texto espera su respuesta en un `session.message` `assistant`: un cron
+# ligado a la conversación no manda deltas y la respuesta llega ~0,1 s después de su `final`
+# (OpenClaw 2026.11.7, docs/openclaw-protocol.md, «Live check of 5.0»).
+PUSH_REPLY_GRACE_S = 3.0
 _DISCONNECTED = "orchestrator_disconnected"
 # 2c.3: los eventos de push que pueden abrir uno (`push_route`), y el tope de la lectura de su
 # dispositivo de avisos (una lectura por clave primaria en SQLite, en un hilo).
@@ -368,6 +372,8 @@ class ChannelTurn:
     started_at: float = field(default_factory=time.monotonic)
     progress_at: float = field(default_factory=time.monotonic)  # presupuesto del push (#286)
     fallback_reason: str | None = None  # push: la del último `fallback_step` de su run (#397)
+    # Push cuyo run acabó sin texto: hasta cuándo espera su respuesta (`session.message`).
+    reply_until: float | None = None
     # Its task broke (an unexpected exception, `internal_error`): nobody waits for its audio.
     crashed: bool = False
     # Decision 5: only a weak reference to the sender; the live session is resolved on use
@@ -1363,9 +1369,10 @@ class ConversationChannel:
         self.enqueue_push(kind, arg, _str_run_id(payload))
 
     def take_session_message(self, payload: dict) -> None:
-        """A `user` `session.message` of this key (2b.2), from the dispatcher: to the worker,
-        in order with the runs' frames (a steered run's empty `final` comes after it). It
-        carries user text: never logged."""
+        """A `user` (2b.2) or `assistant` `session.message` of this key, from the dispatcher:
+        to the worker, in order with the runs' frames (a steered run's empty `final` comes
+        after it; a cron push's reply comes only here, `_push_reply`). It carries user or agent
+        text: never logged."""
         if self._closed:
             return
         if self._acks > 0 and len(self._held) < settings.TURN_QUEUE_MAX:
@@ -1953,8 +1960,12 @@ class ConversationChannel:
 
     def _on_timeouts(self) -> None:
         left = self._push_budget_left()
-        if left is not None and left <= 0:
-            self._push_timed_out()
+        push = self._push
+        if left is not None and left <= 0 and push is not None:
+            if push.reply_until is not None:
+                self._close_push(push)  # ninguna respuesta: acaba vacío, como antes
+            else:
+                self._push_timed_out()
         deadline = self._lost_deadline
         if deadline is not None and deadline <= time.monotonic():
             logger.warning(
@@ -2004,6 +2015,9 @@ class ConversationChannel:
         makes the message's run `absorbed` (`_absorb`). Text never read, never logged."""
         message = _as_dict(payload.get("message"))
         meta = _as_dict(message.get("__openclaw"))
+        if message.get("role") == "assistant":
+            self._push_reply(message, meta.get("runId"))
+            return
         oc_message_id = payload.get("messageId", meta.get("id"))
         run_id = (
             _run_of_idempotency(message.get("idempotencyKey"))
@@ -2057,6 +2071,10 @@ class ConversationChannel:
     # -- push --------------------------------------------------------------------------
 
     def _push_item(self, kind: str, arg: Any, run_id: str | None) -> None:
+        if self._waiting_reply(kind, run_id):
+            # Su run ya acabó: lo que llegue tarde de él (su `final`, una fase) no cuenta.
+            logger.debug(f"[{self._tag}] push {kind} tras el fin de su run: descartado")
+            return
         if self._run_aborted(run_id):
             # #285: lo que quedaba en cola de un run abortado no llega (ni abre push).
             logger.debug(f"[{self._tag}] push {kind} de un run abortado descartado")
@@ -2082,6 +2100,8 @@ class ConversationChannel:
         push = self._push
         if push is None or push.ended:
             return None
+        if push.reply_until is not None:
+            return push.reply_until - time.monotonic()
         return push.progress_at + settings.TURN_TIMEOUT_S - time.monotonic()
 
     def _run_aborted(self, run_id: str | None) -> bool:
@@ -2263,6 +2283,14 @@ class ConversationChannel:
             # #84: un fin sin push abierto (huérfano o ya cerrado) no emite nada.
             logger.debug(f"[{self._tag}] push_turn_end ignorado: no hay push abierto")
             return
+        if failure is None and not self._push_text.all_out and PUSH_REPLY_GRACE_S > 0:
+            # Sin texto: su respuesta puede llegar después como `session.message` (cron).
+            if push.reply_until is None:
+                push.reply_until = time.monotonic() + PUSH_REPLY_GRACE_S
+            return
+        self._close_push(push, failure)
+
+    def _close_push(self, push: ChannelTurn, failure: dict | None = None) -> None:
         if failure is not None:
             code = classify_failure(failure, fallback_reason=push.fallback_reason)
             logger.warning(f"[{self._tag}] push falló en OpenClaw: {code}")
@@ -2276,6 +2304,30 @@ class ConversationChannel:
             while len(self._ended_push_runs) > _ENDED_PUSH_RUNS:
                 self._ended_push_runs.popitem(last=False)
         self.end_turn(push, "done" if failure is None else "error")
+
+    def _push_reply(self, message: dict, run_id: object) -> None:
+        """An `assistant` `session.message`: the reply of the push that ended without text and
+        waits for it (`reply_until`), unless it names another run (a cron's has no `runId`).
+        Its text goes out as the push's text (and voice), then the push ends `done`. Any other
+        `assistant` message is a copy of text already sent: ignored. Text never logged."""
+        push = self._push
+        if push is None or push.ended or push.reply_until is None or _other_run(push.run_id, run_id):
+            return
+        text = extract_message_text(message)
+        if text:
+            self.emit(push, ChannelToken(text))
+        self._close_push(push)
+
+    def _waiting_reply(self, kind: str, run_id: str | None) -> bool:
+        """The open push waits for its reply: a frame of its own run (or without a runId) is
+        late and dropped; an opener of another run ends it first, as it was (one push at a time)."""
+        push = self._push
+        if push is None or push.ended or push.reply_until is None:
+            return False
+        if run_id is not None and run_id != push.run_id and kind in _PUSH_OPENERS:
+            self._close_push(push)
+            return False
+        return kind != "turn_error"  # un error de su run (raro tras el fin) aún lo cierra
 
     def _push_timed_out(self) -> None:
         """#286: un push sin progreso en TURN_TIMEOUT_S se cierra como el turno normal."""

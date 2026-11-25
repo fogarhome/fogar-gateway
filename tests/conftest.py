@@ -26,6 +26,13 @@ def _disable_single_process_lock(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_push_reply_wait(monkeypatch):
+    """Un push sin texto se cierra en el acto, como antes: la espera de su respuesta en un
+    `session.message` (cron, PUSH_REPLY_GRACE_S) solo la prueban los tests que la piden."""
+    monkeypatch.setattr("fogar_gateway.services.channel.PUSH_REPLY_GRACE_S", 0.0)
+
+
+@pytest.fixture(autouse=True)
 def _reset_gateway_stats():
     """Los contadores globales (#219) no deben filtrarse entre tests."""
     from fogar_gateway.services.stats import gateway_stats

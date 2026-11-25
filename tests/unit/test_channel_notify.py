@@ -631,3 +631,116 @@ async def test_notify_device_read_uses_the_indexed_conversation(session, hub):
     hub.notify_device = lookup
     await push(hub, PRIVATE, "hola")
     assert asked and asked[0] is PRIVATE and asked[0].owner_user_id == "ana"
+
+
+# ── a push whose reply comes only as a `session.message` (cron, 2026.11.7) ───
+
+
+def _assistant(sk: str, text: str, run_id: str | None = None) -> dict:
+    """An `assistant` `session.message` as a cron run bound to the session sends it, after its
+    `final`: no deltas before it, no `runId` (live, 2026-11-25, server 2026.11.7)."""
+    meta = {"id": "m-reply", "idempotencyKey": "cron-current-completion:cron:job:1"}
+    if run_id is not None:
+        meta["runId"] = run_id
+    return {
+        "sessionKey": sk,
+        "messageId": "m-reply",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": text}],
+                    "openclawAutomation": {}, "__openclaw": meta},
+    }
+
+
+async def _cron_run(channel, sk: str, run_id: str = "run-cron") -> None:
+    """The frames of that run, in the order seen live: no delta, a `final` without `message`."""
+    channel.enqueue_push("open", sk, run_id=run_id)  # run_status
+    channel.enqueue_push("turn_start", sk, run_id=run_id)
+    channel.enqueue_push("turn_end", sk, run_id=run_id)
+    channel.enqueue_push("chat", {"sessionKey": sk, "runId": run_id, "state": "final"}, run_id=run_id)
+    await channel.push_idle()
+
+
+@pytest.fixture
+def reply_grace(monkeypatch):
+    """The production wait (tests run with 0: `tests/conftest.py`)."""
+    monkeypatch.setattr("fogar_gateway.services.channel.PUSH_REPLY_GRACE_S", 3.0)
+
+
+async def test_cron_push_takes_its_text_from_the_assistant_session_message(session, hub, reply_grace):
+    """A cron reminder sends no delta: its reply arrives after the run's end as an `assistant`
+    `session.message`. The push waits for it, shows it to the attached session and speaks it
+    on the notify device, then ends `done`: one pair each, never empty."""
+    speaker_tts, speaker_stream = _tts()
+    tv, tv_ws = session("tv", HOME, output_mode=("text",))
+    speaker, speaker_ws = session("speaker", OTHER, output_mode=("text", "audio"), tts=speaker_tts)
+    hub.notify[HOME.id] = "speaker"
+    channel = hub.channel_for(HOME.session_key)
+    sk = HOME.session_key
+
+    await _cron_run(channel, sk)
+    assert ("turn_end", "t-1", "done", None) not in turns(tv_ws)  # still waiting for its reply
+    channel.take_session_message(_assistant(sk, "aviso"))
+    await channel.push_idle()
+    await settle(tv, speaker)
+
+    for ws in (tv_ws, speaker_ws):
+        assert turns(ws) == [
+            ("turn_start", "t-1", "push", "conv-home"),
+            ("turn_end", "t-1", "done", None),
+        ]
+        assert texts(ws) == ["aviso"]
+        assert_pairs(ws)
+    speaker_stream.send_text_chunk.assert_awaited()
+    assert audio(speaker_ws) and not audio(tv_ws)
+
+
+async def test_empty_push_without_a_reply_ends_after_the_grace(session, hub, monkeypatch):
+    """No `session.message` comes (a silent run): the push ends `done`, empty, after
+    `PUSH_REPLY_GRACE_S`, as before."""
+    monkeypatch.setattr("fogar_gateway.services.channel.PUSH_REPLY_GRACE_S", 0.05)
+    tv, tv_ws = session("tv", HOME, output_mode=("text",))
+    channel = hub.channel_for(HOME.session_key)
+    await _cron_run(channel, HOME.session_key)
+    await wait_until(lambda: ("turn_end", "t-1", "done", None) in turns(tv_ws))
+    assert texts(tv_ws) == []
+    assert_pairs(tv_ws)
+
+
+async def test_reply_of_another_run_or_a_push_with_text_is_not_taken(session, hub, reply_grace):
+    """Only a push that ended without text waits; an `assistant` message naming another run
+    is not its reply; a push that streamed its text ends at once and a later `assistant`
+    copy of it adds nothing."""
+    tv, tv_ws = session("tv", HOME, output_mode=("text",))
+    channel = await push(hub, HOME, "hola")
+    channel.take_session_message(_assistant(HOME.session_key, "hola", run_id="other"))
+    await channel.push_idle()
+    await settle(tv)
+    assert texts(tv_ws) == ["hola"]
+
+    await _cron_run(channel, HOME.session_key, run_id="run-2")
+    channel.take_session_message(_assistant(HOME.session_key, "ajeno", run_id="run-x"))
+    channel.take_session_message(_assistant(HOME.session_key, "suyo", run_id="run-2"))
+    await channel.push_idle()
+    await settle(tv)
+    assert texts(tv_ws) == ["hola", "suyo"]
+    assert_pairs(tv_ws)
+
+
+async def test_another_push_ends_the_one_waiting_for_its_reply(session, hub, reply_grace):
+    """A push of another run opens while one still waits for its reply: the waiting one ends
+    first, as it was (empty, `done`), and the new one is a pair of its own."""
+    tv, tv_ws = session("tv", HOME, output_mode=("text",))
+    channel = hub.channel_for(HOME.session_key)
+    sk = HOME.session_key
+    await _cron_run(channel, sk, run_id="run-1")
+    channel.enqueue_push("chat", {"sessionKey": sk, "runId": "run-2", "deltaText": "otro"}, run_id="run-2")
+    channel.enqueue_push("turn_end", sk, run_id="run-2")
+    await channel.push_idle()
+    await settle(tv)
+    assert turns(tv_ws) == [
+        ("turn_start", "t-1", "push", "conv-home"),
+        ("turn_end", "t-1", "done", None),
+        ("turn_start", "t-2", "push", "conv-home"),
+        ("turn_end", "t-2", "done", None),
+    ]
+    assert texts(tv_ws) == ["otro"]
+    assert_pairs(tv_ws)

@@ -783,6 +783,8 @@ Un push que llega mientras suena una respuesta tuya se entrega después del `tur
 
 Al revés, cortar el push es explícito: si el cliente envía un `cancel` o un `send` con `interrupt` mientras un push está abierto (hablar encima no lo corta, §7; un `send` sin `interrupt` espera a que termine), el gateway para su audio, te envía su `turn_end` (y a todas las sesiones de la conversación) y lo aborta en OpenClaw: solo su run, por su id (un push sin id solo se corta en el gateway). Solo después arranca el turno del usuario, así que nunca hay dos turnos abiertos a la vez (#202). Lo que quedara de ese push no llega.
 
+Un push puede traer todo su texto al final, justo antes de su `turn_end`: un recordatorio de OpenClaw (cron) no manda el texto mientras lo genera, y el gateway espera hasta 3 s tras el fin del agente a que llegue. Un push que termina sin texto tarda esos 3 s en recibir su `turn_end`.
+
 Un push tiene el mismo tope que un turno normal: si OpenClaw lo abre y deja de mandar nada durante `TURN_TIMEOUT_S` (sin su fin), el gateway lo cierra con `{"type":"error","code":"TURN_ERROR","message":"turn_timeout","fatal":false,"turn_id":...}` y su `turn_end` (en todas las sesiones de la conversación), y aborta en OpenClaw su run, solo ese (#286). El siguiente push abre su propio `turn_start`.
 
 El cliente no necesita distinguirlos de los turnos normales — el `turn_id` y `turn_seq` siguen la misma secuencia (si quiere, `origin` lo dice). Si `tool_calls_enabled` está activo, también pueden llegar mensajes `tool_call` (§5) intercalados; con `"status"` en `output_mode`, `turn_progress` (§5).

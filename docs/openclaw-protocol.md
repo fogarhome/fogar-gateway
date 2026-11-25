@@ -1441,13 +1441,26 @@ for a calm channel instead (5.0 PR 2b.3), which also held live.
     - `message.openclawAutomation` present;
     - `__openclaw.idempotencyKey` `"cron-current-completion:cron:<jobId>:<ts>"`;
     - **no `__openclaw.runId`**.
-- **Gateway effect, a bug to fix.**
-  - The push opens on the run's first event and closes on its `final` with **no `token`**: an
-    empty `turn_start`/`turn_end` `done`.
-  - The notify device's TTS opens with 0 characters, so **nothing sounds**.
-  - The gateway ignores `assistant` `session.message`.
-  - To show and speak a cron reminder, the push must take its text from that `session.message`,
-    which comes after the `final`; or from `chat.history`.
+- **Gateway effect, as tested live (fixed the same day, below).**
+  - The push opened on the run's first event and closed on its lifecycle `end` with **no
+    `token`**: an empty `turn_start`/`turn_end` `done`.
+  - The notify device's TTS opened with 0 characters, so **nothing sounded**.
+  - The gateway ignored `assistant` `session.message`.
+- **How the gateway reacts now** (`services/channel.py`, `PUSH_REPLY_GRACE_S` = 3 s; tested
+  against the fake with the live sequence, then live the same day: the reply came 0.2 s after
+  lifecycle `end`, the attached session and the notify device got its text, and only the notify
+  device got audio):
+  - The dispatcher hands an `assistant` `session.message` to its key's channel, like a `user`
+    one, in order with the frames. Its text is never logged.
+  - A push whose run ends (lifecycle `end`) **without any text** stays open up to
+    `PUSH_REPLY_GRACE_S`, waiting for its reply. Late frames of its run (its `final`, a phase)
+    are dropped meanwhile, as after the end.
+  - An `assistant` `session.message` without `__openclaw.runId`, or with the push's own, is that
+    reply: its text goes out as the push's `token` (and to the notify device's TTS), then the
+    push ends `done`.
+  - No reply in time: the push ends `done`, empty, as before. A push of another run that opens
+    meanwhile ends the waiting one first. An `assistant` message while no push waits (the copy
+    of a reply already streamed) is ignored. A push ended by `error` never waits.
 - **Routing was right.**
   - With the owner's notify device set, the push reached the session attached to the private
     conversation (text) and the notify device as a guest. The guest was `foreign`, in another
@@ -1540,7 +1553,8 @@ Each is logged once at INFO as possible drift, and is harmless:
     - `steer` absorbs only at a model-call boundary.
   - First live try: the per-message `queueMode: "followup"` works.
   - Cron runs bound to a session send no deltas; their reply comes only as an `assistant`
-    `session.message` after the `final`. The gateway shows an empty push, a bug.
+    `session.message` after the `final`. The gateway showed an empty push; it now waits up to
+    `PUSH_REPLY_GRACE_S` for that message and sends its text.
   - On restart, OpenClaw:
     - aborts queued runs with `stopReason: "restart"`;
     - then re-runs them with their original `runId`;
