@@ -3,7 +3,8 @@ onboard.py
 ~~~~~~~~~~
 `fogar-gw onboard`: el asistente de instalación. Pregunta lo mínimo, verifica cada proveedor
 contra el servicio real (`cli/verify.py`) antes de guardarlo con `cli/config.py::_apply`,
-instala o reinicia el servicio y termina en el dashboard: su URL desde otro aparato, el token
+instala o reinicia el servicio (salvo `--no-service`, o si la unidad es de otra base: se
+niega) y termina en el dashboard: su URL desde otro aparato, el token
 (solo en una terminal), dónde está y cómo verlo, y con terminal espera a que entres. El primer
 cliente se empareja desde el dashboard. Con `--answers FICHERO` (JSON 600) no pregunta ni espera
 nada, ni enseña el token: es el modo del CI (y su `first_client`, opcional, crea un cliente). Cortarlo a medias deja config.env
@@ -440,7 +441,7 @@ def _dashboard(ctx: click.Context, out: Out, answers: Any, settings: Any,
     """El final: cómo llegar al dashboard desde otro aparato y con qué token."""
     from fogar_gateway.cli import serve
 
-    port = serve.PORT
+    port = urlsplit(ctx.find_root().obj["url"]).port or serve.PORT  # --no-service: el de --url
     bind = settings.GATEWAY_HOST
     routes = collect(bind, port, configured_public_urls(),
                      gateway_instance_id(ctx.find_root().obj["url"]))
@@ -538,6 +539,7 @@ def _read_answers(path: Path) -> Any:
         first_client: FirstClient | None = None  # el CI; con terminal, desde el dashboard
         access: Access | None = None  # sin él, el paso no se ejecuta (el CI de siempre)
         owner: Owner | None = None  # sin él y sin dueño, se avisa: `fogar-gw users add`
+        service: bool = True  # false = --no-service
 
     try:
         answers = Answers.model_validate_json(raw)
@@ -573,11 +575,30 @@ def _doctor_summary(ctx: click.Context, out: Out) -> None:
     out.note("El asistente sigue. El detalle completo, con `fogar-gw doctor`.")
 
 
-def _run(ctx: click.Context, out: Out, answers: Any) -> None:
+def _own_unit_or_fail() -> None:
+    """La unidad instalada tiene que ser de esta base: si no, instalarla o reiniciarla tocaría
+    otro gateway (p. ej. producción, con `FOGAR_GATEWAY_HOME` de prueba). Sin la variable en la
+    unidad, systemd usa la base por defecto."""
+    from fogar_gateway.cli import service
+
+    unit = service.unit_path()
+    if not unit.exists():
+        return
+    theirs = service._unit_home(unit) or (Path.home() / ".fogar-gateway").resolve()
+    if theirs != paths.home().resolve():
+        raise api.ApiError(f"El servicio instalado ({unit}) es de otra base ({theirs}), no de "
+                           f"{paths.home()}: no lo toco. Para configurar esta base sin servicio, "
+                           "`fogar-gw --url http://127.0.0.1:<puerto> onboard --no-service`.", 1)
+
+
+def _run(ctx: click.Context, out: Out, answers: Any, no_service: bool = False) -> None:
     from fogar_gateway.cli import doctor, service
     from fogar_gateway.cli import init as init_mod
 
-    service.require_systemd()  # antes de crear o preguntar nada
+    use_service = not no_service and (answers is None or answers.service)
+    if use_service:  # antes de crear o preguntar nada
+        service.require_systemd()
+        _own_unit_or_fail()
     styled = out.styled  # --answers lo apaga en `onboard`
     if styled:
         from fogar_gateway.cli import linea_viva
@@ -609,7 +630,13 @@ def _run(ctx: click.Context, out: Out, answers: Any) -> None:
         out.step("Acceso")
         cli_access.access_step(out, answers and answers.access, settings)
     out.step("Servicio")
-    if not service.unit_path().exists():
+    url = ctx.find_root().obj["url"]
+    if not use_service:
+        out.message(f"Sin servicio (--no-service): ni se instala ni se reinicia. Lo que sigue "
+                    f"habla con el gateway de {url} (otro: `fogar-gw --url … onboard`); lo "
+                    "arrancas tú (`uvicorn fogar_gateway.main:app --port <puerto>`) y lo "
+                    "reinicias para aplicar lo nuevo de config.env.", MUTED)
+    elif not service.unit_path().exists():
         with _busy(out, "Instalando y arrancando el servicio…"), _hidden(out):
             ctx.invoke(service.install)
         if styled:
@@ -639,8 +666,10 @@ def _run(ctx: click.Context, out: Out, answers: Any) -> None:
 @click.command()
 @click.option("--answers", "answers_path", type=click.Path(dir_okay=False, path_type=Path),
               metavar="FICHERO", help="Respuestas en JSON (permisos 600): no pregunta nada.")
+@click.option("--no-service", is_flag=True,
+              help="Ni instala ni reinicia el servicio; sigue contra --url.")
 @click.pass_context
-def onboard(ctx: click.Context, answers_path: Path | None) -> None:
+def onboard(ctx: click.Context, answers_path: Path | None, no_service: bool) -> None:
     """Asistente: OpenClaw, voz, servicio y dashboard."""
     from fogar_gateway.cli import output
 
@@ -656,6 +685,6 @@ def onboard(ctx: click.Context, answers_path: Path | None) -> None:
     quiet = logging.NullHandler()
     logging.getLogger().addHandler(quiet)
     try:
-        _run(ctx, out, answers)
+        _run(ctx, out, answers, no_service)
     finally:
         logging.getLogger().removeHandler(quiet)

@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -72,7 +73,7 @@ def gw(monkeypatch, tmp_path, use_api):
         if not st.db.exists():  # como el real: sin BD no instala
             raise ApiError("No existe la base de datos.", 1)
         service.unit_path().parent.mkdir(parents=True, exist_ok=True)
-        service.unit_path().write_text("[Unit]\n")
+        own_unit()
 
     def fake_verb(ctx, verb, state, wait):
         st.calls.append(verb)
@@ -159,6 +160,14 @@ def write_answers(tmp_path, mode=0o600, **over):
     return path
 
 
+def own_unit(home=None):
+    """La unidad del servicio, como la escribe `install`, para `home` (por defecto, esta base)."""
+    from fogar_gateway import paths
+
+    service.unit_path().write_text(
+        service.render_unit(Path("/opt/fogar-gw"), home or paths.home()))
+
+
 def run(*args):
     return CliRunner().invoke(app.cli, list(args))
 
@@ -237,7 +246,7 @@ def test_onboard_voice_off_writes_off(gw, tmp_path):
 def test_onboard_rerun_restarts_not_installs(gw, tmp_path):
     gw.env.write_text(f"ADMIN_TOKEN={ADMIN}\n")
     service.unit_path().parent.mkdir(parents=True)
-    service.unit_path().write_text("[Unit]\n")
+    own_unit()
     r = onboard(write_answers(tmp_path))
     assert r.exit_code == 0, r.output
     assert installs(gw) == ["restart"]
@@ -653,7 +662,7 @@ def test_no_tts_check_when_the_key_does_not_change(gw, tmp_path):
 def test_interactive_rerun_asks_before_restarting(gw, tty, yes):
     gw.env.write_text(f"ADMIN_TOKEN={ADMIN}\n")
     service.unit_path().parent.mkdir(parents=True)
-    service.unit_path().write_text("[Unit]\n")
+    own_unit()
     gw.api.responses[("GET", "/admin/clients")] = [CLIENT]
     tty.queue.extend(["127.0.0.1", "18789", OC_TOKEN, "off", "off", yes])
     r = run("onboard")
@@ -668,7 +677,7 @@ def test_interactive_rerun_asks_before_restarting(gw, tty, yes):
 def test_answers_rerun_restarts_without_asking(gw, tty, tmp_path):
     gw.env.write_text(f"ADMIN_TOKEN={ADMIN}\n")
     service.unit_path().parent.mkdir(parents=True)
-    service.unit_path().write_text("[Unit]\n")
+    own_unit()
     r = onboard(write_answers(tmp_path))
     assert r.exit_code == 0, r.output
     assert tty.asked == [] and installs(gw) == ["restart"]
@@ -904,7 +913,7 @@ def _configured_rerun(gw, env=CONFIGURED):
     """Un relanzamiento: config.env ya escrito, servicio instalado y clientes creados."""
     gw.env.write_text(env)
     service.unit_path().parent.mkdir(parents=True)
-    service.unit_path().write_text("[Unit]\n")
+    own_unit()
     gw.api.responses[("GET", "/admin/clients")] = [CLIENT]
 
 
@@ -1118,3 +1127,44 @@ def test_dashboard_waits_on_the_recommended_url_or_none(gw, tty, monkeypatch, st
     r = run("onboard")
     assert r.exit_code == 0, r.output
     assert "gw.example.com" in r.output and seen == [expected]
+
+
+# --- sin servicio o con la unidad de otra base (prueba en vivo 2026-11-25) ----------------
+
+
+@pytest.mark.parametrize("how", ["flag", "answers"])
+def test_no_service_skips_install_and_restart(gw, tmp_path, monkeypatch, how):
+    """--no-service (o `"service": false`): ni systemd ni la unidad; sigue contra --url."""
+    from fogar_gateway.cli.api import ApiError
+
+    def no_systemd():
+        raise ApiError("Este comando necesita Linux con systemd.", 1)
+
+    monkeypatch.setattr(service, "require_systemd", no_systemd)
+    service.unit_path().parent.mkdir(parents=True)
+    own_unit(tmp_path / "produccion")  # la de otro gateway: ni se mira
+    if how == "flag":
+        r = run("--url", "http://127.0.0.1:8014", "onboard", "--no-service", "--answers",
+                str(write_answers(tmp_path)))
+    else:
+        r = run("--url", "http://127.0.0.1:8014", "onboard", "--answers",
+                str(write_answers(tmp_path, service=False)))
+    assert r.exit_code == 0, r.output
+    assert installs(gw) == [] and "http://127.0.0.1:8014" in r.output
+    assert ":8014/ws/stream" in r.output and ":8004" not in r.output  # el final, también
+    assert dotenv_values(gw.env)["OPENCLAW_TOKEN"] == OC_TOKEN  # los demás pasos, igual
+    assert ("POST", "/admin/clients") in [c[:2] for c in gw.api.calls]
+
+
+@pytest.mark.parametrize("unit_home", ["other", "missing"])
+def test_unit_of_another_base_is_refused_before_asking(gw, tty, tmp_path, unit_home):
+    """La unidad es de otra base (o sin FOGAR_GATEWAY_HOME, la de por defecto): ni se instala
+    ni se reinicia, y se dice antes de crear o preguntar nada."""
+    service.unit_path().parent.mkdir(parents=True)
+    if unit_home == "other":
+        own_unit(tmp_path / "produccion")
+    else:
+        service.unit_path().write_text("[Unit]\n")
+    for r in (run("onboard"), onboard(write_answers(tmp_path))):
+        assert r.exit_code == 1 and "otra base" in r.output and "--no-service" in r.output
+    assert gw.calls == [] and tty.asked == [] and not gw.env.exists()
