@@ -258,10 +258,12 @@ def test_tts_connect_uses_voice_and_speed_from_config(mock_services, db_engine, 
                     }
                 )
                 ws.send_json({"type": "send", "text": "test"})
-                try:
-                    ws.receive_json()
-                except Exception:
-                    pass
+                # Desde la 5.0 el turno (y su TTS) se abre con el primer evento del run:
+                # hay que esperar a su turn_end, no al primer mensaje (ready/message).
+                for _ in range(50):
+                    msg = ws.receive()
+                    if "text" in msg and json.loads(msg["text"]).get("type") == "turn_end":
+                        break
 
     assert connect_calls, "TTSClient.connect nunca fue llamado"
     assert connect_calls[0]["voice"] == "bf_emma"
