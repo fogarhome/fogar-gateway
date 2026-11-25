@@ -219,8 +219,8 @@ class UserUpdate(BaseModel):
     is_active: bool | None = None
 
 
-# El id de un dispositivo (un UUID; el «Panel web» tiene uno fijo). Que exista y valga lo
-# comprueba el gateway (services/notify_device.py).
+# El id de un dispositivo (un UUID). Que exista y valga lo comprueba el gateway
+# (services/notify_device.py).
 NotifyClientId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
 
 

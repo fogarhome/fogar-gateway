@@ -124,8 +124,9 @@ def create_client_record(
     capabilities: list[str] | None = None,
 ) -> ClientRecord:
     """Crea el cliente: la única vía, la usan `POST /admin/clients`, el emparejamiento (#317) y
-    el cliente «Panel web» (M19, el único con `client_id` fijo). Guarda solo el hash de
-    `body.client_key` (M20): quien necesite enseñar la clave la pone en `body` antes."""
+    el inicio de sesión (M20, un dispositivo personal con `user_id`). `client_id` fija el id; si
+    no, uno nuevo. Guarda solo el hash de `body.client_key` (M20): quien necesite enseñar la
+    clave la pone en `body` antes."""
     _check_agent_consistency(body.default_agent, body.allowed_agents)
     data = _lists_to_json(body.model_dump())
     data["key_hash"] = hash_key(data.pop("client_key") or new_key())
