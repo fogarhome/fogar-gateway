@@ -88,7 +88,7 @@ La privacidad es **dentro de Fogar**: OpenClaw, su panel y sus otros canales (Te
 | `/auth/login` | POST | usuario y contraseña | `{"username", "password", "device_name", "client_type"?, "capabilities"?}` → `201 {"client_id", "client_key", "user", "home"}`: este aparato pasa a ser un dispositivo personal y `client_key` es su token, la única vez que se ve. Errores: `401 invalid_credentials` (siempre el mismo), `403 insecure_transport`, `429 too_many_attempts` con `Retry-After` |
 | `/auth/me` | GET | Bearer | `{"user": {id, username, display_name, role}, "home", "device", "notify_client_id"}`; `notify_client_id` es su dispositivo de avisos (`null` = ninguno) |
 | `/auth/me` | PATCH | Bearer | `{"notify_client_id": id \| null}`: elige su dispositivo de avisos, solo uno de sus aparatos personales activos (un aviso privado nunca suena en un aparato del hogar ni de otra persona); `null` lo quita. Responde como `GET`. `422 invalid_notify_device` si no vale |
-| `/auth/devices` | GET | Bearer | Mis dispositivos con sesión (`current` marca este; `is_active` falso si un administrador lo desactivó) |
+| `/auth/devices` | GET | Bearer | Mis dispositivos con sesión (`current` marca este; `is_active` falso si un administrador lo desactivó; `push_enabled` y `output_mode`, lo que necesita para sonar un aviso) |
 | `/auth/devices/{id}` | DELETE | Bearer | Retira uno de los míos: su token deja de valer y sus sesiones se cierran ya (4200) |
 | `/auth/logout` | POST | Bearer | Retira el dispositivo de esta petición |
 

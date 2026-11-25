@@ -17,7 +17,7 @@ const admin = vi.mocked(await import('@/api/admin'))
 const device = (id: string, name: string, extra: Partial<MyDevice> = {}): MyDevice => ({
   id,
   name,
-  client_type: 'web',
+  client_type: 'app',
   created_at: '2026-11-20T10:00:00Z',
   last_seen_at: null,
   is_active: true,
@@ -49,6 +49,8 @@ beforeEach(() => {
     device('d1', 'Móvil'),
     device('d2', 'Este navegador', { current: true }),
     device('d3', 'Viejo', { is_active: false }),
+    device('d4', 'Mudo', { push_enabled: false }),
+    device('d5', 'Portátil', { client_type: 'web', output_mode: null }),
   ])
 })
 
@@ -57,7 +59,7 @@ describe('DispositivosView: «Avisos en…»', () => {
     admin.getMe.mockResolvedValue(me(null))
     const { el, select } = await mount()
     expect(el.textContent).toContain('Avisos en…')
-    expect([...select.options].map((o) => o.textContent)).toEqual(['Ninguno', 'Móvil', 'Este navegador (este)'])
+    expect([...select.options].map((o) => o.textContent)).toEqual(['Ninguno', 'Móvil', 'Este navegador (este)', 'Portátil (solo texto, no suena)'])
     expect(el.textContent).toContain('Elige dónde suenan los avisos')
   })
 

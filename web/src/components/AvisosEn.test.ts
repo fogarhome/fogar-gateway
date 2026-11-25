@@ -58,9 +58,16 @@ describe('AvisosEn: dónde suenan los avisos', () => {
     expect(toast).toHaveBeenCalledWith('bad', 'No he podido cambiarlo', expect.stringContaining('no puede recibir los avisos'))
   })
 
-  it('un elegido que ya no está en la lista se enseña, no se pierde', () => {
-    const { select } = mount('d9')
+  it('un elegido que ya no está en la lista se enseña, no se pierde, y avisa', () => {
+    const { el, select } = mount('d9')
     expect(select.value).toBe('d9')
-    expect(select.options[1]?.textContent).toBe('Uno que ya no está activo')
+    expect(select.options[1]?.textContent).toBe('Uno que ya no puede recibirlos')
+    expect(el.textContent).toContain('Elige dónde suenan los avisos')
+    expect(el.textContent).toContain('ya no puede recibirlos')
+  })
+
+  it('el aviso va en una región viva', () => {
+    const { el } = mount(null)
+    expect(el.querySelector('[role="status"]')?.textContent).toContain('Elige dónde suenan los avisos')
   })
 })

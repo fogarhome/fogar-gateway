@@ -7,6 +7,7 @@ import AvisosEn from '@/components/AvisosEn.vue'
 import FgBoton from '@/components/FgBoton.vue'
 import FgCampo from '@/components/FgCampo.vue'
 import FgEstado from '@/components/FgEstado.vue'
+import { opcionAvisos } from '@/lib/notifyDevice'
 import { toast } from '@/lib/toasts'
 import { useSessionStore } from '@/stores/session'
 
@@ -15,7 +16,9 @@ import { useSessionStore } from '@/stores/session'
 const session = useSessionStore()
 const items = shallowRef<UserRow[]>([])
 const home = shallowRef<Home | null>(null)
-const aparatos = shallowRef<ClientResponse[]>([])
+// Los aparatos del hogar, para elegir dónde suenan sus avisos: aparte, un fallo aquí no tumba Personas.
+const aparatos = shallowRef<ClientResponse[] | null>(null)
+const aparatosError = ref(false)
 const loaded = ref(false)
 const error = ref<string | null>(null)
 const ocupado = ref<string | null>(null)
@@ -32,7 +35,7 @@ const motivo = (e: unknown) => (e instanceof ApiError && MOTIVOS[e.message]) || 
 
 async function cargar(): Promise<void> {
   try {
-    ;[items.value, home.value, aparatos.value] = await Promise.all([listUsers(), getHome(), listClients()])
+    ;[items.value, home.value] = await Promise.all([listUsers(), getHome()])
     error.value = null
   } catch {
     error.value = 'No pude leer las personas.'
@@ -40,17 +43,28 @@ async function cargar(): Promise<void> {
     loaded.value = true
   }
 }
-onMounted(cargar)
+async function cargarAparatos(): Promise<void> {
+  try {
+    aparatos.value = await listClients()
+    aparatosError.value = false
+  } catch {
+    aparatosError.value = true
+  }
+}
+onMounted(() => {
+  void cargar()
+  void cargarAparatos()
+})
 
 // Los avisos de lo común (#407) pueden sonar en cualquier aparato activo del hogar, también en el
-// de una persona activa; la lista ya viene sin los retirados.
+// de una persona activa; la lista ya viene sin los retirados (lib/notifyDevice quita los
+// desactivados y los que tienen los avisos apagados, y marca los que solo leen).
 const opcionesAvisos = computed(() => {
   const personas = new Map(items.value.map((u) => [u.id, u]))
-  return aparatos.value.flatMap((c) => {
-    if (!c.is_active) return []
-    if (!c.user_id) return [{ id: c.id, nombre: c.name }]
+  return (aparatos.value ?? []).flatMap((c) => {
+    if (!c.user_id) return opcionAvisos(c) ?? []
     const u = personas.get(c.user_id)
-    return u?.is_active ? [{ id: c.id, nombre: `${c.name} · de ${u.display_name}` }] : []
+    return u?.is_active ? (opcionAvisos(c, `${c.name} · de ${u.display_name}`) ?? []) : []
   })
 })
 async function guardarAvisos(id: string | null): Promise<void> {
@@ -224,8 +238,11 @@ async function crear(): Promise<void> {
       agente (<code>fogar-gw users edit USUARIO --agent NOMBRE</code>).
     </p>
     <p v-if="home" class="fg-meta">Lo común lo atiende «{{ home.agent ?? 'el agente por defecto' }}».</p>
+    <p v-if="home && aparatosError" class="fg-meta">
+      No pude leer los aparatos del hogar para elegir dónde suenan sus avisos.
+    </p>
     <AvisosEn
-      v-if="home"
+      v-else-if="home && aparatos"
       etiqueta="Avisos del hogar en…"
       :opciones="opcionesAvisos"
       :elegido="home.notify_client_id ?? null"

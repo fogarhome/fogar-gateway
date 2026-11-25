@@ -16,7 +16,7 @@ import pytest
 
 from fogar_gateway.core.config import settings
 from fogar_gateway.models.schemas import Client, ClientConfig
-from fogar_gateway.services.channel import ChannelHub
+from fogar_gateway.services.channel import ChannelHub, ChannelTurn
 from fogar_gateway.services.conversations import (
     Conversation,
     ConversationIndex,
@@ -583,3 +583,51 @@ async def test_early_phase_reaches_the_notify_device_with_nobody_attached(sessio
     assert turns(ws) == [("turn_start", "t-1", "push", "conv-home"), ("turn_end", "t-1", "done", None)]
     assert [m["turn_id"] for m in ws.of("turn_progress")][:1] == ["t-1"]
     assert_pairs(ws)
+
+
+# ── final 2c review ──────────────────────────────────────────────────────────
+
+
+async def test_guest_drops_a_foreign_push_it_cannot_see(session, hub):
+    """Third defence: a foreign push whose conversation this session may not see (a private one
+    on a home device) is dropped in `on_turn_start`, with no pair, even if a channel let it
+    through; a visible one still opens."""
+    tv, tv_ws = session("tv", OTHER, output_mode=("text",))
+    await settle(tv)
+    hidden = ChannelTurn(
+        id="x1", conversation_id=PRIVATE.id, origin="push", by_client_id=None,
+        session_key=PRIVATE.session_key, conversation=PRIVATE,
+    )
+    tv.turns.on_turn_start(hidden)
+    tv.turns.on_turn_end(hidden, "done")
+    await settle(tv)
+    assert tv_ws.sent == []
+
+    visible = ChannelTurn(
+        id="x2", conversation_id=HOME.id, origin="push", by_client_id=None,
+        session_key=HOME.session_key, conversation=HOME,
+    )
+    tv.turns.on_turn_start(visible)
+    tv.turns.on_turn_end(visible, "done")
+    await settle(tv)
+    assert [m[0] for m in turns(tv_ws)] == ["turn_start", "turn_end"]
+    assert_pairs(tv_ws)
+
+
+async def test_notify_device_read_uses_the_indexed_conversation(session, hub):
+    """`_read_notify_device` asks for the conversation the index holds for the key (its home
+    and owner as stored), not the object the channel was created with."""
+    unstamped = Conversation(
+        id=PRIVATE.id, client_id="ana-phone", agent="main",
+        session_key=PRIVATE.session_key, kind="created",  # owner missing
+    )
+    hub.get_or_create(unstamped)
+    asked: list[Conversation] = []
+
+    async def lookup(conversation: Conversation) -> str | None:
+        asked.append(conversation)
+        return None
+
+    hub.notify_device = lookup
+    await push(hub, PRIVATE, "hola")
+    assert asked and asked[0] is PRIVATE and asked[0].owner_user_id == "ana"

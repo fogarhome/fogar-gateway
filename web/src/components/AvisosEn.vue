@@ -2,15 +2,13 @@
 import { computed, ref, watch } from 'vue'
 import { ApiError } from '@/api/http'
 import { API_ERROR, ownText } from '@/lib/labels'
+import type { OpcionAvisos } from '@/lib/notifyDevice'
 import { toast } from '@/lib/toasts'
 
 // El dispositivo de avisos (5.0, #407): dónde suenan los recordatorios de Fogar. Un selector
 // que guarda al cambiar y, mientras no haya uno elegido, el aviso «Elige dónde suenan…».
-// Qué aparatos valen lo decide quien lo usa (el perfil, el hogar); el gateway lo comprueba igual.
-export interface OpcionAvisos {
-  id: string
-  nombre: string
-}
+// Qué aparatos valen lo decide quien lo usa (el perfil, el hogar, con lib/notifyDevice); el gateway
+// lo comprueba igual.
 
 const props = defineProps<{
   etiqueta: string
@@ -26,7 +24,8 @@ watch(
   (v) => (valor.value = v ?? ''),
 )
 const ocupado = ref(false)
-// Uno elegido que ya no está en la lista (desactivado): se enseña tal cual, no se pierde sin querer.
+// Uno elegido que ya no está en la lista (desactivado, avisos apagados): se enseña tal cual, no se
+// pierde sin querer, y se avisa como si no hubiera ninguno: ahí no suena.
 const huerfano = computed(() => Boolean(props.elegido) && !props.opciones.some((o) => o.id === props.elegido))
 
 async function cambiar(): Promise<void> {
@@ -53,15 +52,22 @@ async function cambiar(): Promise<void> {
       <span>{{ etiqueta }}</span>
       <select v-model="valor" :disabled="ocupado" @change="cambiar">
         <option value="">Ninguno</option>
-        <option v-if="huerfano" :value="elegido">Uno que ya no está activo</option>
+        <option v-if="huerfano" :value="elegido">Uno que ya no puede recibirlos</option>
         <option v-for="o in opciones" :key="o.id" :value="o.id">{{ o.nombre }}</option>
       </select>
     </label>
-    <p v-if="!elegido" class="aviso">
-      <strong>Elige dónde suenan los avisos.</strong>
-      Sin uno elegido, los recordatorios de Fogar no suenan en ningún sitio: solo se leen si alguien tiene abierta esa
-      conversación.
-    </p>
+    <div role="status">
+      <p v-if="!elegido || huerfano" class="aviso">
+        <strong>Elige dónde suenan los avisos.</strong>
+        <template v-if="huerfano">
+          El elegido ya no puede recibirlos (desactivado o con los avisos apagados), así que no suenan en ningún sitio.
+        </template>
+        <template v-else>
+          Sin uno elegido, los recordatorios de Fogar no suenan en ningún sitio: solo se leen si alguien tiene abierta
+          esa conversación.
+        </template>
+      </p>
+    </div>
   </div>
 </template>
 

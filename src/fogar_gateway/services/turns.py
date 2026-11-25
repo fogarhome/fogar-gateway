@@ -133,6 +133,7 @@ class Turn:
     # #202 entre canales (2c.3): espera, con lo suyo guardado aquí, a que se cierre el turno
     # abierto de otra conversación en esta sesión; después sale en orden, detrás de su turn_end.
     parked: bool = False
+    # Sin tope propio: lo acota TURN_TIMEOUT_S del turno por el que espera (sin progreso, se cierra).
     held: list[tuple] = field(default_factory=list, repr=False)
 
     @property
@@ -548,11 +549,19 @@ class TurnController:
                 logger.info(f"[{self._client_id}] push de un agente no permitido: descartado")
                 return
         channel = self._channel
+        foreign = channel is None or channel.conversation.id != turn.conversation_id
+        if foreign and turn.conversation is not None:
+            client = self._client
+            if not turn.conversation.visible_to(client.home_id, client.user_id):
+                # 2c.3, tercera defensa (tras `notify_client_for` y `_may_get_push`): un push
+                # que esta sesión no puede ver no le llega, ni su par.
+                logger.warning(f"[{self._client_id}] push ajeno no visible: descartado")
+                return
         local = self._new_turn(turn.origin)
         local.conversation_id = turn.conversation_id
         local.channel = turn
         # 2c.3: el push de otra conversación para el dispositivo de avisos (invitada).
-        local.foreign = channel is None or channel.conversation.id != turn.conversation_id
+        local.foreign = foreign
         # #202: nunca encima del turno de otra conversación que sigue abierto aquí (ni de los
         # que ya esperan): espera detrás, en orden.
         local.parked = any(

@@ -21,6 +21,7 @@ con `Retry-After`), `invalid_credentials` (401), `not_authenticated` (401),
 """
 
 import asyncio
+import json
 import logging
 import math
 from datetime import UTC, datetime
@@ -69,6 +70,9 @@ def _device_view(rec: ClientRecord, current_id: str | None = None) -> dict[str, 
         "created_at": rec.created_at,
         "last_seen_at": rec.last_seen_at,
         "is_active": rec.is_active,  # un administrador puede desactivarlo sin retirarlo
+        # Lo que el dispositivo de avisos necesita para sonar (#407): la web marca el que no puede.
+        "push_enabled": rec.push_enabled,
+        "output_mode": json.loads(rec.output_mode) if rec.output_mode else None,
         "current": rec.id == current_id,
     }
 

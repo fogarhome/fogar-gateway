@@ -376,6 +376,9 @@ class ChannelTurn:
     # The OpenClaw key of its conversation: a session that gets it as a guest (a push for its
     # notify device, 2c.3) checks its agent against this one, not its own conversation's.
     session_key: str | None = None
+    # Its conversation (home, owner): a guest re-checks `visible_to` against it (2c.3, the third
+    # defence after `notify_client_for` and `_may_get_push`).
+    conversation: Conversation | None = field(default=None, repr=False)
     # Who plays the turn's audio: the sender (user turn) or, for a push, the session of the
     # conversation's notify device, if it shows audio (2c.3); nobody else.
     _audio: weakref.ref[ChannelSubscriber] | None = field(default=None, repr=False)
@@ -725,6 +728,7 @@ class ConversationChannel:
             run_id=run_id,
             by_name=by_name,
             session_key=self.session_key,
+            conversation=self.conversation,
             _sender=weakref.ref(sender) if sender is not None else None,
             _audio=weakref.ref(audio) if audio is not None else None,
             _sink=sink,
@@ -1507,14 +1511,19 @@ class ConversationChannel:
         ones behind it wait in the queue); the event loop never blocks. A failed or slow read
         is no notify device: the push still reaches the attached sessions, with no audio."""
         lookup = self._hub.notify_device
-        if lookup is None or not self._indexed():
+        index = self._hub.index
+        indexed = index.get(self.session_key) if index is not None else None
+        if lookup is None or indexed is None:
             self._notify_client_id = None
             return
+        # Its home and owner from the index entry (what the DB says), not from whichever object
+        # the channel was created with; `self.conversation` only if they disagree on the id.
+        conversation = indexed if indexed.id == self.conversation.id else self.conversation
         try:
             # Al vencer el tope, el hilo de la lectura sigue hasta acabar (no se puede cortar);
             # su resultado se descarta.
             self._notify_client_id = await asyncio.wait_for(
-                lookup(self.conversation), timeout=NOTIFY_DEVICE_READ_TIMEOUT_S
+                lookup(conversation), timeout=NOTIFY_DEVICE_READ_TIMEOUT_S
             )
         except Exception as e:  # noqa: BLE001 — boundary: a DB read that fails must not stop the push worker
             self._notify_client_id = None

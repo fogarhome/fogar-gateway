@@ -269,6 +269,10 @@ export interface MyDevice {
   last_seen_at: string | null
   /** Falso si un administrador lo desactivó (sin retirarlo). */
   is_active?: boolean
+  /** Recibe avisos (push); sin ellos no vale como dispositivo de avisos. */
+  push_enabled?: boolean
+  /** Lo que sabe reproducir (de su ficha); `null`, sin fijar. */
+  output_mode?: OutputMode[] | null
   /** Este navegador. */
   current: boolean
 }

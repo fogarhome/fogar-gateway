@@ -7,6 +7,7 @@ import AvisosEn from '@/components/AvisosEn.vue'
 import FgBoton from '@/components/FgBoton.vue'
 import FgEstado from '@/components/FgEstado.vue'
 import { formatRelative } from '@/lib/format'
+import { opcionAvisos } from '@/lib/notifyDevice'
 import { toast } from '@/lib/toasts'
 import { useSessionStore } from '@/stores/session'
 
@@ -45,9 +46,7 @@ const filas = computed(() =>
 
 // Mis avisos solo pueden sonar en uno de mis aparatos activos (el gateway lo comprueba igual).
 const opcionesAvisos = computed(() =>
-  items.value
-    .filter((d) => d.is_active !== false)
-    .map((d) => ({ id: d.id, nombre: d.current ? `${d.name} (este)` : d.name })),
+  items.value.flatMap((d) => opcionAvisos(d, d.current ? `${d.name} (este)` : d.name) ?? []),
 )
 async function guardarAvisos(id: string | null): Promise<void> {
   avisos.value = (await updateMe({ notify_client_id: id })).notify_client_id
