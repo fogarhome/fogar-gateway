@@ -115,6 +115,7 @@ def test_me_and_devices_with_the_token(http, users):
     assert {d["id"]: d["current"] for d in devices} == {
         first["client_id"]: True, second["client_id"]: False,
     }
+    assert all(d["is_active"] for d in devices)  # la web elige entre los activos (#407)
 
 
 @pytest.mark.parametrize(

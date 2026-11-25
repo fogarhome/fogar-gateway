@@ -68,6 +68,7 @@ def _device_view(rec: ClientRecord, current_id: str | None = None) -> dict[str, 
         "client_type": rec.client_type,
         "created_at": rec.created_at,
         "last_seen_at": rec.last_seen_at,
+        "is_active": rec.is_active,  # un administrador puede desactivarlo sin retirarlo
         "current": rec.id == current_id,
     }
 

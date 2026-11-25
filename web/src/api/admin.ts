@@ -2,6 +2,7 @@ import { api } from './http'
 import type {
   ClientInput,
   Home,
+  Me,
   MyDevice,
   UserInput,
   UserRow,
@@ -69,9 +70,14 @@ export const updateUser = (id: string, body: UserInput) =>
   api<UserRow>(`/admin/users/${enc(id)}`, { method: 'PATCH', body: json(body) })
 export const deleteUser = (id: string) => api<void>(`/admin/users/${enc(id)}`, { method: 'DELETE' })
 export const getHome = () => api<Home>('/admin/home')
-export const updateHome = (body: Partial<Pick<Home, 'name' | 'agent'>>) =>
+/** `notify_client_id`: el dispositivo de avisos del hogar (`null` lo quita); 422 `invalid_notify_device` si no vale. */
+export const updateHome = (body: Partial<Pick<Home, 'name' | 'agent' | 'notify_client_id'>>) =>
   api<Home>('/admin/home', { method: 'PATCH', body: json(body) })
 
-// Mis dispositivos con sesión: cualquiera.
+// Lo mío (cualquiera): quién soy, mis dispositivos con sesión y dónde suenan mis avisos.
+export const getMe = () => api<Me>('/auth/me')
+/** Solo uno de mis aparatos personales activos; 422 `invalid_notify_device` si no vale. */
+export const updateMe = (body: { notify_client_id: string | null }) =>
+  api<Me>('/auth/me', { method: 'PATCH', body: json(body) })
 export const listMyDevices = () => api<MyDevice[]>('/auth/devices')
 export const retireMyDevice = (id: string) => api<void>(`/auth/devices/${enc(id)}`, { method: 'DELETE' })

@@ -138,3 +138,8 @@ export const SESSION_STATUS: Record<string, string> = {
   // G-r7-5: `revoked` cubre la clave retirada y el agente retirado (4020); la lista no trae el motivo
   revoked: 'Clave o agente retirado',
 }
+
+/** Errores estables de la API de administración que la web explica (el `detail` de la respuesta). */
+export const API_ERROR: Record<string, string> = {
+  invalid_notify_device: 'Ese dispositivo ya no puede recibir los avisos (retirado, desactivado o no permitido). Elige otro.',
+}

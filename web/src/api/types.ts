@@ -267,6 +267,17 @@ export interface MyDevice {
   client_type: string | null
   created_at: string
   last_seen_at: string | null
+  /** Falso si un administrador lo desactivó (sin retirarlo). */
+  is_active?: boolean
   /** Este navegador. */
   current: boolean
+}
+
+/** `GET`/`PATCH /auth/me`: quién soy y dónde suenan mis avisos. */
+export interface Me {
+  user: { id: string; username: string; display_name: string; role: UserRole }
+  home: { id: string; name: string } | null
+  device: MyDevice | null
+  /** Mi dispositivo de avisos (uno de mis aparatos personales); `null`, ninguno. */
+  notify_client_id: string | null
 }
