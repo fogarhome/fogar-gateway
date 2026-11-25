@@ -204,23 +204,103 @@ async def test_day_cutoff_moves_a_long_lived_session_at_its_next_turn(harness, c
     assert_turns_paired(client.messages)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="push to an unattached conversation: notification device, 5.0 PR 2c (decisión 7)",
-)
-async def test_yesterdays_reminder_reaches_the_tv_in_todays_conversation(harness, clock):
-    """Lo que debe pasar: un recordatorio de la conversación de ayer llega a la tele aunque ya
-    esté en la de hoy (con `turn_start.conversation` = la de ayer)."""
-    client = await harness.connect()
+async def _wait_sessions(harness, n: int) -> None:
+    """Espera a que el gateway tenga `n` sesiones vivas (un socket cerrado tarda en soltarse)."""
+    async with harness.admin() as admin:
+        for _ in range(200):
+            state = (await admin.get("/admin/state")).json()
+            if state["totals"]["sessions_active"] == n:
+                return
+            await asyncio.sleep(0.02)
+    raise AssertionError(f"el gateway no llegó a {n} sesiones")
+
+
+async def test_yesterdays_reminder_reaches_the_tv_in_todays_conversation(
+    harness, clock, home_notify_device
+):
+    """5.0 PR 2c.3 (decisión 7, antes `xfail`): la tele es el dispositivo de avisos del hogar.
+    Un recordatorio de la conversación de ayer le llega aunque ya esté en la de hoy, con
+    `turn_start.conversation` = la de ayer, detrás de su último turno y con audio; su sesión
+    sigue en la de hoy."""
+    client = await harness.connect(output_mode=("text", "audio"))
     yesterday = client.ready["conversation"]["id"]
     await run_turn(client, "uno")
     clock.now = datetime(2026, 11, 15, 5, 30)  # pasado el corte de las 5:00
+    today = of_type(await run_turn(client, "dos"), "turn_start")[0]["conversation"]
+    assert today != yesterday
+    audio_before = sum(isinstance(m, bytes) for m in client.messages)
+
+    await harness.push("se te olvidó algo", session_key=session_key_for("main", yesterday))
+    await client.collect(lambda m: len(of_type(m, "turn_end")) >= 3, timeout=5.0)
+    push_start = of_type(client.messages, "turn_start")[2]
+    assert (push_start["origin"], push_start["conversation"]) == ("push", yesterday)
+    assert of_type(client.messages, "token")[-1]["text"] == "se te olvidó algo"
+    assert sum(isinstance(m, bytes) for m in client.messages) > audio_before
+    assert_turns_paired(client.messages)
+
+    # Sigue en la de hoy: su próximo turno es de hoy.
+    assert of_type(await run_turn(client, "tres"), "turn_start")[0]["conversation"] == today
+    assert_turns_paired(client.messages)
+
+
+async def test_yesterdays_reminder_without_notify_device_reaches_nobody(harness, clock):
+    """Sin dispositivo de avisos elegido (la migración lo deja vacío), un push de una
+    conversación que nadie tiene abierta no llega a nadie (sigue en OpenClaw)."""
+    client = await harness.connect()
+    yesterday = client.ready["conversation"]["id"]
+    await run_turn(client, "uno")
+    clock.now = datetime(2026, 11, 15, 5, 30)
     await run_turn(client, "dos")
 
     await harness.push("se te olvidó algo", session_key=session_key_for("main", yesterday))
-    await client.collect(lambda m: len(of_type(m, "turn_start")) >= 3, timeout=1.0)
-    push_start = of_type(client.messages, "turn_start")[2]
-    assert (push_start["origin"], push_start["conversation"]) == ("push", yesterday)
+    await client.collect(timeout=0.5)
+    assert len(of_type(client.messages, "turn_start")) == 2
+    assert_turns_paired(client.messages)
+
+
+async def test_private_push_sounds_on_its_owner_device_never_on_the_home_one(
+    harness, home_notify_device
+):
+    """Review Focus 4 (2c.3), de punta a punta con la BD: la tele (dispositivo de avisos del
+    hogar) conectada no recibe nada de un push de una conversación privada, ni el texto ni el
+    audio; le llega a la sesión del dispositivo personal de su dueña (su dispositivo de avisos),
+    que está en otra conversación. Un push común suena en la tele y no en el móvil."""
+    tv = await harness.connect(output_mode=("text", "audio"))
+    session = await _login(harness, "ana")
+    bearer = {"authorization": f"Bearer {session['client_key']}"}
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{harness.port}") as http:
+        r = await http.patch(
+            "/auth/me", json={"notify_client_id": session["client_id"]}, headers=bearer
+        )
+        assert r.status_code == 200, r.text
+    first = await harness.connect(handshake={"client_key": session["client_key"], "conversation": "new"})
+    private = first.ready["conversation"]["id"]
+    await first.ws.close()
+    await _wait_sessions(harness, 1)
+    phone = await harness.connect(
+        output_mode=("text", "audio"),
+        handshake={"client_key": session["client_key"], "conversation": "new"},
+    )
+    assert phone.ready["conversation"]["id"] != private
+
+    await harness.push("solo para ana", session_key=session_key_for("main", private))
+    await phone.collect(lambda m: bool(of_type(m, "turn_end")))
+    start = of_type(phone.messages, "turn_start")[0]
+    assert (start["origin"], start["conversation"]) == ("push", private)
+    assert [t["text"] for t in of_type(phone.messages, "token")] == ["solo para ana"]
+    assert any(isinstance(m, bytes) for m in phone.messages)
+
+    await harness.push("para la casa", session_key=harness.session_key(tv))
+    await tv.collect(lambda m: bool(of_type(m, "turn_end")))
+    assert [t["text"] for t in of_type(tv.messages, "token")] == ["para la casa"]
+    assert any(isinstance(m, bytes) for m in tv.messages)
+    assert of_type(tv.messages, "turn_start")[0]["conversation"] == tv.ready["conversation"]["id"]
+    assert "solo para ana" not in "".join(tv.raw_texts)
+
+    await phone.collect(timeout=0.3)
+    assert len(of_type(phone.messages, "turn_start")) == 1  # lo común no le llega al móvil
+    for c in (tv, phone):
+        assert_turns_paired(c.messages)
 
 
 async def test_push_of_a_conversation_reaches_the_session_that_has_it_open(harness, clock):

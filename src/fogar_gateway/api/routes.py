@@ -319,7 +319,9 @@ async def gateway_websocket(websocket: WebSocket):
         if handshake.conversation == NEW:
             # Solo ahora: un handshake que acaba en 1011 no deja una conversación vacía (C-3).
             try:
-                await app_state.conversations.save(conversation.current)
+                # La guardada, con el hogar y el dueño de su dispositivo (`_stamp`): la que se
+                # indexa y la que tiene su canal (2c.3: el reparto de un push privado los mira).
+                conversation.current = await app_state.conversations.save(conversation.current)
             except ConversationClientMissing:
                 logger.warning(f"[{client.id}] Handshake rechazado: el cliente ya no existe.")
                 gateway_stats.handshake_rejected("invalid_key")

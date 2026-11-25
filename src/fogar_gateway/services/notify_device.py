@@ -56,3 +56,21 @@ def clear_notify_device(session: Session, client_id: str) -> None:
             .where(col(table.notify_client_id) == client_id)
             .values(notify_client_id=None)
         )
+
+
+def notify_client_for(session: Session, home_id: str, owner_user_id: str | None) -> str | None:
+    """El dispositivo de avisos de una conversación (5.0 PR 2c.3), o None si no hay uno que
+    valga ahora: el de su dueña si es privada (`owner_user_id`), el del hogar si es común. Se
+    comprueba al repartir cada aviso, no solo al elegirlo: un aparato desactivado, retirado, de
+    otro hogar, de una persona inactiva o (privada) que no es de su dueña no cuenta."""
+    if owner_user_id is None:
+        home = session.get(HomeRecord, home_id)
+        chosen = home.notify_client_id if home is not None else None
+        if chosen is None:
+            return None
+        return chosen if home_device_ok(session, home_id, chosen) else None
+    membership = session.get(MembershipRecord, (owner_user_id, home_id))
+    chosen = membership.notify_client_id if membership is not None else None
+    if chosen is None:
+        return None
+    return chosen if personal_device_ok(session, owner_user_id, home_id, chosen) else None

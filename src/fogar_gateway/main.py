@@ -38,6 +38,7 @@ from fogar_gateway.db.database import dispose_engine, require_database, run_migr
 from fogar_gateway.services.auth import LoginLimiter
 from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.conversations import ConversationService, TitleCache, note_turn_safely
+from fogar_gateway.services.db_client import db_client
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.models import OrchestratorAccess
@@ -113,6 +114,12 @@ async def _lifespan_body(app: FastAPI):
         index=conversations.index,
         turn_registry=turn_registry,
         note_turn=lambda conversation_id: _count_turn(conversation_id),
+        # 2c.3: dónde suena un aviso. Su dispositivo de avisos, leído de la BD en cada aviso
+        # (en un hilo), y las sesiones vivas de ese aparato (la más reciente al final).
+        notify_device=lambda conversation: db_client.notify_device(
+            conversation.home_id, conversation.owner_user_id
+        ),
+        sessions_of=lambda client_id: [b.turns for b in client_registry.for_client(client_id)],
     )
 
     def _count_turn(conversation_id: str) -> None:

@@ -190,3 +190,65 @@ def test_disabling_keeps_the_choice(http, people, db_engine, admin_headers):
     r = http.patch(f"/admin/users/{user}", json={"is_active": False}, headers=admin_headers)
     assert r.status_code == 200
     assert _choices(db_engine, user) == (phone, phone)
+
+
+# ── 2c.3: el reparto lo vuelve a mirar en cada aviso ──────────────────────────────────────
+
+
+def test_notify_client_for_checks_the_device_at_delivery(db_engine):
+    """`notify_client_for` (lo que lee el reparto de cada aviso): el elegido solo vale si sigue
+    activo, sin retirar, en el hogar y, si es personal, con su persona activa y (para una
+    conversación privada) de su dueña. Desactivar no quita la elección (vuelve a valer)."""
+    from datetime import UTC, datetime
+
+    from fogar_gateway.db.models import UserRecord
+    from fogar_gateway.services.notify_device import notify_client_for
+
+    with Session(db_engine) as s:
+        if s.get(HomeRecord, "home") is None:
+            s.add(HomeRecord(id="home", name="Casa"))
+        s.add(UserRecord(id="ana", username="ana", display_name="Ana", password_hash="x"))
+        s.add(UserRecord(id="bea", username="bea", display_name="Bea", password_hash="x"))
+        s.commit()
+        s.add(ClientRecord(id="tv", name="Tele", key_hash="h-tv"))
+        s.add(ClientRecord(id="ana-phone", name="Móvil", key_hash="h-ap", user_id="ana"))
+        s.commit()
+        home = s.get(HomeRecord, "home")
+        home.notify_client_id = "tv"
+        s.add(home)
+        s.add(MembershipRecord(user_id="ana", home_id="home", role="member", notify_client_id="ana-phone"))
+        s.add(MembershipRecord(user_id="bea", home_id="home", role="member", notify_client_id="ana-phone"))
+        s.commit()
+
+    def both() -> tuple[str | None, str | None, str | None]:
+        with Session(db_engine) as s:
+            return (
+                notify_client_for(s, "home", None),
+                notify_client_for(s, "home", "ana"),
+                notify_client_for(s, "home", "bea"),
+            )
+
+    # Bea's choice names Ana's phone (only possible by hand): never valid for her.
+    assert both() == ("tv", "ana-phone", None)
+    with Session(db_engine) as s:  # another home: neither its home nor a membership there
+        assert notify_client_for(s, "other-home", None) is None
+        assert notify_client_for(s, "other-home", "ana") is None
+
+    def edit(model, key, **values) -> None:
+        with Session(db_engine) as s:
+            rec = s.get(model, key)
+            for k, v in values.items():
+                setattr(rec, k, v)
+            s.add(rec)
+            s.commit()
+
+    edit(ClientRecord, "tv", is_active=False)
+    edit(UserRecord, "ana", is_active=False)
+    assert both() == (None, None, None)
+    edit(ClientRecord, "tv", is_active=True)
+    edit(UserRecord, "ana", is_active=True)
+    assert both() == ("tv", "ana-phone", None)  # disabling kept the choice
+
+    edit(ClientRecord, "tv", retired_at=datetime.now(UTC))
+    edit(ClientRecord, "ana-phone", retired_at=datetime.now(UTC))
+    assert both() == (None, None, None)

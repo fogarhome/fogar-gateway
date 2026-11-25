@@ -25,6 +25,9 @@ Delivery rules:
   turn (`closed`).
 - `end_turn` is idempotent: one `on_turn_end` per subscriber that got the turn's
   `on_turn_start` and is still subscribed.
+- A guest (5.0 PR 2c.3: a push for the conversation's notify device, whose session is not
+  attached) gets that one turn like a subscriber that got its start, and nothing else: no
+  messages, no other turn. `drop_guest` removes it; it never keeps the channel alive.
 - A failing callback never stops the others (a boundary: logged by type, never by text); a
   `CancelledError` (a `BaseException`) is not caught and propagates.
 
@@ -58,6 +61,12 @@ and since 5.0 PR 2b it uses OpenClaw's own queue (`messages.queue`; docs/opencla
 - Origin before the ack (decision 3): while a `chat.send` waits for its ack, frames of a run
   nobody knows yet are held; the ack says whose they are, and what is still nobody's is a push.
   A push opens on its run's first event too (`push_route`), not only on lifecycle `start`.
+- Push delivery (2c.3): its text goes to the attached subscribers that may see the
+  conversation (`visible_to`, push on, agent allowed); its audio only to the session of the
+  conversation's notify device (`ChannelHub.notify_device`, read from the DB before each push
+  opener, never cached; that device's attached session, else its most recent one), if it shows
+  audio. That session, when not attached, is a guest of the push if nobody is attached (the
+  text) or if it plays it. Nobody: the push opens for no one (no `turn_start`, the run goes on).
 - One turn open at a time: a run whose first event arrives while another turn is open waits
   (its frames deferred, in order) until that turn ends; so does a push opening while a user
   turn is open.
@@ -88,7 +97,7 @@ import logging
 import time
 import weakref
 from collections import OrderedDict, deque
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -137,6 +146,10 @@ _OC_MESSAGES = 64
 # (`orchestrator_disconnected`), como un run en marcha.
 RECONNECT_GRACE_S = 15.0
 _DISCONNECTED = "orchestrator_disconnected"
+# 2c.3: los eventos de push que pueden abrir uno (`push_route`), y el tope de la lectura de su
+# dispositivo de avisos (una lectura por clave primaria en SQLite, en un hilo).
+_PUSH_OPENERS = frozenset({"turn_start", "open", "chat", "tool", "fallback"})
+NOTIFY_DEVICE_READ_TIMEOUT_S = 2.0
 _UNAVAILABLE = "orchestrator_unavailable"
 TURN_TIMEOUT = "turn_timeout"
 # Solo /v1 (2b.3): su run terminó sin abrir turno propio (`steer` lo plegó en otro run).
@@ -360,8 +373,11 @@ class ChannelTurn:
     # Decision 5: only a weak reference to the sender; the live session is resolved on use
     # (if it left, nobody gets the audio).
     _sender: weakref.ref[ChannelSubscriber] | None = field(default=None, repr=False)
-    # Who plays the turn's audio: the sender (user turn) or, in 2a, the most recently attached
-    # subscriber that wants audio and push (push; 2c replaces it by the notification device).
+    # The OpenClaw key of its conversation: a session that gets it as a guest (a push for its
+    # notify device, 2c.3) checks its agent against this one, not its own conversation's.
+    session_key: str | None = None
+    # Who plays the turn's audio: the sender (user turn) or, for a push, the session of the
+    # conversation's notify device, if it shows audio (2c.3); nobody else.
     _audio: weakref.ref[ChannelSubscriber] | None = field(default=None, repr=False)
     # 2b.3: who collects the turn's events outside the subscribers (a /v1 request's answer).
     _sink: Callable[[ChannelEvent], None] | None = field(default=None, repr=False)
@@ -497,6 +513,10 @@ class ExclusiveOutcome:
 class _Subscription:
     subscriber: ChannelSubscriber
     active: bool = True
+    # 2c.3: a guest of one push turn (the notify device's session, not attached to this
+    # channel): it gets that turn's start, events and end, and nothing else (no messages, no
+    # other turn). Only in `_started`, never in `_subscriptions`.
+    guest: bool = False
 
 
 @dataclass
@@ -553,6 +573,9 @@ class ConversationChannel:
         # Runs dados por fallidos sin conexión: se abortan (por runId) al reconectar.
         self._abort_on_reconnect: set[str] = set()
         self._push_text = ChatTextTracker()  # #241: texto ya emitido en la respuesta del push
+        # 2c.3: el dispositivo de avisos de la conversación (un client id), leído de la BD justo
+        # antes de cada evento que abriría un push (`_read_notify_device`); None = ninguno.
+        self._notify_client_id: str | None = None
         # #254: runId → (última fase de arranque, cuándo) de runs sin push abierto todavía.
         self._early_phases: OrderedDict[str, tuple[ProgressPhase, float]] = OrderedDict()
         # Worker (#130 S3a): el dispatcher encola sin esperar desde el bucle de OpenClaw; un
@@ -609,6 +632,16 @@ class ConversationChannel:
             return False
         if self._subscription(subscriber) is not None:
             return False
+        guest = self._guest(subscriber)
+        if guest is not None:
+            # 2c.3: it already has the open push as a guest (it plays it): it stays in that
+            # turn and is attached from now on, without a second `on_turn_start`.
+            guest.guest = False
+            self._subscriptions.append(guest)
+            for info in list(self._runs.values()):
+                if info.message == "pending" and guest.active:
+                    self._tell(guest, self._message(info))
+            return True
         subscription = _Subscription(subscriber)
         self._subscriptions.append(subscription)
         logger.debug(
@@ -640,6 +673,25 @@ class ConversationChannel:
         )
         return True
 
+    def _guest(self, subscriber: ChannelSubscriber) -> _Subscription | None:
+        return next(
+            (s for s in self._started if s.guest and s.subscriber is subscriber), None
+        )
+
+    def drop_guest(self, subscriber: ChannelSubscriber) -> bool:
+        """A guest of the open push (2c.3) leaves it: it gets nothing more of it, not even its
+        `on_turn_end` (its session ends its own copy). False if it was not a guest."""
+        guest = self._guest(subscriber)
+        if guest is None:
+            return False
+        guest.active = False
+        self._started.remove(guest)
+        logger.debug(
+            "Channel guest left: conversation=%s client=%s",
+            self.conversation.id, subscriber.client.id,
+        )
+        return True
+
     # -- turns -------------------------------------------------------------------------
 
     def open_turn(
@@ -652,12 +704,14 @@ class ConversationChannel:
         by_client_id: str | None = None,
         by_name: str | None = None,
         sink: Callable[[ChannelEvent], None] | None = None,
+        guests: Sequence[ChannelSubscriber] = (),
     ) -> ChannelTurn:
         """Open the channel's turn and give every subscriber its `on_turn_start`. Raises
         `ChannelBusy` while another turn is open (end it first). `audio_to` (default: the
         sender) is who plays its audio; `by_client_id`/`by_name` (default: the sender's) say
         who sent it, also once that session is gone; `sink` also gets every event of the turn
-        (a /v1 request's answer, 2b.3)."""
+        (a /v1 request's answer, 2b.3); `guests` (2c.3, a push for the notify device's session
+        when it is not attached) get this turn, and only this one, as if attached."""
         if self.current_turn is not None:
             raise ChannelBusy(self.conversation.id)
         audio = audio_to if audio_to is not None else sender
@@ -670,6 +724,7 @@ class ConversationChannel:
             by_client_id=by_client_id,
             run_id=run_id,
             by_name=by_name,
+            session_key=self.session_key,
             _sender=weakref.ref(sender) if sender is not None else None,
             _audio=weakref.ref(audio) if audio is not None else None,
             _sink=sink,
@@ -685,6 +740,11 @@ class ConversationChannel:
                 break  # a callback ended it: the rest never see it
             if subscription.active and subscription not in self._started:
                 self._start(turn, subscription)
+        for guest in guests:
+            if turn is not self.current_turn:
+                break
+            if self._subscription(guest) is None:
+                self._start(turn, _Subscription(guest, guest=True))
         return turn
 
     def _start(self, turn: ChannelTurn, subscription: _Subscription) -> None:
@@ -1413,6 +1473,8 @@ class ConversationChannel:
             else:
                 item = await queue.get()
             try:
+                if self._would_open_push(item):
+                    await self._read_notify_device()
                 self._handle(item)
             except Exception as e:  # noqa: BLE001 — frontera: un evento roto no para el worker
                 self._log_push_failure(item[0], e)
@@ -1425,6 +1487,39 @@ class ConversationChannel:
                 queue.task_done()
             if self._backlog.pending == 0:
                 self._hub.drop_if_idle(self.session_key, self)
+
+    def _would_open_push(self, item: tuple[str, Any, str | None]) -> bool:
+        """The item is a push event that would open a push now (none open): its notify device
+        is read first (2c.3). Also when it will wait for the open turn (`_must_defer`): the
+        value read now is the one it opens with."""
+        kind, arg, run_id = item
+        if kind not in _PUSH_OPENERS or self._run_aborted(run_id) or self._defer_push:
+            # Ya espera un push (leído al llegar el primero): los que van detrás no releen.
+            return False
+        push = self._push
+        return (push is None or push.ended) and self._push_opens(kind, arg, run_id)
+
+    async def _read_notify_device(self) -> None:
+        """2c.3: who the conversation's notify device is, read from the DB (in a thread, by the
+        hub's `notify_device`) once per push opener, never cached: every change (the choice,
+        the device disabled or retired, its person disabled) counts from the next push, and a
+        push is rare. The worker awaits it in line, so the key's frames keep their order (the
+        ones behind it wait in the queue); the event loop never blocks. A failed or slow read
+        is no notify device: the push still reaches the attached sessions, with no audio."""
+        lookup = self._hub.notify_device
+        if lookup is None:
+            self._notify_client_id = None
+            return
+        try:
+            self._notify_client_id = await asyncio.wait_for(
+                lookup(self.conversation), timeout=NOTIFY_DEVICE_READ_TIMEOUT_S
+            )
+        except Exception as e:  # noqa: BLE001 — boundary: a DB read that fails must not stop the push worker
+            self._notify_client_id = None
+            logger.warning(
+                f"[{self._tag}] dispositivo de avisos ilegible ({describe_error(e)}): el aviso "
+                "no suena en ningún sitio"
+            )
 
     def _safely(self, what: str, step: Callable[[], None]) -> None:
         try:
@@ -1986,14 +2081,39 @@ class ConversationChannel:
         if run_id is not None:
             self._turn_registry.abort_run(run_id)
 
+    def _may_get_push(self, subscriber: ChannelSubscriber) -> bool:
+        """Takes this conversation's push: it accepts pushes, may use its agent and may see the
+        conversation (M20, `visible_to`: checked again on every delivery path, 2c.3)."""
+        client = subscriber.client
+        return (
+            subscriber.wants_push
+            and subscriber.agent_allowed(self.session_key)
+            and self.conversation.visible_to(client.home_id, client.user_id)
+        )
+
     def _push_audience(self) -> list[ChannelSubscriber]:
-        """Los suscriptores que reciben un push: lo aceptan y pueden usar su agente."""
-        key = self.session_key
-        return [
-            s.subscriber
-            for s in self._subscriptions
-            if s.subscriber.wants_push and s.subscriber.agent_allowed(key)
+        """Los suscriptores que reciben un push (`_may_get_push`)."""
+        return [s.subscriber for s in self._subscriptions if self._may_get_push(s.subscriber)]
+
+    def _notify_session(self) -> ChannelSubscriber | None:
+        """2c.3: the live session of the conversation's notify device that gets its push: the
+        one attached to this channel or, if none, the device's most recent one. None without a
+        notify device, if it is not connected, or if that session may not get it (push off,
+        agent not allowed, conversation not visible to it, closing)."""
+        client_id = self._notify_client_id
+        sessions_of = self._hub.sessions_of
+        if client_id is None or sessions_of is None:
+            return None
+        live = [
+            s for s in sessions_of(client_id)
+            if s.client.id == client_id
+            and not getattr(s, "closing", False)
+            and self._may_get_push(s)
         ]
+        attached = [s for s in live if self.is_subscribed(s)]
+        if attached:
+            return attached[-1]
+        return live[-1] if live else None
 
     def _open_push(self, run_id: str | None) -> ChannelTurn | None:
         """El push abierto, o uno nuevo abierto con este primer evento de su run (2b.2: no
@@ -2045,12 +2165,24 @@ class ConversationChannel:
             self._push.progress_at = time.monotonic()
             logger.debug(f"[{self._tag}] push_turn_start ignorado: ya hay un push abierto")
             return
+        # 2c.3: el texto, a los adjuntos que pueden verlo; el audio, solo a la sesión del
+        # dispositivo de avisos (si su `output_mode` lo lleva), adjunta o no. Si no está adjunta,
+        # recibe este turno como invitada: si no hay nadie adjunto (el texto) o si suena.
         audience = self._push_audience()
-        audio = next((s for s in reversed(audience) if s.wants_audio), None)
+        notify = self._notify_session()
+        audio = notify if notify is not None and notify.wants_audio else None
+        guests: list[ChannelSubscriber] = []
+        if notify is not None and not self.is_subscribed(notify) and (not audience or audio):
+            guests.append(notify)
         self._push_text.reset()
-        turn = self.open_turn("push", run_id=run_id, audio_to=audio)
+        turn = self.open_turn("push", run_id=run_id, audio_to=audio, guests=guests)
         self._push = turn
-        if audience:  # un push que alguien ve cuenta en la conversación
+        logger.debug(
+            "Channel push open: conversation=%s attached=%d notify_device=%s guest=%s audio=%s",
+            self.conversation.id, len(audience), notify is not None, bool(guests),
+            audio is not None,
+        )
+        if audience or guests:  # un push que alguien ve cuenta en la conversación
             self._note_turn()
             gateway_stats.turn_started("push")
         early = self._take_early_phase(run_id)
@@ -2163,8 +2295,11 @@ class ConversationChannel:
     def _note_early_phase(self, run_id: object, phase: ProgressPhase) -> None:
         """Guarda la última fase de arranque de un run sin push abierto (acotado: los últimos
         `_EARLY_PHASE_RUNS` runs, `_EARLY_PHASE_TTL_S`). Solo si alguien la vería."""
-        if not isinstance(run_id, str) or not any(
-            s.subscriber.wants_progress for s in self._subscriptions if s.subscriber.wants_push
+        if not isinstance(run_id, str) or not (
+            self._notify_client_id is not None  # 2c.3: quizá la vea la sesión del dispositivo de avisos
+            or any(
+                s.subscriber.wants_progress for s in self._subscriptions if s.subscriber.wants_push
+            )
         ):
             return
         early = self._early_phases
@@ -2239,7 +2374,8 @@ class ConversationChannel:
 class ChannelHub:
     """The live channels, by OpenClaw `sessionKey`, and what they share: the orchestrator, the
     `TurnRegistry` (tombstones and active runs, #285), the conversation index (a push's
-    `sessionKey` → its conversation) and the turn counter."""
+    `sessionKey` → its conversation), the turn counter and, for pushes (2c.3), the notify
+    device lookup and the live sessions of a device."""
 
     def __init__(
         self,
@@ -2248,6 +2384,8 @@ class ChannelHub:
         orchestrator: OrchestratorProtocol | None = None,
         turn_registry: TurnRegistry | None = None,
         note_turn: Callable[[str], None] | None = None,
+        notify_device: Callable[[Conversation], Awaitable[str | None]] | None = None,
+        sessions_of: Callable[[str], list[ChannelSubscriber]] | None = None,
     ) -> None:
         self._channels: dict[str, ConversationChannel] = {}
         self.index = index
@@ -2256,6 +2394,11 @@ class ChannelHub:
         self.orchestrator = orchestrator
         self.turn_registry = turn_registry if turn_registry is not None else TurnRegistry()
         self.note_turn = note_turn
+        # 2c.3: a conversation's notify device (`db_client.notify_device`: its client id, or
+        # None) and a device's live sessions, the most recent last (`ClientRegistry`). Without
+        # them a push reaches only the attached sessions, and sounds nowhere.
+        self.notify_device = notify_device
+        self.sessions_of = sessions_of
         self._tasks: set[asyncio.Task] = set()
 
     def __len__(self) -> int:

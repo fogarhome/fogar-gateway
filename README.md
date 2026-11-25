@@ -235,7 +235,7 @@ El cliente envía un handshake JSON como primer mensaje. Si es válido, el gatew
 ← {"type":"turn_end","turn_id":"t-1","reason":"done"}
 ```
 
-Un `send` con un turno en curso no lo corta: queda `pending` en la cola de OpenClaw (`"interrupt": true` corta y envía; `withdraw` quita un pendiente; `cancel` para el turno para todas las sesiones de la conversación). Hablar encima no corta nada: el barge-in lo decide el cliente. Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la referencia completa incluyendo interrupciones, transcripción, push turns y manejo de errores.
+Un `send` con un turno en curso no lo corta: queda `pending` en la cola de OpenClaw (`"interrupt": true` corta y envía; `withdraw` quita un pendiente; `cancel` para el turno para todas las sesiones de la conversación). Hablar encima no corta nada: el barge-in lo decide el cliente. Un aviso (push) se lee en todas las sesiones que tienen abierta su conversación y suena solo en su dispositivo de avisos (el de su dueña si es privada, el del hogar si es común; si no tiene ninguna sesión en ella, le llega igual, en cola detrás de su turno); sin dispositivo de avisos elegido, no suena en ningún sitio. Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la referencia completa incluyendo interrupciones, transcripción, push turns y manejo de errores.
 
 ---
 
@@ -656,7 +656,7 @@ src/fogar_gateway/
         ├── device.py        identidad de dispositivo (Ed25519, firma v3) y token de dispositivo
         ├── reconnecting.py  ReconnectingOpenClawClient — backoff + DEGRADED
         ├── dispatcher.py    FrameDispatcher — enruta frames a turn/client registry
-        ├── registry.py      TurnRegistry + ClientRegistry (sesiones vivas por conversación, reparto del push, broadcast_status)
+        ├── registry.py      TurnRegistry + ClientRegistry (sesiones vivas por cliente: revocación, la sesión del dispositivo de avisos, broadcast_status)
         └── models.py        GatewayInfo, OrchestratorAccess (permisos y emparejamiento)
 ```
 
