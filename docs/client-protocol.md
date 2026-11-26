@@ -785,7 +785,7 @@ OpenClaw puede iniciar turnos proactivamente sin que el usuario haya enviado nad
 
 `origin: "push"` lo distingue de un turno tuyo, y `conversation` dice de qué conversación es (puede no ser la tuya, abajo).
 
-**A quién llega (5.0).** Cada conversación tiene un **dispositivo de avisos**: el de su dueña si es privada (`PATCH /auth/me`), el del hogar si es común (`PATCH /admin/home`; ver el [README](../README.md)). Solo cuenta mientras está activo, no retirado, en el mismo hogar y, si es personal, con su persona activa; si no, la conversación no tiene dispositivo de avisos.
+**A quién llega (5.0).** Cada conversación tiene un **dispositivo de avisos**: el de su dueña si es privada (`PATCH /auth/me`), el del hogar si es común (`PATCH /home`; ver el [README](../README.md)). Solo cuenta mientras está activo, no retirado, en el mismo hogar y, si es personal, con su persona activa; si no, la conversación no tiene dispositivo de avisos.
 
 - **El texto** llega a todas las sesiones que tienen abierta su conversación y pueden verla, cada una con su par (§14). Si no hay ninguna, llega a la sesión del dispositivo de avisos, si está conectado; si el push suena en ella (abajo), también le llega aunque haya otras.
 - **El audio** suena solo en la sesión del dispositivo de avisos, si está conectado y su `output_mode` lleva `audio`, tenga o no abierta esa conversación. Ninguna otra sesión recibe el audio de un push. Sin dispositivo de avisos, un push no suena en ningún sitio.
@@ -1014,7 +1014,7 @@ No requiere ningún cambio de cliente si ya reconectas tras un cierre inesperado
 
 ## 14. Conversaciones
 
-**Nuevo en M19.** Cada sesión habla en una **conversación**: una sesión de OpenClaw con su historial, que se puede retomar otro día. El gateway solo guarda su índice (de qué cliente es, con qué agente, cuándo se habló); lo dicho y el título viven en OpenClaw. El administrador las ve todas en `/admin/conversations` (ver el [README](../README.md#admin-requiere-x-admin-token)).
+**Nuevo en M19.** Cada sesión habla en una **conversación**: una sesión de OpenClaw con su historial, que se puede retomar otro día. El gateway solo guarda su índice (de qué cliente es, con qué agente, cuándo se habló); lo dicho y el título viven en OpenClaw. El administrador las ve todas en `/conversations` (ver el [README](../README.md#admin-requiere-x-admin-token)).
 
 Las reglas son las mismas para todos los clientes; el gateway no mira el tipo de cliente. Que tu cliente use una conversación del día o elija las suyas es una decisión de diseño de tu cliente:
 
@@ -1030,13 +1030,13 @@ Las reglas son las mismas para todos los clientes; el gateway no mira el tipo de
 > **Incompatibilidad de protocolo — 5.0**
 > Una conversación ya no está abierta en una sola sesión: varias sesiones (del mismo cliente o de otros dispositivos que pueden verla) comparten la conversación y cada una recibe su par de cada turno. El 4102 se retiró y no se reutiliza. Un cliente que abre la conversación del día en dos sitios ya no se echa a sí mismo.
 
-**Quién abre qué (4.0).** Una conversación es del hogar o de una persona, según el dispositivo que la crea: la de un dispositivo **personal** (con sesión) es privada de su usuario; la de uno **del hogar** (emparejado), del hogar. Desde un dispositivo del hogar se abren solo las del hogar; desde uno personal, las del hogar y las de su usuario, también las empezadas en otro de sus dispositivos. Pedir una que no se puede ver es 4100, igual que una que no existe. Un aviso (push) de una conversación privada nunca llega a un dispositivo del hogar ni a uno de otra persona: su dispositivo de avisos solo puede ser uno de los aparatos personales de su dueña. La web inicia sesión (`/auth/login`), entra con su token como `token`, crea sus conversaciones con `POST /admin/conversations` (o `"conversation": "new"`) y las retoma por su id.
+**Quién abre qué (4.0).** Una conversación es del hogar o de una persona, según el dispositivo que la crea: la de un dispositivo **personal** (con sesión) es privada de su usuario; la de uno **del hogar** (emparejado), del hogar. Desde un dispositivo del hogar se abren solo las del hogar; desde uno personal, las del hogar y las de su usuario, también las empezadas en otro de sus dispositivos. Pedir una que no se puede ver es 4100, igual que una que no existe. Un aviso (push) de una conversación privada nunca llega a un dispositivo del hogar ni a uno de otra persona: su dispositivo de avisos solo puede ser uno de los aparatos personales de su dueña. La web inicia sesión (`/auth/login`), entra con su token como `token`, crea sus conversaciones con `POST /conversations` (o `"conversation": "new"`) y las retoma por su id.
 
 ---
 
 ## 15. Diagnóstico del pipeline (`pipeline_event`)
 
-Solo con `"status"` en `output_mode`. El gateway mide cada sesión por etapas (las mismas que enseña `/admin/sessions` y que van al log a INFO) y, a un cliente que pide `"status"`, le manda cada una según ocurre:
+Solo con `"status"` en `output_mode`. El gateway mide cada sesión por etapas (las mismas que enseña `/system/sessions` y que van al log a INFO) y, a un cliente que pide `"status"`, le manda cada una según ocurre:
 
 ```json
 { "type": "pipeline_event", "stage": "llm_first_token", "elapsed_ms": 2840, "turn": 3 }
@@ -1048,7 +1048,7 @@ Solo con `"status"` en `output_mode`. El gateway mide cada sesión por etapas (l
 | `elapsed_ms` | Milisegundos (entero) desde la etapa **anterior de la sesión**, sea cual sea, no desde el inicio del turno. Para medir un tramo (fin de frase → primer audio), suma los de las etapas que lo forman |
 | `turn` | El contador de turnos **del usuario** de la sesión (0 antes del primer `send`). No es el `turn_id` ni el `turn_seq`: un push no lo incrementa, y sus etapas llevan el del último turno del usuario |
 
-No lleva texto (ni del usuario ni de la respuesta) ni los detalles que el gateway guarda para `/admin/sessions` (longitudes, voz, tiempos internos del TTS): solo la etapa y los dos números.
+No lleva texto (ni del usuario ni de la respuesta) ni los detalles que el gateway guarda para `/system/sessions` (longitudes, voz, tiempos internos del TTS): solo la etapa y los dos números.
 
 | `stage` | Cuándo |
 |---|---|
@@ -1065,6 +1065,6 @@ No lleva texto (ni del usuario ni de la respuesta) ni los detalles que el gatewa
 | `push_tts` | Se cerró el TTS de un push (al terminar o al cortarse) |
 | `session_end` | La sesión se cierra (si el socket aún puede recibirlo) |
 
-Un push no tiene `llm_*`: solo `tts_*` y `push_tts` si hay audio. Las etapas de un cierre forzado (`client_slow`, `session_revoked`, `agent_revoked`, `session_setup_failed`) quedan en `/admin/sessions` pero no llegan: el socket ya no las puede recibir o solo deja salir el `turn_end` (§13).
+Un push no tiene `llm_*`: solo `tts_*` y `push_tts` si hay audio. Las etapas de un cierre forzado (`client_slow`, `session_revoked`, `agent_revoked`, `session_setup_failed`) quedan en `/system/sessions` pero no llegan: el socket ya no las puede recibir o solo deja salir el `turn_end` (§13).
 
 Van en el mismo orden total que el resto (§5), pero desde la 5.0 su posición respecto a los mensajes de turno solo es orientativa: el turno lo pinta cada sesión por su cuenta (§14), y un `pipeline_event` puede llegar antes del `turn_end` del turno anterior (p. ej. el `llm_start` de tu turno nuevo mientras aún sale el final del anterior). Pueden llegar fuera de un turno (`session_start`, `transcription_*`, `session_end`). Son diagnóstico: la lista de etapas puede crecer y un cliente no debe depender de ellas para funcionar (para enseñar en qué está un turno, `turn_progress`, §5). Ignora las etapas que no conozcas.

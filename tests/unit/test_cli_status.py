@@ -27,7 +27,7 @@ def run(*args):
 
 
 def test_status_shows_gateway_and_services(use_api):
-    use_api(FakeApi({("GET", "/admin/state"): STATE, ("GET", "/admin/users"): USERS}))
+    use_api(FakeApi({("GET", "/system/state"): STATE, ("GET", "/home/users"): USERS}))
     r = run("status")
     assert r.exit_code == 0, r.output
     for text in ("1.23.0", "1 h 2 min", "CONNECTED", "elevenlabs", "DISCONNECTED", "ConnectError"):
@@ -36,7 +36,7 @@ def test_status_shows_gateway_and_services(use_api):
 
 
 def test_status_json_is_the_state(use_api):
-    use_api(FakeApi({("GET", "/admin/state"): STATE, ("GET", "/admin/users"): USERS}))
+    use_api(FakeApi({("GET", "/system/state"): STATE, ("GET", "/home/users"): USERS}))
     r = run("--json", "status")
     assert r.exit_code == 0
     assert json.loads(r.output) == STATE
@@ -50,7 +50,7 @@ def test_status_unreachable_exits_3(use_api):
 
 
 def test_version_shows_cli_and_gateway(use_api):
-    use_api(FakeApi({("GET", "/admin/state"): STATE, ("GET", "/admin/users"): USERS}))
+    use_api(FakeApi({("GET", "/system/state"): STATE, ("GET", "/home/users"): USERS}))
     r = run("version")
     assert r.exit_code == 0
     assert __version__ in r.output and "1.23.0" in r.output
@@ -76,15 +76,15 @@ def test_version_without_token_still_exits_0(monkeypatch, tmp_path):
 
 
 def test_status_tolerates_a_partial_state(use_api):
-    use_api(FakeApi({("GET", "/admin/state"): {"gateway": {}, "services": {"stt": {}}},
-                     ("GET", "/admin/users"): []}))
+    use_api(FakeApi({("GET", "/system/state"): {"gateway": {}, "services": {"stt": {}}},
+                     ("GET", "/home/users"): []}))
     r = run("status")
     assert r.exit_code == 0, r.output
     assert "?" in r.output
 
 
 def test_version_distinguishes_no_version_from_no_answer(use_api):
-    use_api(FakeApi({("GET", "/admin/state"): {"gateway": {"uptime_s": 1}}, ("GET", "/admin/users"): []}))
+    use_api(FakeApi({("GET", "/system/state"): {"gateway": {"uptime_s": 1}}, ("GET", "/home/users"): []}))
     r = run("version")
     assert r.exit_code == 0
     assert "sin versión" in r.output and "no responde" not in r.output
@@ -102,7 +102,7 @@ def _with_access(**orch):
 def test_status_shows_openclaw_access(use_api):
     state = _with_access(scopes=["operator.read", "operator.write", "operator.admin"], admin=True,
                          auth_method="device_token", pairing="paired")
-    use_api(FakeApi({("GET", "/admin/state"): state, ("GET", "/admin/users"): USERS}))
+    use_api(FakeApi({("GET", "/system/state"): state, ("GET", "/home/users"): USERS}))
     r = run("status")
     assert r.exit_code == 0, r.output
     assert "admin · token de dispositivo · emparejado" in r.output
@@ -111,23 +111,23 @@ def test_status_shows_openclaw_access(use_api):
 def test_status_shows_pending_pairing_with_the_command(use_api):
     state = _with_access(state="RECONNECTING", last_error="orchestrator_pairing_required",
                          pairing="pending", pairing_request_id="req-3")
-    use_api(FakeApi({("GET", "/admin/state"): state, ("GET", "/admin/users"): USERS}))
+    use_api(FakeApi({("GET", "/system/state"): state, ("GET", "/home/users"): USERS}))
     r = run("status")
     assert "openclaw devices approve req-3" in r.output
 
 
 def test_status_without_access_fields_has_no_access_line(use_api):
-    use_api(FakeApi({("GET", "/admin/state"): STATE, ("GET", "/admin/users"): USERS}))
+    use_api(FakeApi({("GET", "/system/state"): STATE, ("GET", "/home/users"): USERS}))
     assert "acceso OpenClaw" not in run("status").output
 
 
 def test_status_unknown_scopes(use_api):
     state = _with_access(scopes=None, admin=False, auth_method="shared_token", pairing="not_required")
-    use_api(FakeApi({("GET", "/admin/state"): state, ("GET", "/admin/users"): USERS}))
+    use_api(FakeApi({("GET", "/system/state"): state, ("GET", "/home/users"): USERS}))
     assert "permisos desconocidos · token compartido" in run("status").output
 
 
 def test_status_disconnected_hides_access(use_api):
     state = _with_access(state="RECONNECTING", pairing="unknown")
-    use_api(FakeApi({("GET", "/admin/state"): state, ("GET", "/admin/users"): USERS}))
+    use_api(FakeApi({("GET", "/system/state"): state, ("GET", "/home/users"): USERS}))
     assert "acceso OpenClaw" not in run("status").output

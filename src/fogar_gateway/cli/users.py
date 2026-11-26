@@ -1,4 +1,4 @@
-"""`fogar-gw users …`: las personas del hogar, por la API /admin/users (M20).
+"""`fogar-gw users …`: las personas del hogar, por la API /home/users (M20).
 
 Con el `ADMIN_TOKEN` de la máquina: es también la recuperación (`reset-password`) cuando el
 dueño pierde la contraseña. Las contraseñas se piden ocultas o se leen de stdin, nunca como
@@ -50,7 +50,7 @@ def _password() -> str:
 
 def _find(client: api.Api, ref: str) -> dict[str, Any]:
     """Por nombre de usuario (sin distinguir mayúsculas) o por id."""
-    users = client.request("GET", "/admin/users")
+    users = client.request("GET", "/home/users")
     ref = ref.strip()
     for u in users:
         if u["id"] == ref or u["username"] == ref.lower():
@@ -68,7 +68,7 @@ def users() -> None:
 def list_(ctx: click.Context) -> None:
     """Lista las personas, su rol y el agente que las atiende."""
     out = _out(ctx)
-    rows = api.from_context(ctx).request("GET", "/admin/users")
+    rows = api.from_context(ctx).request("GET", "/home/users")
     if out.as_json:
         out.json(rows)
         return
@@ -97,7 +97,7 @@ def add(ctx: click.Context, username: str, display_name: str | None, role: str,
                             "role": role, "password": _password()}
     if agent:
         body["agent"] = agent
-    data = api.from_context(ctx).request("POST", "/admin/users", body)
+    data = api.from_context(ctx).request("POST", "/home/users", body)
     out = _out(ctx)
     if out.as_json:
         out.json(data)
@@ -108,7 +108,7 @@ def add(ctx: click.Context, username: str, display_name: str | None, role: str,
 
 def _patch(ctx: click.Context, ref: str, body: dict[str, Any], done: str) -> None:
     client = api.from_context(ctx)
-    data = client.request("PATCH", f"/admin/users/{_find(client, ref)['id']}", body)
+    data = client.request("PATCH", f"/home/users/{_find(client, ref)['id']}", body)
     out = _out(ctx)
     if out.as_json:
         out.json(data)
@@ -166,7 +166,7 @@ def reset_password(ctx: click.Context, ref: str) -> None:
     """Pone una contraseña nueva (la recuperación, desde la máquina del gateway)."""
     client = api.from_context(ctx)
     target = _find(client, ref)
-    client.request("PUT", f"/admin/users/{target['id']}/password", {"password": _password()})
+    client.request("PUT", f"/home/users/{target['id']}/password", {"password": _password()})
     out = _out(ctx)
     if out.as_json:
         out.json({"id": target["id"], "password_set": True})
@@ -184,7 +184,7 @@ def remove(ctx: click.Context, ref: str) -> None:
     target = _find(client, ref)
     confirm(ctx, f"¿Borrar a «{target['username']}»? Se van sus dispositivos y sus conversaciones "
                  "privadas del gateway (en OpenClaw quedan hasta que limpies su agente).")
-    client.request("DELETE", f"/admin/users/{target['id']}")
+    client.request("DELETE", f"/home/users/{target['id']}")
     out = _out(ctx)
     if out.as_json:
         out.json({"id": target["id"], "removed": True})

@@ -1,4 +1,4 @@
-"""Validación de entrada y duplicados en /admin/clients (#217, G-28 / G-27a)."""
+"""Validación de entrada y duplicados en /home/devices (#217, G-28 / G-27a)."""
 
 import logging
 import traceback
@@ -46,9 +46,9 @@ def http(db_engine):
 
 def test_create_duplicate_client_key_returns_409_without_leaking_key(http, caplog):
     caplog.set_level(logging.DEBUG)
-    r1 = http.post("/admin/clients", json={"name": "A", "client_key": SECRET_KEY}, headers=HEADERS)
+    r1 = http.post("/home/devices", json={"name": "A", "client_key": SECRET_KEY}, headers=HEADERS)
     assert r1.status_code == 201
-    r2 = http.post("/admin/clients", json={"name": "B", "client_key": SECRET_KEY}, headers=HEADERS)
+    r2 = http.post("/home/devices", json={"name": "B", "client_key": SECRET_KEY}, headers=HEADERS)
     assert r2.status_code == 409
     assert SECRET_KEY not in r2.text
     assert SECRET_KEY not in caplog.text
@@ -59,7 +59,7 @@ def test_create_duplicate_client_key_returns_409_without_leaking_key(http, caplo
 
 
 def test_create_without_client_key_generates_one(http):
-    r = http.post("/admin/clients", json={"name": "A"}, headers=HEADERS)
+    r = http.post("/home/devices", json={"name": "A"}, headers=HEADERS)
     assert r.status_code == 201
     assert len(r.json()["client_key"]) > 20
 
@@ -67,13 +67,13 @@ def test_create_without_client_key_generates_one(http):
 @pytest.mark.parametrize("key", ["", "abc", "x" * 31])
 def test_create_empty_or_short_client_key_is_422(http, key):
     # #293: la clave solo se importa (una existente) y con un mínimo; vacía no es «ausente».
-    r = http.post("/admin/clients", json={"name": "A", "client_key": key}, headers=HEADERS)
+    r = http.post("/home/devices", json={"name": "A", "client_key": key}, headers=HEADERS)
     assert r.status_code == 422
 
 
 def test_create_imported_client_key_is_kept(http):
     key = "imported-key-0123456789abcdefghij"
-    r = http.post("/admin/clients", json={"name": "A", "client_key": key}, headers=HEADERS)
+    r = http.post("/home/devices", json={"name": "A", "client_key": key}, headers=HEADERS)
     assert r.status_code == 201
     assert r.json()["client_key"] == key
 
@@ -91,14 +91,14 @@ def test_create_imported_client_key_is_kept(http):
     ],
 )
 def test_create_invalid_values_return_422(http, payload):
-    r = http.post("/admin/clients", json=payload, headers=HEADERS)
+    r = http.post("/home/devices", json=payload, headers=HEADERS)
     assert r.status_code == 422, r.text
 
 
 @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
 def test_create_nan_inf_return_422(http, literal):
     r = http.post(
-        "/admin/clients",
+        "/home/devices",
         content=f'{{"name": "x", "tts_speed": {literal}}}',
         headers=JSON_HEADERS,
     )
@@ -123,26 +123,26 @@ def test_create_nan_inf_return_422(http, literal):
     ],
 )
 def test_patch_invalid_or_null_values_return_422(http, payload):
-    cid = http.post("/admin/clients", json={"name": "A"}, headers=HEADERS).json()["id"]
-    r = http.patch(f"/admin/clients/{cid}", json=payload, headers=HEADERS)
+    cid = http.post("/home/devices", json={"name": "A"}, headers=HEADERS).json()["id"]
+    r = http.patch(f"/home/devices/{cid}", json=payload, headers=HEADERS)
     assert r.status_code == 422, r.text
-    assert http.get(f"/admin/clients/{cid}", headers=HEADERS).json()["name"] == "A"
+    assert http.get(f"/home/devices/{cid}", headers=HEADERS).json()["name"] == "A"
 
 
 def test_patch_nan_returns_422(http):
-    cid = http.post("/admin/clients", json={"name": "A"}, headers=HEADERS).json()["id"]
-    r = http.patch(f"/admin/clients/{cid}", content='{"tts_speed": NaN}', headers=JSON_HEADERS)
+    cid = http.post("/home/devices", json={"name": "A"}, headers=HEADERS).json()["id"]
+    r = http.patch(f"/home/devices/{cid}", content='{"tts_speed": NaN}', headers=JSON_HEADERS)
     assert r.status_code == 422, r.text
 
 
 def test_patch_nullable_fields_can_still_be_cleared(http):
     cid = http.post(
-        "/admin/clients",
+        "/home/devices",
         json={"name": "A", "default_agent": "x", "client_type": "ha"},
         headers=HEADERS,
     ).json()["id"]
     r = http.patch(
-        f"/admin/clients/{cid}",
+        f"/home/devices/{cid}",
         json={"default_agent": None, "client_type": None, "allowed_agents": None},
         headers=HEADERS,
     )

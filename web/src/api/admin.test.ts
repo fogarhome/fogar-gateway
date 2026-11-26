@@ -15,10 +15,10 @@ describe('conversaciones (M19)', () => {
   it('lista y lee lo dicho de una, con su límite', async () => {
     let fetch = reply(200, [])
     await listConversations()
-    expect(fetch.mock.calls[0]![0]).toBe('/admin/conversations')
+    expect(fetch.mock.calls[0]![0]).toBe('/conversations')
     fetch = reply(200, { conversation_id: 'a b', messages: [], has_more: false })
     await getConversationMessages('a b', 1000)
-    expect(fetch.mock.calls[0]![0]).toBe('/admin/conversations/a%20b/messages?limit=1000')
+    expect(fetch.mock.calls[0]![0]).toBe('/conversations/a%20b/messages?limit=1000')
   })
 
   it('crea con el agente elegido, o sin agente para el de por defecto', async () => {

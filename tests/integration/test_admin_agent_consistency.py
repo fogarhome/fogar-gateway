@@ -47,7 +47,7 @@ def http(db_engine):
 
 
 def _create(http, **body):
-    return http.post("/admin/clients", json={"name": "c", **body}, headers=HEADERS)
+    return http.post("/home/devices", json={"name": "c", **body}, headers=HEADERS)
 
 
 # --- POST -----------------------------------------------------------------
@@ -86,25 +86,25 @@ def test_post_valid_combinations_still_work(http):
 
 def test_patch_default_checked_against_stored_allowed(http):
     cid = _create(http, allowed_agents=["a", "b"]).json()["id"]
-    r = http.patch(f"/admin/clients/{cid}", json={"default_agent": "x"}, headers=HEADERS)
+    r = http.patch(f"/home/devices/{cid}", json={"default_agent": "x"}, headers=HEADERS)
     assert r.status_code == 422
-    r = http.patch(f"/admin/clients/{cid}", json={"default_agent": "a"}, headers=HEADERS)
+    r = http.patch(f"/home/devices/{cid}", json={"default_agent": "a"}, headers=HEADERS)
     assert r.status_code == 200
 
 
 def test_patch_allowed_checked_against_stored_default(http):
     cid = _create(http, default_agent="a").json()["id"]
-    r = http.patch(f"/admin/clients/{cid}", json={"allowed_agents": ["b"]}, headers=HEADERS)
+    r = http.patch(f"/home/devices/{cid}", json={"allowed_agents": ["b"]}, headers=HEADERS)
     assert r.status_code == 422
-    assert http.get(f"/admin/clients/{cid}", headers=HEADERS).json()["allowed_agents"] is None
-    r = http.patch(f"/admin/clients/{cid}", json={"allowed_agents": None}, headers=HEADERS)
+    assert http.get(f"/home/devices/{cid}", headers=HEADERS).json()["allowed_agents"] is None
+    r = http.patch(f"/home/devices/{cid}", json={"allowed_agents": None}, headers=HEADERS)
     assert r.status_code == 200
 
 
 def test_patch_both_fields_together_use_resulting_state(http):
     cid = _create(http, default_agent="a", allowed_agents=["a"]).json()["id"]
     r = http.patch(
-        f"/admin/clients/{cid}",
+        f"/home/devices/{cid}",
         json={"default_agent": "b", "allowed_agents": ["b"]},
         headers=HEADERS,
     )
@@ -113,14 +113,14 @@ def test_patch_both_fields_together_use_resulting_state(http):
 
 def test_patch_clearing_default_is_allowed(http):
     cid = _create(http, default_agent="a", allowed_agents=["a"]).json()["id"]
-    r = http.patch(f"/admin/clients/{cid}", json={"default_agent": None}, headers=HEADERS)
+    r = http.patch(f"/home/devices/{cid}", json={"default_agent": None}, headers=HEADERS)
     assert r.status_code == 200
 
 
 def test_patch_empty_strings_are_422(http):
     cid = _create(http).json()["id"]
     for body in ({"default_agent": ""}, {"allowed_agents": [""]}):
-        assert http.patch(f"/admin/clients/{cid}", json=body, headers=HEADERS).status_code == 422
+        assert http.patch(f"/home/devices/{cid}", json=body, headers=HEADERS).status_code == 422
 
 
 # --- Filas antiguas inconsistentes (#122: solo se valida la entrada) -------
@@ -143,17 +143,17 @@ def _legacy_inconsistent(db_engine):
 
 def test_legacy_inconsistent_row_still_reads_and_unrelated_patch_works(http, db_engine):
     cid = _legacy_inconsistent(db_engine)
-    r = http.get(f"/admin/clients/{cid}", headers=HEADERS)
+    r = http.get(f"/home/devices/{cid}", headers=HEADERS)
     assert r.status_code == 200
     assert r.json()["default_agent"] == "x"
-    r = http.patch(f"/admin/clients/{cid}", json={"name": "renamed"}, headers=HEADERS)
+    r = http.patch(f"/home/devices/{cid}", json={"name": "renamed"}, headers=HEADERS)
     assert r.status_code == 200
     assert r.json()["name"] == "renamed"
 
 
 def test_legacy_inconsistent_row_can_be_fixed_through_patch(http, db_engine):
     cid = _legacy_inconsistent(db_engine)
-    r = http.patch(f"/admin/clients/{cid}", json={"default_agent": "a"}, headers=HEADERS)
+    r = http.patch(f"/home/devices/{cid}", json={"default_agent": "a"}, headers=HEADERS)
     assert r.status_code == 200
 
 
@@ -161,7 +161,7 @@ def test_legacy_inconsistent_row_can_be_fixed_through_patch(http, db_engine):
 
 
 def _fake_tokens(monkeypatch, values):
-    from fogar_gateway.api import admin_routes
+    from fogar_gateway.api import home_routes as admin_routes
 
     it = iter(values)
     last = values[-1]
@@ -169,25 +169,25 @@ def _fake_tokens(monkeypatch, values):
 
 
 def test_rotate_key_collision_retries_with_new_key(http, monkeypatch):
-    http.post("/admin/clients", json={"name": "A", "client_key": TAKEN_KEY}, headers=HEADERS)
+    http.post("/home/devices", json={"name": "A", "client_key": TAKEN_KEY}, headers=HEADERS)
     cid = _create(http).json()["id"]
     _fake_tokens(monkeypatch, [TAKEN_KEY, "fresh-key-abcdefghijklmnop"])
-    r = http.post(f"/admin/clients/{cid}/rotate-key", headers=HEADERS)
+    r = http.post(f"/home/devices/{cid}/rotate-key", headers=HEADERS)
     assert r.status_code == 200
     assert r.json()["client_key"] == "fresh-key-abcdefghijklmnop"
 
 
 def test_rotate_key_persistent_collision_is_409_without_leaking_key(http, monkeypatch, caplog):
     caplog.set_level(logging.DEBUG)
-    http.post("/admin/clients", json={"name": "A", "client_key": TAKEN_KEY}, headers=HEADERS)
+    http.post("/home/devices", json={"name": "A", "client_key": TAKEN_KEY}, headers=HEADERS)
     created = _create(http).json()
     _fake_tokens(monkeypatch, [TAKEN_KEY])
-    r = http.post(f"/admin/clients/{created['id']}/rotate-key", headers=HEADERS)
+    r = http.post(f"/home/devices/{created['id']}/rotate-key", headers=HEADERS)
     assert r.status_code == 409
     assert TAKEN_KEY not in r.text
     assert TAKEN_KEY not in caplog.text
     # La fila conserva su clave anterior
-    again = http.get(f"/admin/clients/{created['id']}", headers=HEADERS).json()
+    again = http.get(f"/home/devices/{created['id']}", headers=HEADERS).json()
     assert again["key_fp"] == fingerprint_key(created["client_key"])
 
 
@@ -208,5 +208,5 @@ def test_agent_names_are_stored_lowercase_and_old_rows_still_match(http, db_engi
         record.allowed_agents = json.dumps(["Main"])
         s.add(record)
         s.commit()
-    r = http.patch(f"/admin/clients/{cid}", json={"default_agent": "Main"}, headers=HEADERS)
+    r = http.patch(f"/home/devices/{cid}", json={"default_agent": "Main"}, headers=HEADERS)
     assert (r.status_code, r.json()["default_agent"]) == (200, "main")

@@ -74,7 +74,7 @@ def run(*args):
 
 
 def test_list_shows_name_short_id_and_fp(use_api):
-    use_api(FakeApi({("GET", "/admin/clients"): CLIENTS}))
+    use_api(FakeApi({("GET", "/home/devices"): CLIENTS}))
     r = run("clients", "list")
     assert r.exit_code == 0, r.output
     for text in ("Fogar TV", "aaaa1111", "1a2b3c4d", "main", "sí", "no"):
@@ -83,36 +83,36 @@ def test_list_shows_name_short_id_and_fp(use_api):
 
 
 def test_list_empty(use_api):
-    use_api(FakeApi({("GET", "/admin/clients"): []}))
+    use_api(FakeApi({("GET", "/home/devices"): []}))
     r = run("clients", "list")
     assert r.exit_code == 0
     assert "sin clientes" in r.output.lower()
 
 
 def test_list_json(use_api):
-    use_api(FakeApi({("GET", "/admin/clients"): CLIENTS}))
+    use_api(FakeApi({("GET", "/home/devices"): CLIENTS}))
     r = run("--json", "clients", "list")
     assert json.loads(r.output) == CLIENTS
 
 
 def test_show_by_name(use_api):
     fake = use_api(
-        FakeApi({("GET", "/admin/clients"): CLIENTS, ("GET", f"/admin/clients/{B['id']}"): B})
+        FakeApi({("GET", "/home/devices"): CLIENTS, ("GET", f"/home/devices/{B['id']}"): B})
     )
     r = run("clients", "show", "aaaa2222")
     assert r.exit_code == 0, r.output
     assert "home" in r.output and "5e6f7a8b" in r.output
-    assert fake.calls[-1] == ("GET", f"/admin/clients/{B['id']}", None)
+    assert fake.calls[-1] == ("GET", f"/home/devices/{B['id']}", None)
 
 
 def test_show_json(use_api):
-    use_api(FakeApi({("GET", "/admin/clients"): CLIENTS, ("GET", f"/admin/clients/{A['id']}"): A}))
+    use_api(FakeApi({("GET", "/home/devices"): CLIENTS, ("GET", f"/home/devices/{A['id']}"): A}))
     r = run("--json", "clients", "show", "Fogar TV")
     assert json.loads(r.output) == A
 
 
 def test_show_ambiguous_exits_2(use_api):
-    use_api(FakeApi({("GET", "/admin/clients"): CLIENTS}))
+    use_api(FakeApi({("GET", "/home/devices"): CLIENTS}))
     assert run("clients", "show", "ha").exit_code == 2
 
 

@@ -7,11 +7,11 @@ Público, sin autenticación:
   POST   /pair                      — el cliente canjea un código (y pide sus scopes) y recibe su
                                        token (una sola vez) y los scopes concedidos
 
-Administración (X-Admin-Token):
-  POST   /admin/pairing             — abre un código con la plantilla del cliente
-  GET    /admin/pairing             — códigos abiertos (sin el código)
-  GET    /admin/pairing/{id}        — estado de uno (open, used, expired, cancelled)
-  DELETE /admin/pairing/{id}        — lo anula
+Administración (`home:admin`):
+  POST   /home/pairing             — abre un código con la plantilla del cliente
+  GET    /home/pairing             — códigos abiertos (sin el código)
+  GET    /home/pairing/{id}        — estado de uno (open, used, expired, cancelled)
+  DELETE /home/pairing/{id}        — lo anula
 
 /pair va fuera de /v1 a propósito: /v1 es la API compatible con OpenAI y tiene su propia
 autenticación. Sin aprobación automática por loopback: un proxy en el mismo host haría pasar
@@ -30,12 +30,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlmodel import Session
 
 from fogar_gateway._version import __version__
-from fogar_gateway.api.admin_routes import (
+from fogar_gateway.api.deps import require_admin
+from fogar_gateway.api.home_routes import (
     _check_agent_consistency,
     check_household_scopes,
     create_client_record,
 )
-from fogar_gateway.api.deps import require_admin
 from fogar_gateway.core.config import settings
 from fogar_gateway.core.logging import fingerprint_key
 from fogar_gateway.core.network import client_ip_for_log
@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 INSTANCE_ID: str = secrets.token_hex(8)
 
 public_router = APIRouter()
-admin_router = APIRouter(prefix="/admin/pairing", dependencies=[Depends(require_admin)])
+admin_router = APIRouter(prefix="/home/pairing", dependencies=[Depends(require_admin)])
 
 
 def gateway_name() -> str:

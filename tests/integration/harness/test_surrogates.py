@@ -27,7 +27,7 @@ async def test_send_with_lone_surrogate_gets_a_normal_turn(harness):
     assert_turns_paired(msgs)
 
     async with harness.admin() as admin:
-        res = await admin.get(f"/admin/conversations/{client.ready['conversation']['id']}/messages")
+        res = await admin.get(f"/conversations/{client.ready['conversation']['id']}/messages")
     assert res.status_code == 200
 
 
@@ -42,7 +42,7 @@ async def test_lone_surrogate_from_openclaw_is_dropped(harness):
         harness.session_key(), messages=[{"role": "user", "content": "c\udc00d", "timestamp": 1}]
     )
     async with harness.admin() as admin:
-        res = await admin.get(f"/admin/conversations/{client.ready['conversation']['id']}/messages")
+        res = await admin.get(f"/conversations/{client.ready['conversation']['id']}/messages")
     assert res.status_code == 200
     assert "cd" in [m["text"] for m in res.json()["messages"]]
 

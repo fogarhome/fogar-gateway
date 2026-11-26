@@ -124,7 +124,7 @@ class ConversationIndex:
 
 @dataclass(frozen=True)
 class ConversationRow:
-    """Una fila de `/admin/conversations` (sin título: lo pone la ruta desde OpenClaw)."""
+    """Una fila de `/conversations` (sin título: lo pone la ruta desde OpenClaw)."""
 
     record: ConversationRecord
     client_name: str
@@ -362,7 +362,7 @@ async def list_openclaw_sessions(orchestrator: _Requester) -> list[dict]:
     return rows
 
 
-# Vida de los títulos leídos de OpenClaw (como la caché de /admin/access): la lista de
+# Vida de los títulos leídos de OpenClaw (como la caché de /system/access): la lista de
 # conversaciones no recorre `sessions.list` entero en cada petición.
 TITLES_TTL_S = 20.0
 # Lo que se recuerda un fallo al leerlos (OpenClaw caído o colgado).

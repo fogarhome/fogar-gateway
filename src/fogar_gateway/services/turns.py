@@ -712,7 +712,7 @@ class TurnController:
         )
 
     def snapshot(self, now: float) -> dict[str, Any]:
-        """El turno en curso y la cola de push para /admin/state (#219): solo números."""
+        """El turno en curso y la cola de push para /system/state (#219): solo números."""
         kind, since = "idle", None
         user = next((t for t in self._live if t.origin == "user"), None)
         push = next((t for t in self._live if t.origin == "push"), None)

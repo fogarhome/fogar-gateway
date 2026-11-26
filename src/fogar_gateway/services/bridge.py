@@ -207,7 +207,7 @@ class FogarBridge:
         self._client_registry.index.add(new)
 
     def snapshot(self) -> dict[str, Any]:
-        """Estado vivo de la sesión para /admin/state (#219): solo números, estados e
+        """Estado vivo de la sesión para /system/state (#219): solo números, estados e
         IDs, nunca texto ni client_key. `started_at` y `last_latencies` los añade la ruta
         desde el SessionRecord (aquí van a None)."""
         now = time.monotonic()

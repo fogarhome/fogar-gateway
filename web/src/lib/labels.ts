@@ -132,7 +132,7 @@ export const STAGE: Record<string, string> = {
   session_end: 'Fin de la sesión',
 }
 
-/** Estado de una sesión guardada (`/admin/sessions`). */
+/** Estado de una sesión guardada (`/system/sessions`). */
 export const SESSION_STATUS: Record<string, string> = {
   active: 'Abierta',
   completed: 'Cerrada',

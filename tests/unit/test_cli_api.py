@@ -54,18 +54,18 @@ def server():
 
 
 def test_get_sends_token_and_returns_json(server):
-    assert api.Api(server, "tok").request("GET", "/admin/state") == {"ok": True}
-    assert _Fake.last == {"method": "GET", "path": "/admin/state", "token": "tok", "body": None}
+    assert api.Api(server, "tok").request("GET", "/system/state") == {"ok": True}
+    assert _Fake.last == {"method": "GET", "path": "/system/state", "token": "tok", "body": None}
 
 
 def test_post_sends_json_body(server):
-    api.Api(server, "tok").request("POST", "/admin/clients", {"name": "A"})
+    api.Api(server, "tok").request("POST", "/home/devices", {"name": "A"})
     assert _Fake.last["body"] == {"name": "A"}
 
 
 def test_204_returns_none(server):
     _Fake.status = 204
-    assert api.Api(server, "tok").request("DELETE", "/admin/clients/x") is None
+    assert api.Api(server, "tok").request("DELETE", "/home/devices/x") is None
 
 
 @pytest.mark.parametrize(
@@ -80,7 +80,7 @@ def test_204_returns_none(server):
 def test_http_errors_map_to_exit_codes(server, status, body, code, text):
     _Fake.status, _Fake.body = status, body
     with pytest.raises(api.ApiError) as e:
-        api.Api(server, "tok").request("GET", "/admin/clients")
+        api.Api(server, "tok").request("GET", "/home/devices")
     assert e.value.exit_code == code
     assert text in e.value.message
 
@@ -90,7 +90,7 @@ def test_422_is_usage_error_and_never_echoes_the_input(server):
     _Fake.status = 422
     _Fake.body = {"detail": [{"loc": ["body", "client_key"], "msg": "too short", "input": secret}]}
     with pytest.raises(api.ApiError) as e:
-        api.Api(server, "tok").request("POST", "/admin/clients", {"client_key": secret})
+        api.Api(server, "tok").request("POST", "/home/devices", {"client_key": secret})
     assert e.value.exit_code == 2
     assert "client_key: too short" in e.value.message
     assert secret not in e.value.message
@@ -98,7 +98,7 @@ def test_422_is_usage_error_and_never_echoes_the_input(server):
 
 def test_unreachable_is_exit_3_with_hint():
     with pytest.raises(api.ApiError) as e:
-        api.Api("http://127.0.0.1:9", "tok").request("GET", "/admin/state")
+        api.Api("http://127.0.0.1:9", "tok").request("GET", "/system/state")
     assert e.value.exit_code == 3
     assert "127.0.0.1:9" in e.value.message and "fogar-gw doctor" in e.value.message
 
@@ -106,7 +106,7 @@ def test_unreachable_is_exit_3_with_hint():
 def test_timeout_is_exit_3(server):
     _Fake.delay = 0.5
     with pytest.raises(api.ApiError) as e:
-        api.Api(server, "tok", timeout=0.1).request("GET", "/admin/state")
+        api.Api(server, "tok", timeout=0.1).request("GET", "/system/state")
     assert e.value.exit_code == 3
 
 
@@ -193,7 +193,7 @@ class _Redirect(BaseHTTPRequestHandler):
 
 
 def test_redirect_is_an_error_and_never_forwards_the_token(server):
-    _Redirect.target = server + "/admin/state"
+    _Redirect.target = server + "/system/state"
     srv = ThreadingHTTPServer(("127.0.0.1", 0), _Redirect)
     threading.Thread(target=srv.serve_forever, args=(0.01,), daemon=True).start()
     try:
@@ -210,7 +210,7 @@ def test_redirect_is_an_error_and_never_forwards_the_token(server):
 def test_non_json_2xx_is_an_error(server, monkeypatch):
     monkeypatch.setattr(json, "dumps", lambda *_a, **_k: "<html>login</html>")
     with pytest.raises(api.ApiError) as e:
-        api.Api(server, "tok").request("GET", "/admin/state")
+        api.Api(server, "tok").request("GET", "/system/state")
     assert e.value.exit_code == 1
 
 
@@ -220,7 +220,7 @@ def test_non_json_2xx_is_an_error(server, monkeypatch):
 @pytest.mark.parametrize("url", ["no-es-una-url", "http://[::1"])
 def test_malformed_url_is_usage_error(url):
     with pytest.raises(api.ApiError) as e:
-        api.Api(url, "tok").request("GET", "/admin/state")
+        api.Api(url, "tok").request("GET", "/system/state")
     assert e.value.exit_code == 2
     assert "--url" in e.value.message
 
@@ -270,14 +270,14 @@ def serve():
 
 def test_truncated_response_is_an_error(serve):
     with pytest.raises(api.ApiError) as e:
-        api.Api(serve(_Truncated), "tok").request("GET", "/admin/state")
+        api.Api(serve(_Truncated), "tok").request("GET", "/system/state")
     assert e.value.exit_code == 1
 
 
 def test_total_deadline_even_if_each_read_is_fast(serve):
     started = time.monotonic()
     with pytest.raises(api.ApiError) as e:
-        api.Api(serve(_Drip), "tok", timeout=0.3).request("GET", "/admin/state")
+        api.Api(serve(_Drip), "tok", timeout=0.3).request("GET", "/system/state")
     assert e.value.exit_code == 3
     assert time.monotonic() - started < 1.0
 
@@ -285,13 +285,13 @@ def test_total_deadline_even_if_each_read_is_fast(serve):
 def test_422_with_odd_detail_items_does_not_crash(server):
     _Fake.status, _Fake.body = 422, {"detail": ["raro", 3]}
     with pytest.raises(api.ApiError) as e:
-        api.Api(server, "tok").request("POST", "/admin/clients", {})
+        api.Api(server, "tok").request("POST", "/home/devices", {})
     assert e.value.exit_code == 2
 
 
 def test_tls_error_is_not_unreachable(server):
     with pytest.raises(api.ApiError) as e:
-        api.Api(server.replace("http://", "https://"), "tok").request("GET", "/admin/state")
+        api.Api(server.replace("http://", "https://"), "tok").request("GET", "/system/state")
     assert e.value.exit_code == 1
     assert "TLS" in e.value.message
 
