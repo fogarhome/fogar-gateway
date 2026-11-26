@@ -575,22 +575,6 @@ def _doctor_summary(ctx: click.Context, out: Out) -> None:
     out.note("El asistente sigue. El detalle completo, con `fogar-gw doctor`.")
 
 
-def _own_unit_or_fail() -> None:
-    """La unidad instalada tiene que ser de esta base: si no, instalarla o reiniciarla tocaría
-    otro gateway (p. ej. producción, con `FOGAR_GATEWAY_HOME` de prueba). Sin la variable en la
-    unidad, systemd usa la base por defecto."""
-    from fogar_gateway.cli import service
-
-    unit = service.unit_path()
-    if not unit.exists():
-        return
-    theirs = service._unit_home(unit) or (Path.home() / ".fogar-gateway").resolve()
-    if theirs != paths.home().resolve():
-        raise api.ApiError(f"El servicio instalado ({unit}) es de otra base ({theirs}), no de "
-                           f"{paths.home()}: no lo toco. Para configurar esta base sin servicio, "
-                           "`fogar-gw --url http://127.0.0.1:<puerto> onboard --no-service`.", 1)
-
-
 def _run(ctx: click.Context, out: Out, answers: Any, no_service: bool = False) -> None:
     from fogar_gateway.cli import doctor, service
     from fogar_gateway.cli import init as init_mod
@@ -598,7 +582,8 @@ def _run(ctx: click.Context, out: Out, answers: Any, no_service: bool = False) -
     use_service = not no_service and (answers is None or answers.service)
     if use_service:  # antes de crear o preguntar nada
         service.require_systemd()
-        _own_unit_or_fail()
+        service.own_unit_or_fail("Para configurar esta base sin servicio, "
+                                 "`fogar-gw --url http://127.0.0.1:<puerto> onboard --no-service`.")
     styled = out.styled  # --answers lo apaga en `onboard`
     if styled:
         from fogar_gateway.cli import linea_viva

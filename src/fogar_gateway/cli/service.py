@@ -200,6 +200,7 @@ def install(ctx: click.Context, exe: Path | None) -> None:
 
     out = _out(ctx)
     require_systemd()
+    own_unit_or_fail()
     settings, _ = cfg._load_or_fail(out)
     db = paths.sqlite_file(settings.DATABASE_URL)
     if db is not None and not db.exists():
@@ -355,6 +356,20 @@ def _unit_home(unit: Path) -> Path | None:
     return Path(m.group(1)).resolve() if m else None
 
 
+def own_unit_or_fail(hint: str | None = None) -> None:
+    """La unidad instalada tiene que ser de esta base: si no, instalarla, arrancarla, pararla o
+    reiniciarla tocaría otro gateway (p. ej. producción, con `FOGAR_GATEWAY_HOME` de prueba). Sin
+    la variable en la unidad, systemd usa la base por defecto."""
+    unit = unit_path()
+    if not unit.exists():
+        return
+    theirs = _unit_home(unit) or (Path.home() / ".fogar-gateway").resolve()
+    if theirs != paths.home().resolve():
+        hint = hint or f"Para manejarlo, indica su base: `fogar-gw --home {theirs} …`."
+        raise ApiError(f"El servicio instalado ({unit}) es de otra base ({theirs}), no de "
+                       f"{paths.home()}: no lo toco. {hint}", 1)
+
+
 def _lock_busy(lock: Path) -> bool:
     import fcntl
 
@@ -392,6 +407,7 @@ def require_unit() -> None:
 
 def _verb(ctx: click.Context, verb: str, state: str, wait: bool) -> None:
     require_unit()
+    own_unit_or_fail()
     systemctl_or_fail(verb, UNIT_NAME)
     if wait:
         wait_healthy(ctx.find_root().obj["url"])
@@ -421,5 +437,6 @@ def stop(ctx: click.Context) -> None:
 def restart(ctx: click.Context) -> None:
     """Reinicia el servicio."""
     require_unit()  # antes de preguntar: sin servicio no hay nada que reiniciar
+    own_unit_or_fail()
     confirm(ctx, f"¿Reiniciar {UNIT_NAME}? Se cortarán las sesiones abiertas.")
     _verb(ctx, "restart", "reiniciado", wait=True)
