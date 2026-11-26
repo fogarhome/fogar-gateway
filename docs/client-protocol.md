@@ -37,6 +37,7 @@ Reglas para que el protocolo crezca sin romper a nadie:
 13. [Timeouts y cierre de sesión](#13-timeouts-y-cierre-de-sesión)
 14. [Conversaciones](#14-conversaciones)
 15. [Diagnóstico del pipeline (`pipeline_event`)](#15-diagnóstico-del-pipeline-pipeline_event)
+16. [Chat por HTTP: `/events` y mensajes (5.0)](#16-chat-por-http-events-y-mensajes-50)
 
 ---
 
@@ -1068,3 +1069,57 @@ No lleva texto (ni del usuario ni de la respuesta) ni los detalles que el gatewa
 Un push no tiene `llm_*`: solo `tts_*` y `push_tts` si hay audio. Las etapas de un cierre forzado (`client_slow`, `session_revoked`, `agent_revoked`, `session_setup_failed`) quedan en `/system/sessions` pero no llegan: el socket ya no las puede recibir o solo deja salir el `turn_end` (§13).
 
 Van en el mismo orden total que el resto (§5), pero desde la 5.0 su posición respecto a los mensajes de turno solo es orientativa: el turno lo pinta cada sesión por su cuenta (§14), y un `pipeline_event` puede llegar antes del `turn_end` del turno anterior (p. ej. el `llm_start` de tu turno nuevo mientras aún sale el final del anterior). Pueden llegar fuera de un turno (`session_start`, `transcription_*`, `session_end`). Son diagnóstico: la lista de etapas puede crecer y un cliente no debe depender de ellas para funcionar (para enseñar en qué está un turno, `turn_progress`, §5). Ignora las etapas que no conozcas.
+
+---
+
+## 16. Chat por HTTP: `/events` y mensajes (5.0)
+
+Para chatear no hace falta tener abierto el WebSocket: un stream SSE por aparato (`GET /events`) y un `POST` por mensaje. Usa el **mismo vocabulario** que el WebSocket (`message`, `turn_start`, `token`, `tool_call`, `turn_progress`, `error`, `turn_end`) y **el mismo canal** de cada conversación (§14): lo que escribe un aparato por HTTP lo ven los que la tienen abierta por WebSocket, y al revés. El WebSocket sigue siendo la vía para la voz.
+
+Todo con `Authorization: Bearer <token>`. Leer (`/events`, `GET /conversations/{id}`) pide `conversations:read`; escribir, quitar y parar, `conversations:write` (§0, «Permisos»). La máquina (`X-Admin-Token`) no tiene aparato: `/events` y escribir le dan `403`.
+
+### `GET /events`
+
+Una conexión por aparato, abierta al arrancar el cliente. Lleva todo lo que pasa en **todas las conversaciones que el aparato puede ver** (las del hogar y, si es personal, las de su persona) y sus avisos. Cada evento es una línea `data:` con un JSON y un `id:` numérico que siempre sube; el JSON es el del WebSocket más `conversation` en todos (también en `token`, `tool_call`, `turn_progress`, `error` y `turn_end`).
+
+```text
+retry: 1000
+
+id: 1795689600000001
+data: {"type":"ready","protocol":5,"device_id":"…"}
+
+id: 1795689600000002
+data: {"type":"message","id":"run-1","conversation":"c1","text":"hola","from":{"source":"device","device_id":"…","name":"Mac","self":true},"state":"pending"}
+
+id: 1795689600000003
+data: {"type":"turn_start","turn_id":"9f3c…","conversation":"c1","origin":"user","by":{"device_id":"…","name":"Mac","self":true}}
+```
+
+- **El primer evento es `ready`.** Regla del cliente: **espera `ready` antes de su primer `POST`**; desde ese momento todo le llega.
+- **`turn_id`** es el del turno de la conversación: el mismo en todos los aparatos y entre reconexiones (no es el `t-{n}` del WebSocket). Por SSE no hay `turn_seq` ni audio.
+- **Sin carreras ni pérdidas.** Cada stream dura como mucho unos 25 s y el navegador reconecta solo (`retry: 1000`) con `Last-Event-ID`: el gateway reenvía lo que se perdió si sigue en el búfer del aparato (unos minutos, hasta 2000 eventos). Si no (un hueco largo, o el gateway se reinició), manda **`resync`**: vuelve a pedir el estado de las conversaciones que tengas abiertas (`GET /conversations/{id}`). Al reanudar, `ready` llega sin `id`; `ready` y `resync` en una conexión nueva llevan el id actual.
+- Un lector demasiado lento se corta y reanuda igual. Cada ~15 s sin eventos llega un comentario `: ping`.
+- **Cortar la conexión no para ningún turno** (§14). Para parar, `POST /conversations/{id}/cancel`.
+- Los avisos siguen las reglas de §10 (`push_enabled`, agentes permitidos, privadas solo a su dueña). Un `/events` abierto recibe el texto del aviso, pero no cuenta como «alguien lo ve»: el dispositivo de avisos lo sigue recibiendo igual.
+
+### Entrar en una conversación
+
+`GET /conversations/{id}` devuelve la conversación (los campos de la lista) y su estado en vivo:
+
+```json
+{"id": "c1", "...": "...", "turn": {"type":"turn_start","turn_id":"9f3c…","conversation":"c1","origin":"push","by":null,"text":"Lo que lleva"}, "pending": [{"type":"message","id":"run-2","state":"pending","...":"..."}], "as_of": 1795689600000003}
+```
+
+`turn` es el turno en curso con el texto que lleva (o `null`); `pending`, sus mensajes pendientes; `as_of`, el id del último evento que incluye. **Descarta los eventos de esa conversación con `id` ≤ `as_of`**: ni duplicados ni huecos. El historial terminado: `GET /conversations/{id}/messages` (cada mensaje con su `id` estable; `?before=<id>&limit=N` pagina hacia atrás dentro de los últimos 1000).
+
+### Escribir, quitar y parar
+
+| Petición | Respuesta |
+|---|---|
+| `POST /conversations/{id}/messages {"text", "interrupt"?}` | `202 {"message_id"}` en cuanto OpenClaw lo acepta (el `id` de su `message`). `interrupt: true` es «enviar ahora» (§4). Texto vacío → `422 empty_message`; agente no permitido → `403 agent_not_permitted`; OpenClaw lo rechaza → `502` con su código (§9); si un `/v1` ocupa la conversación más de `TURN_TIMEOUT_S` → `503 turn_timeout` |
+| `POST /conversations {"agent"?, "message"?}` | `201`, la conversación y, con `message`, su `message_id` |
+| `DELETE /conversations/{id}/messages/{message_id}` | `204`; `404 not_pending` si ya no está pendiente (§4, «Quitar») |
+| `POST /conversations/{id}/cancel` | `200 {"cancelled": bool}`: para el turno en curso para todos o, sin turno, el siguiente mensaje que aún no empezó (como `cancel`, §4) |
+
+El mensaje, su estado (`pending`, `delivered`, `withdrawn`) y el turno que lo responde llegan por `/events`, reconocibles por ese `message_id`.
+

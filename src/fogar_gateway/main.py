@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from fogar_gateway import paths
 from fogar_gateway.api.auth_routes import router as auth_router
 from fogar_gateway.api.conversation_routes import router as conversation_router
+from fogar_gateway.api.events_routes import router as events_router
 from fogar_gateway.api.health_routes import router as health_router
 from fogar_gateway.api.home_routes import router as home_router
 from fogar_gateway.api.openai_routes import router as openai_router
@@ -38,6 +39,7 @@ from fogar_gateway.services.auth import LoginLimiter
 from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.conversations import ConversationService, TitleCache, note_turn_safely
 from fogar_gateway.services.db_client import db_client
+from fogar_gateway.services.events import EventHub
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.models import OrchestratorAccess
@@ -199,6 +201,7 @@ async def _lifespan_body(app: FastAPI):
     app.state.turn_registry = turn_registry  # read by routes.py for queue depths (#219)
     app.state.client_registry = client_registry
     app.state.channel_hub = channel_hub
+    app.state.events = EventHub(channel_hub)  # /events de cada aparato (5.0, #412)
     app.state.conversations = conversations
     app.state.conversation_titles = TitleCache()  # títulos de /conversations
     app.state.session_registry = SessionRegistry()
@@ -216,6 +219,8 @@ async def _lifespan_body(app: FastAPI):
         openclaw.on_connected = None
         stt.on_state_change = None
         tts.on_state_change = None
+        # The devices' /events let go of their channels before those close.
+        app.state.events.close_all()
         # Every step runs even if the lifespan is cancelled; failures go to DEBUG (#221).
         async with Teardown("apagado") as td:
             # 2. Speech providers, then OpenClaw.
@@ -283,6 +288,7 @@ app.include_router(auth_router)  # HTTP /auth/* (M20)
 app.include_router(system_router)  # HTTP /system/* (5.0)
 app.include_router(home_router)  # HTTP /home, /home/users, /home/devices (5.0)
 app.include_router(conversation_router)  # HTTP /conversations
+app.include_router(events_router)  # HTTP /events (5.0, SSE por aparato)
 app.include_router(pairing_public_router)  # HTTP /.well-known/fogar-gateway, /pair
 app.include_router(pairing_admin_router)  # HTTP /home/pairing
 # La web va la última: su GET /{path} recoge lo que no es de la API (rutas de Vue).

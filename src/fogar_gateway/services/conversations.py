@@ -419,8 +419,9 @@ def session_title(row: dict) -> str | None:
 
 
 def history_messages(raw: object) -> list[dict]:
-    """Los mensajes de `chat.history` normalizados a `{role, text, timestamp}`: solo `user` y
-    `assistant` con texto (sin herramientas, avisos ni filas vacías), del más antiguo al último."""
+    """Los mensajes de `chat.history` normalizados a `{id, role, text, timestamp}`: solo `user` y
+    `assistant` con texto (sin herramientas, avisos ni filas vacías), del más antiguo al último.
+    `id` es el de OpenClaw (`__openclaw.id`, el mismo que su `session.message`; 5.0)."""
     out = []
     for message in raw if isinstance(raw, list) else []:
         if not isinstance(message, dict) or message.get("role") not in ("user", "assistant"):
@@ -428,7 +429,12 @@ def history_messages(raw: object) -> list[dict]:
         text = extract_message_text(message).strip()
         if text:
             timestamp = _ms_to_datetime(message.get("timestamp"))
-            out.append({"role": message["role"], "text": text, "timestamp": timestamp})
+            meta = message.get("__openclaw")
+            oc_id = meta.get("id") if isinstance(meta, dict) else None
+            out.append({
+                "id": oc_id if isinstance(oc_id, str) else None,
+                "role": message["role"], "text": text, "timestamp": timestamp,
+            })
     return out
 
 

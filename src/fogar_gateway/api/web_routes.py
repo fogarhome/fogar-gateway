@@ -24,7 +24,7 @@ WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 # Primer segmento de las rutas que no son de la web (las de la API y las de FastAPI).
 API_PREFIXES = frozenset(
-    {"admin", "auth", "conversations", "home", "system", "v1", "ws", "healthz", "ready", ".well-known", "pair", "docs", "redoc", "openapi.json"}
+    {"admin", "auth", "conversations", "events", "home", "system", "v1", "ws", "healthz", "ready", ".well-known", "pair", "docs", "redoc", "openapi.json"}
 )
 
 SECURITY_HEADERS = {
