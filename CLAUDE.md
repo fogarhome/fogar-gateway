@@ -16,6 +16,7 @@ Roadmap, specs, plans, decisions and audits live **only in Obsidian** (the gatew
 # the gateway refuses to start without a DB, so run `fogar-gw init` once per base.
 fogar-gw init
 uvicorn fogar_gateway.main:app --port 8004 --reload    # or `fogar-gw serve` (production settings)
+sh scripts/build-web.sh                               # web/ → src/fogar_gateway/web/ (what `/` serves; `pnpm build` alone leaves it in web/dist)
 
 # New migration (Alembic lives inside the package)
 alembic -c src/fogar_gateway/alembic.ini revision --autogenerate -m "…"
@@ -33,7 +34,7 @@ docker compose up
 # Admin CLI (talks to /admin, never writes the DB; doctor/config also work with the gateway stopped)
 fogar-gw                                               # interactive menu on a TTY, help otherwise
 fogar-gw [--home DIR] init | serve [--create-db]      # new install; start the gateway
-fogar-gw onboard [--answers FILE]                     # setup wizard: OpenClaw, voice, service, dashboard handoff
+fogar-gw onboard [--answers FILE] [--no-service]      # setup wizard: OpenClaw, voice, service, dashboard handoff; refuses a unit of another base
 fogar-gw token                                         # machine token (ADMIN_TOKEN: CLI and recovery), only to a terminal
 fogar-gw doctor | config show|get|validate|set|unset | status | version
 fogar-gw install [--exe PATH] | uninstall | start | stop | restart   # systemd user service

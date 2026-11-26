@@ -36,7 +36,7 @@ Detalles en [Instalación](#instalación). Si integras un aparato nuevo, el prot
 
 ### Web
 
-`http://<host>:8004/` es el panel de Fogar: se entra con el token de administrador (`ADMIN_TOKEN`) y desde ahí se ve el estado en vivo (también con qué acceso está el gateway en OpenClaw), las conversaciones de toda la casa y las sesiones, se habla con Fogar por texto en conversaciones propias del panel, y se emparejan, crean, editan, rotan y borran clientes. Lo sirve el propio gateway desde su paquete, sin Node en la máquina; las rutas de la API de abajo tienen siempre prioridad. Si el paquete no lleva la web compilada (un clon sin build), `/` da 404, el gateway funciona igual y lo avisa una vez en el log. Para desarrollarla, [`web/README.md`](web/README.md).
+`http://<host>:8004/` es el panel de Fogar: se entra con el token de administrador (`ADMIN_TOKEN`) y desde ahí se ve el estado en vivo (también con qué acceso está el gateway en OpenClaw), las conversaciones de toda la casa y las sesiones, se habla con Fogar por texto en conversaciones propias del panel, y se emparejan, crean, editan, rotan y borran clientes. Lo sirve el propio gateway desde su paquete, sin Node en la máquina; las rutas de la API de abajo tienen siempre prioridad. Si el paquete no lleva la web compilada (un clon sin build), `/` da 404, el gateway funciona igual y lo avisa una vez en el log. **Desde un clon**, `sh scripts/build-web.sh` (en la raíz; necesita Node y pnpm) la compila y la copia a `src/fogar_gateway/web/`, que es lo que sirve el gateway (con `uv sync` el paquete es editable: basta con reiniciarlo). `pnpm build` solo la deja en `web/dist`, que el gateway no mira. Es el mismo script que usan la release, la CI y el Dockerfile. Para desarrollarla, [`web/README.md`](web/README.md).
 
 ### WebSocket
 
@@ -140,7 +140,7 @@ Los campos de un cliente (`POST`/`PATCH /admin/clients`) están en `src/fogar_ga
 ```bash
 fogar-gw                        # en una terminal: menú interactivo; en un script: la ayuda
 fogar-gw init                   # instalación nueva: <base>, config.env con ADMIN_TOKEN aleatorio y la BD
-fogar-gw onboard [--answers FICHERO]   # asistente: OpenClaw, voz, servicio y dashboard
+fogar-gw onboard [--answers FICHERO] [--no-service]   # asistente: OpenClaw, voz, servicio y dashboard
 fogar-gw token                  # el token de la máquina (ADMIN_TOKEN: la CLI y la recuperación), solo en una terminal
 fogar-gw access                 # desde dónde se llega al gateway, verificado, con la vía recomendada
 fogar-gw access setup           # elige cómo entrar (Tailscale o tu dominio) y después lista las vías
@@ -277,7 +277,16 @@ En una terminal con color empieza con la línea viva de Fogar escribiendo su nom
    - **Con mi propio dominio:** una URL `https://` (sin ruta, parámetros ni usuario) que tu proxy haga llegar a `http://localhost:8004`; se añade a `PUBLIC_URLS` sin quitar las que ya hay.
 
    Lo mismo, en cualquier momento: `fogar-gw access setup`.
-5. Instala el servicio, o lo reinicia si ya estaba instalado (con terminal pregunta antes, porque corta las sesiones abiertas), y pasa `fogar-gw doctor`.
+5. Instala el servicio, o lo reinicia si ya estaba instalado (con terminal pregunta antes, porque corta las sesiones abiertas), y pasa `fogar-gw doctor`. Si la unidad instalada es de otra base (su `FOGAR_GATEWAY_HOME` no es el de esta ejecución; sin él, la de por defecto), se niega antes de preguntar nada: así un `onboard` con otra base no toca el servicio de producción. Con `--no-service` (o `"service": false` en `--answers`) ni instala ni reinicia nada, ni necesita systemd, y los pasos siguientes hablan con el gateway de `--url` (por defecto `http://127.0.0.1:8004`), que arrancas tú. Por ejemplo, un gateway de prueba junto a producción:
+
+   ```bash
+   export FOGAR_GATEWAY_HOME=~/.fogar-gateway-prueba
+   fogar-gw init
+   uvicorn fogar_gateway.main:app --port 8014 &
+   fogar-gw --url http://127.0.0.1:8014 onboard --no-service
+   ```
+
+   Lo que `onboard` escribe en `config.env` se aplica al reiniciar ese uvicorn (antes de la cuenta y el dashboard, que hablan con él, basta con que esté en marcha). Las vías al dashboard salen con el puerto de `--url`.
 6. «Tu cuenta» (4.0): si el hogar aún no tiene dueño, crea la tuya (usuario, nombre y contraseña dos veces). Con ella entras en el dashboard. Con `--answers`, del campo `owner` (`{"username", "display_name", "password"}`); sin él, solo avisa.
 7. Termina en el dashboard:
    - las vías para llegar al dashboard desde otro aparato: la recomendada («Tu dashboard») y las demás, cada una con su estado (verificada, sin comprobar…). Por la LAN es `http://<IP de la LAN>:8004/` (o la de `GATEWAY_HOST` si escucha en una dirección concreta; si solo escucha en loopback y no hay otra vía, te dice cómo entrar con un túnel SSH: `ssh -L 8004:127.0.0.1:8004 …` desde tu equipo, que solo escucha en su loopback; si el puerto reenviado escucha en otra dirección (`-g`, `ssh -L 0.0.0.0:…`), todo lo que entra por él es loopback para `/v1`, ver [OpenAI-compatible](#openai-compatible-v1-para-home-assistant)). Para verlas o cambiarlas después: `fogar-gw access` y `fogar-gw access setup`;
