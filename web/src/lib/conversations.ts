@@ -15,11 +15,6 @@ export function conversationKind(kind: string): string | null {
   return null
 }
 
-/** Se escribe solo en las conversaciones empezadas en este navegador; las demás que puedes ver se
- * leen (5.0 deja abrir una conversación en varios aparatos a la vez; el rediseño de la web lo usará). */
-export const canWrite = (c: Pick<Conversation, 'client_id'>, deviceId: string | null) =>
-  deviceId !== null && c.client_id === deviceId
-
 /** De quién es (4.0): privada de su persona o del hogar, la ven todos los de casa. */
 export const conversationScope = (c: Pick<Conversation, 'owner_user_id'>) =>
   c.owner_user_id ? 'privada' : 'del hogar'

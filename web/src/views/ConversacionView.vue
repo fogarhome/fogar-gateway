@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, shallowRef, useTemplateRef, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { getConversationMessages } from '@/api/admin'
+import { cancelTurn, getConversationLive, getConversationMessages, postMessage, withdrawMessage } from '@/api/admin'
 import { ApiError } from '@/api/http'
 import type { ConversationMessages } from '@/api/types'
 import FgBoton from '@/components/FgBoton.vue'
@@ -10,20 +10,22 @@ import FgIcono from '@/components/FgIcono.vue'
 import MensajeConversacion from '@/components/MensajeConversacion.vue'
 import MensajeVivo from '@/components/MensajeVivo.vue'
 import { createChatSession, type ChatSession } from '@/lib/chatSession'
-import { canWrite, conversationTitle } from '@/lib/conversations'
+import { conversationTitle } from '@/lib/conversations'
 import { formatClock, formatRelative } from '@/lib/format'
 import { useConversationsStore } from '@/stores/conversations'
+import { useEventsStore } from '@/stores/events'
 import { useSessionStore } from '@/stores/session'
 
-// Una conversación: lo que se dijo (de OpenClaw) y, si se empezó en este navegador, el chat en vivo.
-// Las de otros aparatos solo se leen (M19).
+// Una conversación: lo que se dijo (de OpenClaw) y el chat en vivo por /events (5.0). Se escribe en
+// cualquiera que este navegador pueda ver: varios aparatos comparten la misma conversación (C3).
 const route = useRoute()
 const conversations = useConversationsStore()
 const session = useSessionStore()
+const events = useEventsStore()
 
 const id = computed(() => String(route.params.id ?? ''))
 const conv = computed(() => conversations.byId.get(id.value) ?? null)
-const escribible = computed(() => !!conv.value && canWrite(conv.value, session.deviceId))
+const escribible = computed(() => !!session.token)
 const texto = ref('')
 
 // Lo dicho hasta ahora.
@@ -56,18 +58,30 @@ async function cargarHistoria(limit = 200): Promise<void> {
   }
 }
 
-// El chat en vivo, solo en las de este navegador.
+// El chat en vivo: el estado al entrar y lo que llega por el /events de la pestaña.
 const chat = shallowRef<ChatSession | null>(null)
 function cerrarChat(): void {
   chat.value?.dispose()
   chat.value = null
 }
-// La conversación puede estar abierta a la vez en otras pestañas o aparatos (5.0): cada una la sigue.
 function abrirChat(): void {
-  if (chat.value || !escribible.value || !session.token) return
-  chat.value = createChatSession({ conversationId: id.value, token: session.token })
+  if (chat.value || !escribible.value) return
+  events.ensure()
+  chat.value = createChatSession(id.value, {
+    subscribe: events.subscribe,
+    streamState: () => events.connection,
+    getLive: getConversationLive,
+    postMessage,
+    cancelTurn,
+    withdrawMessage,
+  })
   chat.value.start()
 }
+// Un `resync`: lo perdido ya no está en el gateway; se vuelve a leer lo dicho.
+watch(
+  () => chat.value?.state.epoch,
+  (nuevo, antes) => nuevo !== undefined && antes !== undefined && nuevo !== antes && void cargarHistoria(),
+)
 
 watch(
   id,
@@ -100,15 +114,14 @@ const meta = computed(() => {
   const c = conv.value
   if (!c) return ''
   const cuando = c.last_turn_at ? `habló ${formatRelative(c.last_turn_at, ahora.value)}` : 'sin mensajes todavía'
-  return `${c.client_name} · agente ${chat.value?.state.agent ?? c.agent} · ${cuando}`
+  return `${c.client_name} · agente ${c.agent} · ${cuando}`
 })
-const quienPersona = computed(() => (escribible.value ? 'Tú' : (conv.value?.client_name ?? 'Persona')))
 
 const pasados = computed(() =>
   (historia.value?.messages ?? []).map((m, i) => ({
     key: `h-${i}`,
     props: {
-      quien: m.role === 'user' ? quienPersona.value : 'Fogar',
+      quien: m.role === 'user' ? 'Persona' : 'Fogar',
       propio: m.role === 'user',
       texto: m.text,
       hora: m.timestamp ? formatClock(m.timestamp, ahora.value) : null,
@@ -124,28 +137,30 @@ const estado = computed(() => chat.value?.state ?? null)
 const lineaEstado = computed<{ tono: 'ok' | 'warn' | 'off'; texto: string } | null>(() => {
   const s = estado.value
   if (!s) return null
-  if (s.connection === 'ready')
-    return s.orchestratorDown ? { tono: 'warn', texto: 'OpenClaw se está reconectando: las respuestas esperan a que vuelva' } : { tono: 'ok', texto: 'En vivo' }
+  if (s.notice) return { tono: 'warn', texto: s.notice }
+  if (s.connection === 'ready') return { tono: 'ok', texto: 'En vivo' }
   if (s.connection === 'connecting') return { tono: 'off', texto: 'Conectando…' }
-  if (s.connection === 'reconnecting')
-    return { tono: 'warn', texto: s.failures > 1 ? 'Sin conexión con el gateway. Reintento solo…' : 'Se cortó la conexión. Reconectando…' }
-  if (s.connection === 'idle') return { tono: 'off', texto: 'En pausa por inactividad: se reabre al escribir' }
+  if (s.connection === 'reconnecting') return { tono: 'warn', texto: 'Se cortó la conexión. Reconectando…' }
   return null
 })
 const turnoAbierto = computed(() => estado.value?.log.turnOpen ?? false)
 // Al acabar un turno, la cabecera («habló hace…») y el título de OpenClaw se vuelven a leer.
 watch(turnoAbierto, (abierto, antes) => antes && !abierto && void conversations.refresh())
-const puedeEscribir = computed(() => estado.value?.connection === 'ready' || estado.value?.connection === 'idle')
+const puedeEscribir = computed(() => estado.value?.connection === 'ready' && !estado.value.sending)
+const primeroEnCola = computed(() => estado.value?.log.pending[0]?.key ?? null)
 
 const caja = useTemplateRef<HTMLTextAreaElement>('caja')
-function enviar(): void {
+async function enviar(): Promise<void> {
   if (!chat.value || !texto.value.trim()) return
-  if (chat.value.send(texto.value)) texto.value = ''
+  const escrito = texto.value
+  if (await chat.value.send(escrito)) {
+    if (texto.value === escrito) texto.value = ''
+  }
 }
 function alTeclear(e: KeyboardEvent): void {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault()
-    enviar()
+    void enviar()
   }
 }
 // La caja crece con el texto hasta seis líneas.
@@ -187,11 +202,6 @@ watch(firma, () => {
       <p v-else-if="conversations.loaded && !conv && !historia" class="fg-meta">No encuentro esta conversación.</p>
     </header>
 
-    <p v-if="conv && !escribible" class="nota">
-      Solo lectura: se empezó en «{{ conv.client_name }}», y escribir aquí cortaría a ese aparato. Empieza una tuya en
-      <RouterLink to="/conversaciones">Conversaciones</RouterLink>.
-    </p>
-
     <section class="hilo" aria-label="Lo que se ha dicho">
       <div v-if="historia?.has_more" class="anteriores">
         <p class="fg-meta">Hay mensajes anteriores.</p>
@@ -203,9 +213,17 @@ watch(firma, () => {
         <FgBoton tam="sm" :ocupado="cargando" @click="cargarHistoria()">Reintentar</FgBoton>
       </div>
       <p v-else-if="!historia && cargando" class="fg-meta">Leyendo lo que se dijo…</p>
-      <p v-else-if="vacia" class="fg-meta">{{ escribible ? 'Todavía no habéis hablado. Escribe abajo para empezar.' : 'No hay nada dicho en esta conversación.' }}</p>
+      <p v-else-if="vacia" class="fg-meta">Todavía no habéis hablado. Escribe abajo para empezar.</p>
       <div v-if="vivos.length" class="vivos" aria-live="polite" aria-relevant="additions text">
-        <MensajeVivo v-for="l in vivos" :key="l.key" :linea="l" :ahora="ahora" />
+        <MensajeVivo
+          v-for="l in vivos"
+          :key="l.key"
+          :linea="l"
+          :ahora="ahora"
+          :primero-en-cola="l.key === primeroEnCola && turnoAbierto"
+          @quitar="(m) => chat?.withdraw(m)"
+          @ahora="chat?.cancel()"
+        />
       </div>
     </section>
 
@@ -226,7 +244,7 @@ watch(firma, () => {
           @keydown="alTeclear"
         />
         <FgBoton v-if="turnoAbierto" icono="parar" @click="chat?.cancel()">Parar</FgBoton>
-        <FgBoton v-else type="submit" variante="principal" icono="enviar" :disabled="!puedeEscribir || !texto.trim()">Enviar</FgBoton>
+        <FgBoton type="submit" variante="principal" icono="enviar" :disabled="!puedeEscribir || !texto.trim()">Enviar</FgBoton>
       </form>
       <FgEstado v-if="lineaEstado" class="linea fg-meta" :tono="lineaEstado.tono" :texto="lineaEstado.texto" :tam="12" />
     </div>
