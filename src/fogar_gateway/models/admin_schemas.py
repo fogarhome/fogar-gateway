@@ -312,6 +312,8 @@ class MessageCreate(BaseModel):
 
     text: Annotated[str, StringConstraints(min_length=1)]
     interrupt: bool = False
+    # 5c: voz para el turno que lo responde, solo para este aparato y por su /events.
+    speak: bool = False
 
 
 class ConversationResponse(BaseModel):

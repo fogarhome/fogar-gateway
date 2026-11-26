@@ -22,12 +22,15 @@ que puede ver y los avisos que le tocan.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import time
-from collections import deque
+from collections import OrderedDict, deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from fogar_gateway.core.config import settings
 from fogar_gateway.models.schemas import Client, ClientConfig
 from fogar_gateway.services.channel import (
     ChannelError,
@@ -35,12 +38,16 @@ from fogar_gateway.services.channel import (
     ChannelHub,
     ChannelMessage,
     ChannelProgress,
+    ChannelSubscriber,
     ChannelToken,
     ChannelToolCall,
     ChannelTurn,
     ConversationChannel,
 )
+from fogar_gateway.services.pacing import AudioPacer
 from fogar_gateway.services.pipeline_tracker import PipelineTracker
+from fogar_gateway.services.reconnection import describe_error
+from fogar_gateway.services.speech.ports import TextToSpeechProvider, TtsStream
 from fogar_gateway.services.turns import EndReason, _tool_call_message
 
 logger = logging.getLogger(__name__)
@@ -50,6 +57,7 @@ RESUME_S = 120.0  # cuánto sigue suscrito un aparato tras su último corte
 BUFFER_MAX = 2000  # eventos que guarda un aparato para reanudar
 QUEUE_MAX = 1000  # eventos pendientes de un stream; un lector más lento se corta y reanuda
 KEEPALIVE_S = 15.0
+SPEAK_MAX = 256  # mensajes con `speak` recordados por aparato hasta que abre su turno
 
 _ids = time.time_ns() // 1000  # base temporal: los ids suben también entre reinicios
 
@@ -117,6 +125,95 @@ def _agent_allowed(config: ClientConfig, session_key: str) -> bool:
     return parts[1].lower() in {a.lower() for a in allowed}
 
 
+class _SpeechTurn:
+    """La voz de un turno por /events (5.0 5c): un TTS, su texto por una cola y su audio como
+    eventos `audio` del aparato, al ritmo de reproducción. Toda espera, acotada por
+    PUSH_TTS_DRAIN_TIMEOUT_S de inactividad; un TTS caído se abandona y el turno sigue en texto.
+    `on_done` corre al terminar (el `turn_end` del aparato sale detrás de su audio)."""
+
+    def __init__(self, adapter: "_Adapter", turn: ChannelTurn, provider: TextToSpeechProvider) -> None:
+        self._adapter = adapter
+        self._turn = turn
+        self._provider = provider
+        self._text: asyncio.Queue[str | None] = asyncio.Queue()
+        self._progress_at = time.monotonic()
+        self.on_done: Callable[[], None] | None = None
+        self.task = asyncio.create_task(self._run(), name="events_tts")
+
+    def feed(self, text: str) -> None:
+        self._text.put_nowait(text)
+
+    def end(self) -> None:
+        self._text.put_nowait(None)
+
+    def stop(self) -> None:
+        self.on_done = None
+        self.task.cancel()
+
+    async def _run(self) -> None:
+        device = self._adapter.device
+        stream: TtsStream | None = None
+        try:
+            stream = await asyncio.wait_for(
+                self._provider.connect(
+                    self._provider.resolve_voice(device.config.tts_voice),
+                    device.config.tts_speed,
+                    device.client.id,
+                ),
+                timeout=settings.PUSH_TTS_DRAIN_TIMEOUT_S,
+            )
+            if stream is None:
+                return  # TTS caído u `off`: el turno sigue solo con texto
+            audio = asyncio.create_task(self._pipe(stream), name="events_tts_audio")
+            try:
+                while (text := await self._text.get()) is not None:
+                    await asyncio.wait_for(
+                        stream.send_text_chunk(text), timeout=settings.PUSH_TTS_DRAIN_TIMEOUT_S
+                    )
+                await asyncio.wait_for(stream.end(), timeout=settings.PUSH_TTS_DRAIN_TIMEOUT_S)
+                while not audio.done():
+                    idle = settings.PUSH_TTS_DRAIN_TIMEOUT_S - (time.monotonic() - self._progress_at)
+                    if idle <= 0:
+                        break  # el audio no progresa: se abandona
+                    await asyncio.wait({audio}, timeout=idle)
+            finally:
+                audio.cancel()
+                await asyncio.wait({audio})
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — frontera: un TTS caído no rompe el turno (sigue en texto)
+            logger.warning(
+                f"[{device.client.id}] TTS de /events abandonado ({describe_error(e)}); "
+                "el turno sigue solo con texto."
+            )
+        finally:
+            if stream is not None:
+                try:
+                    await stream.close()
+                except Exception as e:  # noqa: BLE001 — limpieza: va a DEBUG
+                    logger.debug(f"cierre del TTS de /events: {describe_error(e)}")
+            done, self.on_done = self.on_done, None
+            if done is not None:
+                done()
+
+    async def _pipe(self, stream: TtsStream) -> None:
+        pacer = AudioPacer(settings.AUDIO_LEAD_S, settings.AUDIO_PACING_ENABLED)
+        turn = self._turn
+        async for chunk in stream.get_audio_stream():
+            self._progress_at = time.monotonic()
+            for_frames = pacer.frames(chunk) if chunk else None
+            if for_frames is None:
+                continue
+            async for frame in for_frames:
+                if turn.cancel_reason is not None:
+                    return  # nada desde que se corta
+                self._adapter.device.publish_live({
+                    "type": "audio", "turn_id": turn.id, "conversation": turn.conversation_id,
+                    "data": base64.b64encode(frame).decode("ascii"),
+                })
+                self._progress_at = time.monotonic()
+
+
 class _Adapter:
     """El suscriptor de un aparato en un canal: traduce sus callbacks a eventos del aparato.
 
@@ -125,8 +222,8 @@ class _Adapter:
     2c no cambia por tener una web abierta)."""
 
     passive = True
-    wants_audio = False  # la voz por /events llega en la 5c
     wants_progress = True
+    claimed = True  # para `ChannelHub.sessions_of`: puede ser la sesión del dispositivo de avisos
     tracker: PipelineTracker | None = None
 
     def __init__(self, device: "DeviceEvents", channel: ConversationChannel) -> None:
@@ -134,6 +231,20 @@ class _Adapter:
         self.channel = channel
         self._started: set[str] = set()
         self._phase: dict[str, tuple[str, str | None]] = {}
+        self._speech: dict[str, _SpeechTurn] = {}
+
+    @property
+    def device(self) -> "DeviceEvents":
+        return self._device
+
+    @property
+    def wants_audio(self) -> bool:
+        """Los avisos con voz: su stream se abrió con `/events?audio=1` (5c)."""
+        return self._device.audio
+
+    @property
+    def closing(self) -> bool:
+        return self._device.closed
 
     @property
     def client(self) -> Client:
@@ -161,6 +272,31 @@ class _Adapter:
         self._device.publish(turn_payload(turn, self.client.id))
         if turn.text:  # llega a mitad de turno: lo que lleva, en un solo token (como el WS)
             self._token(turn, turn.text)
+        else:
+            self.maybe_speak(turn)
+
+    def maybe_speak(self, turn: ChannelTurn) -> None:
+        """Le pone voz si este aparato la reproduce: el aviso (con `audio=1`) o la respuesta a un
+        mensaje suyo con `speak`. Desde el turno abierto, o al marcarse después (sin carrera
+        con su primer evento): con el texto que ya lleve."""
+        if turn.id not in self._started or turn.id in self._speech or turn.cancel_reason:
+            return
+        if turn.audio_session is not self:
+            return
+        if turn.origin == "push":
+            wanted = self._device.audio
+        else:
+            wanted = turn.run_id is not None and turn.run_id in self._device.speak
+        provider = self._device.tts()
+        if not wanted or provider is None:
+            return
+        if turn.run_id is not None:
+            self._device.speak.pop(turn.run_id, None)
+        speech = _SpeechTurn(self, turn, provider)
+        if turn.text:
+            speech.feed(turn.text)
+        self._speech[turn.id] = speech
+        self._device.track(speech.task)
 
     def on_event(self, turn: ChannelTurn, event: ChannelEvent) -> None:
         if turn.id not in self._started:
@@ -168,6 +304,9 @@ class _Adapter:
         base = {"conversation": turn.conversation_id}
         if isinstance(event, ChannelToken):
             self._token(turn, event.text)
+            speech = self._speech.get(turn.id)
+            if speech is not None:
+                speech.feed(event.text)
         elif isinstance(event, ChannelToolCall):
             if self._device.config.tool_calls_enabled:
                 self._device.publish({**_tool_call_message(turn.id, event.tool_call), **base})
@@ -189,10 +328,19 @@ class _Adapter:
             return
         self._started.discard(turn.id)
         self._phase.pop(turn.id, None)
-        self._device.publish({
+        end = {
             "type": "turn_end", "turn_id": turn.id, "conversation": turn.conversation_id,
             "reason": reason,
-        })
+        }
+        speech = self._speech.pop(turn.id, None)
+        if speech is not None and reason == "done":
+            # Su audio nunca sale después de su turn_end: el turn_end, detrás del audio.
+            speech.on_done = lambda: self._device.publish(end)
+            speech.end()
+            return
+        if speech is not None:
+            speech.stop()
+        self._device.publish(end)
 
     def on_message(self, message: ChannelMessage) -> None:
         self._device.publish(message_payload(message, self.client.id))
@@ -213,10 +361,16 @@ class _Listener:
 class DeviceEvents:
     """Los eventos de un aparato: sus adaptadores, su búfer y sus streams abiertos."""
 
-    def __init__(self, hub: "EventHub", client: Client, config: ClientConfig) -> None:
+    def __init__(
+        self, hub: "EventHub", client: Client, config: ClientConfig, *, audio: bool = False
+    ) -> None:
         self._hub = hub
         self.client = client
         self.config = config
+        self.audio = audio  # `/events?audio=1`: los avisos suenan aquí
+        # runIds de sus mensajes con `speak` cuyo turno aún no empezó (acotado).
+        self.speak: OrderedDict[str, None] = OrderedDict()
+        self._tasks: set[asyncio.Task] = set()
         self._adapters: dict[str, _Adapter] = {}  # session_key → adaptador
         self._buffer: deque[tuple[int, str]] = deque(maxlen=BUFFER_MAX)
         self._floor = current_id()  # el último id que este aparato ya no puede reenviar
@@ -245,6 +399,23 @@ class DeviceEvents:
             return None
         return adapter
 
+    def tts(self) -> TextToSpeechProvider | None:
+        return self._hub.tts()
+
+    def track(self, task: asyncio.Task) -> None:
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def mark_speak(self, run_id: str, channel: ConversationChannel) -> None:
+        """Un mensaje suyo con `speak` (5c): su turno sonará aquí. Si ya empezó, desde ya."""
+        self.speak[run_id] = None
+        while len(self.speak) > SPEAK_MAX:
+            self.speak.popitem(last=False)
+        adapter = self.adapter_for(channel)
+        turn = channel.current_turn
+        if adapter is not None and turn is not None and turn.run_id == run_id:
+            adapter.maybe_speak(turn)
+
     def adapter_for(self, channel: ConversationChannel) -> _Adapter | None:
         adapter = self._adapters.get(channel.session_key)
         return adapter if adapter is not None and adapter.channel is channel else None
@@ -256,6 +427,20 @@ class DeviceEvents:
             del self._adapters[channel.session_key]
 
     # -- eventos ----------------------------------------------------------------------
+
+    def publish_live(self, data: dict) -> None:
+        """Sin id ni búfer (el audio): solo a los streams abiertos; en un corte se pierde."""
+        if self.closed:
+            return
+        line = sse(data)
+        for listener in list(self._listeners):
+            if listener.overflowed:
+                continue
+            try:
+                listener.queue.put_nowait((0, line))
+            except asyncio.QueueFull:
+                listener.overflowed = True
+                self._wake(listener)
 
     def publish(self, data: dict) -> None:
         """Síncrono (lo llaman los callbacks del canal): le da id, lo guarda y lo encola."""
@@ -317,6 +502,8 @@ class DeviceEvents:
         if self.closed:
             return
         self.closed = True
+        for task in list(self._tasks):
+            task.cancel()
         if self._expiry is not None:
             self._expiry.cancel()
             self._expiry = None
@@ -337,26 +524,39 @@ class EventHub:
     (`drop_if_idle`) y sus adaptadores no se recalculan si le cambian `allowed_agents` (hasta
     que caduque). En un hogar son pocos; si crece, soltar adaptadores de canales sin turno."""
 
-    def __init__(self, channel_hub: ChannelHub) -> None:
+    def __init__(
+        self,
+        channel_hub: ChannelHub,
+        tts: Callable[[], TextToSpeechProvider | None] = lambda: None,
+    ) -> None:
         self.channel_hub = channel_hub
+        self.tts = tts  # el TTS del gateway (`app.state.speech.tts`), para `speak` y los avisos
         self._devices: dict[str, DeviceEvents] = {}
         channel_hub.on_new_channel = self.on_channel
 
     def device(self, client_id: str) -> DeviceEvents | None:
         return self._devices.get(client_id)
 
-    def open(self, client: Client, config: ClientConfig) -> DeviceEvents:
+    def open(self, client: Client, config: ClientConfig, *, audio: bool = False) -> DeviceEvents:
         """El de este aparato (el que siga vivo, con su búfer, o uno nuevo adjunto a los
-        canales vivos que puede ver). Su configuración, la de esta petición."""
+        canales vivos que puede ver). Su configuración y `audio`, los de esta petición."""
         device = self._devices.get(client.id)
         if device is None or device.closed:
-            device = DeviceEvents(self, client, config)
+            device = DeviceEvents(self, client, config, audio=audio)
             self._devices[client.id] = device
             for channel in self.channel_hub.channels():
                 device.attach(channel)
         else:
-            device.client, device.config = client, config
+            device.client, device.config, device.audio = client, config, audio
         return device
+
+    def sessions_of(self, client_id: str) -> list[ChannelSubscriber]:
+        """Sus adaptadores, para `ChannelHub.sessions_of` (el dispositivo de avisos, 5c). Solo con
+        `audio=1`: sin audio no compiten con su sesión del WebSocket, que suena (revisión 5c)."""
+        device = self._devices.get(client_id)
+        if device is None or device.closed or not device.audio:
+            return []
+        return list(device._adapters.values())
 
     def on_channel(self, channel: ConversationChannel) -> None:
         """Un canal nuevo: se adjuntan los aparatos con `/events` que pueden verlo. Síncrono."""

@@ -79,6 +79,8 @@ class Close:
 
     # --- 49xx: pasajeros, se reintentan con espera ---
     HANDSHAKE_TIMEOUT = CloseFrame(4900, "handshake timeout", "backoff")
+    # `/speech/dictation` (5c): STT `off`, o sin respuesta tras `end`.
+    SPEECH_UNAVAILABLE = CloseFrame(4901, "speech unavailable", "backoff")
 
 
 # Códigos que el gateway mandó alguna vez y ya no manda: reservados, nunca se reutilizan.

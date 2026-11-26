@@ -140,6 +140,8 @@ Las personas se gestionan desde la web (Personas) o con `fogar-gw users`. **Si e
 | `/conversations/{id}/messages/{message_id}` | DELETE | Quita un mensaje pendiente (`204`; `404 not_pending`) |
 | `/conversations/{id}/cancel` | POST | Para el turno en curso para todos (`{"cancelled": bool}`) |
 | `/events` | GET | SSE del aparato (`conversations:read`): `ready`, luego todo lo de sus conversaciones visibles y sus avisos, con `id` y reanudación por `Last-Event-ID` (o `resync`). Ver [`docs/client-protocol.md` §16](docs/client-protocol.md#16-chat-por-http-events-y-mensajes-50) |
+| `/conversations/{id}/messages/{message_id}/speech` | POST | Voz de una respuesta ya terminada (`conversations:write`): PCM16 24 kHz en streaming; `503 tts_unavailable` sin TTS (5.0) |
+| `/speech/dictation` | WS | Dictado (`conversations:write`): `{"protocol": 5, "token"}`, audio PCM float32 16 kHz y `{"type":"end"}` → `transcription_partial`/`transcription`; no inicia turnos. Con `speak: true` en un mensaje, la voz de su respuesta llega por `/events` (y la de los avisos con `/events?audio=1`). Ver [`docs/client-protocol.md` §16](docs/client-protocol.md#voz-sin-el-websocket-de-conversación-50) |
 | `/home/users` | GET | Personas del hogar: `id`, `username`, `display_name`, `role`, `agent` (el suyo; `null`, el de lo común), `is_active`, `created_at`, `effective_agent` y `agent_shared` |
 | `/home/users` | POST | Alta: `{"username", "display_name", "password" (8+), "role"?, "agent"?}`. `409 username_taken` |
 | `/home/users/{id}` | PATCH | `display_name`, `role`, `agent` (`null` vuelve al de lo común), `is_active`. Desactivar corta ya sus dispositivos |
