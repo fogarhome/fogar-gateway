@@ -12,6 +12,7 @@ FastAPI dependencies compartidas: quién llama (M20) y con qué permisos (5.0, #
 """
 
 import asyncio
+import logging
 import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -25,7 +26,10 @@ from fogar_gateway.db.database import get_engine
 from fogar_gateway.db.models import MembershipRecord, UserRecord
 from fogar_gateway.models.schemas import Client
 from fogar_gateway.services.db_client import db_client
+from fogar_gateway.services.reconnection import describe_error
 from fogar_gateway.services.scopes import HOME_ADMIN, Scope
+
+logger = logging.getLogger(__name__)
 
 ADMIN_ROLES = frozenset({"owner", "admin"})
 
@@ -85,8 +89,11 @@ async def _caller_from_bearer(authorization: str | None) -> Caller:
         device, _ = await db_client.get_session(token.strip())
     except (ClientNotFound, ClientInactive):
         raise _UNAUTHENTICATED from None
-    except ValueError:  # fila con `allowed_agents` corrupto (C-r7-2): no autentica
-        raise _UNAUTHENTICATED from None
+    except ValueError as e:
+        # C-r7-2: fila con `allowed_agents` corrupto (editada a mano): como /v1, 500 y solo el
+        # tipo en el log; la credencial no es el problema.
+        logger.error(f"Bearer: configuración del cliente ilegible: {describe_error(e)}")
+        raise HTTPException(status_code=500, detail="internal_error") from None
     if device.user_id is None:  # del hogar: sin persona
         return Caller(device)
     found = await asyncio.to_thread(_user_and_membership, device.user_id, device.home_id)

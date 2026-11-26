@@ -156,3 +156,14 @@ def test_v1_bearer_needs_write(client, db_engine):
         json={"model": "fogar-gateway", "messages": [{"role": "user", "content": "hola"}]},
     )
     assert r.status_code == 403 and r.json()["detail"] == "missing_scope"
+
+
+def test_bearer_with_unreadable_config_is_500_not_401(client, db_engine, caplog):
+    with Session(db_engine) as s:
+        rec = s.get(ClientRecord, CLIENT_ID)
+        rec.allowed_agents = "{roto"
+        s.add(rec)
+        s.commit()
+    r = client.get("/admin/conversations", headers={"authorization": f"Bearer {VALID_KEY}"})
+    assert r.status_code == 500 and r.json()["detail"] == "internal_error"
+    assert "ilegible" in caplog.text and "{roto" not in caplog.text
