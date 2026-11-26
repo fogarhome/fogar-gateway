@@ -50,3 +50,18 @@ def test_client():
     """FastAPI TestClient con lifespan (conecta/cierra db_client)."""
     with TestClient(app) as client:
         yield client
+
+
+# #425: una vez pytest se quedó parado 32 min a 0 % de CPU. `timeout = 60` (pytest-timeout) ya
+# corta cada test, así que fue fuera de uno: al recoger, al cerrar la sesión o al salir el
+# intérprete esperando un hilo no daemon. Si tras el fin de la sesión el proceso no acaba en
+# EXIT_WATCHDOG_S, se vuelcan las trazas de todos los hilos y sale con error en vez de colgarse
+# en silencio.
+EXIT_WATCHDOG_S = 120
+
+
+def pytest_unconfigure(config):
+    import faulthandler
+    import sys
+
+    faulthandler.dump_traceback_later(EXIT_WATCHDOG_S, exit=True, file=sys.__stderr__)
