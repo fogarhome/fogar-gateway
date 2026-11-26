@@ -450,6 +450,10 @@ def _offer_restart(ctx: click.Context, out: Out) -> bool:
     if not service.unit_path().exists() or service.systemctl(
             "is-active", "--quiet", service.UNIT_NAME, check=False).returncode != 0:
         return False
+    try:  # la unidad de otra base (p. ej. producción) no se reinicia por un cambio de esta
+        service.own_unit_or_fail()
+    except api.ApiError:
+        return False
     # No `output.confirm`: sale con 2 al decir que no y aquí el cambio ya está hecho.
     # --json no es interactivo: solo reinicia con --yes.
     yes = bool(ctx.find_root().obj["yes"])

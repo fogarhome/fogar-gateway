@@ -35,13 +35,17 @@ def test_unit_text_exact():
     assert "--create-db" not in text and "LOG_FORMAT" not in text
 
 
-def test_unit_quotes_and_escapes_odd_paths():
+def test_unit_quotes_and_escapes_odd_paths(tmp_path):
     # Espacio, especificador %, variable $, comilla y barra: la unidad no debe partir ni expandir.
     odd = 'a b%c$d"e\\f'
     text = service.render_unit(Path(f"/x/{odd}/fogar-gw"), Path(f"/h/{odd}"))
     # En ExecStart, systemd expande % y $ (se doblan); en Environment= solo % ($ es literal).
     assert 'ExecStart="/x/a b%%c$$d\\"e\\\\f/fogar-gw" serve\n' in text
     assert 'Environment="FOGAR_GATEWAY_HOME=/h/a b%%c$d\\"e\\\\f"\n' in text
+    # Y se lee de vuelta: si no, la unidad de esta base parecería de otra.
+    unit = tmp_path / "u.service"
+    unit.write_text(text)
+    assert service._unit_home(unit) == Path(f"/h/{odd}").resolve()
 
 
 def test_pick_exe_makes_relative_exe_absolute_without_resolving(monkeypatch, tmp_path):
@@ -231,6 +235,11 @@ def _unit_text(svc):
     return service.render_unit(Path(EXE), svc.home)
 
 
+def _old_unit(svc):
+    """Una unidad de esta base con otro ejecutable (una instalación anterior)."""
+    return service.render_unit(Path("/opt/viejo/fogar-gw"), svc.home)
+
+
 def test_install_refuses_without_db(svc):
     (svc.home / "data" / "gateway.db").unlink()
     r = run("install", "--exe", EXE)
@@ -279,7 +288,7 @@ def test_install_active_service_same_unit_skips_port_check(svc, monkeypatch):
 
 def test_install_active_service_new_unit_restarts(svc, monkeypatch):
     svc.unit.parent.mkdir(parents=True)
-    svc.unit.write_text("viejo")
+    svc.unit.write_text(_old_unit(svc))
     svc.active = True
     monkeypatch.setattr(service, "port_free", lambda: False)
     r = run("--yes", "install", "--exe", EXE)
@@ -330,10 +339,10 @@ def test_install_same_unit_is_noop(svc):
 
 def test_install_overwrite_needs_confirm(svc):
     svc.unit.parent.mkdir(parents=True)
-    svc.unit.write_text("viejo")
+    svc.unit.write_text(_old_unit(svc))
     r = run("install", "--exe", EXE)
     assert r.exit_code == 2 and "--yes" in r.output
-    assert svc.unit.read_text() == "viejo" and svc.calls == []
+    assert svc.unit.read_text() == _old_unit(svc) and svc.calls == []
     r = run("--yes", "install", "--exe", EXE)
     assert r.exit_code == 0, r.output
     assert svc.unit.read_text() == _unit_text(svc)
@@ -438,6 +447,47 @@ def test_inside_container_explains_docker(installed, monkeypatch):
     r = run("--yes", "restart")
     assert r.exit_code == 1 and service.NO_SERVICE_MSG in r.output
     assert installed.calls == []
+
+
+# --- la unidad de otra base (prueba en vivo 2026-11-25) ---
+
+
+@pytest.mark.parametrize("unit_home", ["other", "missing"])
+@pytest.mark.parametrize("cmd", [("install", "--exe", EXE), ("start",), ("stop",), ("restart",)])
+def test_unit_of_another_base_is_left_alone(svc, unit_home, cmd):
+    """Con FOGAR_GATEWAY_HOME de prueba, la unidad de producción (o una sin la variable, que
+    systemd lanza con la base por defecto) no se sobrescribe, arranca, para ni reinicia."""
+    svc.unit.parent.mkdir(parents=True)
+    other = svc.tmp / "produccion"
+    text = (service.render_unit(Path(EXE), other) if unit_home == "other"
+            else "[Service]\nExecStart=/x/fogar-gw serve\n")
+    svc.unit.write_text(text)
+    svc.active = True
+    r = run("--yes", *cmd)
+    assert r.exit_code == 1, r.output
+    theirs = other if unit_home == "other" else Path.home() / ".fogar-gateway"
+    assert "otra base" in r.output and f"--home {theirs.resolve()}" in r.output
+    assert svc.unit.read_text() == text and svc.calls == []
+
+
+def test_unit_of_this_base_by_another_path_is_ours(svc, monkeypatch):
+    """La misma base escrita de otra forma (un enlace) sigue siendo la nuestra."""
+    link = svc.tmp / "enlace"
+    link.symlink_to(svc.home)
+    monkeypatch.setenv("FOGAR_GATEWAY_HOME", str(link))
+    svc.unit.parent.mkdir(parents=True)
+    svc.unit.write_text(_unit_text(svc))
+    assert run("stop").exit_code == 0
+    assert svc.calls == [("stop", "fogar-gateway.service")]
+
+
+def test_unit_without_home_is_ours_in_the_default_base(svc, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: svc.tmp)
+    monkeypatch.setenv("FOGAR_GATEWAY_HOME", str(svc.tmp / ".fogar-gateway"))
+    svc.unit.parent.mkdir(parents=True)
+    svc.unit.write_text("[Service]\nExecStart=/x/fogar-gw serve\n")
+    assert run("stop").exit_code == 0
+    assert svc.calls == [("stop", "fogar-gateway.service")]
 
 
 # --- uninstall --purge ---

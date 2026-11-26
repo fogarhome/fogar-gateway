@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from fogar_gateway import paths
 from fogar_gateway.cli.app import cli
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -339,7 +340,7 @@ def test_set_warns_when_environment_wins(home, monkeypatch):
 
 
 @pytest.fixture()
-def systemd(monkeypatch, tmp_path):
+def systemd(monkeypatch, tmp_path, home):
     from types import SimpleNamespace
 
     from fogar_gateway.cli import output, service
@@ -347,7 +348,7 @@ def systemd(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     unit = service.unit_path()
     unit.parent.mkdir(parents=True)
-    unit.write_text("[Unit]\n")
+    unit.write_text(service.render_unit(Path("/opt/fogar-gw"), paths.home()))
     st = SimpleNamespace(calls=[], active=True, tty=False, healthy=True, fail=False)
     monkeypatch.setattr(service, "require_systemd", lambda: None)
     monkeypatch.setattr(service, "_probe", lambda url: st.healthy)
@@ -384,6 +385,15 @@ def test_set_offers_restart_when_active(home, systemd):
 def test_set_no_restart_when_inactive_or_no_unit(home, systemd):
     systemd.active = False
     run("--yes", "config", "set", "LOG_FORMAT", "text")
+    assert ("restart", "fogar-gateway.service") not in systemd.calls
+
+
+def test_set_never_restarts_the_unit_of_another_base(home, systemd, tmp_path):
+    from fogar_gateway.cli import service
+
+    service.unit_path().write_text(service.render_unit(Path("/opt/fogar-gw"), tmp_path / "prod"))
+    r = run("--yes", "config", "set", "LOG_FORMAT", "text")
+    assert r.exit_code == 0, r.output
     assert ("restart", "fogar-gateway.service") not in systemd.calls
 
 
