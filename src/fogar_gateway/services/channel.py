@@ -2173,7 +2173,7 @@ class ConversationChannel:
 
     def _indexed(self) -> bool:
         """Its key is a Fogar conversation's (`ConversationIndex`): only then does a push have a
-        notify device. A live channel of an unindexed key (the /v1 trusted-origin `…:ha` key,
+        notify device. A live channel of an unindexed key (a cron session,
         an owner-less stand-in) reaches its attached sessions only."""
         index = self._hub.index
         return index is not None and index.get(self.session_key) is not None

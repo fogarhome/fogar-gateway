@@ -165,7 +165,7 @@ def test_set_invalid_writes_nothing(home):
     assert [p.name for p in home.iterdir()] == ["config.env"]
 
 
-@pytest.mark.parametrize("field", ["TRUSTED_PROXIES", "TRUSTED_NETWORKS"])
+@pytest.mark.parametrize("field", ["TRUSTED_PROXIES"])
 @pytest.mark.parametrize(
     "value",
     [
@@ -183,7 +183,7 @@ def test_set_invalid_network_list_writes_nothing(home, field, value):
 
 
 def test_set_valid_network_list(home):
-    r = run("config", "set", "TRUSTED_NETWORKS", " 192.168.1.0/24 , fd12:3456::/48 ")
+    r = run("config", "set", "TRUSTED_PROXIES", " 192.168.1.0/24 , fd12:3456::/48 ")
     assert r.exit_code == 0, r.output
 
 
@@ -193,20 +193,20 @@ def test_validate_marks_invalid_network_list(home):
     r = run("config", "validate")
     assert r.exit_code == 1
     assert "TRUSTED_PROXIES" in r.output and "«127.0.0.1;::1»" in r.output
-    assert "fallo cerrado" in r.output
+    assert "ningún peer cuenta como proxy" in r.output
 
 
 def test_validate_fails_on_wide_networks(home):
-    (home / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nTRUSTED_NETWORKS=0.0.0.0/1,128.0.0.0/1\n")
+    (home / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nTRUSTED_PROXIES=0.0.0.0/1,128.0.0.0/1\n")
     r = run("--json", "config", "validate")
     assert r.exit_code == 1
-    checks = [c for c in json.loads(r.output) if c["check"] == "TRUSTED_NETWORKS"]
+    checks = [c for c in json.loads(r.output) if c["check"] == "TRUSTED_PROXIES"]
     assert [c["level"] for c in checks] == ["fail"]
     assert "«0.0.0.0/1»" in checks[0]["detail"] and "«128.0.0.0/1»" in checks[0]["detail"]
 
 
 def test_host_bits_hint_only_for_host_bits(home):
-    r = run("config", "set", "TRUSTED_NETWORKS", "192.168.1.5/24,localhost")
+    r = run("config", "set", "TRUSTED_PROXIES", "192.168.1.5/24,localhost")
     assert r.exit_code == 1
     assert "«192.168.1.5/24» (bits de host: 192.168.1.0/24)" in r.output
     assert "«localhost» (no es una IP ni un CIDR)" in r.output
@@ -214,10 +214,10 @@ def test_host_bits_hint_only_for_host_bits(home):
 
 def test_validate_only_warns_on_host_bits(home):
     # El gateway acepta 192.168.1.5/24 (= 192.168.1.0/24): aviso, no fallo; `config set` sí lo rechaza.
-    (home / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nTRUSTED_NETWORKS=192.168.1.5/24\n")
+    (home / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nTRUSTED_PROXIES=192.168.1.5/24\n")
     r = run("--json", "config", "validate")
     assert r.exit_code == 0, r.output
-    checks = [c for c in json.loads(r.output) if c["check"] == "TRUSTED_NETWORKS"]
+    checks = [c for c in json.loads(r.output) if c["check"] == "TRUSTED_PROXIES"]
     assert [c["level"] for c in checks] == ["warn"] and "192.168.1.5/24" in checks[0]["detail"]
     assert "válid" not in checks[0]["detail"]
 
@@ -666,3 +666,18 @@ def test_unset_accepts_retired_key(home):
     assert r.exit_code == 0, r.output
     assert _env(home).read_text() == f"ADMIN_TOKEN={SECRET}\n"
     assert run("config", "set", "ORCHESTRATOR_RECONNECT_MAX_DURATION", "5").exit_code == 2
+
+
+def test_validate_names_a_retired_trusted_networks_line(home):
+    # 5.0 (#413): TRUSTED_NETWORKS y TRUST_LOOPBACK ya no existen; como los demás ajustes
+    # retirados, validate los nombra para borrarlos, y `config unset` los quita.
+    (home / "config.env").write_text(
+        f"ADMIN_TOKEN={SECRET}\nTRUSTED_NETWORKS=192.168.1.0/24\nTRUST_LOOPBACK=true\n"
+    )
+    r = run("config", "validate")
+    assert r.exit_code == 1
+    assert "TRUSTED_NETWORKS" in r.output and "TRUST_LOOPBACK" in r.output
+    assert "bórralo de config.env" in r.output
+    assert run("config", "unset", "TRUSTED_NETWORKS").exit_code == 0
+    assert run("config", "unset", "TRUST_LOOPBACK").exit_code == 0
+    assert "TRUSTED_NETWORKS" not in _env(home).read_text()
