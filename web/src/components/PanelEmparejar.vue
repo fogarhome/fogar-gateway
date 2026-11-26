@@ -20,6 +20,9 @@ const abierto = shallowRef<PairingOpened | null>(null)
 const estado = ref<PairingState | 'abriendo' | 'error'>('abriendo')
 const error = ref('')
 const lleno = ref(false) // 409: ya hay 5 códigos abiertos
+// 5.0: lo que concede el código. Siempre conversar; ver el hogar y su estado, si se marca (una tablet
+// en la pared). Nunca administrar: un aparato del hogar no tiene persona detrás.
+const verHogar = ref(false)
 const clients = useClientsStore()
 const ahora = ref(performance.now())
 let recibido = 0
@@ -82,7 +85,9 @@ async function abrir(): Promise<void> {
   estado.value = 'abriendo'
   const mio = ++intento
   try {
-    const p = await openPairing()
+    const p = await openPairing({
+      scopes: verHogar.value ? ['conversations:write', 'home:read'] : ['conversations:write'],
+    })
     if (fuera || mio !== intento) {
       void cancelPairing(p.id).catch(() => undefined)
       return
@@ -163,6 +168,10 @@ onBeforeUnmount(() => {
         <div class="pista" aria-hidden="true"><div class="barra" :style="{ width: progreso }" /></div>
         <p class="fg-meta pie"><span>Esperando al aparato…</span><span>caduca en {{ cuenta }}</span></p>
       </div>
+      <label class="permiso fg-meta">
+        <input v-model="verHogar" type="checkbox" :disabled="estado === 'abriendo'" @change="abrir" />
+        Que también pueda ver el hogar y su estado (personas, aparatos, servicios). Nunca administrarlo.
+      </label>
       <p class="fg-meta nota">El aparato pondrá su nombre y su tipo; después puedes cambiarlos. Un código vale una sola vez.</p>
     </template>
     <template v-else-if="estado === 'expired' || estado === 'cancelled'">
@@ -179,6 +188,11 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.permiso {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
 .emparejar {
   position: relative;
   display: flex;

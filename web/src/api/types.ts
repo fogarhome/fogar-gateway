@@ -115,6 +115,8 @@ export type PairingState = 'open' | 'used' | 'expired' | 'cancelled'
 /** Plantilla de `POST /home/pairing`: los campos de crear un cliente, todos opcionales y sin clave. */
 export type PairingTemplate = Partial<Omit<ClientResponse, 'id' | 'key_fp' | 'is_active' | 'created_at' | 'client_type'>> & {
   client_type?: ClientType | null
+  /** 5.0: los permisos que concede el código (un aparato del hogar llega como mucho a `home:read`). */
+  scopes?: string[]
 }
 
 /** `GET /home/pairing` y `/{id}`: nunca lleva el código. */
@@ -208,9 +210,21 @@ export interface Conversation {
 }
 
 export interface ConversationMessage {
+  /** El de OpenClaw (5.0): estable, también para la voz bajo demanda. */
+  id?: string | null
   role: 'user' | 'assistant'
   text: string
   timestamp: string | null
+}
+
+/** `GET /conversations/{id}` (5.0): la conversación con su estado en vivo. */
+export interface ConversationLive extends Conversation {
+  /** El turno en curso (su `turn_start` de /events más el texto que lleva), o null. */
+  turn: ({ turn_id: string; origin?: 'user' | 'push'; text: string; [key: string]: unknown }) | null
+  /** Sus mensajes pendientes, como los `message` de /events. */
+  pending: Array<Record<string, unknown>>
+  /** El último id de /events que incluye: lo que llegue con id ≤ as_of ya está aquí. */
+  as_of: number
 }
 
 export interface ConversationMessages {

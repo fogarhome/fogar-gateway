@@ -10,6 +10,7 @@ import type {
   ClientWithKey,
   Conversation,
   ConversationAgents,
+  ConversationLive,
   ConversationMessages,
   PairingOpened,
   PairingSummary,
@@ -59,6 +60,12 @@ export const listConversations = () => api<Conversation[]>('/conversations')
 export const getConversationMessages = (id: string, limit = 200) =>
   api<ConversationMessages>(`/conversations/${enc(id)}/messages?limit=${limit}`, { timeoutMs: 20_000 })
 export const getConversationAgents = () => api<ConversationAgents>('/conversations/agents')
+export const getConversationLive = (id: string) => api<ConversationLive>(`/conversations/${enc(id)}`)
+export const postMessage = (id: string, text: string, interrupt = false) =>
+  api<{ message_id: string }>(`/conversations/${enc(id)}/messages`, { method: 'POST', body: json({ text, interrupt }) })
+export const cancelTurn = (id: string) => api<{ cancelled: boolean }>(`/conversations/${enc(id)}/cancel`, { method: 'POST' })
+export const withdrawMessage = (id: string, messageId: string) =>
+  api<void>(`/conversations/${enc(id)}/messages/${enc(messageId)}`, { method: 'DELETE' })
 /** Conversación nueva del panel web; sin agente, el que toque por defecto. */
 export const createConversation = (agent: string | null) =>
   api<Conversation>('/conversations', { method: 'POST', body: json(agent ? { agent } : {}) })
