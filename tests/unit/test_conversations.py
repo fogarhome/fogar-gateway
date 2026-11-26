@@ -300,7 +300,8 @@ async def test_openclaw_sessions_are_listed_page_by_page_with_titles():
 
 def test_history_is_normalised_to_role_text_and_time():
     raw = [
-        {"role": "user", "content": "hola", "timestamp": 1_794_665_071_190},
+        {"role": "user", "content": "hola", "timestamp": 1_794_665_071_190,
+         "__openclaw": {"id": "m-1", "seq": 1}},
         {"role": "assistant", "content": [{"type": "text", "text": "¿qué tal?"},
                                           {"type": "toolCall", "name": "x"}], "timestamp": 1},
         {"role": "assistant", "content": [{"type": "toolCall", "name": "x"}]},  # sin texto
@@ -309,9 +310,10 @@ def test_history_is_normalised_to_role_text_and_time():
         "basura",
     ]
     assert history_messages(raw) == [
-        {"role": "user", "text": "hola",
+        {"id": "m-1", "role": "user", "text": "hola",
          "timestamp": datetime.fromtimestamp(1_794_665_071.19, UTC)},
-        {"role": "assistant", "text": "¿qué tal?", "timestamp": datetime.fromtimestamp(0.001, UTC)},
+        {"id": None, "role": "assistant", "text": "¿qué tal?",
+         "timestamp": datetime.fromtimestamp(0.001, UTC)},
     ]
     assert history_messages(None) == []
 

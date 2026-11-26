@@ -484,9 +484,13 @@ def retire_client(session: Session, rec: ClientRecord) -> None:
 
 
 def close_client_sessions(app: FastAPI, client_id: str) -> None:
-    """Cierra ya (4200) las sesiones vivas de un cliente, sin esperar a la revalidación."""
+    """Cierra ya (4200) las sesiones vivas de un cliente, sin esperar a la revalidación, y su
+    `/events` (también el que sigue vivo sin conexión para reanudar, #412)."""
     for bridge in app.state.client_registry.for_client(client_id):
         bridge.revoke()
+    events = getattr(app.state, "events", None)
+    if events is not None:
+        events.close_device(client_id)
 
 
 def _retire_client_record(client_id: str) -> None:

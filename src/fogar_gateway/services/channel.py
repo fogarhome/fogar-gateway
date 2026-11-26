@@ -367,7 +367,7 @@ ChannelEvent = ChannelToken | ChannelToolCall | ChannelProgress | ChannelError
 class ChannelTurn:
     """A turn of the channel. Every subscriber maps it to its own client-facing turn."""
 
-    id: str  # internal, `uuid4().hex`; never sent to clients
+    id: str  # `uuid4().hex`: the `turn_id` of /events (stable across reconnections, #412)
     conversation_id: str
     origin: TurnOrigin
     by_client_id: str | None  # the durable origin: the sender's client (None for a push)
@@ -864,6 +864,10 @@ class ConversationChannel:
 
     def is_subscribed(self, subscriber: ChannelSubscriber) -> bool:
         return self._subscription(subscriber) is not None
+
+    def pending_messages(self) -> list[ChannelMessage]:
+        """Its messages still waiting for their turn, in order (`GET /conversations/{id}`)."""
+        return [self._message(info) for info in self._runs.values() if info.message == "pending"]
 
     def _note_turn(self) -> None:
         """Cuenta un turno de la conversación (una vez por turno del canal)."""
@@ -2262,7 +2266,10 @@ class ConversationChannel:
         notify = self._notify_session()
         audio = notify if notify is not None and notify.wants_audio else None
         guests: list[ChannelSubscriber] = []
-        if notify is not None and not self.is_subscribed(notify) and (not audience or audio):
+        # A passive subscriber (a device's /events, #412) gets the text but does not count as
+        # "someone sees it": the notify device's delivery stays as without it.
+        watching = [s for s in audience if not getattr(s, "passive", False)]
+        if notify is not None and not self.is_subscribed(notify) and (not watching or audio):
             guests.append(notify)
         self._push_text.reset()
         turn = self.open_turn("push", run_id=run_id, audio_to=audio, guests=guests)
@@ -2518,6 +2525,9 @@ class ChannelHub:
         # them a push reaches only the attached sessions, and sounds nowhere.
         self.notify_device = notify_device
         self.sessions_of = sessions_of
+        # 5.0 #412: who hears of a new channel (`EventHub.on_channel`, the devices with /events).
+        # Synchronous, called before the channel is handed out: no turn can open before it.
+        self.on_new_channel: Callable[[ConversationChannel], None] | None = None
         self._tasks: set[asyncio.Task] = set()
 
     def __len__(self) -> int:
@@ -2533,7 +2543,13 @@ class ChannelHub:
         if channel is None:
             channel = ConversationChannel(conversation, self)
             self._channels[conversation.session_key] = channel
+            if self.on_new_channel is not None:
+                self.on_new_channel(channel)
         return channel
+
+    def channels(self) -> list[ConversationChannel]:
+        """The live channels (a device opening /events attaches to those it may see)."""
+        return list(self._channels.values())
 
     def channel_for(self, session_key: str) -> ConversationChannel | None:
         """The channel of a push's `sessionKey` (decision 5: the conversation from the index,

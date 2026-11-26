@@ -301,6 +301,17 @@ class ConversationCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     agent: AgentName | None = None
+    # 5.0 (#412): el primer mensaje, enviado nada más crearla (su `message_id` en la respuesta).
+    message: Annotated[str, StringConstraints(min_length=1)] | None = None
+
+
+class MessageCreate(BaseModel):
+    """`POST /conversations/{id}/messages` (5.0, #412): `interrupt` es «enviar ahora»."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: Annotated[str, StringConstraints(min_length=1)]
+    interrupt: bool = False
 
 
 class ConversationResponse(BaseModel):
@@ -317,6 +328,16 @@ class ConversationResponse(BaseModel):
     turn_count: int
     title: str | None = None
     owner_user_id: str | None = None  # M20: null = del hogar; con valor, privada de ese usuario
+    message_id: str | None = None  # 5.0: solo al crearla con `message`
+
+
+class ConversationLive(ConversationResponse):
+    """`GET /conversations/{id}` (5.0, #412): su estado en vivo y `as_of`, el último id de
+    `/events` que incluye (el cliente descarta los eventos con id ≤ `as_of`)."""
+
+    turn: dict | None = None  # el turno en curso: turn_start de /events + `text` que lleva
+    pending: list[dict] = []  # sus mensajes pendientes (el `message` de /events)
+    as_of: int
 
 
 class ConversationAgents(BaseModel):
@@ -328,6 +349,7 @@ class ConversationAgents(BaseModel):
 
 
 class ConversationMessage(BaseModel):
+    id: str | None = None  # el de OpenClaw (`__openclaw.id`), estable; 5.0
     role: Literal["user", "assistant"]
     text: str
     timestamp: datetime | None
