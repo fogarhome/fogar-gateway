@@ -352,8 +352,14 @@ def _purge(ctx: click.Context, out: Out, unit: Path, home: Path) -> None:
 
 def _unit_home(unit: Path) -> Path | None:
     """El FOGAR_GATEWAY_HOME de la unidad instalada (resuelto), o None si no se entiende."""
-    m = re.search(r'^Environment="?FOGAR_GATEWAY_HOME=([^"\n]*)"?$', unit.read_text(), re.M)
-    return Path(m.group(1)).resolve() if m else None
+    # Deshace las comillas de `_quote`: primero %%, después los escapes con barra.
+    m = re.search(r'^Environment=(?:"((?:[^"\\\n]|\\.)*)"|(\S+))$', unit.read_text(), re.M)
+    if m is None:
+        return None
+    raw = m.group(2) or re.sub(r"\\(.)", lambda e: "\n" if e.group(1) == "n" else e.group(1),
+                                m.group(1).replace("%%", "%"))
+    key, _, value = raw.partition("=")
+    return Path(value).resolve() if key == "FOGAR_GATEWAY_HOME" and value else None
 
 
 def own_unit_or_fail(hint: str | None = None) -> None:

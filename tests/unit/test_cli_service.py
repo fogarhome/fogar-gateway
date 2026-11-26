@@ -35,13 +35,17 @@ def test_unit_text_exact():
     assert "--create-db" not in text and "LOG_FORMAT" not in text
 
 
-def test_unit_quotes_and_escapes_odd_paths():
+def test_unit_quotes_and_escapes_odd_paths(tmp_path):
     # Espacio, especificador %, variable $, comilla y barra: la unidad no debe partir ni expandir.
     odd = 'a b%c$d"e\\f'
     text = service.render_unit(Path(f"/x/{odd}/fogar-gw"), Path(f"/h/{odd}"))
     # En ExecStart, systemd expande % y $ (se doblan); en Environment= solo % ($ es literal).
     assert 'ExecStart="/x/a b%%c$$d\\"e\\\\f/fogar-gw" serve\n' in text
     assert 'Environment="FOGAR_GATEWAY_HOME=/h/a b%%c$d\\"e\\\\f"\n' in text
+    # Y se lee de vuelta: si no, la unidad de esta base parecería de otra.
+    unit = tmp_path / "u.service"
+    unit.write_text(text)
+    assert service._unit_home(unit) == Path(f"/h/{odd}").resolve()
 
 
 def test_pick_exe_makes_relative_exe_absolute_without_resolving(monkeypatch, tmp_path):
