@@ -144,7 +144,18 @@ _OC_MESSAGES = 64
 # Tras una caída de OpenClaw, lo que un run en cola (sin turno) espera a que la reconexión
 # relea `pendingInputs` y diga si sigue en la cola; si no llega a tiempo, falla
 # (`orchestrator_disconnected`), como un run en marcha.
-RECONNECT_GRACE_S = 15.0
+# Medido en vivo (OpenClaw 2026.11.7, `systemctl restart`): 15 s y 22 s sin aceptar conexiones.
+RECONNECT_GRACE_S = 45.0
+# Tras un reinicio, OpenClaw no lista enseguida lo que tenía en cola: `pendingInputs` sale vacío
+# al reconectar y el mensaje reaparece (con su runId) ~10-13 s después, detrás del run con el que
+# rehace el turno cortado. Lo que aún no lista se relee cada RECOVERY_POLL_S hasta
+# RECOVERY_WINDOW_S tras la reconexión antes de darlo por perdido.
+RECOVERY_WINDOW_S = 30.0
+RECOVERY_POLL_S = 3.0
+# Un push que acaba sin texto espera su respuesta en un `session.message` `assistant`: un cron
+# ligado a la conversación no manda deltas y la respuesta llega ~0,1 s después de su `final`
+# (OpenClaw 2026.11.7, docs/openclaw-protocol.md, «Live check of 5.0»).
+PUSH_REPLY_GRACE_S = 3.0
 _DISCONNECTED = "orchestrator_disconnected"
 # 2c.3: los eventos de push que pueden abrir uno (`push_route`), y el tope de la lectura de su
 # dispositivo de avisos (una lectura por clave primaria en SQLite, en un hilo).
@@ -368,6 +379,8 @@ class ChannelTurn:
     started_at: float = field(default_factory=time.monotonic)
     progress_at: float = field(default_factory=time.monotonic)  # presupuesto del push (#286)
     fallback_reason: str | None = None  # push: la del último `fallback_step` de su run (#397)
+    # Push cuyo run acabó sin texto: hasta cuándo espera su respuesta (`session.message`).
+    reply_until: float | None = None
     # Its task broke (an unexpected exception, `internal_error`): nobody waits for its audio.
     crashed: bool = False
     # Decision 5: only a weak reference to the sender; the live session is resolved on use
@@ -572,6 +585,8 @@ class ConversationChannel:
         self._oc_messages: OrderedDict[str, str] = OrderedDict()
         # Tras una caída: hasta cuándo esperan los runs sin confirmar, y con qué código fallan.
         self._lost_deadline: float | None = None
+        self._reconnected = True  # False desde una caída hasta que OpenClaw vuelve
+        self._recovery_until: float | None = None  # fin de RECOVERY_WINDOW_S tras reconectar
         self._lost_code = _DISCONNECTED
         # Runs dados por fallidos sin conexión: se abortan (por runId) al reconectar.
         self._abort_on_reconnect: set[str] = set()
@@ -1363,9 +1378,10 @@ class ConversationChannel:
         self.enqueue_push(kind, arg, _str_run_id(payload))
 
     def take_session_message(self, payload: dict) -> None:
-        """A `user` `session.message` of this key (2b.2), from the dispatcher: to the worker,
-        in order with the runs' frames (a steered run's empty `final` comes after it). It
-        carries user text: never logged."""
+        """A `user` (2b.2) or `assistant` `session.message` of this key, from the dispatcher:
+        to the worker, in order with the runs' frames (a steered run's empty `final` comes
+        after it; a cron push's reply comes only here, `_push_reply`). It carries user or agent
+        text: never logged."""
         if self._closed:
             return
         if self._acks > 0 and len(self._held) < settings.TURN_QUEUE_MAX:
@@ -1403,6 +1419,12 @@ class ConversationChannel:
             self._enqueue(("reconnected", None, None))
 
     def _on_reconnected(self) -> None:
+        self._reconnected = True
+        if any(i.unconfirmed for i in self._runs.values()):
+            # Desde ahora decide la relectura de `pendingInputs` (`_reconcile`), dentro de la
+            # ventana de recuperación de OpenClaw; el tope de la caída ya no corre.
+            self._lost_deadline = None
+            self._recovery_until = time.monotonic() + RECOVERY_WINDOW_S
         for run_id in sorted(self._abort_on_reconnect):
             self._spawn_abort(run_id)
         self._abort_on_reconnect.clear()
@@ -1802,6 +1824,15 @@ class ConversationChannel:
                 self._end_run(info, "done")
                 return
             if state == "aborted":
+                if payload.get("stopReason") == "restart" and info.state == "queued":
+                    # OpenClaw se apaga: lo vuelve a poner en cola al arrancar (con su runId).
+                    # No es un `withdrawn`: queda sin confirmar, como tras una caída.
+                    info.unconfirmed = True
+                    self._lost_code = _DISCONNECTED
+                    if self._lost_deadline is None:
+                        self._lost_deadline = time.monotonic() + RECONNECT_GRACE_S
+                    logger.info(f"[{self._tag}] mensaje en cola parado por el reinicio de OpenClaw: sin confirmar")
+                    return
                 if info.message == "pending":
                     self._announce(info, "withdrawn")
                 self._finish(info)
@@ -1900,10 +1931,11 @@ class ConversationChannel:
                 self._finish(info)
         for info in waiting:
             info.unconfirmed = True
-        if waiting:
+        self._reconnected = False
+        self._recovery_until = None
+        if waiting or any(i.unconfirmed for i in runs):
             self._lost_code = code
-            if self._lost_deadline is None:
-                self._lost_deadline = time.monotonic() + RECONNECT_GRACE_S
+            self._lost_deadline = time.monotonic() + RECONNECT_GRACE_S
             logger.info(
                 f"[{self._tag}] OpenClaw caído: {len(waiting)} mensaje(s) en cola sin confirmar"
             )
@@ -1916,8 +1948,11 @@ class ConversationChannel:
 
     def _reconcile(self, alive: set[str] | None) -> None:
         """Tras reconectar (`reconcile_pending`): los runs sin confirmar que `pendingInputs`
-        (o `inFlightRun`) aún lista siguen pendientes; los demás fallan con el código de la
-        caída. `alive` None: la lectura no demostró nada, fallan todos."""
+        (o `inFlightRun`) lista siguen pendientes. Los demás no fallan aún: tras un reinicio
+        OpenClaw restaura su cola unos segundos después de aceptar conexiones, así que se
+        relee cada RECOVERY_POLL_S (también si la lectura falló, `alive` None) hasta que
+        vence RECOVERY_WINDOW_S (`_on_timeouts`); un frame o un `session.message` suyo
+        también lo confirma."""
         unconfirmed = [i for i in self._runs.values() if i.unconfirmed]
         if not unconfirmed:
             logger.debug(f"[{self._tag}] pendingInputs releído: nada sin confirmar")
@@ -1929,12 +1964,23 @@ class ConversationChannel:
                 info.unconfirmed = False
                 info.progress_at = now
                 kept += 1
+        missing = len(unconfirmed) - kept
         logger.info(
             f"[{self._tag}] pendingInputs tras reconectar: {kept} sigue(n) en cola, "
-            f"{len(unconfirmed) - kept} falla(n)"
+            f"{missing} sin confirmar"
         )
-        self._fail_unconfirmed(connected=True)
+        until = self._recovery_until
+        if missing and (until is None or until <= now):
+            self._fail_unconfirmed(connected=True)
+        elif missing:
+            self._lost_deadline = until  # si las relecturas no llegan, falla al cerrarse la ventana
+            self._hub.spawn(self._reread_later(), "pending_inputs_again")
         self._touch_head()
+
+    async def _reread_later(self) -> None:
+        await asyncio.sleep(RECOVERY_POLL_S)
+        if not self._closed and any(i.unconfirmed for i in self._runs.values()):
+            await self.reconcile_pending()
 
     def _fail_unconfirmed(self, *, connected: bool) -> None:
         """Los runs aún sin confirmar fallan, cada uno con su par y su TURN_ERROR. A quien se
@@ -1942,6 +1988,7 @@ class ConversationChannel:
         aborta por su runId; sin conexión (vence RECONNECT_GRACE_S), en la próxima
         reconexión (`_on_reconnected`)."""
         self._lost_deadline = None
+        self._recovery_until = None
         for info in [i for i in self._runs.values() if i.unconfirmed]:
             info.unconfirmed = False
             self._abort_run(info.run_id)
@@ -1953,15 +2000,22 @@ class ConversationChannel:
 
     def _on_timeouts(self) -> None:
         left = self._push_budget_left()
-        if left is not None and left <= 0:
-            self._push_timed_out()
+        push = self._push
+        if left is not None and left <= 0 and push is not None:
+            if push.reply_until is not None:
+                self._close_push(push)  # ninguna respuesta: acaba vacío, como antes
+            else:
+                self._push_timed_out()
         deadline = self._lost_deadline
-        if deadline is not None and deadline <= time.monotonic():
+        if deadline is not None and not any(i.unconfirmed for i in self._runs.values()):
+            # Ya confirmados (o terminados) por otra vía: no queda nada que vigilar.
+            self._lost_deadline = self._recovery_until = None
+        elif deadline is not None and deadline <= time.monotonic():
             logger.warning(
-                f"[{self._tag}] sin reconexión en RECONNECT_GRACE_S={RECONNECT_GRACE_S}s: "
-                "fallan los mensajes en cola sin confirmar"
+                f"[{self._tag}] OpenClaw no confirmó a tiempo los mensajes en cola "
+                f"(RECONNECT_GRACE_S={RECONNECT_GRACE_S}s, RECOVERY_WINDOW_S={RECOVERY_WINDOW_S}s): fallan"
             )
-            self._fail_unconfirmed(connected=False)
+            self._fail_unconfirmed(connected=self._reconnected)
         info = self._active_run()
         if info is not None and info.progress_at + settings.TURN_TIMEOUT_S <= time.monotonic():
             self._run_timed_out(info)
@@ -2004,6 +2058,9 @@ class ConversationChannel:
         makes the message's run `absorbed` (`_absorb`). Text never read, never logged."""
         message = _as_dict(payload.get("message"))
         meta = _as_dict(message.get("__openclaw"))
+        if message.get("role") == "assistant":
+            self._push_reply(message, meta.get("runId"))
+            return
         oc_message_id = payload.get("messageId", meta.get("id"))
         run_id = (
             _run_of_idempotency(message.get("idempotencyKey"))
@@ -2019,6 +2076,12 @@ class ConversationChannel:
                     known.popitem(last=False)
             else:
                 run_id = known.get(oc_message_id)
+        confirmed = self._runs.get(run_id) if run_id is not None else None
+        if confirmed is not None and confirmed.unconfirmed:
+            # OpenClaw lo restauró tras reiniciarse: sigue vivo.
+            confirmed.unconfirmed = False
+            confirmed.progress_at = time.monotonic()
+            self._touch_head()
         target = meta.get("steerTargetRunId")
         if run_id is None or not isinstance(target, str) or not target or target == run_id:
             return
@@ -2057,6 +2120,10 @@ class ConversationChannel:
     # -- push --------------------------------------------------------------------------
 
     def _push_item(self, kind: str, arg: Any, run_id: str | None) -> None:
+        if self._waiting_reply(kind, run_id):
+            # Su run ya acabó: lo que llegue tarde de él (su `final`, una fase) no cuenta.
+            logger.debug(f"[{self._tag}] push {kind} tras el fin de su run: descartado")
+            return
         if self._run_aborted(run_id):
             # #285: lo que quedaba en cola de un run abortado no llega (ni abre push).
             logger.debug(f"[{self._tag}] push {kind} de un run abortado descartado")
@@ -2082,6 +2149,8 @@ class ConversationChannel:
         push = self._push
         if push is None or push.ended:
             return None
+        if push.reply_until is not None:
+            return push.reply_until - time.monotonic()
         return push.progress_at + settings.TURN_TIMEOUT_S - time.monotonic()
 
     def _run_aborted(self, run_id: str | None) -> bool:
@@ -2263,6 +2332,14 @@ class ConversationChannel:
             # #84: un fin sin push abierto (huérfano o ya cerrado) no emite nada.
             logger.debug(f"[{self._tag}] push_turn_end ignorado: no hay push abierto")
             return
+        if failure is None and not self._push_text.all_out and PUSH_REPLY_GRACE_S > 0:
+            # Sin texto: su respuesta puede llegar después como `session.message` (cron).
+            if push.reply_until is None:
+                push.reply_until = time.monotonic() + PUSH_REPLY_GRACE_S
+            return
+        self._close_push(push, failure)
+
+    def _close_push(self, push: ChannelTurn, failure: dict | None = None) -> None:
         if failure is not None:
             code = classify_failure(failure, fallback_reason=push.fallback_reason)
             logger.warning(f"[{self._tag}] push falló en OpenClaw: {code}")
@@ -2276,6 +2353,30 @@ class ConversationChannel:
             while len(self._ended_push_runs) > _ENDED_PUSH_RUNS:
                 self._ended_push_runs.popitem(last=False)
         self.end_turn(push, "done" if failure is None else "error")
+
+    def _push_reply(self, message: dict, run_id: object) -> None:
+        """An `assistant` `session.message`: the reply of the push that ended without text and
+        waits for it (`reply_until`), unless it names another run (a cron's has no `runId`).
+        Its text goes out as the push's text (and voice), then the push ends `done`. Any other
+        `assistant` message is a copy of text already sent: ignored. Text never logged."""
+        push = self._push
+        if push is None or push.ended or push.reply_until is None or _other_run(push.run_id, run_id):
+            return
+        text = extract_message_text(message)
+        if text:
+            self.emit(push, ChannelToken(text))
+        self._close_push(push)
+
+    def _waiting_reply(self, kind: str, run_id: str | None) -> bool:
+        """The open push waits for its reply: a frame of its own run (or without a runId) is
+        late and dropped; an opener of another run ends it first, as it was (one push at a time)."""
+        push = self._push
+        if push is None or push.ended or push.reply_until is None:
+            return False
+        if run_id is not None and run_id != push.run_id and kind in _PUSH_OPENERS:
+            self._close_push(push)
+            return False
+        return kind != "turn_error"  # un error de su run (raro tras el fin) aún lo cierra
 
     def _push_timed_out(self) -> None:
         """#286: un push sin progreso en TURN_TIMEOUT_S se cierra como el turno normal."""

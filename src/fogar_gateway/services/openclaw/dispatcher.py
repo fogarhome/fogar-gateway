@@ -196,15 +196,17 @@ class FrameDispatcher:
         channel.enqueue_push(kind, arg, run_id=_run_id(payload))
 
     def _handle_session_message(self, payload: dict) -> None:
-        """`session.message` (2026.11.7): a transcript append. Only a `user` one matters: it
-        links an OpenClaw message id to the `chat.send` that sent it (`idempotencyKey`
-        `"<runId>:user"`) and, on a repeated copy, says that `steer` folded it into the active
-        run (`__openclaw.steerTargetRunId`). It goes to the key's channel, in order with its
-        frames (`ConversationChannel.take_session_message`). It carries user text: never
+        """`session.message` (2026.11.7): a transcript append. A `user` one links an OpenClaw
+        message id to the `chat.send` that sent it (`idempotencyKey` `"<runId>:user"`) and, on
+        a repeated copy, says that `steer` folded it into the active run
+        (`__openclaw.steerTargetRunId`). An `assistant` one is the only place a cron run bound
+        to the conversation puts its reply (no deltas; live 2026-11-25): the push that ended
+        without text takes it. Both go to the key's channel, in order with its frames
+        (`ConversationChannel.take_session_message`). They carry user or agent text: never
         logged. Not drift."""
         sk = payload.get("sessionKey")
         message = _as_dict(payload.get("message"))
-        if not isinstance(sk, str) or message.get("role") != "user":
+        if not isinstance(sk, str) or message.get("role") not in ("user", "assistant"):
             return
         channel = self._channels.channel_for(sk)
         take = getattr(channel, "take_session_message", None) if channel is not None else None

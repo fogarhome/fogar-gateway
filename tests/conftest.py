@@ -26,6 +26,16 @@ def _disable_single_process_lock(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_push_reply_wait(monkeypatch):
+    """Un push sin texto se cierra en el acto, como antes: la espera de su respuesta en un
+    `session.message` (cron, PUSH_REPLY_GRACE_S) solo la prueban los tests que la piden."""
+    monkeypatch.setattr("fogar_gateway.services.channel.PUSH_REPLY_GRACE_S", 0.0)
+    # Igual con la ventana en la que OpenClaw restaura su cola tras reiniciarse: con 0, lo que
+    # `pendingInputs` no lista al reconectar falla en el acto (RECOVERY_WINDOW_S).
+    monkeypatch.setattr("fogar_gateway.services.channel.RECOVERY_WINDOW_S", 0.0)
+
+
+@pytest.fixture(autouse=True)
 def _reset_gateway_stats():
     """Los contadores globales (#219) no deben filtrarse entre tests."""
     from fogar_gateway.services.stats import gateway_stats
@@ -40,3 +50,18 @@ def test_client():
     """FastAPI TestClient con lifespan (conecta/cierra db_client)."""
     with TestClient(app) as client:
         yield client
+
+
+# #425: una vez pytest se quedó parado 32 min a 0 % de CPU. `timeout = 60` (pytest-timeout) ya
+# corta cada test, así que fue fuera de uno: al recoger, al cerrar la sesión o al salir el
+# intérprete esperando un hilo no daemon. Si tras el fin de la sesión el proceso no acaba en
+# EXIT_WATCHDOG_S, se vuelcan las trazas de todos los hilos y sale con error en vez de colgarse
+# en silencio.
+EXIT_WATCHDOG_S = 120
+
+
+def pytest_unconfigure(config):
+    import faulthandler
+    import sys
+
+    faulthandler.dump_traceback_later(EXIT_WATCHDOG_S, exit=True, file=sys.__stderr__)

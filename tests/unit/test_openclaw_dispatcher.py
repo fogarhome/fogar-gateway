@@ -513,7 +513,7 @@ async def test_session_message_is_known_not_drift_and_reaches_nobody(caplog):
     dispatcher, _, client_reg = make_dispatcher()
     bridge = MagicMock()
     client_reg.register("client-a", bridge, keyed_conversation("client-a"))
-    payload = {"sessionKey": "agent:main:client-a", "message": {"role": "assistant"}, "messageSeq": 3}
+    payload = {"sessionKey": "agent:main:client-a", "message": {"role": "toolResult"}, "messageSeq": 3}
     with caplog.at_level(logging.DEBUG, logger="fogar_gateway.services.openclaw.dispatcher"):
         await dispatcher.dispatch({"type": "event", "event": "session.message", "payload": payload})
         await dispatcher.dispatch({"type": "event", "event": "brand.new", "payload": {}})
@@ -531,6 +531,21 @@ async def test_a_user_session_message_goes_to_its_channel(caplog):
     client_reg.register("client-a", channel, keyed_conversation("client-a"))
     secret = {"role": "user", "content": "SECRETO", "idempotencyKey": "run-b:user"}
     payload = {"sessionKey": "agent:main:client-a", "message": secret, "messageId": "m-1"}
+    with caplog.at_level(logging.DEBUG):
+        await dispatcher.dispatch({"type": "event", "event": "session.message", "payload": payload})
+    channel.take_session_message.assert_called_once_with(payload)
+    assert not channel.enqueue_push.called
+    assert "SECRETO" not in caplog.text
+
+
+async def test_an_assistant_session_message_goes_to_its_channel(caplog):
+    """A cron run bound to the conversation puts its reply only in an `assistant`
+    `session.message` (live, 2026.11.7): it goes to the channel too, never logged."""
+    dispatcher, _, client_reg = make_dispatcher()
+    channel = MagicMock()
+    client_reg.register("client-a", channel, keyed_conversation("client-a"))
+    reply = {"role": "assistant", "content": [{"type": "text", "text": "SECRETO"}]}
+    payload = {"sessionKey": "agent:main:client-a", "message": reply, "messageId": "m-2"}
     with caplog.at_level(logging.DEBUG):
         await dispatcher.dispatch({"type": "event", "event": "session.message", "payload": payload})
     channel.take_session_message.assert_called_once_with(payload)

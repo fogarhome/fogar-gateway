@@ -67,6 +67,11 @@ const EN_MENU = ['/personas', '/dispositivos']
 const inferior = computed(() => (session.isAdmin ? secciones.value.filter((s) => !EN_MENU.includes(s.to)) : secciones.value))
 const enMenu = computed(() => secciones.value.filter((s) => !inferior.value.includes(s)))
 
+// El nombre del gateway y su versión, en el pie de escritorio y en el menú del móvil.
+const pie = computed(() =>
+  [props.nombre, props.version ? `v${props.version}` : ''].filter(Boolean).join(' · '),
+)
+
 watch(() => route.fullPath, () => (menu.value = false))
 
 // Salir retira este navegador como dispositivo (su token deja de valer), no solo lo olvida.
@@ -94,7 +99,7 @@ async function salir(): Promise<void> {
     </div>
     <div class="pie">
       <span v-if="session.user" class="fg-meta">{{ session.user.display_name }}</span>
-      <span v-if="props.nombre || props.version" class="fg-meta">{{ props.nombre }}<template v-if="props.nombre && props.version"> · </template><template v-if="props.version">v{{ props.version }}</template></span>
+      <span v-if="pie" class="fg-meta">{{ pie }}</span>
       <button type="button" class="salir" @click="salir">Salir</button>
     </div>
   </nav>
@@ -109,7 +114,7 @@ async function salir(): Promise<void> {
     <RouterLink v-for="s in enMenu" :key="s.to" :to="s.to" class="menu-enlace" :aria-current="s.activa ? 'page' : undefined">
       <FgIcono :nombre="s.icono" />{{ s.texto }}
     </RouterLink>
-    <span v-if="props.nombre || props.version" class="fg-meta">{{ props.nombre }}<template v-if="props.nombre && props.version"> · </template><template v-if="props.version">v{{ props.version }}</template></span>
+    <span v-if="pie" class="fg-meta">{{ pie }}</span>
     <button type="button" class="salir" @click="salir">Salir</button>
   </div>
   <nav class="inferior" aria-label="Secciones">
