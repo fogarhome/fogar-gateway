@@ -9,7 +9,6 @@ from fogar_gateway.core.network import (
     NO_REAL_IP,
     _parsed,
     client_ip_for_log,
-    is_trusted_origin,
     is_trusted_proxy,
     resolve_client_ip,
     warn_if_open_proxy_config,
@@ -30,33 +29,7 @@ class _FakeRequest:
 
 @pytest.fixture(autouse=True)
 def _reset_network_settings(monkeypatch):
-    monkeypatch.setattr(settings, "TRUST_LOOPBACK", True)
-    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "")
     monkeypatch.setattr(settings, "TRUSTED_PROXIES", "127.0.0.1,::1")
-
-
-def test_loopback_trusted_by_default():
-    assert is_trusted_origin("127.0.0.1") is True
-    assert is_trusted_origin("::1") is True
-
-
-def test_loopback_untrusted_when_disabled(monkeypatch):
-    monkeypatch.setattr(settings, "TRUST_LOOPBACK", False)
-    assert is_trusted_origin("127.0.0.1") is False
-
-
-def test_ip_in_trusted_networks_is_trusted(monkeypatch):
-    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "192.168.1.0/24")
-    assert is_trusted_origin("192.168.1.42") is True
-
-
-def test_ip_outside_trusted_networks_is_untrusted(monkeypatch):
-    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "192.168.1.0/24")
-    assert is_trusted_origin("203.0.113.5") is False
-
-
-def test_malformed_ip_is_untrusted():
-    assert is_trusted_origin("testclient") is False
 
 
 def test_is_trusted_proxy_matches_default_loopback():
@@ -77,13 +50,13 @@ def test_resolve_client_ip_ignores_x_real_ip_from_untrusted_peer():
 def test_resolve_client_ip_trusted_proxy_without_header_fails_closed():
     # G-31 (#216): a same-host proxy that sets no X-Real-IP must not look like loopback.
     request = _FakeRequest("127.0.0.1")
-    assert is_trusted_origin(resolve_client_ip(request)) is False
+    assert resolve_client_ip(request) == NO_REAL_IP
 
 
 def test_resolve_client_ip_trusted_proxy_with_invalid_header_fails_closed():
     for bad in ("", "  ", "garbage", "1.2.3.4, 5.6.7.8"):
         request = _FakeRequest("127.0.0.1", headers={"x-real-ip": bad})
-        assert is_trusted_origin(resolve_client_ip(request)) is False
+        assert resolve_client_ip(request) == NO_REAL_IP
 
 
 def test_nginx_overwriting_x_real_ip_with_matching_xff_is_honored():
@@ -100,16 +73,15 @@ def test_nginx_overwriting_x_real_ip_with_matching_xff_is_honored():
 @pytest.mark.parametrize("tunnel", [{"cf-connecting-ip": "203.0.113.9"}, {"tailscale-user-login": "a@b"}])
 def test_tunnel_on_trusted_network_host_is_not_trusted(monkeypatch, tunnel):
     # D-r2-1: cloudflared / tailscale serve on another LAN machine inside TRUSTED_NETWORKS.
-    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "192.168.1.0/24")
     direct = _FakeRequest("192.168.1.5", headers={**tunnel, "x-forwarded-for": "203.0.113.9"})
-    assert not is_trusted_origin(resolve_client_ip(direct))
+    assert resolve_client_ip(direct) == NO_REAL_IP
     # Same with a LAN proxy in TRUSTED_PROXIES vouching for itself.
     monkeypatch.setattr(settings, "TRUSTED_PROXIES", "192.168.1.10")
     proxied = _FakeRequest(
         "192.168.1.10",
         headers={"x-real-ip": "192.168.1.10", "x-forwarded-for": "203.0.113.9, 192.168.1.10", **tunnel},
     )
-    assert not is_trusted_origin(resolve_client_ip(proxied))
+    assert resolve_client_ip(proxied) == NO_REAL_IP
 
 
 @pytest.mark.parametrize(
@@ -122,8 +94,7 @@ def test_tunnel_on_trusted_network_host_is_not_trusted(monkeypatch, tunnel):
 )
 def test_tunnel_or_forwarded_header_alone_on_trusted_network_is_not_trusted(monkeypatch, headers):
     # Sin XFF (o con XFF igual al peer): la cabecera de túnel o Forwarded basta para negar.
-    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "192.168.1.0/24")
-    assert not is_trusted_origin(resolve_client_ip(_FakeRequest("192.168.1.5", headers=headers)))
+    assert resolve_client_ip(_FakeRequest("192.168.1.5", headers=headers)) == NO_REAL_IP
 
 
 def test_client_ip_for_log_keeps_the_peer_on_sentinel():
@@ -133,18 +104,12 @@ def test_client_ip_for_log_keeps_the_peer_on_sentinel():
     assert client_ip_for_log(_FakeRequest("203.0.113.5")) == "203.0.113.5"
 
 
-def test_direct_trusted_network_peer_without_proxy_headers_is_trusted(monkeypatch):
-    # Home Assistant straight to the gateway: no XFF, no tunnel headers.
-    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "192.168.1.0/24")
-    assert is_trusted_origin(resolve_client_ip(_FakeRequest("192.168.1.5")))
-
-
 @pytest.mark.parametrize("values", [["127.0.0.1", "203.0.113.5"], ["203.0.113.5", "127.0.0.1"]])
 def test_repeated_x_real_ip_fails_closed(values):
     # D-r2-2: a proxy that appends X-Real-IP instead of overwriting it.
     request = _FakeRequest("127.0.0.1")
     request.headers = Headers(raw=[(b"x-real-ip", v.encode()) for v in values])
-    assert not is_trusted_origin(resolve_client_ip(request))
+    assert resolve_client_ip(request) == NO_REAL_IP
 
 
 def test_proxy_passing_client_x_real_ip_through_fails_closed():
@@ -153,7 +118,7 @@ def test_proxy_passing_client_x_real_ip_through_fails_closed():
     request = _FakeRequest(
         "127.0.0.1", headers={"x-real-ip": "127.0.0.1", "x-forwarded-for": "100.64.0.7"}
     )
-    assert is_trusted_origin(resolve_client_ip(request)) is False
+    assert resolve_client_ip(request) == NO_REAL_IP
 
 
 def test_nginx_with_client_injected_xff_fails_closed():
@@ -161,17 +126,17 @@ def test_nginx_with_client_injected_xff_fails_closed():
     request = _FakeRequest(
         "127.0.0.1", headers={"x-real-ip": "203.0.113.5", "x-forwarded-for": "127.0.0.1"}
     )
-    assert is_trusted_origin(resolve_client_ip(request)) is False
+    assert resolve_client_ip(request) == NO_REAL_IP
 
 
 @pytest.mark.parametrize("header", ["tailscale-user-login", "tailscale-user-name", "cf-connecting-ip"])
 def test_tunnel_headers_never_earn_loopback_exemption(monkeypatch, header):
     vouched = _FakeRequest("127.0.0.1", headers={"x-real-ip": "127.0.0.1", header: "x"})
-    assert is_trusted_origin(resolve_client_ip(vouched)) is False
+    assert resolve_client_ip(vouched) == NO_REAL_IP
     # Also without a proxy list (`TRUSTED_PROXIES=` with `fogar-gw access`).
     monkeypatch.setattr(settings, "TRUSTED_PROXIES", "")
     direct = _FakeRequest("127.0.0.1", headers={header: "x"})
-    assert is_trusted_origin(resolve_client_ip(direct)) is False
+    assert resolve_client_ip(direct) == NO_REAL_IP
 
 
 def test_resolve_client_ip_direct_peer_unchanged():
@@ -212,7 +177,7 @@ def test_tunnel_without_identity_headers_and_no_proxies_is_not_loopback(monkeypa
     # con TRUSTED_PROXIES vacío el peer 127.0.0.1 no basta si XFF trae un salto de fuera.
     monkeypatch.setattr(settings, "TRUSTED_PROXIES", "")
     ip = resolve_client_ip(_FakeRequest("127.0.0.1", headers={"x-forwarded-for": "100.101.102.103"}))
-    assert not is_trusted_origin(ip)
+    assert ip == NO_REAL_IP
 
 
 def test_tunnel_in_front_of_nginx_is_not_loopback():
@@ -221,13 +186,13 @@ def test_tunnel_in_front_of_nginx_is_not_loopback():
     request = _FakeRequest(
         "127.0.0.1", headers={"x-real-ip": "127.0.0.1", "x-forwarded-for": "100.101.102.103, 127.0.0.1"}
     )
-    assert not is_trusted_origin(resolve_client_ip(request))
+    assert resolve_client_ip(request) == NO_REAL_IP
 
 
 def test_loopback_client_behind_same_host_nginx_still_trusted():
     # Home Assistant en el mismo equipo detrás del nginx documentado: toda la cadena es loopback.
     request = _FakeRequest("127.0.0.1", headers={"x-real-ip": "127.0.0.1", "x-forwarded-for": "127.0.0.1"})
-    assert is_trusted_origin(resolve_client_ip(request))
+    assert resolve_client_ip(request) == "127.0.0.1"
 
 
 def test_x_real_ip_with_ipv6_scope_id_fails_closed(caplog):
@@ -238,13 +203,11 @@ def test_x_real_ip_with_ipv6_scope_id_fails_closed(caplog):
     assert "FORGED" not in caplog.text
 
 
-
 @pytest.mark.parametrize("bad", ["127.0.0.1;::1", "localhost", "192.168.1.0/33", "::1%eth0", "0.0.0.0/0"])
 def test_invalid_trusted_proxies_fail_closed_for_everyone(monkeypatch, caplog, bad):
     # F-r3-1: antes la entrada se ignoraba (lista vacía) y un proxy del mismo host que solo pone
-    # X-Real-IP abría /v1. Ahora nadie es proxy ni origen exento, y el aviso sale al arrancar.
+    # X-Real-IP pasaba por loopback. Ahora nadie es proxy, y el aviso sale al arrancar.
     monkeypatch.setattr(settings, "TRUSTED_PROXIES", f"127.0.0.1,{bad}")
-    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "192.168.1.0/24")
     with caplog.at_level(logging.WARNING):
         for request in (
             _FakeRequest("127.0.0.1", headers={"x-real-ip": "192.168.1.9"}),
@@ -257,43 +220,9 @@ def test_invalid_trusted_proxies_fail_closed_for_everyone(monkeypatch, caplog, b
     assert len(caplog.records) == 1 and "TRUSTED_PROXIES" in caplog.text and bad in caplog.text
 
 
-@pytest.mark.parametrize("bad", ["nope", "0.0.0.0/0", "::/0"])
-def test_invalid_or_catch_all_trusted_networks_are_ignored(monkeypatch, caplog, bad):
-    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", f"{bad},192.168.1.0/24")
-    assert is_trusted_origin("192.168.1.5")
-    assert not is_trusted_origin("203.0.113.9") and not is_trusted_origin("2001:db8::1")
-    with caplog.at_level(logging.WARNING):
-        warn_if_open_proxy_config()
-    assert "TRUSTED_NETWORKS" in caplog.text and bad in caplog.text
-
-
 def test_valid_lists_with_spaces_ipv6_and_host_bits_still_work(monkeypatch):
     monkeypatch.setattr(settings, "TRUSTED_PROXIES", " 127.0.0.1 , ::1 ,, fd00::/8")
-    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "10.0.0.0/8, 192.168.1.5/24")
     assert resolve_client_ip(_FakeRequest("::1", headers={"x-real-ip": "192.168.1.7"})) == "192.168.1.7"
-    assert is_trusted_origin("192.168.1.7") and is_trusted_origin("10.1.2.3")
-
-
-def test_invalid_proxies_and_networks_both_warn_and_skip_the_empty_proxies_warning(monkeypatch, caplog):
-    monkeypatch.setattr(settings, "TRUSTED_PROXIES", "localhost")
-    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "nope")
-    with caplog.at_level(logging.WARNING):
-        warn_if_open_proxy_config()
-    messages = [r.getMessage() for r in caplog.records]
-    assert len(messages) == 2
-    assert messages[0].startswith("TRUSTED_PROXIES") and messages[1].startswith("TRUSTED_NETWORKS")
-
-
-@pytest.mark.parametrize(
-    "wide", ["0.0.0.0/1,128.0.0.0/1", "10.0.0.0/7", "::/1,8000::/1", "::ffff:0:0/96", "::/80", "::ffff:0:0/97"]
-)
-def test_wide_networks_still_work_at_runtime_but_warn(monkeypatch, caplog, wide):
-    # No rompe instalaciones al actualizar: solo /0 se rechaza en tiempo de ejecución.
-    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", wide)
-    assert resolve_client_ip(_FakeRequest("127.0.0.1", headers={"x-real-ip": "10.1.2.3"})) == "10.1.2.3"
-    with caplog.at_level(logging.WARNING):
-        warn_if_open_proxy_config()
-    assert "TRUSTED_NETWORKS" in caplog.text and wide.split(",")[0] in caplog.text
 
 
 @pytest.mark.parametrize("ok", ["10.0.0.0/8", "fd00::/16", "::ffff:10.0.0.0/104", "::1"])
@@ -305,7 +234,7 @@ def test_parsing_is_cached_per_string(monkeypatch):
     _parsed.cache_clear()
     for _ in range(3):
         resolve_client_ip(_FakeRequest("127.0.0.1", headers={"x-real-ip": "10.1.2.3"}))
-    assert _parsed.cache_info().misses <= 2  # TRUSTED_PROXIES y TRUSTED_NETWORKS, una vez cada una
+    assert _parsed.cache_info().misses <= 1  # TRUSTED_PROXIES, una vez
     monkeypatch.setattr(settings, "TRUSTED_PROXIES", "localhost")  # la clave es la cadena
     assert resolve_client_ip(_FakeRequest("127.0.0.1", headers={"x-real-ip": "10.1.2.3"})) == NO_REAL_IP
 
@@ -316,4 +245,12 @@ def test_loopback_x_real_ip_from_remote_proxy_is_not_loopback(monkeypatch, real_
     monkeypatch.setattr(settings, "TRUSTED_PROXIES", "192.168.1.0/24")
     request = _FakeRequest("192.168.1.10", headers={"x-real-ip": real_ip})
     assert resolve_client_ip(request) == NO_REAL_IP
-    assert is_trusted_origin(resolve_client_ip(request)) is False
+    assert resolve_client_ip(request) == NO_REAL_IP
+
+
+@pytest.mark.parametrize("wide", ["0.0.0.0/1,128.0.0.0/1", "10.0.0.0/7", "::ffff:0:0/96"])
+def test_wide_trusted_proxies_still_work_at_runtime_but_warn(monkeypatch, caplog, wide):
+    monkeypatch.setattr(settings, "TRUSTED_PROXIES", wide)
+    with caplog.at_level(logging.WARNING):
+        warn_if_open_proxy_config()
+    assert "TRUSTED_PROXIES" in caplog.text and wide.split(",")[0] in caplog.text

@@ -243,7 +243,7 @@ def client(mock_services, mock_registry, seed_client, monkeypatch):
 
 @pytest.fixture
 def client_untrusted(mock_services, mock_registry, seed_client, monkeypatch):
-    """TestClient cuyo peer TCP no es loopback ni está en TRUSTED_NETWORKS
+    """TestClient cuyo peer TCP no es loopback
     (203.0.113.5 es TEST-NET-3, RFC 5737 — rango reservado para documentación)."""
     _configure_app_mocks(mock_registry, monkeypatch)
     with TestClient(app, client=("203.0.113.5", 54321)) as c:

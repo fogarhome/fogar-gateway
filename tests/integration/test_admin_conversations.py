@@ -350,27 +350,6 @@ def test_v1_database_failure_is_a_stable_error(client_untrusted, monkeypatch, ca
     assert "/secret/path" not in caplog.text
 
 
-def test_v1_legacy_trusted_origin_keeps_its_key_and_uses_default_agent(
-    client, mock_orchestrator, monkeypatch
-):
-    """Sin Bearer no hay ficha de cliente, ni conversación: conserva `agent:{agent}:ha`, y su
-    agente sale de la cascada, con DEFAULT_AGENT (#245)."""
-    from tests.fakes.orchestrator import OrchestratorEvent
-
-    keys = []
-
-    async def stream(text, session_key=None):
-        keys.append(session_key)
-        yield OrchestratorEvent(type="status", content="done")
-
-    mock_orchestrator.stream_response = stream
-    monkeypatch.setattr(settings, "DEFAULT_AGENT", "jota")
-    body = {"messages": [{"role": "user", "content": "hola"}]}
-    assert client.post("/v1/chat/completions", json=body).status_code == 200
-    assert keys == ["agent:jota:ha"]
-    assert client.app.state.conversations.index.get("agent:jota:ha") is None
-
-
 def test_ws_uses_default_agent_when_nothing_else_says(client, monkeypatch):
     monkeypatch.setattr(settings, "DEFAULT_AGENT", "a")
     with client.websocket_connect("/ws/stream") as ws:

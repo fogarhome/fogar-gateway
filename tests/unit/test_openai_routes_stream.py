@@ -7,9 +7,12 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from fogar_gateway.api.openai_routes import HACaller, _ChatCompletionRequest, chat_completions
+from fogar_gateway.api.openai_routes import V1Caller, _ChatCompletionRequest, chat_completions
+from fogar_gateway.models.schemas import Client, ClientConfig
 from fogar_gateway.services.channel import ChannelHub
+from fogar_gateway.services.conversations import Conversation
 from fogar_gateway.services.protocol import OrchestratorProtocol
+from fogar_gateway.services.scopes import DEFAULT_SCOPES
 from fogar_gateway.services.session_registry import SessionRegistry
 from tests.fakes.orchestrator import OrchestratorEvent, wire_stream_orchestrator
 
@@ -40,8 +43,25 @@ def _orchestrator(abort_delay: float = 0.0):
 def _request(abort_delay: float = 0.0) -> tuple[SimpleNamespace, SessionRegistry]:
     orchestrator, hub = _orchestrator(abort_delay)
     registry = SessionRegistry()
-    state = SimpleNamespace(openclaw=orchestrator, session_registry=registry, channel_hub=hub)
-    return SimpleNamespace(app=SimpleNamespace(state=state)), registry
+    state = SimpleNamespace(openclaw=orchestrator, session_registry=registry, channel_hub=hub,
+                            conversations=_Conversations())
+    return SimpleNamespace(app=SimpleNamespace(state=state), headers={}), registry
+
+
+class _Conversations:
+    """La conversación del día del aparato, sin BD."""
+
+    async def default_for(self, client_id, agent):
+        return Conversation(id="c1", client_id=client_id, agent=agent,
+                            session_key=f"agent:{agent}:fogar-c1", kind="default")
+
+    async def note_turn(self, conversation_id):
+        pass
+
+
+def _caller() -> V1Caller:
+    client = Client(id="tv", key_hash="h", is_active=True, scopes=DEFAULT_SCOPES)
+    return V1Caller(client=client, config=ClientConfig())
 
 
 def _body(stream: bool) -> _ChatCompletionRequest:
@@ -51,7 +71,7 @@ def _body(stream: bool) -> _ChatCompletionRequest:
 async def test_cancelled_stream_closes_session_as_error():
     """G-26: un stream cortado (cliente que se va) no es un turno completado."""
     request, registry = _request()
-    resp = await chat_completions(request, _body(True), HACaller(None, None))
+    resp = await chat_completions(request, _body(True), _caller())
     gen = resp.body_iterator
     await gen.__anext__()
     await gen.aclose()
@@ -62,7 +82,7 @@ async def test_cancelled_stream_closes_session_as_error():
 
 async def test_cancelled_non_stream_closes_session_as_error():
     request, registry = _request()
-    task = asyncio.create_task(chat_completions(request, _body(False), HACaller(None, None)))
+    task = asyncio.create_task(chat_completions(request, _body(False), _caller()))
     for _ in range(5):
         await asyncio.sleep(0)
     task.cancel()
@@ -76,7 +96,7 @@ async def test_stream_close_does_not_swallow_caller_cancellation():
     """Si cancelan a quien cierra el stream mientras espera al corte del turno, la cancelación
     sigue."""
     request, _ = _request(abort_delay=0.2)
-    resp = await chat_completions(request, _body(True), HACaller(None, None))
+    resp = await chat_completions(request, _body(True), _caller())
     gen = resp.body_iterator
     await gen.__anext__()
     closer = asyncio.create_task(gen.aclose())

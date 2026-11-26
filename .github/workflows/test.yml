@@ -368,7 +368,7 @@ jobs:
             echo "GATEWAY_UID=$(id -u)"
             echo "GATEWAY_GID=$(id -g)"
             echo "DATABASE_URL=sqlite:///data/gateway.db"
-            echo "export TRUST_LOOPBACK=true"
+            echo "export TRUSTED_PROXIES=127.0.0.1,::1"
           } > "$D/.env"
           rm "$D/config.env"
           ls -l "$D" "$D/data"
@@ -409,7 +409,7 @@ jobs:
           grep -qx 'LOG_FORMAT=json' "$NATIVE_HOME/config.env"
           grep -q '^ADMIN_TOKEN=' "$NATIVE_HOME/config.env"
           grep -q '^# \.env de compose' "$NATIVE_HOME/config.env"  # el resto del fichero, tal cual
-          grep -q '^export TRUST_LOOPBACK=true' "$NATIVE_HOME/config.env"
+          grep -q '^export TRUSTED_PROXIES=127.0.0.1,::1' "$NATIVE_HOME/config.env"
           sha256sum -c "$RUNNER_TEMP/src.sha"  # el origen, intacto
 
       - name: install nativo tras migrate y el cliente sigue

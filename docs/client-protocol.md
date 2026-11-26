@@ -2,7 +2,7 @@
 
 Guía completa para implementar clientes que se conecten a fogar-gateway. Cubre el ciclo de vida de la sesión WebSocket, todos los mensajes posibles en ambas direcciones y el formato de audio binario.
 
-> **¿Integras Home Assistant u otro cliente OpenAI-compatible?** Eso va por REST (`/v1/*`), no por este protocolo WebSocket. Su modelo de autenticación (origen de confianza o `Authorization: Bearer <token>`, con el permiso `conversations:write`) está en el [README](../README.md#openai-compatible-v1-para-home-assistant).
+> **¿Integras Home Assistant u otro cliente OpenAI-compatible?** Eso va por REST (`/v1/*`), no por este protocolo WebSocket: siempre con `Authorization: Bearer <token>` de un aparato con `conversations:write`, y la conversación con la cabecera `X-Fogar-Conversation` (sin ella, la del día). Detalle en el [README](../README.md#openai-compatible-v1-la-puerta-estándar).
 
 ---
 

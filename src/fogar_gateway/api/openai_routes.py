@@ -17,13 +17,12 @@ from fogar_gateway.core.agent_policy import (
     resolve_agent,
 )
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
-from fogar_gateway.core.network import is_trusted_origin, resolve_client_ip
-from fogar_gateway.core.session_key import make_session_key
 from fogar_gateway.models.schemas import Client, ClientConfig
 from fogar_gateway.services.channel import ChannelEvent, ChannelToken, ConversationChannel
 from fogar_gateway.services.conversations import (
     Conversation,
     ConversationClientMissing,
+    ConversationNotFound,
     note_turn_safely,
 )
 from fogar_gateway.services.db_client import db_client
@@ -42,11 +41,9 @@ router = APIRouter(prefix="/v1")
 # Cada cuánto mira /v1 sin stream si el cliente sigue ahí (D-r6-1).
 _DISCONNECT_POLL_S = 0.25
 
-# El origen de confianza sin Bearer no tiene ficha de cliente (ni conversación): su canal es el
-# de su clave `agent:{agente}:ha`, y su mensaje sale con este origen (5.0 PR 2b.3). Nadie se
-# adjunta a ese canal (ninguna conversación tiene esa clave), así que nadie lo ve.
-TRUSTED_ORIGIN_ID = "ha"
-TRUSTED_ORIGIN_NAME = "Home Assistant"
+# La conversación elegida (5.0, #413), como `x-openclaw-session-key` en OpenClaw.
+CONVERSATION_HEADER = "x-fogar-conversation"
+_CONVERSATION_ID_MAX = 64  # como `conversation` en el handshake
 
 # Solo /v1 (5.0 PR 2b.3): otro aparato paró su turno (`cancel`), o el canal se cerró, antes
 # de que terminara su respuesta.
@@ -72,67 +69,43 @@ class _ChatCompletionRequest(BaseModel):
 
 
 @dataclass
-class HACaller:
-    """Identidad resuelta para un caller de /v1/*.
+class V1Caller:
+    """El aparato que llama a /v1/* (5.0, #413: siempre con Bearer)."""
 
-    client/config son None en el path legacy (origen de red confiable,
-    sin Authorization) — preserva el comportamiento histórico fijo "ha".
-    """
-
-    client: Client | None
-    config: ClientConfig | None
+    client: Client
+    config: ClientConfig
 
 
-async def resolve_ha_caller(request: Request) -> HACaller:
-    """Dependency de auth para /v1/*.
-
-    - Authorization: Bearer <token> presente -> valida contra la BD
-      (igual que el handshake WS) y exige `conversations:write` (403 `missing_scope`).
-      Aplica siempre, sin importar el origen.
-    - Sin Authorization -> exige que el origen (ver resolve_client_ip) sea
-      confiable (loopback y/o TRUSTED_NETWORKS); si no, 401.
-    - Una petición de navegador (`Origin` o `Sec-Fetch-*`) nunca usa la exención de
-      origen: corta el DNS rebinding desde una página web (auditoría 3.0, D-2). Home
-      Assistant (aiohttp) no manda esas cabeceras.
-    """
+async def resolve_v1_caller(request: Request) -> V1Caller:
+    """Dependency de auth para /v1/*: `Authorization: Bearer <token>` de un aparato (el mismo
+    token que en el handshake WS) con `conversations:write`. Sin él, 401; sin el permiso, 403
+    `missing_scope`. Ninguna IP exime (5.0, #413): ya no hay origen de confianza."""
     auth = request.headers.get("authorization")
-    if auth:
-        if not auth.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="authentication required")
-        client_key = auth[len("Bearer ") :]
-        try:
-            client, config = await db_client.get_session(client_key)
-        except (ClientNotFound, ClientInactive):
-            raise HTTPException(status_code=401, detail="authentication required") from None
-        except ValueError as e:
-            # D-r8-1: `allowed_agents` corrupto (editado a mano), como en el handshake: solo el tipo.
-            logger.error(f"/v1: configuración del cliente ilegible: {describe_error(e)}")
-            raise HTTPException(status_code=500, detail="internal_error") from None
-        if CONVERSATIONS_WRITE not in client.scopes:  # #410: hablar por /v1 es escribir
-            raise missing_scope(CONVERSATIONS_WRITE)
-        return HACaller(client=client, config=config)
-
-    from_browser = "origin" in request.headers or any(
-        name.startswith("sec-fetch-") for name in request.headers
-    )
-    if not from_browser and is_trusted_origin(resolve_client_ip(request)):
-        return HACaller(client=None, config=None)
-
-    raise HTTPException(status_code=401, detail="authentication required")
+    if not auth or not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="authentication required")
+    token = auth[len("Bearer ") :]
+    try:
+        client, config = await db_client.get_session(token)
+    except (ClientNotFound, ClientInactive):
+        raise HTTPException(status_code=401, detail="authentication required") from None
+    except ValueError as e:
+        # D-r8-1: `allowed_agents` corrupto (editado a mano), como en el handshake: solo el tipo.
+        logger.error(f"/v1: configuración del cliente ilegible: {describe_error(e)}")
+        raise HTTPException(status_code=500, detail="internal_error") from None
+    if CONVERSATIONS_WRITE not in client.scopes:  # #410: hablar por /v1 es escribir
+        raise missing_scope(CONVERSATIONS_WRITE)
+    return V1Caller(client=client, config=config)
 
 
 @router.get("/models")
-async def list_models(request: Request, caller: HACaller = Depends(resolve_ha_caller)):
+async def list_models(request: Request, caller: V1Caller = Depends(resolve_v1_caller)):
     # Alias first, then the roster agents (#234). The roster is whatever OpenClaw announced
     # (`agents.list`); without it only the alias is advertised. An authenticated client with
     # an explicit `allowed_agents` list only sees the agents it may actually use.
     models = [{"id": MODEL_ALIAS, "object": "model", "created": 0, "owned_by": "fogar-gateway"}]
     orchestrator = getattr(request.app.state, "openclaw", None)
-    # The legacy trusted-origin caller (no Bearer, no config) gets only the alias: the legacy
-    # chat path ignores `model` and always uses the default agent, so advertising agents it
-    # cannot actually pick would be misleading.
-    gateway_info = getattr(orchestrator, "gateway_info", None) if caller.config else None
-    allowed = caller.config.allowed_agents if caller.config is not None else None
+    gateway_info = getattr(orchestrator, "gateway_info", None)
+    allowed = caller.config.allowed_agents
     for agent_id in gateway_info.agents if gateway_info is not None else ():
         if agent_id == MODEL_ALIAS or (allowed is not None and agent_id not in allowed):
             continue
@@ -161,7 +134,7 @@ def _make_http_tracker(session_id: str, registry, client_id: str) -> PipelineTra
 async def chat_completions(
     request: Request,
     body: _ChatCompletionRequest,
-    caller: HACaller = Depends(resolve_ha_caller),
+    caller: V1Caller = Depends(resolve_v1_caller),
 ):
     text = _extract_last_user_message(body.messages)
     if not text.strip():
@@ -172,48 +145,52 @@ async def chat_completions(
     session_registry = request.app.state.session_registry
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-    # body.model is the requested agent (analogous to handshake.agent in WS), except the
-    # advertised model name `fogar-gateway`, which means "no explicit agent" (#217, G-36).
-    # resolve_agent() normalizes empty/whitespace-only to None so the cascade
-    # falls through to client_config.default_agent, then
-    # gateway_info.default_agent_id, then the legacy "main" fallback. Issue #105.
-    #
-    # Trusted-origin legacy path (caller.config is None): skip policy checks,
-    # use gateway default directly. This preserves the historical behaviour where
-    # body.model was ignored for loopback/trusted-network callers.
-    if caller.config is not None:
+    # The conversation (5.0, #413): the one in `X-Fogar-Conversation` if this device may see it
+    # (M20), else its default one (one per client, agent and day, M19). A chosen conversation
+    # fixes the agent, like `conversation` in the handshake (4101 there, 409 here).
+    conversations = request.app.state.conversations
+    chosen = request.headers.get(CONVERSATION_HEADER)
+    existing: Conversation | None = None
+    requested = agent_from_model(body.model)
+    if chosen is not None:
         try:
-            resolved_agent = resolve_agent(
-                requested=agent_from_model(body.model),
-                client_config=caller.config,
-                gateway_info=orchestrator.gateway_info,
+            if not 0 < len(chosen) <= _CONVERSATION_ID_MAX:
+                raise ConversationNotFound()
+            existing = await conversations.get_visible(
+                chosen, caller.client.home_id, caller.client.user_id
             )
-        except AgentPolicyError as e:
-            return JSONResponse(
-                {
-                    "error": "forbidden",
-                    "reason": (
-                        "agent_not_permitted"
-                        if e.kind == "not_permitted"
-                        else "agent_not_available"
-                    ),
-                    "message": str(e),
-                },
-                status_code=403,
-            )
-    else:
-        # Legacy trusted-origin path: no policy checks (no client config), only the cascade
-        # (DEFAULT_AGENT, #245, then the OpenClaw default, then "main").
+        except ConversationNotFound:
+            return JSONResponse({"error": "conversation_not_found"}, status_code=404)
+        if requested and requested.strip().lower() != existing.agent.lower():
+            return JSONResponse({"error": "conversation_agent_mismatch"}, status_code=409)
+        requested = existing.agent
+
+    # body.model is the requested agent (analogous to handshake.agent in WS), except the
+    # advertised model name `fogar-gateway`, which means "no explicit agent" (#217, G-36);
+    # then the cascade (#105). The device's policy applies to a chosen conversation's agent too.
+    try:
         resolved_agent = resolve_agent(
-            requested=None, client_config=None, gateway_info=orchestrator.gateway_info
+            requested=requested,
+            client_config=caller.config,
+            gateway_info=orchestrator.gateway_info,
+        )
+    except AgentPolicyError as e:
+        return JSONResponse(
+            {
+                "error": "forbidden",
+                "reason": (
+                    "agent_not_permitted" if e.kind == "not_permitted" else "agent_not_available"
+                ),
+                "message": str(e),
+            },
+            status_code=403,
         )
 
-    if caller.client is not None:
-        # M19: like any client that does not pick a conversation, the caller talks in its
-        # default conversation (one per client, agent and day).
-        client_id = caller.client.id
-        by_name = caller.client.name
-        conversations = request.app.state.conversations
+    client_id = caller.client.id
+    by_name = caller.client.name
+    if existing is not None:
+        conversation = existing
+    else:
         try:
             conversation = await conversations.default_for(client_id, resolved_agent)
         except ConversationClientMissing:
@@ -222,21 +199,7 @@ async def chat_completions(
         except Exception as e:  # noqa: BLE001 — frontera: sin conversación no hay turno (502 estable)
             _log_unexpected_error(e)
             return JSONResponse({"error": "internal_error"}, status_code=502)
-        conversation_id: str | None = conversation.id
-    else:
-        # Legacy trusted-origin path: no client row, so no conversation; it keeps its key, and
-        # its channel is that key's alone (nobody attaches to it).
-        client_id = TRUSTED_ORIGIN_ID
-        by_name = TRUSTED_ORIGIN_NAME
-        session_key = make_session_key(resolved_agent, client_id)
-        conversation = Conversation(
-            id=f"{TRUSTED_ORIGIN_ID}:{session_key}",
-            client_id=client_id,
-            agent=resolved_agent.lower(),
-            session_key=session_key,
-            kind="default",
-        )
-        conversation_id = None
+    conversation_id = conversation.id
     # 5.0 PR 2b.3: the turn goes through the conversation's channel, like a WebSocket message,
     # but alone: it waits until the channel is calm and its answer is its own run's.
     hub = request.app.state.channel_hub
@@ -244,8 +207,7 @@ async def chat_completions(
     async def _count_turn() -> None:
         """El turno cuenta en su conversación en cuanto OpenClaw acepta su chat.send (aunque
         el cliente se vaya después); un rechazo previo no cuenta."""
-        if conversation_id is not None:
-            await note_turn_safely(request.app.state.conversations, conversation_id)
+        await note_turn_safely(conversations, conversation_id)
 
     tracker = _make_http_tracker(f"http:{completion_id}", session_registry, client_id)
     session_registry.register(tracker)

@@ -67,7 +67,7 @@ def resolve_agent(
          home device, if set
       4. settings.DEFAULT_AGENT, the installation default (#245), if set
       5. gateway_info.default_agent_id (if gateway_info is not None)
-      6. "main" (last-resort fallback; preserves legacy REST trusted-origin)
+      6. "main" (last-resort fallback)
 
     Policy checks, fail-fast in order:
       a. If client_config is not None and client_config.allowed_agents is

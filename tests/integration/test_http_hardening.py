@@ -47,16 +47,6 @@ def test_api_docs_are_not_published(client, path):
     assert client.get(path).status_code == 404
 
 
-@pytest.mark.parametrize(
-    "headers",
-    [{"origin": "http://evil.example"}, {"sec-fetch-site": "cross-site"}, {"sec-fetch-mode": "cors"}],
-)
-def test_browser_request_never_gets_trusted_origin_exemption(client, headers):
-    # DNS rebinding: la página llega desde un origen de confianza pero es un navegador.
-    assert client.get("/v1/models").status_code == 200
-    assert client.get("/v1/models", headers=headers).status_code == 401
-
-
 def test_browser_request_with_bearer_still_works(client, ha_bearer_headers):
     r = client.get("/v1/models", headers={**ha_bearer_headers, "origin": "http://x"})
     assert r.status_code == 200

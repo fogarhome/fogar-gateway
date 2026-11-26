@@ -181,8 +181,7 @@ def validation_checks(settings: Any) -> list[dict[str, str]]:
 
 # Listas de IP/CIDR: sus entradas no son secretas y se muestran (F-r3-1).
 _NETWORK_FIELDS = {
-    "TRUSTED_PROXIES": "Mientras tanto ningún origen queda exento de Bearer en /v1 (fallo cerrado).",
-    "TRUSTED_NETWORKS": "El gateway las ignora.",
+    "TRUSTED_PROXIES": "Mientras tanto ningún peer cuenta como proxy (los logs enseñan su IP).",
 }
 
 

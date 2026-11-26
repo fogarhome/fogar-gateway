@@ -1,12 +1,14 @@
 """
 network.py
 ~~~~~~~~~~
-Resolución de origen de red confiable para /v1/* y /ws/stream.
+La IP real de quien llama, para los logs (HTTP y WebSocket).
 
-is_trusted_origin(ip)   -> bool  — ip exenta de auth (loopback y/o TRUSTED_NETWORKS)
-resolve_client_ip(conn)  -> str   — IP real a evaluar, respetando X-Real-IP
-                                    solo cuando el peer TCP es un proxy confiable.
-                                    Compartido por HTTP y WebSocket.
+resolve_client_ip(conn)  -> str   — IP real, respetando X-Real-IP solo cuando el peer TCP es un
+                                    proxy de TRUSTED_PROXIES.
+client_ip_for_log(conn)  -> str   — la misma, con el peer si no se pudo fiar.
+
+Desde la 5.0 (#413) ninguna IP exime de credencial: `/v1` exige siempre Bearer, así que ya no hay
+origen de confianza ni `TRUSTED_NETWORKS`/`TRUST_LOOPBACK`.
 """
 
 import functools
@@ -23,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 _IpNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
-# Not an IP on purpose: is_trusted_origin() rejects it, and it reads well in logs.
+# Not an IP on purpose: it reads well in logs.
 NO_REAL_IP = "proxy-without-real-ip"
 
 
@@ -125,19 +127,6 @@ def is_trusted_proxy(ip_str: str) -> bool:
     return _ip_in_networks(ip_str, _parse_networks(settings.TRUSTED_PROXIES))
 
 
-def is_trusted_origin(ip_str: str) -> bool:
-    """True if ip_str is exempt from /v1/* auth (loopback and/or TRUSTED_NETWORKS)."""
-    from fogar_gateway.core.config import settings
-
-    try:
-        ip = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return False
-    if settings.TRUST_LOOPBACK and ip.is_loopback:
-        return True
-    return _ip_in_networks(ip_str, _parse_networks(settings.TRUSTED_NETWORKS))
-
-
 def _proxies_invalid() -> bool:
     from fogar_gateway.core.config import settings
 
@@ -145,57 +134,37 @@ def _proxies_invalid() -> bool:
 
 
 def warn_if_open_proxy_config() -> None:
-    """Startup WARNINGs: invalid TRUSTED_* entries (F-r3-1) and TRUST_LOOPBACK with an empty
-    TRUSTED_PROXIES (#216).
-
-    A same-host reverse proxy with no TRUSTED_PROXIES would look like a loopback client for
-    everyone behind it (its X-Real-IP is ignored), leaving /v1/* open to the Internet.
-    """
+    """Startup WARNINGs about TRUSTED_PROXIES (F-r3-1): invalid entries (no peer is a proxy, the
+    logs show the proxy's address) and entries that cover far more than a proxy."""
     from fogar_gateway.core.config import settings
 
-    proxies_bad = invalid_entries(settings.TRUSTED_PROXIES)
-    if proxies_bad:
+    if bad := invalid_entries(settings.TRUSTED_PROXIES):
         logger.warning(
-            f"TRUSTED_PROXIES has invalid entries {proxies_bad!r}: no peer is a trusted proxy and "
-            "no origin is exempt from /v1/* auth (fail closed) until it is fixed "
-            "(`fogar-gw config validate`)."
+            f"TRUSTED_PROXIES has invalid entries {bad!r}: no peer is a trusted proxy until it "
+            "is fixed (`fogar-gw config validate`)."
         )
-    if bad := invalid_entries(settings.TRUSTED_NETWORKS):
-        logger.warning(f"TRUSTED_NETWORKS: ignoring invalid entries {bad!r}.")
-    for name in ("TRUSTED_PROXIES", "TRUSTED_NETWORKS"):
-        if wide := wide_entries(getattr(settings, name)):
-            logger.warning(
-                f"{name}: {wide!r} cover far more than a LAN or a proxy; "
-                "check them with `fogar-gw config validate`."
-            )
-    if proxies_bad:  # fail closed already: the empty-proxies warning below would mislead
-        return
-    if settings.TRUST_LOOPBACK and not _parse_networks(settings.TRUSTED_PROXIES):
+    if wide := wide_entries(settings.TRUSTED_PROXIES):
         logger.warning(
-            "TRUST_LOOPBACK is on and TRUSTED_PROXIES is empty: a reverse proxy on this "
-            "host would make every client look like loopback and /v1/* would be open. "
-            "Fine without a proxy; otherwise set TRUSTED_PROXIES to the proxy address "
-            "and make it overwrite X-Real-IP."
+            f"TRUSTED_PROXIES: {wide!r} cover far more than a proxy; "
+            "check them with `fogar-gw config validate`."
         )
 
 
 # Headers that only a tunnel or proxy sets (tailscale serve, cloudflared, RFC 7239 `Forwarded`):
-# a request carrying them never earns the trusted-origin exemption, whatever its address
+# a request carrying them is never attributed to a single address, whatever it says
 # (auditoría 3.0, D-1, D-r2-1).
 _TUNNEL_HEADERS = ("tailscale-user-login", "tailscale-user-name", "cf-connecting-ip", "forwarded")
 
 
 def resolve_client_ip(connection: HTTPConnection) -> str:
     """
-    Returns the IP to evaluate with is_trusted_origin().
+    Returns the caller's real IP, for logs.
 
     If the immediate TCP peer is a trusted proxy (settings.TRUSTED_PROXIES),
     its X-Real-IP is the client address. A proxy peer WITHOUT a valid X-Real-IP
-    fails closed (G-31, #216): returning the peer would turn a same-host proxy
-    (loopback is trusted) into an open door for every Internet client, so we
-    return a non-IP sentinel that is_trusted_origin() rejects and /v1 asks for
-    a Bearer. Otherwise the peer connected directly — use its address as-is and
-    ignore any X-Real-IP it sends.
+    gets a non-IP sentinel (G-31, #216) instead of the proxy's own address.
+    Otherwise the peer connected directly — use its address as-is and ignore any
+    X-Real-IP it sends.
 
     D-1: a proxy that passes the client's X-Real-IP through (tailscale serve,
     cloudflared) still sets X-Forwarded-For with the real address last, while

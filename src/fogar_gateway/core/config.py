@@ -51,11 +51,8 @@ class Settings(BaseSettings):
     # Admin API
     ADMIN_TOKEN: str = ""
 
-    # /v1/* trusted-origin auth (issue #52)
-    TRUST_LOOPBACK: bool = True
-    TRUSTED_NETWORKS: str = (
-        ""  # CSV of CIDRs, e.g. "192.168.1.0/24". Empty = only loopback trusted.
-    )
+    # Proxies cuyo X-Real-IP es la IP real de quien llama (los logs). Desde la 5.0 (#413) ninguna IP
+    # exime de credencial: fuera TRUST_LOOPBACK y TRUSTED_NETWORKS.
     TRUSTED_PROXIES: str = "127.0.0.1,::1"  # CSV of IPs/CIDRs allowed to set X-Real-IP
 
     # Servicios externos
