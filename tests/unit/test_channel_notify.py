@@ -744,3 +744,25 @@ async def test_another_push_ends_the_one_waiting_for_its_reply(session, hub, rep
     ]
     assert texts(tv_ws) == ["otro"]
     assert_pairs(tv_ws)
+
+
+async def test_a_long_fallback_chain_keeps_the_push_alive(session, hub, monkeypatch):
+    """#424: each `fallback_step` of the open push's run counts as progress (#286): a chain of
+    fallbacks longer than TURN_TIMEOUT_S, with no token in between, does not cut it."""
+    monkeypatch.setattr(settings, "TURN_TIMEOUT_S", 0.3)
+    tv, ws = session("tv", HOME, output_mode=("text",))
+    channel = hub.channel_for(HOME.session_key)
+    sk = HOME.session_key
+    channel.enqueue_push("turn_start", sk, run_id="run-f")
+    step = {"phase": "fallback_step", "fallbackStepFinalOutcome": "next_fallback"}
+    for _ in range(6):  # 6 steps of 0.15 s = 0.9 s, three times the budget
+        await asyncio.sleep(0.15)
+        channel.enqueue_push("fallback", step, run_id="run-f")
+    await channel.push_idle()
+    assert ("turn_end", "t-1", "timeout", None) not in turns(ws)
+    channel.enqueue_push("chat", {"sessionKey": sk, "runId": "run-f", "deltaText": "ok"}, run_id="run-f")
+    channel.enqueue_push("turn_end", sk, run_id="run-f")
+    await channel.push_idle()
+    await settle(tv)
+    assert turns(ws) == [("turn_start", "t-1", "push", "conv-home"), ("turn_end", "t-1", "done", None)]
+    assert_pairs(ws)
