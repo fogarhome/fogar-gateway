@@ -1,4 +1,4 @@
-"""El dispositivo de avisos (5.0, #407): el del hogar (`PATCH /admin/home`) y el de cada persona
+"""El dispositivo de avisos (5.0, #407): el del hogar (`PATCH /home`) y el de cada persona
 (`PATCH /auth/me`). Retirar el aparato lo quita de donde estuviera elegido."""
 
 import pytest
@@ -25,7 +25,7 @@ def people(http, admin_headers):
     for username, role in (("sito", "owner"), ("ana", "member")):
         body = {"username": username, "display_name": username.title(), "password": PW,
                 "role": role}
-        r = http.post("/admin/users", json=body, headers=admin_headers)
+        r = http.post("/home/users", json=body, headers=admin_headers)
         assert r.status_code == 201, r.text
         ids[username] = r.json()["id"]
     return ids
@@ -97,7 +97,7 @@ def test_user_cannot_pick_home_or_others_device(http, people, db_engine, admin_h
     anas, _ = _login(http, "ana")
     tv = _home_device(db_engine)
     assert http.post("/auth/logout", headers=old_auth).status_code == 204  # retirado
-    r = http.patch(f"/admin/clients/{off}", json={"is_active": False}, headers=admin_headers)
+    r = http.patch(f"/home/devices/{off}", json={"is_active": False}, headers=admin_headers)
     assert r.status_code == 200
     assert http.patch("/auth/me", json={"notify_client_id": mac}, headers=auth).status_code == 200
 
@@ -112,23 +112,23 @@ def test_admin_sets_home_notify_device(http, people, db_engine, admin_headers):
     tv = _home_device(db_engine)
     anas, ana_auth = _login(http, "ana")
     _, owner_auth = _login(http, "sito")
-    assert http.get("/admin/home", headers=admin_headers).json()["notify_client_id"] is None
+    assert http.get("/home", headers=admin_headers).json()["notify_client_id"] is None
 
-    r = http.patch("/admin/home", json={"notify_client_id": tv}, headers=admin_headers)
+    r = http.patch("/home", json={"notify_client_id": tv}, headers=admin_headers)
     assert r.status_code == 200, r.text
     assert r.json() == {"id": "home", "name": "Mi hogar", "agent": None, "notify_client_id": tv}
-    assert http.get("/admin/home", headers=owner_auth).json()["notify_client_id"] == tv
+    assert http.get("/home", headers=owner_auth).json()["notify_client_id"] == tv
     # Cualquier aparato activo del hogar, también el móvil de alguien (un aviso común).
-    r = http.patch("/admin/home", json={"notify_client_id": anas}, headers=owner_auth)
+    r = http.patch("/home", json={"notify_client_id": anas}, headers=owner_auth)
     assert r.status_code == 200 and r.json()["notify_client_id"] == anas
     # Cambiar otro campo no lo toca.
-    r = http.patch("/admin/home", json={"name": "Casa"}, headers=admin_headers)
+    r = http.patch("/home", json={"name": "Casa"}, headers=admin_headers)
     assert r.json()["notify_client_id"] == anas
-    r = http.patch("/admin/home", json={"notify_client_id": None}, headers=admin_headers)
+    r = http.patch("/home", json={"notify_client_id": None}, headers=admin_headers)
     assert r.status_code == 200 and r.json()["notify_client_id"] is None
 
     # Un miembro no toca el hogar, como el resto de /admin.
-    r = http.patch("/admin/home", json={"notify_client_id": tv}, headers=ana_auth)
+    r = http.patch("/home", json={"notify_client_id": tv}, headers=ana_auth)
     assert r.status_code == 403 and r.json() == {"detail": "missing_scope"}
 
     with Session(db_engine) as s:
@@ -136,14 +136,14 @@ def test_admin_sets_home_notify_device(http, people, db_engine, admin_headers):
         s.commit()
     elsewhere = _home_device(db_engine, "Fuera", home_id="h2")
     retired = _home_device(db_engine, "Retirada")
-    assert http.delete(f"/admin/clients/{retired}", headers=admin_headers).status_code == 204
+    assert http.delete(f"/home/devices/{retired}", headers=admin_headers).status_code == 204
     off = _home_device(db_engine, "Apagada")
-    http.patch(f"/admin/clients/{off}", json={"is_active": False}, headers=admin_headers)
+    http.patch(f"/home/devices/{off}", json={"is_active": False}, headers=admin_headers)
     for bad in (elsewhere, retired, off, "no-existe"):
-        r = http.patch("/admin/home", json={"notify_client_id": bad}, headers=admin_headers)
+        r = http.patch("/home", json={"notify_client_id": bad}, headers=admin_headers)
         assert r.status_code == 422, bad
         assert r.json() == {"detail": "invalid_notify_device"}
-    assert http.get("/admin/home", headers=admin_headers).json()["notify_client_id"] is None
+    assert http.get("/home", headers=admin_headers).json()["notify_client_id"] is None
 
 
 @pytest.mark.parametrize("path", ["admin_delete", "logout", "my_devices", "delete_user"])
@@ -153,20 +153,20 @@ def test_retiring_device_clears_notify(http, people, db_engine, admin_headers, p
     _, other_auth = _login(http, "ana", "Mac")
     _set_both(db_engine, user, phone)
     assert http.get("/auth/me", headers=other_auth).json()["notify_client_id"] == phone
-    assert http.get("/admin/home", headers=admin_headers).json()["notify_client_id"] == phone
+    assert http.get("/home", headers=admin_headers).json()["notify_client_id"] == phone
 
     if path == "admin_delete":
-        r = http.delete(f"/admin/clients/{phone}", headers=admin_headers)
+        r = http.delete(f"/home/devices/{phone}", headers=admin_headers)
     elif path == "logout":
         r = http.post("/auth/logout", headers=phone_auth)
     elif path == "my_devices":
         r = http.delete(f"/auth/devices/{phone}", headers=other_auth)
     else:
-        r = http.delete(f"/admin/users/{user}", headers=admin_headers)
+        r = http.delete(f"/home/users/{user}", headers=admin_headers)
     assert r.status_code == 204, r.text
 
     assert _choices(db_engine, user) == (None, None)
-    assert http.get("/admin/home", headers=admin_headers).json()["notify_client_id"] is None
+    assert http.get("/home", headers=admin_headers).json()["notify_client_id"] is None
     if path != "delete_user":
         assert http.get("/auth/me", headers=other_auth).json()["notify_client_id"] is None
 
@@ -186,9 +186,9 @@ def test_disabling_keeps_the_choice(http, people, db_engine, admin_headers):
     user = people["ana"]
     phone, _ = _login(http, "ana", "Móvil")
     _set_both(db_engine, user, phone)
-    r = http.patch(f"/admin/clients/{phone}", json={"is_active": False}, headers=admin_headers)
+    r = http.patch(f"/home/devices/{phone}", json={"is_active": False}, headers=admin_headers)
     assert r.status_code == 200
-    r = http.patch(f"/admin/users/{user}", json={"is_active": False}, headers=admin_headers)
+    r = http.patch(f"/home/users/{user}", json={"is_active": False}, headers=admin_headers)
     assert r.status_code == 200
     assert _choices(db_engine, user) == (phone, phone)
 

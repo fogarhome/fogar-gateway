@@ -1,11 +1,11 @@
-"""Integration tests for /admin/transcriber/status and /admin/tts/status."""
+"""Integration tests for /system/services/transcriber and /system/services/tts."""
 
 from unittest.mock import patch
 
 
 def test_get_transcriber_status_reachable(client, admin_headers):
     with patch("fogar_gateway.services.transcriber_client.TranscriberClient.ping", return_value=True):
-        response = client.get("/admin/transcriber/status", headers=admin_headers)
+        response = client.get("/system/services/transcriber", headers=admin_headers)
     assert response.status_code == 200
     data = response.json()
     assert data["name"] == "transcriber"
@@ -14,18 +14,18 @@ def test_get_transcriber_status_reachable(client, admin_headers):
 
 def test_get_transcriber_status_unreachable(client, admin_headers):
     with patch("fogar_gateway.services.transcriber_client.TranscriberClient.ping", return_value=False):
-        response = client.get("/admin/transcriber/status", headers=admin_headers)
+        response = client.get("/system/services/transcriber", headers=admin_headers)
     assert response.status_code == 200
     assert response.json()["state"] == "DEGRADED"
 
 
 def test_get_transcriber_status_requires_admin_token(client):
-    response = client.get("/admin/transcriber/status")
+    response = client.get("/system/services/transcriber")
     assert response.status_code == 401
 
 
 def test_get_tts_status_default_connected(client, admin_headers):
-    response = client.get("/admin/tts/status", headers=admin_headers)
+    response = client.get("/system/services/tts", headers=admin_headers)
     assert response.status_code == 200
     data = response.json()
     assert data["name"] == "tts"
@@ -34,5 +34,5 @@ def test_get_tts_status_default_connected(client, admin_headers):
 
 
 def test_get_tts_status_requires_admin_token(client):
-    response = client.get("/admin/tts/status")
+    response = client.get("/system/services/tts")
     assert response.status_code == 401

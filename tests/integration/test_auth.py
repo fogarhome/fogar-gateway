@@ -136,7 +136,7 @@ def test_without_a_valid_token_is_401(http, headers):
 
 
 def test_a_paired_home_device_has_no_account(http, admin_headers):
-    key = http.post("/admin/clients", json={"name": "Tele"}, headers=admin_headers).json()["client_key"]
+    key = http.post("/home/devices", json={"name": "Tele"}, headers=admin_headers).json()["client_key"]
     assert http.get("/auth/me", headers=_bearer(key)).status_code == 401
 
 
@@ -214,35 +214,37 @@ def test_devices_query_lists_only_live_ones(http, db_engine):
 # ── /admin por rol (paso 4) ─────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("path", ["/admin/clients", "/admin/state", "/admin/pairing"])
-def test_admin_is_for_owners_and_admins(http, db_engine, path):
+@pytest.mark.parametrize(("path", "scope"), [
+    ("/home/devices", "home:read"), ("/system/state", "home:read"), ("/home/pairing", "home:admin"),
+])
+def test_admin_is_for_owners_and_admins(http, db_engine, path, scope):
     _add_user(db_engine, "admi", "admin")
     owner = _bearer(_login(http).json()["token"])
     admin = _bearer(_login(http, "admi").json()["token"])
     member = _bearer(_login(http, "ana").json()["token"])
     assert http.get(path, headers=owner).status_code == 200
     assert http.get(path, headers=admin).status_code == 200
-    r = http.get(path, headers=member)  # pidió home:admin, pero su rol no llega (#410)
+    r = http.get(path, headers=member)  # pidió home:admin, pero su rol no llega a home:read (#410)
     assert r.status_code == 403 and r.json()["detail"] == "missing_scope"
-    assert 'scope="home:admin"' in r.headers["www-authenticate"]
+    assert f'scope="{scope}"' in r.headers["www-authenticate"]
 
 
 def test_admin_refuses_a_paired_device_key_and_a_bad_admin_token(http, admin_headers):
-    key = http.post("/admin/clients", json={"name": "Tele"}, headers=admin_headers).json()["client_key"]
+    key = http.post("/home/devices", json={"name": "Tele"}, headers=admin_headers).json()["client_key"]
     # 5.0 (#410): la clave de un aparato del hogar autentica, pero nunca llega a home:admin.
-    r = http.get("/admin/clients", headers=_bearer(key))
+    r = http.get("/home/devices", headers=_bearer(key))
     assert r.status_code == 403 and r.json()["detail"] == "missing_scope"
     owner = _bearer(_login(http).json()["token"])
     # Un X-Admin-Token presente manda: si no vale, 401 aunque el Bearer sí valga.
-    assert http.get("/admin/clients", headers={**owner, "x-admin-token": "mal"}).status_code == 401
+    assert http.get("/home/devices", headers={**owner, "x-admin-token": "mal"}).status_code == 401
 
 
 def test_a_demoted_user_loses_admin_at_once(http, db_engine, users):
     owner = _bearer(_login(http).json()["token"])
-    assert http.get("/admin/clients", headers=owner).status_code == 200
+    assert http.get("/home/devices", headers=owner).status_code == 200
     with Session(db_engine) as s:
         m = s.get(MembershipRecord, (users["sito"], "home"))
         m.role = "member"
         s.add(m)
         s.commit()
-    assert http.get("/admin/clients", headers=owner).status_code == 403
+    assert http.get("/home/devices", headers=owner).status_code == 403

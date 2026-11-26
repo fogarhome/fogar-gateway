@@ -15,6 +15,8 @@ from fogar_gateway.cli.clients import set_values
 from fogar_gateway.cli.output import ACCENT, MUTED, Out
 
 POLL_S = 1.0
+# Lo que un administrador puede conceder a un aparato del hogar (5.0, #410): nunca home:admin.
+HOUSEHOLD_SCOPES = ("conversations:read", "conversations:write", "home:read")
 
 
 def _sleep(seconds: float) -> None:
@@ -26,6 +28,8 @@ def _sleep(seconds: float) -> None:
 @click.option("--type", "client_type", help="Tipo: ha, esp32, web, app o screen.")
 @click.option("--agent", help="Agente por defecto.")
 @click.option("--allowed-agent", "allowed", multiple=True, help="Agente permitido (repetible).")
+@click.option("--scope", "scopes", multiple=True, type=click.Choice(HOUSEHOLD_SCOPES),
+              help="Permiso que se le concede (repetible). Sin ninguno, conversations:write.")
 @click.option("--set", "sets", multiple=True, metavar="CAMPO=TEXTO|CAMPO:=JSON",
               help="Cualquier otro campo del cliente (voz, turno…). Con := el valor va como JSON.")
 @click.option("--no-wait", is_flag=True, help="Enseña el código y termina, sin esperar.")
@@ -36,6 +40,7 @@ def pair(
     client_type: str | None,
     agent: str | None,
     allowed: tuple[str, ...],
+    scopes: tuple[str, ...],
     sets: tuple[str, ...],
     no_wait: bool,
 ) -> None:
@@ -51,17 +56,22 @@ def pair(
         body["default_agent"] = agent
     if allowed:
         body["allowed_agents"] = list(allowed)
-    body.update(set_values(sets, set(ClientCreate.model_fields) - {"client_key"}))
+    if scopes:
+        body["scopes"] = list(scopes)
+    body.update(set_values(sets, set(ClientCreate.model_fields) - {"client_key", "scopes"}))
 
     out = Out(ctx.find_root().obj["json"])
     client = api.from_context(ctx)
-    item = client.request("POST", "/admin/pairing", body)
+    item = client.request("POST", "/home/pairing", body)
     code = item["code"]
     expires = datetime.fromisoformat(item["expires_at"]).astimezone().strftime("%H:%M")
+    granted = item.get("template", {}).get("scopes") or ["conversations:write"]
     if out.as_json:
-        out.json({"id": item["id"], "code": code, "expires_at": item["expires_at"]})
+        out.json({"id": item["id"], "code": code, "expires_at": item["expires_at"],
+                  "scopes": granted})
         return
     out.message(f"{code[:3]} {code[3:]}", ACCENT)
+    out.message(f"Permisos que concede: {', '.join(granted)}.", MUTED)
     if no_wait:
         out.message(f"Caduca a las {expires}.", MUTED)
         return
@@ -69,7 +79,7 @@ def pair(
         # El nombre de la casa es solo para la frase: si no se lee (o la respuesta trae otra
         # forma), va sin él.
         try:
-            home = client.request("GET", "/admin/home")
+            home = client.request("GET", "/home")
         except api.ApiError:
             home = None
         casa = home.get("name") if isinstance(home, dict) else None
@@ -82,7 +92,7 @@ def pair(
         )
         while True:
             _sleep(POLL_S)
-            state = client.request("GET", f"/admin/pairing/{item['id']}")
+            state = client.request("GET", f"/home/pairing/{item['id']}")
             if state["state"] == "used":
                 out.message(f"Cliente «{state['client_name']}» emparejado (id {state['client_id'][:8]}).")
                 return
@@ -99,6 +109,6 @@ def pair(
 
 def _cancel(client: api.Api, pairing_id: str) -> None:
     try:
-        client.request("DELETE", f"/admin/pairing/{pairing_id}", accept=(404,))
+        client.request("DELETE", f"/home/pairing/{pairing_id}", accept=(404,))
     except api.ApiError:
         pass  # si el gateway no responde, el código caduca solo en 10 minutos

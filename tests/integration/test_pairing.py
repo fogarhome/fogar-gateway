@@ -1,4 +1,4 @@
-"""Descubrimiento y emparejamiento (#317): /.well-known/fogar-gateway, POST /pair y /admin/pairing."""
+"""Descubrimiento y emparejamiento (#317): /.well-known/fogar-gateway, POST /pair y /home/pairing."""
 
 import json
 import logging
@@ -41,7 +41,7 @@ def http(make_client) -> TestClient:
 
 
 def _open(http: TestClient, **template) -> dict:
-    r = http.post("/admin/pairing", json=template, headers=ADMIN)
+    r = http.post("/home/pairing", json=template, headers=ADMIN)
     assert r.status_code == 201, r.text
     return r.json()
 
@@ -77,13 +77,13 @@ def test_well_known_does_not_expose_name(http, monkeypatch):
     assert set(http.get("/.well-known/fogar-gateway").json()) == {"service", "version", "instance_id"}
 
 
-# --- /admin/pairing ---
+# --- /home/pairing ---
 
 
 @pytest.mark.parametrize(
     "method,path",
-    [("post", "/admin/pairing"), ("get", "/admin/pairing"), ("get", "/admin/pairing/x"),
-     ("delete", "/admin/pairing/x")],
+    [("post", "/home/pairing"), ("get", "/home/pairing"), ("get", "/home/pairing/x"),
+     ("delete", "/home/pairing/x")],
 )
 def test_admin_pairing_requires_token(http, method, path):
     kwargs = {"json": {}} if method == "post" else {}
@@ -92,19 +92,19 @@ def test_admin_pairing_requires_token(http, method, path):
 
 def test_admin_pairing_validates_template_upfront(http):
     r = http.post(
-        "/admin/pairing", json={"default_agent": "a", "allowed_agents": ["b"]}, headers=ADMIN
+        "/home/pairing", json={"default_agent": "a", "allowed_agents": ["b"]}, headers=ADMIN
     )
     assert r.status_code == 422
-    assert http.post("/admin/pairing", json={"tts_speed": 0}, headers=ADMIN).status_code == 422
-    assert http.post("/admin/pairing", json={"client_key": "x" * 40}, headers=ADMIN).status_code == 422
+    assert http.post("/home/pairing", json={"tts_speed": 0}, headers=ADMIN).status_code == 422
+    assert http.post("/home/pairing", json={"client_key": "x" * 40}, headers=ADMIN).status_code == 422
 
 
 def test_admin_pairing_open_returns_code_once(http):
     item = _open(http, name="tele", client_type="screen")
     assert len(item["code"]) == 6 and item["code"].isdigit()
     assert item["template"] == {"name": "tele", "client_type": "screen"}
-    listed = http.get("/admin/pairing", headers=ADMIN).json()
-    one = http.get(f"/admin/pairing/{item['id']}", headers=ADMIN).json()
+    listed = http.get("/home/pairing", headers=ADMIN).json()
+    one = http.get(f"/home/pairing/{item['id']}", headers=ADMIN).json()
     assert [p["id"] for p in listed] == [item["id"]]
     assert "code" not in listed[0] and "code" not in one
     assert item["code"] not in json.dumps(listed) + json.dumps(one)
@@ -119,14 +119,14 @@ def test_admin_pairing_ignores_legacy_barge_in_fields(http):
 def test_admin_pairing_limit(http):
     for _ in range(pairing.MAX_OPEN):
         _open(http)
-    assert http.post("/admin/pairing", json={}, headers=ADMIN).status_code == 409
+    assert http.post("/home/pairing", json={}, headers=ADMIN).status_code == 409
 
 
 def test_admin_pairing_cancel(http):
     item = _open(http)
-    assert http.delete(f"/admin/pairing/{item['id']}", headers=ADMIN).status_code == 204
-    assert http.get(f"/admin/pairing/{item['id']}", headers=ADMIN).json()["state"] == "cancelled"
-    assert http.delete(f"/admin/pairing/{item['id']}", headers=ADMIN).status_code == 404
+    assert http.delete(f"/home/pairing/{item['id']}", headers=ADMIN).status_code == 204
+    assert http.get(f"/home/pairing/{item['id']}", headers=ADMIN).json()["state"] == "cancelled"
+    assert http.delete(f"/home/pairing/{item['id']}", headers=ADMIN).status_code == 404
     r = http.post("/pair", json={"code": item["code"]})
     assert r.status_code == 400
 
@@ -228,7 +228,7 @@ def test_failed_attempts_burn_all_codes(http):
     a, b = _open(http), _open(http)
     for _ in range(pairing.MAX_FAILED):
         assert http.post("/pair", json={"code": _wrong(a["code"])}).status_code == 400
-    assert http.get("/admin/pairing", headers=ADMIN).json() == []
+    assert http.get("/home/pairing", headers=ADMIN).json() == []
     assert http.post("/pair", json={"code": b["code"]}).status_code == 400
 
 
@@ -246,13 +246,13 @@ def test_create_failure_keeps_code_open(http, monkeypatch, db_engine):
     for _ in range(pairing.MAX_FAILED):
         assert http.post("/pair", json={"code": item["code"]}).status_code == 409
     monkeypatch.undo()
-    assert http.get(f"/admin/pairing/{item['id']}", headers=ADMIN).json()["state"] == "open"
+    assert http.get(f"/home/pairing/{item['id']}", headers=ADMIN).json()["state"] == "open"
 
 
 def test_pairing_state_after_use(http):
     item = _open(http, name="tele")
     client_id = http.post("/pair", json={"code": item["code"]}).json()["client_id"]
-    state = http.get(f"/admin/pairing/{item['id']}", headers=ADMIN).json()
+    state = http.get(f"/home/pairing/{item['id']}", headers=ADMIN).json()
     assert (state["state"], state["client_id"], state["client_name"]) == ("used", client_id, "tele")
 
 

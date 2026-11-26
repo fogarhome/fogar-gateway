@@ -50,7 +50,7 @@ def _set_scopes(db_engine, client_id: str, scopes: list[str]) -> None:
 def test_login_without_scopes_grants_only_conversations(http):
     body = _login(http)
     assert body["scopes"] == CONVERSE
-    r = http.get("/admin/clients", headers=_bearer(body["token"]))
+    r = http.get("/home/devices", headers=_bearer(body["token"]))
     assert r.status_code == 403 and r.json()["detail"] == "missing_scope"
     assert http.get("/auth/me", headers=_bearer(body["token"])).json()["scopes"] == CONVERSE
 
@@ -58,7 +58,7 @@ def test_login_without_scopes_grants_only_conversations(http):
 def test_login_grants_what_is_asked_within_the_role(http):
     owner = _login(http, scopes=ADMIN)
     assert owner["scopes"] == EVERYTHING
-    assert http.get("/admin/clients", headers=_bearer(owner["token"])).status_code == 200
+    assert http.get("/home/devices", headers=_bearer(owner["token"])).status_code == 200
     member = _login(http, "ana", scopes=ADMIN)  # pide de más: se recorta al rol
     assert member["scopes"] == CONVERSE
 
@@ -77,7 +77,7 @@ def test_demoting_the_person_cuts_her_devices_at_once(http, db_engine, users):
         m.role = "member"
         s.add(m)
         s.commit()
-    assert http.get("/admin/clients", headers=_bearer(token)).status_code == 403
+    assert http.get("/home/devices", headers=_bearer(token)).status_code == 403
     assert http.get("/auth/me", headers=_bearer(token)).json()["scopes"] == CONVERSE
     # Lo concedido sigue guardado: si vuelve a ser administradora, lo recupera sin entrar otra vez.
     with Session(db_engine) as s:
@@ -85,29 +85,29 @@ def test_demoting_the_person_cuts_her_devices_at_once(http, db_engine, users):
         m.role = "admin"
         s.add(m)
         s.commit()
-    assert http.get("/admin/clients", headers=_bearer(token)).status_code == 200
+    assert http.get("/home/devices", headers=_bearer(token)).status_code == 200
 
 
 # --- Aparatos del hogar ---
 
 
 def test_household_device_never_gets_home_admin(http, admin_headers):
-    r = http.post("/admin/clients", json={"name": "Tele", "scopes": ["home:admin"]},
+    r = http.post("/home/devices", json={"name": "Tele", "scopes": ["home:admin"]},
                   headers=admin_headers)
     assert r.status_code == 422 and r.json()["detail"] == "scope_not_allowed"
-    r = http.post("/admin/clients", json={"name": "Tele"}, headers=admin_headers)
+    r = http.post("/home/devices", json={"name": "Tele"}, headers=admin_headers)
     assert r.status_code == 201 and r.json()["scopes"] == CONVERSE
-    r = http.patch(f"/admin/clients/{r.json()['id']}", json={"scopes": ["home:admin"]},
+    r = http.patch(f"/home/devices/{r.json()['id']}", json={"scopes": ["home:admin"]},
                    headers=admin_headers)
     assert r.status_code == 422
 
 
 def test_household_device_with_read_lists_but_cannot_create(http, admin_headers):
-    created = http.post("/admin/clients", json={"name": "Tablet", "scopes": ["conversations:read"]},
+    created = http.post("/home/devices", json={"name": "Tablet", "scopes": ["conversations:read"]},
                         headers=admin_headers).json()
     tablet = _bearer(created["client_key"])
-    assert http.get("/admin/conversations", headers=tablet).status_code == 200
-    r = http.post("/admin/conversations", json={}, headers=tablet)
+    assert http.get("/conversations", headers=tablet).status_code == 200
+    r = http.post("/conversations", json={}, headers=tablet)
     assert r.status_code == 403
     assert 'scope="conversations:write"' in r.headers["www-authenticate"]
     assert http.get("/auth/me", headers=tablet).status_code == 401  # /auth es de personas
@@ -115,7 +115,7 @@ def test_household_device_with_read_lists_but_cannot_create(http, admin_headers)
 
 def test_admin_can_only_take_scopes_from_a_personal_device(http, admin_headers):
     device = _login(http)  # conversations:*
-    path = f"/admin/clients/{device['client_id']}"
+    path = f"/home/devices/{device['client_id']}"
     r = http.patch(path, json={"scopes": ["conversations:write", "home:read"]}, headers=admin_headers)
     assert r.status_code == 422  # para pedir más, su persona inicia sesión otra vez
     r = http.patch(path, json={"scopes": ["conversations:read"]}, headers=admin_headers)
@@ -126,13 +126,13 @@ def test_admin_can_only_take_scopes_from_a_personal_device(http, admin_headers):
 
 
 def test_pair_grants_asked_within_the_template(http, admin_headers):
-    r = http.post("/admin/pairing", json={"scopes": ["home:admin"]}, headers=admin_headers)
+    r = http.post("/home/pairing", json={"scopes": ["home:admin"]}, headers=admin_headers)
     assert r.status_code == 422
-    code = http.post("/admin/pairing", json={"scopes": ["conversations:write", "home:read"]},
+    code = http.post("/home/pairing", json={"scopes": ["conversations:write", "home:read"]},
                      headers=admin_headers).json()["code"]
     body = http.post("/pair", json={"code": code, "scopes": ["home:read", "home:admin"]}).json()
     assert body["scopes"] == ["home:read"]  # lo pedido ∩ lo aprobado
-    code = http.post("/admin/pairing", json={}, headers=admin_headers).json()["code"]
+    code = http.post("/home/pairing", json={}, headers=admin_headers).json()["code"]
     assert http.post("/pair", json={"code": code}).json()["scopes"] == CONVERSE  # sin pedir
 
 
@@ -164,6 +164,31 @@ def test_bearer_with_unreadable_config_is_500_not_401(client, db_engine, caplog)
         rec.allowed_agents = "{roto"
         s.add(rec)
         s.commit()
-    r = client.get("/admin/conversations", headers={"authorization": f"Bearer {VALID_KEY}"})
+    r = client.get("/conversations", headers={"authorization": f"Bearer {VALID_KEY}"})
     assert r.status_code == 500 and r.json()["detail"] == "internal_error"
     assert "ilegible" in caplog.text and "{roto" not in caplog.text
+
+
+def test_household_device_with_home_read_sees_but_cannot_write(http, admin_headers):
+    # 5.0 (#411): una tablet del hogar con home:read ve el hogar y el sistema, nunca escribe.
+    tablet = _bearer(http.post("/home/devices", json={"name": "Tablet", "scopes": ["home:read"]},
+                               headers=admin_headers).json()["client_key"])
+    for path in ("/home", "/home/users", "/home/devices", "/system/state", "/system/sessions",
+                 "/system/services/orchestrator", "/system/speech"):
+        assert http.get(path, headers=tablet).status_code == 200, path
+    assert all("client_key" not in d for d in http.get("/home/devices", headers=tablet).json())
+    for method, path, body in (
+        ("POST", "/home/devices", {"name": "X"}),
+        ("PATCH", "/home", {"name": "Otra"}),
+        ("POST", "/home/users", {"username": "eva", "display_name": "Eva", "password": "x" * 12}),
+        ("POST", "/system/services/orchestrator/reconnect", None),
+        ("POST", "/home/pairing", {}),
+        ("GET", "/home/pairing", None),
+    ):
+        r = http.request(method, path, json=body, headers=tablet)
+        assert r.status_code == 403 and r.json()["detail"] == "missing_scope", (method, path)
+
+
+def test_admin_paths_are_gone(http, admin_headers):
+    r = http.get("/admin/clients", headers=admin_headers)
+    assert r.status_code == 404 and r.headers["content-type"].startswith("application/json")

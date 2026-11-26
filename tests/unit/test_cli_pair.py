@@ -11,16 +11,16 @@ from tests.fakes.cli_api import FakeApi
 
 ITEM = {"id": "p1", "code": "482913", "expires_at": "2026-11-08T17:10:00+00:00",
         "state": "open", "template": {}}
-POLL = ("GET", "/admin/pairing/p1")
+POLL = ("GET", "/home/pairing/p1")
 
 
 class PollingApi(FakeApi):
     """Como FakeApi, pero el sondeo devuelve los estados en orden (o lanza lo que se le dé)."""
 
     def __init__(self, states, responses=None):
-        super().__init__({("POST", "/admin/pairing"): ITEM,
-                          ("GET", "/admin/home"): {"name": "green-house"},
-                          ("DELETE", "/admin/pairing/p1"): None, **(responses or {})})
+        super().__init__({("POST", "/home/pairing"): ITEM,
+                          ("GET", "/home"): {"name": "green-house"},
+                          ("DELETE", "/home/pairing/p1"): None, **(responses or {})})
         self.states = list(states)
 
     def request(self, method, path, body=None, accept=()):
@@ -51,7 +51,7 @@ def test_pair_without_home_name_still_shows_code(use_api, home):
     # sin nombre de casa (sin permiso, o una respuesta con otra forma, #426): el código se
     # muestra igual, sin la frase «con la casa»
     use_api(PollingApi([{"state": "used", "client_id": "c0ffee00-1", "client_name": "tele"}],
-                       responses={("GET", "/admin/home"): home}))
+                       responses={("GET", "/home"): home}))
     r = run("pair", "--type", "screen")
     assert r.exit_code == 0, r.output
     assert "482 913" in r.output and "con la casa" not in r.output
@@ -80,7 +80,7 @@ def test_pair_ctrl_c_cancels_code(use_api):
     r = run("pair")
     assert r.exit_code == 1
     assert "Código anulado" in r.output
-    assert ("DELETE", "/admin/pairing/p1", None) in fake.calls
+    assert ("DELETE", "/home/pairing/p1", None) in fake.calls
 
 
 def test_pair_error_while_waiting_cancels_code(use_api):
@@ -89,14 +89,15 @@ def test_pair_error_while_waiting_cancels_code(use_api):
     fake = use_api(PollingApi([{}, ApiError("El gateway no responde", 3)]))
     r = run("pair")
     assert r.exit_code == 3
-    assert ("DELETE", "/admin/pairing/p1", None) in fake.calls
+    assert ("DELETE", "/home/pairing/p1", None) in fake.calls
 
 
 def test_pair_no_wait_json(use_api):
     fake = use_api(PollingApi([]))
     r = run("--json", "pair", "--no-wait")
     assert r.exit_code == 0, r.output
-    assert json.loads(r.output) == {"id": "p1", "code": "482913", "expires_at": ITEM["expires_at"]}
+    assert json.loads(r.output) == {"id": "p1", "code": "482913", "expires_at": ITEM["expires_at"],
+                                    "scopes": ["conversations:write"]}
     assert [c[0] for c in fake.calls] == ["POST"]
 
 
@@ -121,6 +122,17 @@ def test_pair_template_body(use_api):
             "--allowed-agent", "j-assistant", "--set", "tts_voice=ef_dora",
             "--set", "push_enabled:=false")
     assert r.exit_code == 0, r.output
-    assert fake.calls[0] == ("POST", "/admin/pairing", {
+    assert fake.calls[0] == ("POST", "/home/pairing", {
         "name": "tele", "client_type": "screen", "default_agent": "j-assistant",
         "allowed_agents": ["j-assistant"], "tts_voice": "ef_dora", "push_enabled": False})
+
+
+def test_pair_scopes_go_in_the_template_and_are_shown(use_api):
+    # #410: el administrador elige qué concede el código; un aparato del hogar, nunca home:admin.
+    item = {**ITEM, "template": {"scopes": ["conversations:write", "home:read"]}}
+    fake = use_api(PollingApi([], responses={("POST", "/home/pairing"): item}))
+    r = run("pair", "--no-wait", "--scope", "conversations:write", "--scope", "home:read")
+    assert r.exit_code == 0, r.output
+    assert fake.calls[0][2] == {"scopes": ["conversations:write", "home:read"]}
+    assert "conversations:write, home:read" in r.output
+    assert run("pair", "--no-wait", "--scope", "home:admin").exit_code == 2

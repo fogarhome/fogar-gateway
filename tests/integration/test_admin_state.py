@@ -1,4 +1,4 @@
-"""/admin/state y /admin/state/stream (#219): instantánea viva sin texto ni claves."""
+"""/system/state y /system/state/stream (#219): instantánea viva sin texto ni claves."""
 
 import asyncio
 import json
@@ -9,7 +9,7 @@ import pytest
 
 from tests.integration.conftest import CLIENT_ID, CLIENT_NAME, VALID_KEY
 
-ROUTES = ["/admin/state", "/admin/state/stream"]
+ROUTES = ["/system/state", "/system/state/stream"]
 
 SNAPSHOT_KEYS = {
     "session_id",
@@ -51,7 +51,7 @@ def test_state_shape_with_active_session(client, admin_headers):
         else:
             pytest.fail("sin turn_end")
 
-        r = client.get("/admin/state", headers=admin_headers)
+        r = client.get("/system/state", headers=admin_headers)
 
     assert r.status_code == 200
     body = r.json()
@@ -83,13 +83,13 @@ def test_state_shape_with_active_session(client, admin_headers):
 
 
 async def test_state_stream_emits_and_stops_when_request_reports_disconnect(client, monkeypatch):
-    import fogar_gateway.api.admin_routes as admin_routes
+    import fogar_gateway.api.system_routes as system_routes
     from fogar_gateway.main import app
 
-    monkeypatch.setattr(admin_routes, "STATE_STREAM_INTERVAL_S", 0.01)
+    monkeypatch.setattr(system_routes, "STATE_STREAM_INTERVAL_S", 0.01)
     request = SimpleNamespace(app=app, is_disconnected=AsyncMock(side_effect=[False, False, True]))
 
-    resp = await admin_routes.get_state_stream(request)
+    resp = await system_routes.get_state_stream(request)
     assert resp.media_type == "text/event-stream"
     # D-r6-5: que un proxy (nginx) no retenga los eventos.
     assert resp.headers["cache-control"] == "no-cache"
@@ -115,31 +115,31 @@ async def test_state_stream_emits_and_stops_when_request_reports_disconnect(clie
 
 async def test_state_counts_open_streams_for_the_onboard(client, monkeypatch):
     """`gateway.dashboards`: flujos abiertos ahora (el onboard espera a que haya uno)."""
-    import fogar_gateway.api.admin_routes as admin_routes
+    import fogar_gateway.api.system_routes as system_routes
     from fogar_gateway.main import app
 
-    monkeypatch.setattr(admin_routes, "STATE_STREAM_INTERVAL_S", 0.01)
+    monkeypatch.setattr(system_routes, "STATE_STREAM_INTERVAL_S", 0.01)
     request = SimpleNamespace(app=app, is_disconnected=AsyncMock(side_effect=[False, False, True]))
-    stream = (await admin_routes.get_state_stream(request)).body_iterator
+    stream = (await system_routes.get_state_stream(request)).body_iterator
 
     first = await anext(stream)
     text = first if isinstance(first, str) else first.decode()
     assert json.loads(text[len("data: ") :])["gateway"]["dashboards"] == 1
-    assert admin_routes._build_state(app)["gateway"]["dashboards"] == 1
+    assert system_routes._build_state(app)["gateway"]["dashboards"] == 1
     _ = [c async for c in stream]  # el cliente se va: el contador vuelve a 0
-    assert admin_routes._build_state(app)["gateway"]["dashboards"] == 0
+    assert system_routes._build_state(app)["gateway"]["dashboards"] == 0
 
 
 async def test_state_stream_ends_by_itself_after_max_lifetime(client, monkeypatch):
     """Sin desconexión: el stream termina solo tras STATE_STREAM_MAX_S (no bloquea el apagado)."""
-    import fogar_gateway.api.admin_routes as admin_routes
+    import fogar_gateway.api.system_routes as system_routes
     from fogar_gateway.main import app
 
-    monkeypatch.setattr(admin_routes, "STATE_STREAM_INTERVAL_S", 0.01)
-    monkeypatch.setattr(admin_routes, "STATE_STREAM_MAX_S", 0.05)
+    monkeypatch.setattr(system_routes, "STATE_STREAM_INTERVAL_S", 0.01)
+    monkeypatch.setattr(system_routes, "STATE_STREAM_MAX_S", 0.05)
     request = SimpleNamespace(app=app, is_disconnected=AsyncMock(return_value=False))
 
-    resp = await admin_routes.get_state_stream(request)
+    resp = await system_routes.get_state_stream(request)
 
     async def drain():
         return [c async for c in resp.body_iterator]
@@ -157,7 +157,7 @@ def test_state_skips_bridge_whose_snapshot_fails(client, admin_headers):
 
     app.state.client_registry.register("bad", _Bad())
     try:
-        r = client.get("/admin/state", headers=admin_headers)
+        r = client.get("/system/state", headers=admin_headers)
     finally:
         app.state.client_registry.unregister("bad", app.state.client_registry.get("bad"))
     assert r.status_code == 200
@@ -172,7 +172,7 @@ ACCESS_KEYS = {"state", "last_error", "scopes", "admin", "auth_method", "pairing
 
 
 def test_state_orchestrator_access_before_connecting(client, admin_headers):
-    orch = client.get("/admin/state", headers=admin_headers).json()["services"]["orchestrator"]
+    orch = client.get("/system/state", headers=admin_headers).json()["services"]["orchestrator"]
     assert set(orch) == ACCESS_KEYS
     assert orch["scopes"] is None and orch["admin"] is False
     assert orch["auth_method"] is None and orch["pairing"] == "unknown"
@@ -185,7 +185,7 @@ def test_state_orchestrator_access_connected_with_admin(client, admin_headers):
     access.auth_method = "device_token"
     access.pairing = "paired"
     access.device_id = "ab" * 32
-    orch = client.get("/admin/state", headers=admin_headers).json()["services"]["orchestrator"]
+    orch = client.get("/system/state", headers=admin_headers).json()["services"]["orchestrator"]
     assert orch["admin"] is True and orch["scopes"][-1] == "operator.admin"
     assert orch["auth_method"] == "device_token" and orch["pairing"] == "paired"
     assert orch["device_id"] == "ab" * 32 and orch["pairing_request_id"] is None
@@ -195,7 +195,7 @@ def test_state_orchestrator_pairing_pending(client, admin_headers):
     access = client.app.state.openclaw_access
     access.pairing = "pending"
     access.pairing_request_id = "req-7"
-    orch = client.get("/admin/state", headers=admin_headers).json()["services"]["orchestrator"]
+    orch = client.get("/system/state", headers=admin_headers).json()["services"]["orchestrator"]
     assert orch["pairing"] == "pending" and orch["pairing_request_id"] == "req-7"
     assert orch["admin"] is False
     # La frase y el comando salen del gateway, el mismo texto que la CLI (una sola fuente).
@@ -206,7 +206,7 @@ def test_state_orchestrator_identity_required_says_why(client, admin_headers):
     access = client.app.state.openclaw_access
     access.pairing = "identity_required"
     access.identity_error = "challenge_without_nonce"
-    orch = client.get("/admin/state", headers=admin_headers).json()["services"]["orchestrator"]
+    orch = client.get("/system/state", headers=admin_headers).json()["services"]["orchestrator"]
     assert orch["identity_error_text"] == (
         "este OpenClaw no manda nonce en el reto y no hay nada que firmar"
     )
@@ -214,8 +214,8 @@ def test_state_orchestrator_identity_required_says_why(client, admin_headers):
 
 
 async def test_state_reflects_a_real_pairing_flow(tmp_path, monkeypatch):
-    """OpenClawClient real contra el fake remoto; /admin/state lee el mismo objeto de acceso."""
-    import fogar_gateway.api.admin_routes as admin_routes
+    """OpenClawClient real contra el fake remoto; /system/state lee el mismo objeto de acceso."""
+    import fogar_gateway.api.system_routes as system_routes
     from fogar_gateway.main import app
     from fogar_gateway.services.channel import ChannelHub
     from fogar_gateway.services.openclaw.client import OpenClawClient, OrchestratorPairingRequired
@@ -242,15 +242,15 @@ async def test_state_reflects_a_real_pairing_flow(tmp_path, monkeypatch):
                                 device_store=DeviceStore(tmp_path / "d.json"), access=access)
         with pytest.raises(OrchestratorPairingRequired):
             await client.connect()
-        orch = admin_routes._build_state(app)["services"]["orchestrator"]
+        orch = system_routes._build_state(app)["services"]["orchestrator"]
         assert orch["pairing"] == "pending" and orch["pairing_request_id"] == "req-1"
         assert orch["last_error"] == "orchestrator_pairing_required"
         server.approve()
         await client.connect()
-        orch = admin_routes._build_state(app)["services"]["orchestrator"]
+        orch = system_routes._build_state(app)["services"]["orchestrator"]
         assert orch["pairing"] == "paired" and orch["admin"] is True
         assert "devtok" not in json.dumps(orch)
         await client.close()  # sin conexión: el acceso vuelve a desconocido
-        orch = admin_routes._build_state(app)["services"]["orchestrator"]
+        orch = system_routes._build_state(app)["services"]["orchestrator"]
         assert orch["pairing"] == "unknown" and orch["admin"] is False
         assert orch["device_id"] is not None

@@ -1,4 +1,4 @@
-"""Tests para /admin/clients/* CRUD."""
+"""Tests para /home/devices/* CRUD."""
 
 import pytest
 from sqlalchemy.pool import StaticPool
@@ -46,7 +46,7 @@ def http(db_engine):
 
 
 def test_create_client_minimal(http):
-    r = http.post("/admin/clients", json={"name": "ESP32"}, headers=HEADERS)
+    r = http.post("/home/devices", json={"name": "ESP32"}, headers=HEADERS)
     assert r.status_code == 201
     data = r.json()
     assert data["name"] == "ESP32"
@@ -59,7 +59,7 @@ def test_create_client_ignores_legacy_barge_in_fields(http):
     """#406: the barge-in left the gateway; an older CLI or web still sending its fields gets
     201 (the fields ignored), not 422."""
     body = {"name": "Old CLI", "barge_in_enabled": False, "barge_in_min_chars": 9}
-    r = http.post("/admin/clients", json=body, headers=HEADERS)
+    r = http.post("/home/devices", json=body, headers=HEADERS)
     assert r.status_code == 201, r.text
     data = r.json()
     assert "barge_in_enabled" not in data and "barge_in_min_chars" not in data
@@ -75,7 +75,7 @@ def test_create_client_full(http):
         "stt_language": "en",
         "silence_timeout_s": 3.5,
     }
-    r = http.post("/admin/clients", json=body, headers=HEADERS)
+    r = http.post("/home/devices", json=body, headers=HEADERS)
     assert r.status_code == 201
     data = r.json()
     assert data["client_type"] == "ha"
@@ -90,7 +90,7 @@ def test_create_client_with_empty_allowed_agents_denies_all(http):
     as [] through storage, not collapse to None (unrestricted) via a Python
     truthy check on the empty list."""
     r = http.post(
-        "/admin/clients",
+        "/home/devices",
         json={"name": "locked-down", "allowed_agents": []},
         headers=HEADERS,
     )
@@ -102,15 +102,15 @@ def test_create_client_with_empty_allowed_agents_denies_all(http):
 
 
 def test_list_clients_empty(http):
-    r = http.get("/admin/clients", headers=HEADERS)
+    r = http.get("/home/devices", headers=HEADERS)
     assert r.status_code == 200
     assert r.json() == []
 
 
 def test_list_clients_after_creates(http):
-    http.post("/admin/clients", json={"name": "A"}, headers=HEADERS)
-    http.post("/admin/clients", json={"name": "B"}, headers=HEADERS)
-    r = http.get("/admin/clients", headers=HEADERS)
+    http.post("/home/devices", json={"name": "A"}, headers=HEADERS)
+    http.post("/home/devices", json={"name": "B"}, headers=HEADERS)
+    r = http.get("/home/devices", headers=HEADERS)
     assert r.status_code == 200
     assert len(r.json()) == 2
 
@@ -119,14 +119,14 @@ def test_list_clients_after_creates(http):
 
 
 def test_get_client(http):
-    created = http.post("/admin/clients", json={"name": "X"}, headers=HEADERS).json()
-    r = http.get(f"/admin/clients/{created['id']}", headers=HEADERS)
+    created = http.post("/home/devices", json={"name": "X"}, headers=HEADERS).json()
+    r = http.get(f"/home/devices/{created['id']}", headers=HEADERS)
     assert r.status_code == 200
     assert r.json()["id"] == created["id"]
 
 
 def test_get_client_not_found(http):
-    r = http.get("/admin/clients/nonexistent", headers=HEADERS)
+    r = http.get("/home/devices/nonexistent", headers=HEADERS)
     assert r.status_code == 404
 
 
@@ -134,12 +134,12 @@ def test_get_client_not_found(http):
 
 
 def test_read_endpoints_never_return_client_key(http):
-    created = http.post("/admin/clients", json={"name": "K"}, headers=HEADERS).json()
+    created = http.post("/home/devices", json={"name": "K"}, headers=HEADERS).json()
     key, cid = created["client_key"], created["id"]
     responses = [
-        http.get("/admin/clients", headers=HEADERS),
-        http.get(f"/admin/clients/{cid}", headers=HEADERS),
-        http.patch(f"/admin/clients/{cid}", json={"name": "K2"}, headers=HEADERS),
+        http.get("/home/devices", headers=HEADERS),
+        http.get(f"/home/devices/{cid}", headers=HEADERS),
+        http.patch(f"/home/devices/{cid}", json={"name": "K2"}, headers=HEADERS),
     ]
     for r in responses:
         assert r.status_code == 200
@@ -152,8 +152,8 @@ def test_read_endpoints_never_return_client_key(http):
 
 
 def test_rotate_key_returns_new_key_and_fp(http):
-    cid = http.post("/admin/clients", json={"name": "R"}, headers=HEADERS).json()["id"]
-    data = http.post(f"/admin/clients/{cid}/rotate-key", headers=HEADERS).json()
+    cid = http.post("/home/devices", json={"name": "R"}, headers=HEADERS).json()["id"]
+    data = http.post(f"/home/devices/{cid}/rotate-key", headers=HEADERS).json()
     assert data["key_fp"] == fingerprint_key(data["client_key"])
 
 
@@ -161,16 +161,16 @@ def test_rotate_key_returns_new_key_and_fp(http):
 
 
 def test_patch_client_name(http):
-    created = http.post("/admin/clients", json={"name": "Old"}, headers=HEADERS).json()
-    r = http.patch(f"/admin/clients/{created['id']}", json={"name": "New"}, headers=HEADERS)
+    created = http.post("/home/devices", json={"name": "Old"}, headers=HEADERS).json()
+    r = http.patch(f"/home/devices/{created['id']}", json={"name": "New"}, headers=HEADERS)
     assert r.status_code == 200
     assert r.json()["name"] == "New"
 
 
 def test_patch_client_config(http):
-    created = http.post("/admin/clients", json={"name": "C"}, headers=HEADERS).json()
+    created = http.post("/home/devices", json={"name": "C"}, headers=HEADERS).json()
     r = http.patch(
-        f"/admin/clients/{created['id']}",
+        f"/home/devices/{created['id']}",
         json={"tts_voice": "en_heart", "push_enabled": False},
         headers=HEADERS,
     )
@@ -180,8 +180,8 @@ def test_patch_client_config(http):
 
 
 def test_patch_deactivate(http):
-    created = http.post("/admin/clients", json={"name": "D"}, headers=HEADERS).json()
-    r = http.patch(f"/admin/clients/{created['id']}", json={"is_active": False}, headers=HEADERS)
+    created = http.post("/home/devices", json={"name": "D"}, headers=HEADERS).json()
+    r = http.patch(f"/home/devices/{created['id']}", json={"is_active": False}, headers=HEADERS)
     assert r.json()["is_active"] is False
 
 
@@ -189,10 +189,10 @@ def test_patch_deactivate(http):
 
 
 def test_delete_client(http):
-    created = http.post("/admin/clients", json={"name": "Del"}, headers=HEADERS).json()
-    r = http.delete(f"/admin/clients/{created['id']}", headers=HEADERS)
+    created = http.post("/home/devices", json={"name": "Del"}, headers=HEADERS).json()
+    r = http.delete(f"/home/devices/{created['id']}", headers=HEADERS)
     assert r.status_code == 204
-    r2 = http.get(f"/admin/clients/{created['id']}", headers=HEADERS)
+    r2 = http.get(f"/home/devices/{created['id']}", headers=HEADERS)
     assert r2.status_code == 404
 
 
@@ -200,9 +200,9 @@ def test_delete_client(http):
 
 
 def test_rotate_key(http):
-    created = http.post("/admin/clients", json={"name": "R"}, headers=HEADERS).json()
+    created = http.post("/home/devices", json={"name": "R"}, headers=HEADERS).json()
     old_key = created["client_key"]
-    r = http.post(f"/admin/clients/{created['id']}/rotate-key", headers=HEADERS)
+    r = http.post(f"/home/devices/{created['id']}/rotate-key", headers=HEADERS)
     assert r.status_code == 200
     new_key = r.json()["client_key"]
     assert new_key != old_key
@@ -213,12 +213,12 @@ def test_rotate_key(http):
 
 
 def test_missing_token_returns_401(http):
-    r = http.get("/admin/clients")
+    r = http.get("/home/devices")
     assert r.status_code == 401
 
 
 def test_wrong_token_returns_401(http):
-    r = http.get("/admin/clients", headers={"x-admin-token": "bad"})
+    r = http.get("/home/devices", headers={"x-admin-token": "bad"})
     assert r.status_code == 401
 
 
@@ -226,21 +226,21 @@ def test_wrong_token_returns_401(http):
 
 
 def test_create_client_tool_calls_enabled_defaults_false(http):
-    r = http.post("/admin/clients", json={"name": "T"}, headers=HEADERS)
+    r = http.post("/home/devices", json={"name": "T"}, headers=HEADERS)
     assert r.status_code == 201
     assert r.json()["tool_calls_enabled"] is False
 
 
 def test_create_client_tool_calls_enabled_explicit_true(http):
-    r = http.post("/admin/clients", json={"name": "T", "tool_calls_enabled": True}, headers=HEADERS)
+    r = http.post("/home/devices", json={"name": "T", "tool_calls_enabled": True}, headers=HEADERS)
     assert r.status_code == 201
     assert r.json()["tool_calls_enabled"] is True
 
 
 def test_patch_client_tool_calls_enabled(http):
-    created = http.post("/admin/clients", json={"name": "C"}, headers=HEADERS).json()
+    created = http.post("/home/devices", json={"name": "C"}, headers=HEADERS).json()
     r = http.patch(
-        f"/admin/clients/{created['id']}",
+        f"/home/devices/{created['id']}",
         json={"tool_calls_enabled": True},
         headers=HEADERS,
     )
@@ -256,7 +256,7 @@ def test_patch_client_tool_calls_enabled(http):
 
 def test_create_client_ignores_system_prompt_extra(http):
     r = http.post(
-        "/admin/clients",
+        "/home/devices",
         json={"name": "Legacy", "system_prompt_extra": "Habla en inglés"},
         headers=HEADERS,
     )
@@ -266,9 +266,9 @@ def test_create_client_ignores_system_prompt_extra(http):
 
 
 def test_patch_client_ignores_system_prompt_extra(http):
-    created = http.post("/admin/clients", json={"name": "Legacy"}, headers=HEADERS).json()
+    created = http.post("/home/devices", json={"name": "Legacy"}, headers=HEADERS).json()
     r = http.patch(
-        f"/admin/clients/{created['id']}",
+        f"/home/devices/{created['id']}",
         json={"system_prompt_extra": "Habla en inglés"},
         headers=HEADERS,
     )
@@ -278,26 +278,26 @@ def test_patch_client_ignores_system_prompt_extra(http):
 
 @pytest.mark.parametrize("client_type", ["ha", "esp32", "web", "app", "screen"])
 def test_create_client_accepts_known_client_types(http, client_type):
-    r = http.post("/admin/clients", json={"name": "X", "client_type": client_type}, headers=HEADERS)
+    r = http.post("/home/devices", json={"name": "X", "client_type": client_type}, headers=HEADERS)
     assert r.status_code == 201
     assert r.json()["client_type"] == client_type
 
 
 def test_create_client_rejects_unknown_client_type(http):
-    r = http.post("/admin/clients", json={"name": "X", "client_type": "esp23"}, headers=HEADERS)
+    r = http.post("/home/devices", json={"name": "X", "client_type": "esp23"}, headers=HEADERS)
     assert r.status_code == 422
 
 
 def test_create_client_rejects_unknown_output_mode(http):
     r = http.post(
-        "/admin/clients", json={"name": "X", "output_mode": ["audio", "video"]}, headers=HEADERS
+        "/home/devices", json={"name": "X", "output_mode": ["audio", "video"]}, headers=HEADERS
     )
     assert r.status_code == 422
 
 
 def test_create_client_accepts_known_output_modes(http):
     r = http.post(
-        "/admin/clients",
+        "/home/devices",
         json={"name": "X", "output_mode": ["audio", "text", "status"]},
         headers=HEADERS,
     )
@@ -306,8 +306,8 @@ def test_create_client_accepts_known_output_modes(http):
 
 
 def test_patch_client_rejects_unknown_client_type_and_output_mode(http):
-    created = http.post("/admin/clients", json={"name": "X"}, headers=HEADERS).json()
-    url = f"/admin/clients/{created['id']}"
+    created = http.post("/home/devices", json={"name": "X"}, headers=HEADERS).json()
+    url = f"/home/devices/{created['id']}"
     assert http.patch(url, json={"client_type": "toaster"}, headers=HEADERS).status_code == 422
     assert http.patch(url, json={"output_mode": ["smell"]}, headers=HEADERS).status_code == 422
     # El rechazo no debe haber mutado nada.
@@ -323,7 +323,7 @@ def test_legacy_row_with_unknown_client_type_is_still_readable(http, db_engine):
         s.add(rec)
         s.commit()
         client_id = rec.id
-    r = http.get(f"/admin/clients/{client_id}", headers=HEADERS)
+    r = http.get(f"/home/devices/{client_id}", headers=HEADERS)
     assert r.status_code == 200
     assert r.json()["client_type"] == "e2e-test"
 
@@ -332,10 +332,10 @@ def test_the_db_never_holds_a_client_key(http, db_engine):
     """M20: solo el SHA-256 de la clave; la clave sale una vez (crear, rotar) y nunca se guarda."""
     from sqlalchemy import text
 
-    created = http.post("/admin/clients", json={"name": "A"}, headers=HEADERS).json()
-    rotated = http.post(f"/admin/clients/{created['id']}/rotate-key", headers=HEADERS).json()
+    created = http.post("/home/devices", json={"name": "A"}, headers=HEADERS).json()
+    rotated = http.post(f"/home/devices/{created['id']}/rotate-key", headers=HEADERS).json()
     imported = "imported-key-" + "x" * 32
-    r = http.post("/admin/clients", json={"name": "B", "client_key": imported}, headers=HEADERS)
+    r = http.post("/home/devices", json={"name": "B", "client_key": imported}, headers=HEADERS)
     assert r.status_code == 201
     with db_engine.connect() as c:
         dump = "\n".join(c.connection.iterdump())

@@ -35,7 +35,7 @@ export interface StateStreamOptions {
 const MAX_BACKOFF_MS = 30_000
 
 /**
- * Sigue /admin/state/stream. `EventSource` no puede mandar cabeceras (el Bearer), así que se lee con
+ * Sigue /system/state/stream. `EventSource` no puede mandar cabeceras (el Bearer), así que se lee con
  * fetch. El gateway corta cada flujo a los 25 s (STATE_STREAM_MAX_S): se reabre al momento.
  * Si falla, reintenta con espera creciente (1 s → 30 s). Con la pestaña oculta se para.
  * Devuelve la función que lo detiene.
@@ -52,7 +52,7 @@ export function openStateStream(options: StateStreamOptions): () => void {
     controller = ctrl
     const decoder = new TextDecoder()
     try {
-      const response = await fetch('/admin/state/stream', {
+      const response = await fetch('/system/state/stream', {
         headers: { Authorization: `Bearer ${options.token}`, Accept: 'text/event-stream' },
         signal: ctrl.signal,
       })

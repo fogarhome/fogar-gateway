@@ -850,7 +850,7 @@ class ConversationChannel:
             and not self._abort_on_reconnect
         )
 
-    # -- state for the sessions (watchdogs, /admin/state) ------------------------------
+    # -- state for the sessions (watchdogs, /system/state) ------------------------------
 
     def user_turn_running(self) -> bool:
         """A message of this channel is still in flight: waiting for its ack, queued in

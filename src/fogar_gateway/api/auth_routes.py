@@ -31,12 +31,12 @@ from typing import Any, cast
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session, select
 
-from fogar_gateway.api.admin_routes import (
+from fogar_gateway.api.deps import PersonalCaller, current_caller
+from fogar_gateway.api.home_routes import (
     close_client_sessions,
     create_client_record,
     retire_client,
 )
-from fogar_gateway.api.deps import PersonalCaller, current_caller
 from fogar_gateway.core.logging import fingerprint_key
 from fogar_gateway.db.database import get_engine
 from fogar_gateway.db.models import ClientRecord, HomeRecord, MembershipRecord, UserRecord

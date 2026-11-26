@@ -583,7 +583,7 @@ a challenge/`hello`/`hello.payload` that is not a JSON object all raise
 retried by the reconnect loop like any failed connect (the one exception, the retryable
 `startup-sidecars` `UNAVAILABLE`, is first retried inside `connect()` itself — see "OpenClaw
 still starting" below). `ReconnectingOpenClawClient`'s
-`last_error` (exposed by `GET /admin/orchestrator/status`) holds that code, or just the
+`last_error` (exposed by `GET /system/services/orchestrator`) holds that code, or just the
 exception type name (`OSError`, `TimeoutError`...) for anything else. The same `last_error`
 rule applies to every wrapper that goes through `reconnect_with_backoff`.
 
@@ -894,7 +894,7 @@ remote connection.
   (identity file unusable, or a challenge without nonce) raises
   `OrchestratorDeviceIdentityRequired` (`orchestrator_device_identity_required`, `cause`
   `identity_file_invalid`|`challenge_without_nonce`) and never suggests `devices approve`.
-- `/admin/state` (`services.orchestrator`), `fogar-gw status` and `fogar-gw doctor` show the
+- `/system/state` (`services.orchestrator`), `fogar-gw status` and `fogar-gw doctor` show the
   granted scopes, `admin`, `auth_method` (`shared_token`|`device_token`), `pairing`
   (`unknown`|`not_required`|`paired`|`pending`|`identity_required`) with the request id or the
   `identity_error`, and the deviceId (public: `openclaw devices list` shows it). This is the access

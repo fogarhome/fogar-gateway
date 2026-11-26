@@ -1,8 +1,8 @@
-"""Integration tests for /admin/orchestrator/status and /admin/orchestrator/reconnect."""
+"""Integration tests for /system/services/orchestrator and /system/services/orchestrator/reconnect."""
 
 
 def test_get_orchestrator_status_connected(client, admin_headers):
-    response = client.get("/admin/orchestrator/status", headers=admin_headers)
+    response = client.get("/system/services/orchestrator", headers=admin_headers)
     assert response.status_code == 200
     data = response.json()
     assert data["name"] == "openclaw"
@@ -19,12 +19,12 @@ def test_old_named_routes_are_gone(client, admin_headers):
 
 
 def test_get_orchestrator_status_requires_admin_token(client):
-    response = client.get("/admin/orchestrator/status")
+    response = client.get("/system/services/orchestrator")
     assert response.status_code == 401
 
 
 def test_post_orchestrator_reconnect_accepted(client, admin_headers):
-    response = client.post("/admin/orchestrator/reconnect", headers=admin_headers)
+    response = client.post("/system/services/orchestrator/reconnect", headers=admin_headers)
     assert response.status_code == 202
 
 
@@ -35,7 +35,7 @@ def test_post_orchestrator_reconnect_triggers_without_blocking_connect(
     not the blocking connect() directly. #272: no job id any more."""
     connect_calls_before = mock_registry.connect.call_count
 
-    response = client.post("/admin/orchestrator/reconnect", headers=admin_headers)
+    response = client.post("/system/services/orchestrator/reconnect", headers=admin_headers)
 
     assert response.status_code == 202
     assert response.json() == {"accepted": True}
@@ -49,7 +49,7 @@ def test_post_orchestrator_reconnect_not_accepted_when_connected(
     """Already CONNECTED: reconnecting would tear down a healthy socket."""
     mock_registry.trigger_reconnect.return_value = False
 
-    response = client.post("/admin/orchestrator/reconnect", headers=admin_headers)
+    response = client.post("/system/services/orchestrator/reconnect", headers=admin_headers)
 
     assert response.status_code == 202
     assert response.json() == {"accepted": False}

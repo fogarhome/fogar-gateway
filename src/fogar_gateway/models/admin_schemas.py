@@ -1,7 +1,7 @@
 """
 admin_schemas.py
 ~~~~~~~~~~~~~~~~
-Schemas Pydantic para la API de administración /admin/clients/*.
+Schemas Pydantic para la API de administración /home/devices/*.
 
 Separados de schemas.py (modelos runtime del bridge) para no mezclar
 contratos internos con la interfaz HTTP de administración.
@@ -248,7 +248,7 @@ NotifyClientId = Annotated[str, StringConstraints(strip_whitespace=True, min_len
 
 
 class HomeUpdate(BaseModel):
-    """`PATCH /admin/home`: `agent: null` vuelve a la cascada de siempre; `notify_client_id`, el
+    """`PATCH /home`: `agent: null` vuelve a la cascada de siempre; `notify_client_id`, el
     dispositivo de avisos del hogar (`null` lo quita)."""
 
     model_config = ConfigDict(extra="forbid")
@@ -290,12 +290,12 @@ class LoginRequest(BaseModel):
 # Parámetros de las rutas (FastAPI valida Path/Query, no un Field suelto).
 ConversationIdPath = Annotated[str, Path(min_length=1, max_length=200)]
 ClientIdFilter = Annotated[str | None, Query(min_length=1, max_length=200)]
-# Mensajes de `GET /admin/conversations/{id}/messages` (el tope de `chat.history` es 1000).
+# Mensajes de `GET /conversations/{id}/messages` (el tope de `chat.history` es 1000).
 HistoryLimit = Annotated[int, Query(ge=1, le=1000)]
 
 
 class ConversationCreate(BaseModel):
-    """`POST /admin/conversations`: una conversación nueva del usuario, de su dispositivo. Sin
+    """`POST /conversations`: una conversación nueva del usuario, de su dispositivo. Sin
     `agent`, el de la cascada (`default_agent` del dispositivo, `DEFAULT_AGENT`, el de OpenClaw)."""
 
     model_config = ConfigDict(extra="forbid")
@@ -320,7 +320,7 @@ class ConversationResponse(BaseModel):
 
 
 class ConversationAgents(BaseModel):
-    """`GET /admin/conversations/agents`: con qué agentes puede empezar quien llama una conversación
+    """`GET /conversations/agents`: con qué agentes puede empezar quien llama una conversación
     y cuál tocaría sin elegir (None si el de la cascada no le está permitido)."""
 
     agents: list[str]

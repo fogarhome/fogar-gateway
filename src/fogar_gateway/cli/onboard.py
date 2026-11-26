@@ -271,7 +271,7 @@ def _owner(ctx: click.Context, out: Out, answers: Any) -> str | None:
     """La cuenta del dueño (M20): con ella se entra en el dashboard; el `ADMIN_TOKEN` queda para
     la CLI y la recuperación. Si ya hay un dueño activo, no pregunta. Devuelve su usuario."""
     client = api.from_context(ctx)
-    owner = next((u for u in client.request("GET", "/admin/users")
+    owner = next((u for u in client.request("GET", "/home/users")
                   if u["role"] == "owner" and u["is_active"]), None)
     if owner is not None:
         out.ok(f"Ya hay dueño: «{owner['username']}».")
@@ -281,7 +281,7 @@ def _owner(ctx: click.Context, out: Out, answers: Any) -> str | None:
             out.message("Sin dueño: créalo con `fogar-gw users add NOMBRE --role owner`.", MUTED)
             return None
         body = {**answers.owner.model_dump(), "role": "owner"}
-        return str(client.request("POST", "/admin/users", body)["username"])
+        return str(client.request("POST", "/home/users", body)["username"])
     import getpass
     import re
 
@@ -295,7 +295,7 @@ def _owner(ctx: click.Context, out: Out, answers: Any) -> str | None:
             out.warn("No coinciden; otra vez.")
             continue
         try:
-            created = client.request("POST", "/admin/users", {
+            created = client.request("POST", "/home/users", {
                 "username": username, "display_name": name, "password": password, "role": "owner",
             })
         except api.ApiError as e:  # contraseña corta, nombre no válido o ya usado: se repite
@@ -312,9 +312,9 @@ def _first_client(ctx: click.Context, out: Out, answers: Any) -> None:
     if not (answers and answers.first_client):
         return
     client = api.from_context(ctx)
-    if not client.request("GET", "/admin/clients"):
+    if not client.request("GET", "/home/devices"):
         body = {"name": answers.first_client.name, "client_type": answers.first_client.type}
-        clients._show_key(out, client.request("POST", "/admin/clients", body))
+        clients._show_key(out, client.request("POST", "/home/devices", body))
 
 
 def _enter_pressed(timeout: float) -> bool:
@@ -372,7 +372,7 @@ def _poll_dashboard(client: Any) -> bool:
     try:
         while True:
             try:
-                state = client.request("GET", "/admin/state")
+                state = client.request("GET", "/system/state")
             except api.ApiError:
                 state = {}
             if state.get("gateway", {}).get("dashboards"):

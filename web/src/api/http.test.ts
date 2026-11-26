@@ -12,7 +12,7 @@ describe('api', () => {
 
   it('un 503 de /admin es «not-configured»', async () => {
     reply(503, { detail: 'admin disabled' })
-    await expect(api('/admin/state')).rejects.toMatchObject({ kind: 'not-configured', status: 503 })
+    await expect(api('/system/state')).rejects.toMatchObject({ kind: 'not-configured', status: 503 })
   })
 
   it('/ready con OpenClaw caído responde 503 con cuerpo: se lee, no es un error', async () => {
@@ -35,7 +35,7 @@ describe('api', () => {
 
   it('un 403 es «forbidden» y un 429 «too-many»', async () => {
     reply(403, { detail: 'forbidden' })
-    await expect(api('/admin/clients')).rejects.toMatchObject({ kind: 'forbidden', message: 'forbidden' })
+    await expect(api('/home/devices')).rejects.toMatchObject({ kind: 'forbidden', message: 'forbidden' })
     reply(429, { detail: 'too_many_attempts' })
     await expect(api('/auth/login')).rejects.toMatchObject({ kind: 'too-many' })
   })

@@ -53,7 +53,7 @@ class Pairing:
 class PairingStore:
     def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
-        self._lock = threading.Lock()  # /pair y /admin/pairing corren en el threadpool
+        self._lock = threading.Lock()  # /pair y /home/pairing corren en el threadpool
         self._items: dict[str, Pairing] = {}
         self._failed = 0
 

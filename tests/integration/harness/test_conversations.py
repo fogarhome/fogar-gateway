@@ -208,7 +208,7 @@ async def _wait_sessions(harness, n: int) -> None:
     """Espera a que el gateway tenga `n` sesiones vivas (un socket cerrado tarda en soltarse)."""
     async with harness.admin() as admin:
         for _ in range(200):
-            state = (await admin.get("/admin/state")).json()
+            state = (await admin.get("/system/state")).json()
             if state["totals"]["sessions_active"] == n:
                 return
             await asyncio.sleep(0.02)
@@ -368,7 +368,7 @@ async def test_a_new_session_that_fails_its_health_check_leaves_the_live_one_alo
 
 async def test_a_new_conversation_is_saved_only_if_the_session_opens(harness, db_engine):
     """Auditoría 3.0, C-3: un handshake con `"new"` que acaba en 1011 (OpenClaw caído) no deja
-    una conversación vacía en `/admin/conversations` ni en el índice del push."""
+    una conversación vacía en `/conversations` ni en el índice del push."""
     from fogar_gateway.main import app
 
     async def down() -> bool:
@@ -400,7 +400,7 @@ async def test_a_revoked_session_ends_its_open_turn_before_the_close(harness, mo
     await client.collect(lambda m: bool(of_type(m, "turn_start")))
 
     async with harness.admin() as admin:
-        r = await admin.patch(f"/admin/clients/{CLIENT_ID}", json={"is_active": False})
+        r = await admin.patch(f"/home/devices/{CLIENT_ID}", json={"is_active": False})
         assert r.status_code == 200
     closed = await closed_by_gateway(client)
     assert (closed.rcvd.code, closed.rcvd.reason) == (4200, "credential revoked")
@@ -548,7 +548,7 @@ async def test_turn_end_reason_for_each_way_a_turn_ends(harness, monkeypatch):
 async def _login(harness, username: str = "sito") -> dict:
     """Alta del usuario (por la máquina) e inicio de sesión desde un dispositivo nuevo."""
     async with harness.admin() as admin:
-        r = await admin.post("/admin/users", json={
+        r = await admin.post("/home/users", json={
             "username": username, "display_name": username.title(), "password": "contraseña larga",
         })
         assert r.status_code in (201, 409), r.text
@@ -568,7 +568,7 @@ async def test_a_logged_in_device_chats_in_a_private_conversation(harness, caplo
     msgs = await run_turn(me, "hola desde la web")
     assert of_type(msgs, "turn_start")[0]["conversation"] == me.ready["conversation"]["id"]
     async with harness.admin() as admin:
-        rows = (await admin.get("/admin/conversations")).json()
+        rows = (await admin.get("/conversations")).json()
     (row,) = [r for r in rows if r["id"] == me.ready["conversation"]["id"]]
     assert row["owner_user_id"] == session["user"]["id"]  # privada: de su dispositivo
     assert session["token"] not in caplog.text
@@ -578,7 +578,7 @@ async def test_a_user_resumes_a_conversation_created_from_admin(harness):
     session = await _login(harness)
     bearer = {"authorization": f"Bearer {session['token']}"}
     async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{harness.port}") as http:
-        r = await http.post("/admin/conversations", json={}, headers=bearer)
+        r = await http.post("/conversations", json={}, headers=bearer)
         assert r.status_code == 201, r.text
         created = r.json()
     assert (created["client_id"], created["kind"], created["agent"]) == (
@@ -592,9 +592,9 @@ async def test_a_user_resumes_a_conversation_created_from_admin(harness):
     await run_turn(me, "hola")
 
     async with harness.admin() as admin:
-        rows = (await admin.get("/admin/conversations",
+        rows = (await admin.get("/conversations",
                                 params={"client_id": session["client_id"]})).json()
-        history = (await admin.get(f"/admin/conversations/{created['id']}/messages")).json()
+        history = (await admin.get(f"/conversations/{created['id']}/messages")).json()
     (row,) = [r for r in rows if r["id"] == created["id"]]
     assert row["turn_count"] == 1 and row["last_turn_at"] is not None
     assert [(m["role"], m["text"]) for m in history["messages"]] == [

@@ -1,19 +1,19 @@
 """
 conversation_routes.py
 ~~~~~~~~~~~~~~~~~~~~~~
-/admin/conversations — conversaciones (M19). Auth (M20): la máquina (`X-Admin-Token`) las ve
+/conversations — conversaciones (M19). Auth (M20): la máquina (`X-Admin-Token`) las ve
 todas; un usuario (Bearer, cualquier rol) ve las del hogar y las suyas, nunca las privadas de otro,
 y las que crea son suyas (de su dispositivo).
 
-  GET  /admin/conversations                — lista (filtro `client_id`), la última en hablarse
+  GET  /conversations                — lista (filtro `client_id`), la última en hablarse
                                              primero, sin las del día vacías; el título, de OpenClaw
                                              (caché de TITLES_TTL_S; si no responde, null)
-  GET  /admin/conversations/{id}/messages  — lo dicho, de `chat.history` (`limit`, 200 por defecto);
+  GET  /conversations/{id}/messages  — lo dicho, de `chat.history` (`limit`, 200 por defecto);
                                              503 `orchestrator_unavailable` sin OpenClaw
-  POST /admin/conversations                — conversación nueva del usuario, de su dispositivo
+  POST /conversations                — conversación nueva del usuario, de su dispositivo
                                              (agente validado como en el handshake); la máquina,
                                              403 `user_required`
-  GET  /admin/conversations/agents         — los agentes con los que quien llama puede empezar
+  GET  /conversations/agents         — los agentes con los que quien llama puede empezar
                                              una y el que tocaría sin elegir (para su selector)
 
 El gateway no guarda texto: títulos y mensajes se leen de OpenClaw en cada petición y nunca se
@@ -53,7 +53,7 @@ from fogar_gateway.services.scopes import CONVERSATIONS_READ, CONVERSATIONS_WRIT
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/admin/conversations")
+router = APIRouter(prefix="/conversations")
 
 
 def _utc(value: datetime) -> datetime:

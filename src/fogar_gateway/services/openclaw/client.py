@@ -302,7 +302,7 @@ class OpenClawClient:
         # False (`fogar-gw onboard`): always the shared token, so it is what gets tested; the
         # identity still signs, so pairing is detected (and a token issued is still stored).
         self._use_device_token = use_device_token
-        # Updated in place (main.py shares it with /admin/state); never replaced.
+        # Updated in place (main.py shares it with /system/state); never replaced.
         self.access = access if access is not None else OrchestratorAccess()
         self._pairing_logged: str | None = None  # last pending request logged at WARNING
         self._identity_warned = False

@@ -3,7 +3,7 @@ openclaw_access.py
 ~~~~~~~~~~~~~~~~~~
 Cómo se cuenta el acceso del gateway a OpenClaw (M19), igual en `fogar-gw status`, `doctor` y el
 veredicto de `onboard` (`cli/verify.py`). Trabaja sobre el diccionario de
-`OrchestratorAccess.as_dict()`, que es también `services.orchestrator` de `/admin/state`; un
+`OrchestratorAccess.as_dict()`, que es también `services.orchestrator` de `/system/state`; un
 gateway de otra versión puede no traer algún campo. Solo stdlib (más `models`, que también lo es).
 """
 
@@ -16,7 +16,7 @@ from fogar_gateway.services.openclaw.models import (
 )
 
 AUTH_LABELS = {"shared_token": "token compartido", "device_token": "token de dispositivo"}
-IDENTITY_ERRORS = IDENTITY_ERROR_TEXT  # la misma frase que enseña el panel (/admin/state)
+IDENTITY_ERRORS = IDENTITY_ERROR_TEXT  # la misma frase que enseña el panel (/system/state)
 Level = Literal["ok", "info", "warn"]
 
 

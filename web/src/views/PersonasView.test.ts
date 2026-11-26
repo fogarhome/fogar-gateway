@@ -65,7 +65,7 @@ describe('PersonasView: «Avisos del hogar en…»', () => {
     expect(el.textContent).toContain('Elige dónde suenan los avisos')
   })
 
-  it('elegir uno lo guarda con PATCH /admin/home', async () => {
+  it('elegir uno lo guarda con PATCH /home', async () => {
     admin.getHome.mockResolvedValue(home(null))
     admin.updateHome.mockResolvedValue(home('tv'))
     const { el, select } = await mount()

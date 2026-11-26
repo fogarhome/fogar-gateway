@@ -15,7 +15,7 @@ def _chunks():
         yield TOO_BIG[i : i + 64 * 1024]
 
 
-@pytest.mark.parametrize("path", ["/admin/clients", "/pair", "/v1/chat/completions"])
+@pytest.mark.parametrize("path", ["/home/devices", "/pair", "/v1/chat/completions"])
 def test_chunked_body_over_cap_is_413_before_auth_or_parsing(client_untrusted, path):
     # Sin Content-Length (chunked) y sin credenciales: 413, no 422 ni 401.
     r = client_untrusted.post(path, content=_chunks(), headers={"content-type": "application/json"})
@@ -24,14 +24,14 @@ def test_chunked_body_over_cap_is_413_before_auth_or_parsing(client_untrusted, p
 
 
 def test_declared_length_over_cap_is_413(client_untrusted):
-    r = client_untrusted.post("/admin/clients", content=TOO_BIG, headers=ADMIN)
+    r = client_untrusted.post("/home/devices", content=TOO_BIG, headers=ADMIN)
     assert r.status_code == 413
 
 
 def test_body_at_cap_reaches_the_route(client):
     body = b'{"name": "' + b"x" * (MAX_BODY_BYTES - 12) + b'"}'
     assert len(body) == MAX_BODY_BYTES
-    r = client.post("/admin/clients", content=body, headers={**ADMIN, "content-type": "application/json"})
+    r = client.post("/home/devices", content=body, headers={**ADMIN, "content-type": "application/json"})
     assert r.status_code == 422  # name > 200 caracteres: lo valida la ruta, no el tope
 
 

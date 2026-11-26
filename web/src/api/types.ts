@@ -112,12 +112,12 @@ export interface ClientWithKey extends ClientResponse {
 // Emparejamiento: src/api/pairing_routes.py. Códigos de 6 cifras, 10 min, hasta 5 abiertos.
 export type PairingState = 'open' | 'used' | 'expired' | 'cancelled'
 
-/** Plantilla de `POST /admin/pairing`: los campos de crear un cliente, todos opcionales y sin clave. */
+/** Plantilla de `POST /home/pairing`: los campos de crear un cliente, todos opcionales y sin clave. */
 export type PairingTemplate = Partial<Omit<ClientResponse, 'id' | 'key_fp' | 'is_active' | 'created_at' | 'client_type'>> & {
   client_type?: ClientType | null
 }
 
-/** `GET /admin/pairing` y `/{id}`: nunca lleva el código. */
+/** `GET /home/pairing` y `/{id}`: nunca lleva el código. */
 export interface PairingSummary {
   id: string
   state: PairingState
@@ -127,12 +127,12 @@ export interface PairingSummary {
   template: PairingTemplate
 }
 
-/** `POST /admin/pairing`: el código solo llega aquí. */
+/** `POST /home/pairing`: el código solo llega aquí. */
 export interface PairingOpened extends PairingSummary {
   code: string
 }
 
-/** `/admin/orchestrator/status`, `/admin/transcriber/status`, `/admin/tts/status`. */
+/** `/system/services/orchestrator`, `/system/services/transcriber`, `/system/services/tts`. */
 export interface ServiceDetail {
   name: string
   provider?: string
@@ -148,7 +148,7 @@ export interface ReadyResponse {
   services: Record<'orchestrator' | 'transcriber' | 'tts', 'ok' | 'unavailable'>
 }
 
-/** `POST /admin/clients` (sin clave: la genera el gateway) y `PATCH` (solo lo que cambia). */
+/** `POST /home/devices` (sin clave: la genera el gateway) y `PATCH` (solo lo que cambia). */
 export type ClientInput = Partial<Omit<ClientResponse, 'id' | 'key_fp' | 'created_at'>>
 
 // Sesiones en memoria: src/api/admin_routes.py (_session_summary, _session_detail).
@@ -219,7 +219,7 @@ export interface ConversationMessages {
   has_more: boolean
 }
 
-/** `GET /admin/conversations/agents`: con qué agentes puede empezar el panel y cuál tocaría sin elegir. */
+/** `GET /conversations/agents`: con qué agentes puede empezar el panel y cuál tocaría sin elegir. */
 export interface ConversationAgents {
   agents: string[]
   default: string | null

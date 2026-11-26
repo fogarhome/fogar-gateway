@@ -19,7 +19,7 @@ La puerta de entrada de Fogar en casa. Un solo servicio que reconoce cada aparat
 
   Tú, desde casa, Tailscale o tu dominio:
     navegador ──► /           panel web, con tu cuenta (/auth): conversaciones y, si cuidas del hogar, el resto
-    terminal  ──► fogar-gw    CLI sobre /admin/* con ADMIN_TOKEN (doctor, config, servicio, logs, pair, users)
+    terminal  ──► fogar-gw    CLI sobre /home y /system con ADMIN_TOKEN (doctor, config, servicio, logs, pair, users)
 ```
 
 La identidad y la configuración de cada aparato viven en una base de datos SQLite local (`<base>/data/gateway.db`, con `<base>` = `~/.fogar-gateway` por defecto). Requiere OpenClaw **2026.6.11 o posterior**.
@@ -81,7 +81,7 @@ Los dos son públicos: detrás de un proxy o un túnel también llegan desde int
 - **Del hogar**: los que se emparejan con un código (la tele, los altavoces, Home Assistant). No se sabe quién habla: lo que se dice desde ellos es **del hogar**, y desde ellos solo se ven las conversaciones del hogar.
 - **Personales**: cada inicio de sesión (la web, una app). Lo que se dice desde ellos es **privado** de su persona, y desde ellos se ven las suyas y las del hogar. Nadie lee las privadas de otro, tampoco un dueño; solo la CLI con `ADMIN_TOKEN`, que es la máquina.
 
-La privacidad es **dentro de Fogar**: OpenClaw, su panel y sus otros canales (Telegram…) ven todas las sesiones. Cada persona habla con su agente o, si no tiene, con el de lo común (`/admin/home`); si varias comparten agente, comparten su memoria aunque las conversaciones sean privadas, y la web lo avisa.
+La privacidad es **dentro de Fogar**: OpenClaw, su panel y sus otros canales (Telegram…) ven todas las sesiones. Cada persona habla con su agente o, si no tiene, con el de lo común (`/home`); si varias comparten agente, comparten su memoria aunque las conversaciones sean privadas, y la web lo avisa.
 
 | Endpoint | Método | Auth | Descripción |
 |----------|--------|------|-------------|
@@ -96,46 +96,58 @@ El token va como `Authorization: Bearer <token>` por HTTP y como `token` en el W
 
 Las personas se gestionan desde la web (Personas) o con `fogar-gw users`. **Si el dueño pierde la contraseña**, la recuperación es en la máquina del gateway: `fogar-gw users reset-password USUARIO`.
 
-### Admin (`X-Admin-Token` de la máquina, o Bearer con `home:admin`)
+### Hogar, sistema y conversaciones (5.0)
+
+`/admin` ya no existe: cada cosa va bajo su competencia (`/home`, `/system`, `/conversations`). Quien llama: la máquina (`X-Admin-Token`, puede todo) o un aparato con su Bearer y el scope de la columna. En `/home` y `/system` leer es `home:read` y escribir, `home:admin`; `/home/pairing` es todo `home:admin`. Las conversaciones piden `conversations:read` (leer) o `conversations:write` (crear), y además cada aparato solo ve las que le tocan (las del hogar y, si es personal, las de su persona).
+
+| Antes (4.x) | Ahora |
+|---|---|
+| `/admin/clients…` | `/home/devices…` |
+| `/admin/users…`, `/admin/home` | `/home/users…`, `/home` |
+| `/admin/pairing…` | `/home/pairing…` |
+| `/admin/state…`, `/admin/sessions…`, `/admin/access`, `/admin/speech` | `/system/state…`, `/system/sessions…`, `/system/access`, `/system/speech` |
+| `/admin/orchestrator/status`, `/admin/transcriber/status`, `/admin/tts/status`, `/admin/orchestrator/reconnect` | `/system/services/orchestrator`, `…/transcriber`, `…/tts`, `POST /system/services/orchestrator/reconnect` |
+| `/admin/conversations…` | `/conversations…` |
+
 
 | Endpoint | Método | Descripción |
 |----------|--------|-------------|
-| `/admin/sessions` | GET | Sesiones activas y recientes en memoria |
-| `/admin/sessions/{id}` | GET | Detalle con eventos y latencias por turno |
-| `/admin/orchestrator/status` | GET | Estado del orquestador (CONNECTED / RECONNECTING) |
-| `/admin/orchestrator/reconnect` | POST | Reintenta ya (corta la espera del backoff) — responde 202 con `{"accepted": true}`; `{"accepted": false}` si ya está CONNECTED |
-| `/admin/transcriber/status` | GET | Estado del proveedor STT activo (`provider`; con fogar, reachability en vivo; con ElevenLabs, salud cacheada + `counters`) |
-| `/admin/tts/status` | GET | Estado del proveedor TTS activo (`provider`, breaker, último error; con ElevenLabs, `counters`) |
-| `/admin/speech` | GET | Proveedores de voz activos (`stt`, `tts`) y puerta de audio efectiva |
-| `/admin/clients` | GET | Lista clientes (sin `client_key`; la huella `key_fp`), con `user_id` (`null` = del hogar), `capabilities` y `last_seen_at`. Un inicio de sesión también es un cliente |
-| `/admin/clients` | POST | Crear cliente; la respuesta trae su `client_key`, la única vez que se ve (se genera, o se importa una existente de ≥ 32 caracteres). `scopes` (por defecto `conversations:write`; un aparato del hogar como mucho `home:read`, si no `422 scope_not_allowed`); `PATCH` los cambia (a uno personal solo se le pueden quitar) |
-| `/admin/clients/{id}` | GET | Detalle de un cliente |
-| `/admin/clients/{id}` | PATCH | Actualizar cliente (campos parciales) |
-| `/admin/clients/{id}` | DELETE | Retirar cliente: su clave deja de valer y sus sesiones se cierran ya (4200); sigue en la BD con sus conversaciones y no sale en la lista |
-| `/admin/clients/{id}/rotate-key` | POST | Rotar `client_key` (la respuesta trae la nueva) |
-| `/admin/pairing` | POST | Abrir un código de emparejamiento con la plantilla del cliente (los campos de `POST /admin/clients`, nombre opcional y sin clave). La respuesta trae el código, la única vez que se ve. Como mucho 5 abiertos (409) |
-| `/admin/pairing` | GET | Códigos abiertos (sin el código) |
-| `/admin/pairing/{id}` | GET | Estado de un código: `open`, `used` (con `client_id` y `client_name`), `expired` o `cancelled` |
-| `/admin/pairing/{id}` | DELETE | Anular un código abierto |
-| `/admin/state` | GET | Instantánea viva: versión, uptime, flujos `/admin/state/stream` abiertos (`gateway.dashboards`), estado de servicios (el de OpenClaw, con su acceso: `scopes`, `admin`, `auth_method`, `pairing`, `pairing_request_id`, `identity_error`, `device_id` y, para el panel, `approve_command` con el emparejamiento pendiente e `identity_error_text` con `identity_required`; nunca secretos), contadores y una fila por sesión |
-| `/admin/state/stream` | GET | La misma instantánea por SSE cada segundo; cada stream termina solo a los 25 s, el cliente debe reconectar (`EventSource` lo hace solo) |
-| `/admin/conversations` | GET | **Cualquier persona** (no solo dueños y administradores): las que puede ver, las del hogar y las suyas; la máquina, todas (filtro `?client_id=`), la última en hablarse primero: `id`, `client_id`, `client_name`, `agent`, `kind` (`default`, `created`), `day`, `created_at`, `last_turn_at`, `turn_count`, `owner_user_id` (`null` = del hogar) y `title`, que se lee de OpenClaw (`sessions.list`, en caché 20 s, y un fallo, 5 s; `null` si no lo tiene o no responde; la lista nunca falla por eso). No salen las del día en las que nunca se habló (un cliente que conectó y calló) |
-| `/admin/conversations/{id}/messages` | GET | Cualquier persona, de una que pueda ver (si no, 404). Lo dicho, de OpenClaw (`chat.history`), normalizado a `{role, text, timestamp}` (solo `user` y `assistant`); `?limit=` 1–1000 (200). `503 orchestrator_unavailable` con OpenClaw caído, `502 orchestrator_error` si lo rechaza |
-| `/admin/conversations` | POST | Cualquier persona: conversación nueva de su dispositivo, privada (`{"agent"?}`; sin agente, el de la cascada). El agente se valida como en el handshake (`422 agent_not_permitted`/`agent_not_available`). La máquina no tiene dispositivo: `403 user_required` |
-| `/admin/conversations/agents` | GET | Cualquier persona, para el selector de la web: `{"agents", "default"}`, los agentes del roster de OpenClaw que su dispositivo puede usar (su `allowed_agents`; sin roster, esa lista o `[]`) y el que le tocaría sin elegir (`null` si ese no le está permitido). La máquina, sin política de ningún dispositivo |
-| `/admin/users` | GET | Personas del hogar: `id`, `username`, `display_name`, `role`, `agent` (el suyo; `null`, el de lo común), `is_active`, `created_at`, `effective_agent` y `agent_shared` |
-| `/admin/users` | POST | Alta: `{"username", "display_name", "password" (8+), "role"?, "agent"?}`. `409 username_taken` |
-| `/admin/users/{id}` | PATCH | `display_name`, `role`, `agent` (`null` vuelve al de lo común), `is_active`. Desactivar corta ya sus dispositivos |
-| `/admin/users/{id}/password` | PUT | Contraseña nueva (`{"password"}`); las sesiones abiertas siguen |
-| `/admin/users/{id}` | DELETE | Borra a la persona, sus dispositivos y sus conversaciones privadas del gateway (en OpenClaw quedan hasta que se limpie su agente) |
-| `/admin/home` | GET, PATCH | El hogar: `name`, `agent`, el de lo común (`null` = la cascada de siempre), y `notify_client_id`, su dispositivo de avisos: cualquier aparato activo del hogar, del hogar o personal (`null` = ninguno; `422 invalid_notify_device` si no vale). Retirar un aparato lo quita de donde estuviera elegido; desactivarlo, no |
-| `/admin/access` | GET | Vías para llegar al gateway (`public`, `tailscale_https`, `tailscale`, `lan`), cada una con su estado (`ok`, `protegida`, `otro_gateway`, `inalcanzable`, `sin_verificar`) y la recomendada; `{"docker": bool, "routes": [...]}`, en caché 15 s |
+| `/system/sessions` | GET | Sesiones activas y recientes en memoria |
+| `/system/sessions/{id}` | GET | Detalle con eventos y latencias por turno |
+| `/system/services/orchestrator` | GET | Estado del orquestador (CONNECTED / RECONNECTING) |
+| `/system/services/orchestrator/reconnect` | POST | Reintenta ya (corta la espera del backoff) — responde 202 con `{"accepted": true}`; `{"accepted": false}` si ya está CONNECTED |
+| `/system/services/transcriber` | GET | Estado del proveedor STT activo (`provider`; con fogar, reachability en vivo; con ElevenLabs, salud cacheada + `counters`) |
+| `/system/services/tts` | GET | Estado del proveedor TTS activo (`provider`, breaker, último error; con ElevenLabs, `counters`) |
+| `/system/speech` | GET | Proveedores de voz activos (`stt`, `tts`) y puerta de audio efectiva |
+| `/home/devices` | GET | Lista clientes (sin `client_key`; la huella `key_fp`), con `user_id` (`null` = del hogar), `capabilities` y `last_seen_at`. Un inicio de sesión también es un cliente |
+| `/home/devices` | POST | Crear cliente; la respuesta trae su `client_key`, la única vez que se ve (se genera, o se importa una existente de ≥ 32 caracteres). `scopes` (por defecto `conversations:write`; un aparato del hogar como mucho `home:read`, si no `422 scope_not_allowed`); `PATCH` los cambia (a uno personal solo se le pueden quitar) |
+| `/home/devices/{id}` | GET | Detalle de un cliente |
+| `/home/devices/{id}` | PATCH | Actualizar cliente (campos parciales) |
+| `/home/devices/{id}` | DELETE | Retirar cliente: su clave deja de valer y sus sesiones se cierran ya (4200); sigue en la BD con sus conversaciones y no sale en la lista |
+| `/home/devices/{id}/rotate-key` | POST | Rotar `client_key` (la respuesta trae la nueva) |
+| `/home/pairing` | POST | Abrir un código de emparejamiento con la plantilla del cliente (los campos de `POST /home/devices`, nombre opcional y sin clave). La respuesta trae el código, la única vez que se ve. Como mucho 5 abiertos (409) |
+| `/home/pairing` | GET | Códigos abiertos (sin el código) |
+| `/home/pairing/{id}` | GET | Estado de un código: `open`, `used` (con `client_id` y `client_name`), `expired` o `cancelled` |
+| `/home/pairing/{id}` | DELETE | Anular un código abierto |
+| `/system/state` | GET | Instantánea viva: versión, uptime, flujos `/system/state/stream` abiertos (`gateway.dashboards`), estado de servicios (el de OpenClaw, con su acceso: `scopes`, `admin`, `auth_method`, `pairing`, `pairing_request_id`, `identity_error`, `device_id` y, para el panel, `approve_command` con el emparejamiento pendiente e `identity_error_text` con `identity_required`; nunca secretos), contadores y una fila por sesión |
+| `/system/state/stream` | GET | La misma instantánea por SSE cada segundo; cada stream termina solo a los 25 s, el cliente debe reconectar (`EventSource` lo hace solo) |
+| `/conversations` | GET | Cualquier aparato con `conversations:read`: las que puede ver, las del hogar y las suyas; la máquina, todas (filtro `?client_id=`), la última en hablarse primero: `id`, `client_id`, `client_name`, `agent`, `kind` (`default`, `created`), `day`, `created_at`, `last_turn_at`, `turn_count`, `owner_user_id` (`null` = del hogar) y `title`, que se lee de OpenClaw (`sessions.list`, en caché 20 s, y un fallo, 5 s; `null` si no lo tiene o no responde; la lista nunca falla por eso). No salen las del día en las que nunca se habló (un cliente que conectó y calló) |
+| `/conversations/{id}/messages` | GET | Con `conversations:read`, de una que pueda ver (si no, 404). Lo dicho, de OpenClaw (`chat.history`), normalizado a `{role, text, timestamp}` (solo `user` y `assistant`); `?limit=` 1–1000 (200). `503 orchestrator_unavailable` con OpenClaw caído, `502 orchestrator_error` si lo rechaza |
+| `/conversations` | POST | Con `conversations:write`: conversación nueva de su dispositivo (privada si es personal; `{"agent"?}`; sin agente, el de la cascada). El agente se valida como en el handshake (`422 agent_not_permitted`/`agent_not_available`). La máquina no tiene dispositivo: `403 user_required` |
+| `/conversations/agents` | GET | Con `conversations:read`, para el selector de la web: `{"agents", "default"}`, los agentes del roster de OpenClaw que su dispositivo puede usar (su `allowed_agents`; sin roster, esa lista o `[]`) y el que le tocaría sin elegir (`null` si ese no le está permitido). La máquina, sin política de ningún dispositivo |
+| `/home/users` | GET | Personas del hogar: `id`, `username`, `display_name`, `role`, `agent` (el suyo; `null`, el de lo común), `is_active`, `created_at`, `effective_agent` y `agent_shared` |
+| `/home/users` | POST | Alta: `{"username", "display_name", "password" (8+), "role"?, "agent"?}`. `409 username_taken` |
+| `/home/users/{id}` | PATCH | `display_name`, `role`, `agent` (`null` vuelve al de lo común), `is_active`. Desactivar corta ya sus dispositivos |
+| `/home/users/{id}/password` | PUT | Contraseña nueva (`{"password"}`); las sesiones abiertas siguen |
+| `/home/users/{id}` | DELETE | Borra a la persona, sus dispositivos y sus conversaciones privadas del gateway (en OpenClaw quedan hasta que se limpie su agente) |
+| `/home` | GET, PATCH | El hogar: `name`, `agent`, el de lo común (`null` = la cascada de siempre), y `notify_client_id`, su dispositivo de avisos: cualquier aparato activo del hogar, del hogar o personal (`null` = ninguno; `422 invalid_notify_device` si no vale). Retirar un aparato lo quita de donde estuviera elegido; desactivarlo, no |
+| `/system/access` | GET | Vías para llegar al gateway (`public`, `tailscale_https`, `tailscale`, `lan`), cada una con su estado (`ok`, `protegida`, `otro_gateway`, `inalcanzable`, `sin_verificar`) y la recomendada; `{"docker": bool, "routes": [...]}`, en caché 15 s |
 
-En `/admin/users`, siempre queda un dueño activo (`409 last_owner`) y solo un dueño o la máquina tocan a un dueño o dan ese rol (`403 owner_only`). Los tres endpoints `*/status` comparten la forma `{"name", "state", "connected_at", "reconnect_attempts", "last_error"}`; los de transcriber y TTS añaden `provider` y, con ElevenLabs, `counters`.
+En `/home/users`, siempre queda un dueño activo (`409 last_owner`) y solo un dueño o la máquina tocan a un dueño o dan ese rol (`403 owner_only`). Los tres de `/system/services/*` comparten la forma `{"name", "state", "connected_at", "reconnect_attempts", "last_error"}`; los de transcriber y TTS añaden `provider` y, con ElevenLabs, `counters`.
 
 **Conversaciones (M19).** Cada sesión habla en una conversación, que es una sesión de OpenClaw (`agent:{agente}:fogar-{id}`). Quien no elige cae en la del día (una por cliente, agente y día; el día empieza a las `CONVERSATION_DAY_START_HOUR`, y una sesión abierta días pasa a la nueva en su primer turno tras el corte); un cliente puede elegir una de las suyas o crear una (`conversation` en el handshake). El gateway solo guarda el índice (tabla `conversations`, sin texto): lo dicho y el título viven en OpenClaw. Cada conversación es del hogar o privada de una persona, según el dispositivo que la crea (4.0): un dispositivo del hogar abre solo las del hogar; uno personal, también las de su usuario. La web inicia sesión (`/auth/login`) y entra en el WebSocket con su `token`, como cualquier dispositivo. Quitar un cliente lo **retira** (4.0): su clave deja de valer y sus conversaciones se conservan, siempre con su hogar y su dispositivo; la base de datos lo garantiza con claves foráneas (el gateway activa `PRAGMA foreign_keys` en cada conexión). Protocolo: [`docs/client-protocol.md` §14](docs/client-protocol.md#14-conversaciones).
 
-Los campos de un cliente (`POST`/`PATCH /admin/clients`) están en `src/fogar_gateway/models/admin_schemas.py` y sus defaults en `src/fogar_gateway/db/models.py`. Desde la terminal, `fogar-gw`. Los comandos de clientes y de estado necesitan el gateway en marcha y pasan por esta API (la CLI nunca escribe en la BD); `doctor` y `config` funcionan también con el gateway parado:
+Los campos de un cliente (`POST`/`PATCH /home/devices`) están en `src/fogar_gateway/models/admin_schemas.py` y sus defaults en `src/fogar_gateway/db/models.py`. Desde la terminal, `fogar-gw`. Los comandos de clientes y de estado necesitan el gateway en marcha y pasan por esta API (la CLI nunca escribe en la BD); `doctor` y `config` funcionan también con el gateway parado:
 
 ```bash
 fogar-gw                        # en una terminal: menú interactivo; en un script: la ayuda
@@ -178,7 +190,7 @@ Opciones globales: van **antes** del subcomando (`fogar-gw --yes clients remove 
 - **`--import-key`** lee la clave de stdin, nunca de un argumento.
 - **En Docker:** `docker exec fogar_gateway fogar-gw …`. La imagen fija `FOGAR_GATEWAY_HOME=/app`, así que `doctor` encuentra la BD del volumen. Sin `-t` no hay terminal: no se abre el menú y `rotate-key`/`remove` necesitan `--yes` (o usa `docker exec -it`). Con `GATEWAY_HOST` en una IP de la LAN, pasa `--url http://<esa IP>:8004`.
 
-Auth (4.0): `X-Admin-Token` = `ADMIN_TOKEN` (la CLI, en la máquina del gateway) o `Authorization: Bearer <token>` de un aparato con `home:admin` (solo puede tenerlo uno personal de un **dueño o administrador** que lo pidió); sin él, `403 missing_scope`. `/admin/conversations` pide `conversations:read` (listar, historial, agentes) o `conversations:write` (crear). Sin credenciales o con un token que no vale → `401`. Si llega `X-Admin-Token`, manda él aunque haya Bearer. `ADMIN_TOKEN` vacío y `X-Admin-Token` presente → 503.
+Auth (4.0): `X-Admin-Token` = `ADMIN_TOKEN` (la CLI, en la máquina del gateway) o `Authorization: Bearer <token>` de un aparato con `home:admin` (solo puede tenerlo uno personal de un **dueño o administrador** que lo pidió); sin él, `403 missing_scope`. `/conversations` pide `conversations:read` (listar, historial, agentes) o `conversations:write` (crear). Sin credenciales o con un token que no vale → `401`. Si llega `X-Admin-Token`, manda él aunque haya Bearer. `ADMIN_TOKEN` vacío y `X-Admin-Token` presente → 503.
 
 **Límites de toda la API HTTP:** un cuerpo de más de 1 MiB recibe `413 {"detail": "request body too large"}` antes de cualquier validación o autenticación (cuenta los bytes recibidos, también sin `Content-Length`). Un `422` lista campo, tipo y mensaje de cada error, nunca el valor recibido. No hay `/docs`, `/redoc` ni `/openapi.json`: la referencia es esta página.
 
@@ -211,7 +223,7 @@ Auth (4.0): `X-Admin-Token` = `ADMIN_TOKEN` (la CLI, en la máquina del gateway)
 - `TRUSTED_NETWORKS` vacío = fail-closed: solo loopback puede quedar exento (sujeto al matiz de `TRUSTED_PROXIES` de arriba).
 - `HANDSHAKE_MAX_BYTES` mide **caracteres**, no bytes (con caracteres multibyte el tope real puede ser hasta 4x mayor). El tope de 1 MiB por mensaje WebSocket lo pone `fogar-gw serve`: con `uvicorn` a mano rige el de uvicorn (16 MiB).
 - Con Bearer válido, `model` selecciona el agente (sin distinguir mayúsculas) y se aplican `default_agent`/`allowed_agents` del cliente (violación → `403`; un `model` que no es un id de agente válido, con `:` o espacios, es `403 agent_not_available` aunque OpenClaw no esté conectado). Sin `model`, la cascada: `default_agent` del cliente, `DEFAULT_AGENT`, el agente por defecto de OpenClaw y `main`.
-- Con Bearer, cada petición va a la **conversación por defecto del día** del cliente para ese agente (M19), como un cliente WebSocket que no elige conversación. El origen de confianza sin Bearer no tiene ficha de cliente: conserva su sesión `agent:{agente}:ha` y no sale en `/admin/conversations`.
+- Con Bearer, cada petición va a la **conversación por defecto del día** del cliente para ese agente (M19), como un cliente WebSocket que no elige conversación. El origen de confianza sin Bearer no tiene ficha de cliente: conserva su sesión `agent:{agente}:ha` y no sale en `/conversations`.
 - **Desde 5.0, `/v1` pasa por el canal de su conversación** (como un mensaje del WebSocket): las sesiones que tengan abierta esa conversación ven su mensaje y su turno (con Home Assistant como origen, sin audio). Su respuesta es siempre la de su propio run: si hay un turno en marcha en la conversación, la petición espera a que termine (y lo que llegue mientras corre el suyo espera detrás), así que dos peticiones a la vez ya no reciben `409 turn_in_progress`: la segunda espera a la primera. Esa espera tiene tope: si en `TURN_TIMEOUT_S` la conversación no queda libre, `502 turn_timeout` sin enviar nada. Si otro aparato para su turno (`cancel` o un `send` con `interrupt`, que se atienden en el acto aunque ese aparato tenga envíos esperando), `502 turn_cancelled`; si OpenClaw incorpora su mensaje a un turno que empezó a la vez (un push), `502 turn_absorbed`, nunca una respuesta vacía.
 
 | Endpoint | Método | Descripción |
@@ -237,7 +249,7 @@ El cliente envía un handshake JSON como primer mensaje. Si es válido, el gatew
 
 Un `send` con un turno en curso no lo corta: queda `pending` en la cola de OpenClaw (`"interrupt": true` corta y envía; `withdraw` quita un pendiente; `cancel` para el turno para todas las sesiones de la conversación). Hablar encima no corta nada: el barge-in lo decide el cliente. Un aviso (push) se lee en todas las sesiones que tienen abierta su conversación y suena solo en su dispositivo de avisos (el de su dueña si es privada, el del hogar si es común; si no tiene ninguna sesión en ella, le llega igual, en cola detrás de su turno); sin dispositivo de avisos elegido, no suena en ningún sitio. Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la referencia completa incluyendo interrupciones, transcripción, push turns y manejo de errores.
 
-**Dónde suenan los avisos.** Se elige en la web: cada persona, el suyo en «Mis dispositivos» («Avisos en…», uno de sus aparatos personales activos); un dueño o administrador, el del hogar en «Personas» («Avisos del hogar en…», cualquier aparato activo del hogar). Mientras no hay uno elegido, la web avisa «Elige dónde suenan los avisos». Al actualizar a la 5.0 no hay ninguno: hasta elegirlo, los recordatorios solo se leen en las sesiones que tienen abierta su conversación (y siguen en el historial de OpenClaw). También por la API: `PATCH /auth/me` y `PATCH /admin/home`.
+**Dónde suenan los avisos.** Se elige en la web: cada persona, el suyo en «Mis dispositivos» («Avisos en…», uno de sus aparatos personales activos); un dueño o administrador, el del hogar en «Personas» («Avisos del hogar en…», cualquier aparato activo del hogar). Mientras no hay uno elegido, la web avisa «Elige dónde suenan los avisos». Al actualizar a la 5.0 no hay ninguno: hasta elegirlo, los recordatorios solo se leen en las sesiones que tienen abierta su conversación (y siguen en el historial de OpenClaw). También por la API: `PATCH /auth/me` y `PATCH /home`.
 
 ---
 
@@ -295,7 +307,7 @@ En una terminal con color empieza con la línea viva de Fogar escribiendo su nom
 
    Después te espera hasta que abres el dashboard y entras («Conectado»); Enter sigue sin esperar. El primer cliente se empareja desde Clientes, en el dashboard. También da la dirección `ws://<host>:8004/ws/stream` para quien configure un cliente a mano.
 
-**El token de administración (`ADMIN_TOKEN`):** desde la 4.0 ya no abre el panel (allí entra cada persona con su cuenta); es la llave de la máquina para `/admin`, la que usa la CLI y con la que se recupera la cuenta del dueño. `/admin` no limita sus intentos: necesita al menos 32 caracteres ASCII imprimibles, sin espacios (`fogar-gw init` genera uno aleatorio de 43; `config set ADMIN_TOKEN` rechaza uno más corto y `doctor` lo marca). `fogar-gw token` lo escribe solo en una terminal; en una tubería, un fichero o con `--json` se niega, para que no acabe en un log. No lo pegues en chats ni en capturas. Sin la CLI, está en `config.env` (`ADMIN_TOKEN`), legible solo por tu usuario.
+**El token de administración (`ADMIN_TOKEN`):** desde la 4.0 ya no abre el panel (allí entra cada persona con su cuenta); es la llave de la máquina (`X-Admin-Token`, puede todo), la que usa la CLI y con la que se recupera la cuenta del dueño. El gateway no limita sus intentos: necesita al menos 32 caracteres ASCII imprimibles, sin espacios (`fogar-gw init` genera uno aleatorio de 43; `config set ADMIN_TOKEN` rechaza uno más corto y `doctor` lo marca). `fogar-gw token` lo escribe solo en una terminal; en una tubería, un fichero o con `--json` se niega, para que no acabe en un log. No lo pegues en chats ni en capturas. Sin la CLI, está en `config.env` (`ADMIN_TOKEN`), legible solo por tu usuario.
 
 Si lo cortas a medias, `config.env` queda como estaba más lo ya verificado, y volver a ejecutarlo retoma. También sirve para cambiar de proveedores más adelante (en el menú de `fogar-gw`, «Configurar proveedores»): cada paso que `config.env` ya tiene ofrece primero «Dejar como está», que ni verifica ni escribe nada. Necesita una terminal; para scripts, `fogar-gw onboard --answers respuestas.json` no pregunta nada y un fallo de verificación sale con 1 y su motivo. El fichero lleva secretos: tiene que ser tuyo y con permisos 600. Créalo ya privado, para que no haya un momento en que otros puedan leerlo: `(umask 077; cat > respuestas.json)` y pega el JSON (termina con Ctrl+D), o `install -m 600 /dev/null respuestas.json` antes de editarlo. Escribirlo y después hacer `chmod` deja esa ventana abierta.
 
@@ -370,7 +382,7 @@ fogar-gw logs -n 20         # últimas líneas del journal (-f para seguir)
 El gateway se conecta a OpenClaw como `gateway-client`/`backend` pidiendo `operator.read`, `operator.write` y `operator.admin` (ninguna función usa todavía el admin), y firma cada conexión con su **identidad de dispositivo**: una clave Ed25519 propia de la instalación, en `<base>/data/openclaw-device.json` (permisos 600; es una credencial, como `config.env`).
 
 - **OpenClaw en esta máquina:** basta el token compartido (`OPENCLAW_TOKEN`); OpenClaw se fía de la conexión local y concede los permisos pedidos, sin emparejar.
-- **OpenClaw en otra máquina** (Tailscale, LAN, o en Docker con el puerto publicado): la primera vez OpenClaw pide aprobar el gateway como dispositivo. El gateway lo dice en el log, en `fogar-gw status`/`doctor` y en `/admin/state`, con el comando exacto: `openclaw devices approve <id>`, en la máquina de OpenClaw. Tras aprobarlo, el gateway recibe un **token de dispositivo**, lo guarda en ese fichero y conecta con él (aunque cambie el token compartido); si OpenClaw lo revoca, vuelve al token compartido y, si hace falta, a pedir aprobación.
+- **OpenClaw en otra máquina** (Tailscale, LAN, o en Docker con el puerto publicado): la primera vez OpenClaw pide aprobar el gateway como dispositivo. El gateway lo dice en el log, en `fogar-gw status`/`doctor` y en `/system/state`, con el comando exacto: `openclaw devices approve <id>`, en la máquina de OpenClaw. Tras aprobarlo, el gateway recibe un **token de dispositivo**, lo guarda en ese fichero y conecta con él (aunque cambie el token compartido); si OpenClaw lo revoca, vuelve al token compartido y, si hace falta, a pedir aprobación.
 - **Por Tailscale (lo recomendado para otra máquina):** si OpenClaw se publica en la tailnet con su `tailscale serve` (`gateway.tailscale.mode: serve`), sigue escuchando solo en loopback y se llega con TLS: `OPENCLAW_HOST=<máquina>.<tailnet>.ts.net`, `OPENCLAW_PORT=443` y `OPENCLAW_TLS=true`. No abras el puerto 18789 a la red ni lo pongas detrás de otro proxy inverso: con cabeceras de proxy y sin `gateway.trustedProxies`, OpenClaw responde 403.
 
 > **El gateway nunca crea una BD por su cuenta.** Si no la encuentra en `<base>/data/gateway.db`
@@ -504,8 +516,8 @@ Variables de entorno o, si no, de `<base>/config.env` (instalación nativa). En 
 | `OPENCLAW_PORT` | `18789` | Puerto de OpenClaw |
 | `OPENCLAW_TLS` | `false` | `true` = conecta por `wss://` (OpenClaw de otra máquina tras TLS, p. ej. Tailscale) |
 | `OPENCLAW_TOKEN` | — | Token de OpenClaw. Sin él el gateway arranca con un aviso, pero OpenClaw rechaza la conexión (`/ready` 503) |
-| `ADMIN_TOKEN` | — | Token de la máquina para `/admin/*` (`X-Admin-Token`: la CLI y la recuperación); la web ya no lo usa, entra con usuario y contraseña. Vacío lo deshabilita. Al menos 32 caracteres (uno más corto arranca con un aviso, pero `doctor` lo marca como fallo) |
-| `DEFAULT_AGENT` | — | Agente por defecto de la instalación (#245): en la cascada, después del `default_agent` del cliente y antes del de OpenClaw; también el de una conversación nueva. Vacío = el de OpenClaw. Si no está en OpenClaw, avisa al conectar. Es un id de agente de OpenClaw (letras, cifras, `_` y `-`, hasta 64, empezando por letra o cifra), la misma regla que `default_agent` y `allowed_agents` de un cliente. Sin distinguir mayúsculas: se usa en minúsculas, como en OpenClaw (`Main` es `main`); `/admin/clients` guarda y devuelve también en minúsculas `default_agent` y `allowed_agents` |
+| `ADMIN_TOKEN` | — | Token de la máquina (`X-Admin-Token`, puede todo: la CLI y la recuperación); la web ya no lo usa, entra con usuario y contraseña. Vacío lo deshabilita. Al menos 32 caracteres (uno más corto arranca con un aviso, pero `doctor` lo marca como fallo) |
+| `DEFAULT_AGENT` | — | Agente por defecto de la instalación (#245): en la cascada, después del `default_agent` del cliente y antes del de OpenClaw; también el de una conversación nueva. Vacío = el de OpenClaw. Si no está en OpenClaw, avisa al conectar. Es un id de agente de OpenClaw (letras, cifras, `_` y `-`, hasta 64, empezando por letra o cifra), la misma regla que `default_agent` y `allowed_agents` de un cliente. Sin distinguir mayúsculas: se usa en minúsculas, como en OpenClaw (`Main` es `main`); `/home/devices` guarda y devuelve también en minúsculas `default_agent` y `allowed_agents` |
 | `CONVERSATION_DAY_START_HOUR` | `5` | Hora local (0–23) a la que empieza el día de las conversaciones por defecto. En Docker la hora local es la de `TZ` (ver [Docker](#docker-alternativa)) |
 | `ORCHESTRATOR_RECONNECT_INITIAL_BACKOFF` | `1.0` | Backoff inicial en reconexión del orquestador (s) |
 | `ORCHESTRATOR_RECONNECT_MAX_BACKOFF` | `60.0` | Backoff máximo en reconexión del orquestador (s) (el gateway reintenta sin parar, sin tope de duración) |
@@ -622,13 +634,14 @@ src/fogar_gateway/
 ├── web/                     el panel compilado (lo mete el build en el wheel; no está en git)
 ├── api/
 │   ├── routes.py            WebSocket /ws/stream — handshake, ready, ciclo de vida del bridge
-│   ├── pairing_routes.py    /.well-known/fogar-gateway, POST /pair y /admin/pairing
-│   ├── admin_routes.py      /admin/* — clientes, sesiones, servicios, voz, vías de acceso y estado en vivo (SSE)
-│   ├── conversation_routes.py /admin/conversations — lista, mensajes (chat.history) y alta del panel
+│   ├── pairing_routes.py    /.well-known/fogar-gateway, POST /pair y /home/pairing
+│   ├── home_routes.py       /home — el hogar, sus personas y sus aparatos
+│   ├── system_routes.py     /system — sesiones, servicios, voz, vías de acceso y estado en vivo (SSE)
+│   ├── conversation_routes.py /conversations — lista, mensajes (chat.history) y alta del panel
 │   ├── openai_routes.py     /v1/models, /v1/chat/completions
 │   ├── web_routes.py        el panel en / (caché, CSP y vuelta a index.html)
 │   ├── health_routes.py     /healthz, /ready
-│   └── deps.py              get_admin_auth — dependencia de auth para admin
+│   └── deps.py              quién llama y require_scope (permisos por aparato)
 ├── core/
 │   ├── config.py            Settings (pydantic-settings, <base>/config.env)
 │   ├── agent_policy.py      resolve_agent() — cascada y política de agentes
