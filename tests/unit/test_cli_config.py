@@ -561,12 +561,21 @@ def test_set_validates_its_field_ignoring_other_bad_environment(home, monkeypatc
     assert os.environ["TTS_VOICE_MAP"] == "bad"  # el entorno queda como estaba
 
 
-def test_config_validate_reports_retired_key(home):
-    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nSHUTDOWN_DRAIN_S=10\n")
+@pytest.mark.parametrize("line", ["SHUTDOWN_DRAIN_S=10", "ORCHESTRATOR_RECONNECT_MAX_DURATION=60"])
+def test_config_validate_reports_retired_key(home, line):
+    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\n{line}\n")
     r = run("config", "validate")
     assert r.exit_code == 1
-    assert "SHUTDOWN_DRAIN_S" in r.output and "bórralo" in r.output
+    assert line.split("=")[0] in r.output and "bórralo" in r.output
     assert "Traceback" not in r.output
+
+
+def test_config_validate_says_which_values_a_literal_takes(home):
+    """#422: `STT_AUDIO_GATE=auto` (4.x) names the valid values, not only `literal_error`."""
+    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nSTT_AUDIO_GATE=auto\n")
+    r = run("config", "validate")
+    assert r.exit_code == 1
+    assert "STT_AUDIO_GATE: literal_error (usa 'off' o 'energy' o bórralo de config.env)" in r.output
 
 
 @pytest.mark.parametrize("value", ["0", "inf", "nan"])

@@ -68,6 +68,10 @@ def _errors(exc: Any) -> list[str]:
         loc = ".".join(str(p) for p in e["loc"])
         if e["type"] == "extra_forbidden":  # las claves de config.env llegan en minúsculas
             out.append(f"{loc.upper()}: {e['type']} (ajuste retirado o desconocido: bórralo de config.env)")
+        elif e["type"] == "literal_error":
+            # Los valores válidos son del esquema, no del usuario (#422: STT_AUDIO_GATE=auto, de la 4.x).
+            expected = str(e.get("ctx", {}).get("expected", "")).replace(" or ", " o ")
+            out.append(f"{loc}: {e['type']} (usa {expected} o bórralo de config.env)")
         else:
             out.append(f"{loc}: {e['type']}")
     return out
