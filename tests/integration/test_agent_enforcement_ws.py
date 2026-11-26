@@ -30,7 +30,7 @@ def test_ws_allowed_agent_passes(client, db_engine):
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_json(
             {
-                "client_key": VALID_KEY,
+                "token": VALID_KEY,
                 "protocol": 5,
                 "input_mode": "text",
                 "output_mode": ["text"],
@@ -48,7 +48,7 @@ def test_ws_disallowed_agent_closes_4020(client, db_engine):
     with pytest.raises(WebSocketDisconnect) as exc, client.websocket_connect("/ws/stream") as ws:
         ws.send_json(
             {
-                "client_key": VALID_KEY,
+                "token": VALID_KEY,
                 "protocol": 5,
                 "input_mode": "text",
                 "output_mode": ["text"],
@@ -65,7 +65,7 @@ def test_ws_agent_not_in_roster_closes_4021(client, db_engine):
     with pytest.raises(WebSocketDisconnect) as exc, client.websocket_connect("/ws/stream") as ws:
         ws.send_json(
             {
-                "client_key": VALID_KEY,
+                "token": VALID_KEY,
                 "protocol": 5,
                 "input_mode": "text",
                 "output_mode": ["text"],
@@ -86,7 +86,7 @@ def test_ws_default_agent_applied_when_handshake_omits_agent(client, db_engine):
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_json(
             {
-                "client_key": VALID_KEY,
+                "token": VALID_KEY,
                 "protocol": 5,
                 "input_mode": "text",
                 "output_mode": ["text"],
@@ -104,7 +104,7 @@ def test_ws_empty_allowed_denies_everything(client, db_engine):
     with pytest.raises(WebSocketDisconnect) as exc, client.websocket_connect("/ws/stream") as ws:
         ws.send_json(
             {
-                "client_key": VALID_KEY,
+                "token": VALID_KEY,
                 "protocol": 5,
                 "input_mode": "text",
                 "output_mode": ["text"],

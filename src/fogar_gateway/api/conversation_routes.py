@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from fogar_gateway.api.deps import Caller, Principal, current_principal
+from fogar_gateway.api.deps import Caller, Principal, require_scope
 from fogar_gateway.core.agent_policy import AgentPolicyError, resolve_agent
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
 from fogar_gateway.models.admin_schemas import (
@@ -49,6 +49,7 @@ from fogar_gateway.services.openclaw.client import (
     ORCHESTRATOR_UNAVAILABLE_ERROR,
     OrchestratorRequestError,
 )
+from fogar_gateway.services.scopes import CONVERSATIONS_READ, CONVERSATIONS_WRITE
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ def _response(row: ConversationRow, title: str | None = None) -> ConversationRes
 
 def _visible_to(principal: Principal) -> tuple[str, str | None] | None:
     if isinstance(principal, Caller):
-        return principal.device.home_id, principal.user.id
+        return principal.device.home_id, principal.device.user_id
     return None  # la máquina
 
 
@@ -95,7 +96,7 @@ async def _caller_config(caller: Caller) -> ClientConfig:
 async def list_conversations(
     request: Request,
     client_id: ClientIdFilter = None,
-    principal: Principal = Depends(current_principal),
+    principal: Principal = Depends(require_scope(CONVERSATIONS_READ)),
 ) -> list[ConversationResponse]:
     rows = await request.app.state.conversations.list_rows(
         client_id, visible_to=_visible_to(principal)
@@ -107,7 +108,7 @@ async def list_conversations(
 
 @router.get("/agents", response_model=ConversationAgents)
 async def get_conversation_agents(
-    request: Request, principal: Principal = Depends(current_principal)
+    request: Request, principal: Principal = Depends(require_scope(CONVERSATIONS_READ))
 ) -> ConversationAgents:
     """Los del roster de OpenClaw que quien llama puede usar (`allowed_agents` de su dispositivo;
     la máquina, todos) y el de la cascada. Sin roster (OpenClaw sin conectar), su
@@ -132,7 +133,7 @@ async def get_conversation_messages(
     conversation_id: ConversationIdPath,
     request: Request,
     limit: HistoryLimit = 200,
-    principal: Principal = Depends(current_principal),
+    principal: Principal = Depends(require_scope(CONVERSATIONS_READ)),
 ) -> ConversationMessages:
     conversation = await request.app.state.conversations.get(conversation_id)
     visible = _visible_to(principal)
@@ -155,7 +156,9 @@ async def get_conversation_messages(
 
 @router.post("", response_model=ConversationResponse, status_code=status.HTTP_201_CREATED)
 async def create_conversation(
-    body: ConversationCreate, request: Request, principal: Principal = Depends(current_principal)
+    body: ConversationCreate,
+    request: Request,
+    principal: Principal = Depends(require_scope(CONVERSATIONS_WRITE)),
 ) -> ConversationResponse:
     if not isinstance(principal, Caller):
         # Una conversación es de un dispositivo (M20): la máquina no tiene ninguno.

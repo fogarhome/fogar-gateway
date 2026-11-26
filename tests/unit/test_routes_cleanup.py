@@ -20,13 +20,14 @@ from fogar_gateway.models.schemas import Client, ClientConfig
 from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.conversations import Conversation, ConversationIndex, conversation_day
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+from fogar_gateway.services.scopes import DEFAULT_SCOPES
 from fogar_gateway.services.session_registry import SessionRegistry
 
 CLIENT_KEY = "test-key"
 CLIENT_ID = "hab_sito"
 
 HANDSHAKE_TEXT = {
-    "client_key": CLIENT_KEY,
+    "token": CLIENT_KEY,
     "protocol": 5,
     "input_mode": "text",
     "output_mode": ["text"],
@@ -98,7 +99,7 @@ def _patch_db_client(monkeypatch):
     async def _get_session(client_key):
         assert client_key == CLIENT_KEY
         return (
-            Client(id=CLIENT_ID, key_hash=CLIENT_KEY, is_active=True),
+            Client(id=CLIENT_ID, key_hash=CLIENT_KEY, is_active=True, scopes=DEFAULT_SCOPES),
             ClientConfig(),
         )
 

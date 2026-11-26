@@ -11,7 +11,7 @@ from fogar_gateway.core.config import settings
 from tests.integration.conftest import CLIENT_ID, VALID_KEY
 
 HANDSHAKE = {
-    "client_key": VALID_KEY,
+    "token": VALID_KEY,
     "protocol": 5,
     "input_mode": "text",
     "output_mode": ["text", "status"],

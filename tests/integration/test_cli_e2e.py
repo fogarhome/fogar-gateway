@@ -55,7 +55,7 @@ def _cli(port, *args, json_out=False):
 
 async def _open(port, key):
     ws = await websockets.connect(f"ws://127.0.0.1:{port}/ws/stream")
-    await ws.send(json.dumps({"client_key": key, "protocol": 5, "input_mode": "text", "output_mode": ["text"]}))
+    await ws.send(json.dumps({"token": key, "protocol": 5, "input_mode": "text", "output_mode": ["text"]}))
     ready = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
     assert ready["type"] == "ready"
     return ws
@@ -108,8 +108,8 @@ async def test_pairing_through_the_cli_opens_a_session(server):
     )
     with urllib.request.urlopen(req, timeout=5) as resp:
         paired = json.loads(resp.read())
-    ws = await _open(port, paired["client_key"])
+    ws = await _open(port, paired["token"])
     await ws.close()
     shown = _cli(port, "clients", "show", "Tele del salón", json_out=True)
     assert (shown["client_type"], shown["tts_voice"]) == ("screen", "ef_dora")
-    assert paired["client_key"] not in _cli(port, "clients", "list")
+    assert paired["token"] not in _cli(port, "clients", "list")

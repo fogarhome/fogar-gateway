@@ -17,6 +17,10 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 from fogar_gateway.core.session_key import AGENT_ID_PATTERN
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.models.schemas import CREDENTIAL_MAX_LEN, Capabilities, OutputMode
+from fogar_gateway.services.scopes import Scope
+
+# Scopes pedidos o concedidos (#410): sin repetir de más; `write`/`admin` incluyen su `read`.
+Scopes = Annotated[list[Scope], Field(max_length=8)]
 
 # Etiqueta de cliente. Solo se valida la ENTRADA (create/update/CLI); la respuesta
 # sigue siendo `str` para no romper la lectura de filas antiguas con valores libres (#122).
@@ -50,6 +54,7 @@ _NOT_NULL_UPDATE_FIELDS = (
     "silence_timeout_s",
     "push_enabled",
     "tool_calls_enabled",
+    "scopes",
 )
 
 
@@ -70,6 +75,9 @@ class ClientCreate(BaseModel):
     silence_timeout_s: _Seconds = 2.0
     push_enabled: bool = True
     tool_calls_enabled: bool = False
+    # 5.0 (#410): los permisos que se le conceden; sin ellos, `conversations:write`. Un aparato
+    # del hogar llega como mucho a `home:read` (422 `scope_not_allowed`).
+    scopes: Scopes | None = None
 
 
 class ClientUpdate(BaseModel):
@@ -94,6 +102,7 @@ class ClientUpdate(BaseModel):
     silence_timeout_s: _Seconds | None = None
     push_enabled: bool | None = None
     tool_calls_enabled: bool | None = None
+    scopes: Scopes | None = None
 
     @model_validator(mode="after")
     def _reject_null_for_not_null_columns(self) -> "ClientUpdate":
@@ -118,6 +127,7 @@ class ClientResponse(BaseModel):
     user_id: str | None = None
     capabilities: list[str] | None = None
     last_seen_at: datetime | None = None
+    scopes: list[str] = []  # concedidos (#410); lo efectivo los recorta el rol de su persona
     # Pipeline config
     stt_language: str
     stt_vad_thold: float
@@ -144,6 +154,7 @@ class ClientResponse(BaseModel):
             user_id=r.user_id,
             capabilities=json.loads(r.capabilities) if r.capabilities else None,
             last_seen_at=r.last_seen_at,
+            scopes=_stored_scopes(r.scopes),
             stt_language=r.stt_language,
             stt_vad_thold=r.stt_vad_thold,
             tts_voice=r.tts_voice,
@@ -153,6 +164,15 @@ class ClientResponse(BaseModel):
             push_enabled=r.push_enabled,
             tool_calls_enabled=r.tool_calls_enabled,
         )
+
+
+def _stored_scopes(raw: str) -> list[str]:
+    """Para enseñar: una fila con JSON roto no concede nada (db_client tampoco)."""
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return []
+    return sorted(str(v) for v in value) if isinstance(value, list) else []
 
 
 class ClientWithKey(ClientResponse):
@@ -186,6 +206,9 @@ class PairRequest(BaseModel):
     name: _Name | None = None
     client_type: ClientType | None = None
     output_mode: list[OutputMode] | None = None
+    # Los que pide (#410); se concede lo pedido ∩ lo que aprobó el administrador en el código.
+    # Sin la lista, lo aprobado.
+    scopes: Scopes | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +278,9 @@ class LoginRequest(BaseModel):
     device_name: _Name
     client_type: ClientType | None = None
     capabilities: Capabilities | None = None
+    # Los que pide este aparato (#410); se concede lo pedido ∩ el tope del rol de la persona.
+    # Sin la lista, `conversations:write`.
+    scopes: Scopes | None = None
 
 
 # ---------------------------------------------------------------------------

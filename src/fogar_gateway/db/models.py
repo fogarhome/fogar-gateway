@@ -1,8 +1,11 @@
+import json
 import uuid
 from datetime import UTC, date, datetime
 
 from sqlalchemy import DDL, ForeignKey, ForeignKeyConstraint, Index, UniqueConstraint, event
 from sqlmodel import Field, SQLModel
+
+from fogar_gateway.services.scopes import DEFAULT_SCOPES, to_list
 
 
 def _gen_uuid() -> str:
@@ -12,6 +15,7 @@ def _gen_uuid() -> str:
 # shortcut: un solo hogar por gateway (M20); su id es fijo y es el valor por defecto de
 # `home_id`. Cuando haya varios hogares (Cloud), cada alta tendrá que decir el suyo.
 DEFAULT_HOME_ID = "home"
+DEFAULT_SCOPES_JSON = json.dumps(to_list(DEFAULT_SCOPES))
 DEFAULT_HOME_NAME = "Mi hogar"
 
 
@@ -91,6 +95,9 @@ class ClientRecord(SQLModel, table=True):
     default_agent: str | None = Field(default=None)
     allowed_agents: str | None = Field(default=None)  # JSON list serializado
     capabilities: str | None = Field(default=None)  # JSON list serializado
+    # 5.0 (#410): los scopes concedidos, expandidos (services/scopes.py); JSON list serializado.
+    # Lo efectivo es esto ∩ el tope de hoy (rol de su persona o el del hogar).
+    scopes: str = Field(default=DEFAULT_SCOPES_JSON)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     last_seen_at: datetime | None = Field(default=None)
     retired_at: datetime | None = Field(default=None)

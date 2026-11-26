@@ -142,12 +142,12 @@ def test_pair_creates_client_with_template(http, db_engine):
     r = http.post("/pair", json={"code": item["code"]})
     assert r.status_code == 201, r.text
     body = r.json()
-    assert set(body) == {"client_id", "name", "client_key", "gateway"}
+    assert set(body) == {"client_id", "name", "token", "scopes", "gateway"}
     assert body["name"] == "tele"
     assert set(body["gateway"]) == {"name", "version"}
     assert body["gateway"]["name"]  # el nombre solo sale al canjear un código, nunca en el well-known
     [row] = _rows(db_engine)
-    assert row.id == body["client_id"] and row.key_hash == hash_key(body["client_key"])
+    assert row.id == body["client_id"] and row.key_hash == hash_key(body["token"])
     assert (row.client_type, row.default_agent, row.tts_voice, row.push_enabled) == (
         "screen", "j-assistant", "ef_dora", False,
     )
@@ -259,7 +259,7 @@ def test_pairing_state_after_use(http):
 def test_paired_key_authenticates(make_client):
     http = make_client(("203.0.113.5", 54321))  # fuera de la LAN de confianza: exige clave
     item = _open(http)
-    key = http.post("/pair", json={"code": item["code"]}).json()["client_key"]
+    key = http.post("/pair", json={"code": item["code"]}).json()["token"]
     assert http.get("/v1/models").status_code == 401
     assert http.get("/v1/models", headers={"authorization": f"Bearer {key}"}).status_code == 200
 
@@ -268,7 +268,7 @@ def test_pair_logs_never_contain_code_or_key(http, caplog):
     caplog.set_level(logging.DEBUG)
     item = _open(http)
     http.post("/pair", json={"code": _wrong(item["code"])})
-    key = http.post("/pair", json={"code": item["code"]}).json()["client_key"]
+    key = http.post("/pair", json={"code": item["code"]}).json()["token"]
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "Emparejamiento: cliente" in text
     assert item["code"] not in text and key not in text

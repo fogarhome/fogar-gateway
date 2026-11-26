@@ -25,7 +25,7 @@ from tests.integration.conftest import (
     _configure_app_mocks,
 )
 
-HANDSHAKE = {"client_key": VALID_KEY, "protocol": 5, "input_mode": "text", "output_mode": ["text"]}
+HANDSHAKE = {"token": VALID_KEY, "protocol": 5, "input_mode": "text", "output_mode": ["text"]}
 INTERVAL_S = 0.2
 # La puerta de salida de la issue es ≤ 15 s; con intervalos cortos debe cerrar mucho antes.
 CLOSE_DEADLINE_S = 5.0
@@ -190,3 +190,17 @@ async def test_narrowing_allowed_agents_closes_the_live_session_with_4020(server
     assert "agent_revoked" in [e.stage for e in record.events]
     assert "session_revoked" not in [e.stage for e in record.events]
     assert gateway_stats.snapshot()["sessions_closed"] == {"agent_revoked": 1}
+
+
+async def test_losing_write_closes_the_session_with_4011(server):
+    """#410: quitarle `conversations:write` a un aparato con la sesión abierta la cierra con 4011
+    (no 4200: su clave sigue valiendo) en la siguiente revalidación."""
+    ws = await _open(server)
+    async with _admin(server) as admin:
+        r = await admin.patch(f"/admin/clients/{CLIENT_ID}", json={"scopes": ["conversations:read"]})
+        assert r.status_code == 200, r.text
+    with pytest.raises(websockets.ConnectionClosed) as exc:
+        while True:
+            await asyncio.wait_for(ws.recv(), timeout=CLOSE_DEADLINE_S)
+    assert exc.value.rcvd is not None
+    assert (exc.value.rcvd.code, exc.value.rcvd.reason) == (4011, "missing scope")

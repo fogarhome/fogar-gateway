@@ -249,7 +249,7 @@ def test_agent_ids_are_lowercased_everywhere():
     assert ClientCreate(name="n", default_agent="Main", allowed_agents=["Main"]).allowed_agents == ["main"]
     assert ClientUpdate(default_agent="Main").default_agent == "main"
     assert ConversationCreate(agent="Main").agent == "main"
-    hs = Handshake(client_key="k", input_mode="text", output_mode=["text"], agent=" Main ")
+    hs = Handshake(token="k", input_mode="text", output_mode=["text"], agent=" Main ")
     assert hs.agent == "main"
 
 
@@ -268,14 +268,14 @@ def test_handshake_rejects_invalid_agent_ids(bad):
     from fogar_gateway.models.schemas import Handshake
 
     with pytest.raises(ValidationError):
-        Handshake(client_key="k", input_mode="text", output_mode=["text"], agent=bad)
+        Handshake(token="k", input_mode="text", output_mode=["text"], agent=bad)
 
 
 @pytest.mark.parametrize("empty", ["", "   "])
 def test_handshake_empty_agent_still_means_the_cascade(empty):
     from fogar_gateway.models.schemas import Handshake
 
-    hs = Handshake(client_key="k", input_mode="text", output_mode=["text"], agent=empty)
+    hs = Handshake(token="k", input_mode="text", output_mode=["text"], agent=empty)
     assert resolve_agent(hs.agent, None, None) == "main"
 
 

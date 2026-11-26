@@ -374,7 +374,7 @@ def test_v1_legacy_trusted_origin_keeps_its_key_and_uses_default_agent(
 def test_ws_uses_default_agent_when_nothing_else_says(client, monkeypatch):
     monkeypatch.setattr(settings, "DEFAULT_AGENT", "a")
     with client.websocket_connect("/ws/stream") as ws:
-        ws.send_json({"client_key": VALID_KEY, "protocol": 5, "input_mode": "text", "output_mode": ["text"]})
+        ws.send_json({"token": VALID_KEY, "protocol": 5, "input_mode": "text", "output_mode": ["text"]})
         ready = ws.receive_json()
     assert ready["type"] == "ready"
     assert ready["agent"] == ready["conversation"]["agent"] == "a"

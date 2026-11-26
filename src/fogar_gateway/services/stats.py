@@ -11,6 +11,7 @@ CloseReason = Literal[
     "slow_client",
     "revoked",
     "agent_revoked",  # C-r6-1: su agente salió de allowed_agents (4020); la clave vale
+    "scope_revoked",  # #410: perdió `conversations:write` (4011); la clave vale
     "shutdown",
     "error",
     "unknown",

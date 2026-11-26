@@ -267,19 +267,19 @@ async def test_private_push_sounds_on_its_owner_device_never_on_the_home_one(
     que está en otra conversación. Un push común suena en la tele y no en el móvil."""
     tv = await harness.connect(output_mode=("text", "audio"))
     session = await _login(harness, "ana")
-    bearer = {"authorization": f"Bearer {session['client_key']}"}
+    bearer = {"authorization": f"Bearer {session['token']}"}
     async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{harness.port}") as http:
         r = await http.patch(
             "/auth/me", json={"notify_client_id": session["client_id"]}, headers=bearer
         )
         assert r.status_code == 200, r.text
-    first = await harness.connect(handshake={"client_key": session["client_key"], "conversation": "new"})
+    first = await harness.connect(handshake={"token": session["token"], "conversation": "new"})
     private = first.ready["conversation"]["id"]
     await first.ws.close()
     await _wait_sessions(harness, 1)
     phone = await harness.connect(
         output_mode=("text", "audio"),
-        handshake={"client_key": session["client_key"], "conversation": "new"},
+        handshake={"token": session["token"], "conversation": "new"},
     )
     assert phone.ready["conversation"]["id"] != private
 
@@ -563,7 +563,7 @@ async def _login(harness, username: str = "sito") -> dict:
 
 async def test_a_logged_in_device_chats_in_a_private_conversation(harness, caplog):
     session = await _login(harness)
-    me = await harness.connect(handshake={"client_key": session["client_key"]})
+    me = await harness.connect(handshake={"token": session["token"]})
     assert me.ready["session_id"].startswith(f"{session['client_id']}:")
     msgs = await run_turn(me, "hola desde la web")
     assert of_type(msgs, "turn_start")[0]["conversation"] == me.ready["conversation"]["id"]
@@ -571,12 +571,12 @@ async def test_a_logged_in_device_chats_in_a_private_conversation(harness, caplo
         rows = (await admin.get("/admin/conversations")).json()
     (row,) = [r for r in rows if r["id"] == me.ready["conversation"]["id"]]
     assert row["owner_user_id"] == session["user"]["id"]  # privada: de su dispositivo
-    assert session["client_key"] not in caplog.text
+    assert session["token"] not in caplog.text
 
 
 async def test_a_user_resumes_a_conversation_created_from_admin(harness):
     session = await _login(harness)
-    bearer = {"authorization": f"Bearer {session['client_key']}"}
+    bearer = {"authorization": f"Bearer {session['token']}"}
     async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{harness.port}") as http:
         r = await http.post("/admin/conversations", json={}, headers=bearer)
         assert r.status_code == 201, r.text
@@ -586,7 +586,7 @@ async def test_a_user_resumes_a_conversation_created_from_admin(harness):
     )
 
     me = await harness.connect(
-        handshake={"client_key": session["client_key"], "conversation": created["id"]}
+        handshake={"token": session["token"], "conversation": created["id"]}
     )
     assert me.ready["conversation"] == {"id": created["id"], "agent": "main"}
     await run_turn(me, "hola")

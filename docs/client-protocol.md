@@ -2,7 +2,7 @@
 
 Guía completa para implementar clientes que se conecten a fogar-gateway. Cubre el ciclo de vida de la sesión WebSocket, todos los mensajes posibles en ambas direcciones y el formato de audio binario.
 
-> **¿Integras Home Assistant u otro cliente OpenAI-compatible?** Eso va por REST (`/v1/*`), no por este protocolo WebSocket. Su modelo de autenticación (origen de confianza o `Authorization: Bearer <client_key>`) está en el [README](../README.md#openai-compatible-v1-para-home-assistant).
+> **¿Integras Home Assistant u otro cliente OpenAI-compatible?** Eso va por REST (`/v1/*`), no por este protocolo WebSocket. Su modelo de autenticación (origen de confianza o `Authorization: Bearer <token>`, con el permiso `conversations:write`) está en el [README](../README.md#openai-compatible-v1-para-home-assistant).
 
 ---
 
@@ -42,7 +42,7 @@ Reglas para que el protocolo crezca sin romper a nadie:
 
 ## 0. Descubrir el gateway y emparejarse
 
-Antes de la sesión, tu cliente necesita dos cosas: **dónde está el gateway** y **su `client_key`**. Las dos pueden venir de la configuración (un administrador creó el cliente con `fogar-gw clients add` y te pasó la clave), pero lo cómodo es que el cliente las consiga solo. Esta sección es lo que tiene que implementar.
+Antes de la sesión, tu cliente necesita dos cosas: **dónde está el gateway** y **su `token`**. Las dos pueden venir de la configuración (un administrador creó el cliente con `fogar-gw clients add` y te pasó la clave), pero lo cómodo es que el cliente las consiga solo. Esta sección es lo que tiene que implementar.
 
 **Dos clases de cliente (4.0).** Un aparato **del hogar**, de uso compartido (una tele, un altavoz), **se empareja** con un código: no se sabe quién habla y lo que se dice es del hogar. Un aparato **personal** (una app en el móvil de alguien, su Mac) **inicia sesión** con la cuenta de su persona: lo que se dice es privado de ella y ve también las conversaciones del hogar. Elige una de las dos; un aparato no cambia de clase (para pasar de una a otra, retira la clave y haz lo otro).
 
@@ -90,18 +90,19 @@ Content-Type: application/json
 | `name` | — | El cliente propone uno (el nombre del dispositivo o el que elija el usuario, si le dejas). Si el administrador fijó otro, gana el suyo; si nadie da uno, el gateway pone `<tipo>-xxxx` |
 | `client_type` | — | Fijo en tu cliente: `ha`, `esp32`, `web`, `app` o `screen` |
 | `output_mode` | — | Fijo en tu cliente: lo que sabe reproducir (`"audio"`, `"text"`, `"status"`, como en §1). Se guarda en la ficha del cliente para el administrador; en cada sesión manda el `output_mode` del handshake |
+| `scopes` | — | Fijo en tu cliente: los permisos que necesita (5.0). Se concede lo pedido ∩ lo que aprobó el administrador al abrir el código; sin la lista, lo aprobado |
 
 Regla: **el cliente dice qué es** (tipo y formatos) **y el administrador decide cómo se comporta**. Lo que fijó el administrador al abrir el código manda sobre lo que mandes. El handshake de cada sesión (§1) sigue llevando `input_mode` y `output_mode`; no mandes `agent` salvo que el usuario elija uno, para que valga el que fijó el administrador.
 
 | Respuesta | Qué significa |
 |-----------|---------------|
-| `201 {"client_id", "name", "client_key", "gateway": {"name", "version"}}` | Emparejado. **`client_key` solo llega aquí, una vez:** guárdala ya junto a la dirección del gateway, con permisos 0600 si va a un fichero, y nunca la escribas en un log. `name` es el nombre con el que quedó dado de alta (puede no ser el que propusiste) |
+| `201 {"client_id", "name", "token", "scopes", "gateway": {"name", "version"}}` | Emparejado. **`token` (la clave del aparato) solo llega aquí, una vez:** guárdalo ya junto a la dirección del gateway, con permisos 0600 si va a un fichero, y nunca lo escribas en un log. `scopes`, los permisos concedidos (ver «Permisos» abajo). `name` es el nombre con el que quedó dado de alta (puede no ser el que propusiste) |
 | `400 {"detail": "invalid or expired code"}` | Código desconocido, caducado, ya usado o mal escrito (siempre el mismo mensaje). Deja corregirlo |
 | `422` | `code` no es un texto de hasta 32 caracteres (mándalo como texto, no como número), o `name` (1–200 caracteres), `client_type` u `output_mode` no válidos: es un fallo de tu cliente, no del usuario. No cuenta como intento |
 | `413 {"detail": "request body too large"}` | El cuerpo pasa de 1 MiB (todas las peticiones HTTP del gateway tienen ese tope). Fallo de tu cliente; no cuenta como intento |
 | `5xx` o sin respuesta | Si el gateway falló al crear el cliente, el código sigue abierto: reintenta con el mismo código. Si se cortó la conexión después del `201`, el código ya está gastado y la clave perdida: pide otro código |
 
-Después abre la sesión normal (§1) con esa `client_key`.
+Después abre la sesión normal (§1) con ese `token`.
 
 **Intentos fallidos:** mientras haya códigos abiertos, cada `400` cuenta (un código caducado o ya usado también), sea de quien sea, y al quinto seguido se anulan todos los abiertos (un canje correcto pone la cuenta a 0); el administrador tiene que abrir otro. Es la defensa contra quien intente adivinar, porque `/pair` puede estar expuesto a internet a través de un proxy. El cliente no puede saber cuántos intentos quedan: si tras un `400` el usuario está seguro del código, dile que pida uno nuevo.
 
@@ -113,21 +114,37 @@ Para un aparato de una persona: la persona escribe **su usuario y su contraseña
 POST https://<host>/auth/login
 Content-Type: application/json
 
-{"username": "ana", "password": "…", "device_name": "iPhone de Ana", "client_type": "app", "capabilities": ["screen", "mic", "speaker"]}
+{"username": "ana", "password": "…", "device_name": "iPhone de Ana", "client_type": "app", "capabilities": ["screen", "mic", "speaker"], "scopes": ["conversations:write"]}
 ```
 
 | Respuesta | Qué significa |
 |-----------|---------------|
-| `201 {"client_id", "client_key", "user": {"id", "username", "display_name", "role"}, "home": {"id", "name"}}` | Dentro. `client_key` es el token de este aparato: **solo llega aquí, una vez**. Guárdalo como una contraseña (en el Llavero, nunca en un log) y úsalo como `client_key` en el handshake (§1) y como `Authorization: Bearer` en `/auth` y `/admin` |
+| `201 {"client_id", "token", "scopes", "user": {"id", "username", "display_name", "role"}, "home": {"id", "name"}}` | Dentro. `token` es la credencial de este aparato: **solo llega aquí, una vez**. Guárdalo como una contraseña (en el Llavero, nunca en un log) y úsalo como `token` en el handshake (§1) y como `Authorization: Bearer` en HTTP. `scopes`, los permisos concedidos (ver «Permisos») |
 | `401 {"detail": "invalid_credentials"}` | Usuario o contraseña incorrectos, o cuenta desactivada (siempre el mismo) |
 | `403 {"detail": "insecure_transport"}` | Por HTTP desde la red de casa la contraseña iría en claro: el gateway solo la acepta por HTTPS, o por HTTP desde su propia máquina o la tailnet. Usa la URL `https://` del gateway |
 | `429 {"detail": "too_many_attempts"}` + `Retry-After` | Demasiados fallos seguidos (por IP o por cuenta): espera esos segundos |
 
-**El token no caduca ni se refresca:** vale hasta que se retira. `GET /auth/me` (con Bearer) dice quién eres y tu rol; `POST /auth/logout` retira este aparato (al cerrar sesión, **borra también lo que tengas en caché de esa persona**: un iPad puede ser compartido); `GET /auth/devices` y `DELETE /auth/devices/{id}`, los aparatos de la persona; `PATCH /auth/me` con `{"notify_client_id"}` elige su dispositivo de avisos, uno de sus aparatos personales activos (`422 invalid_notify_device` si no). Una contraseña nunca va en el handshake ni se guarda en el cliente.
+**El token no caduca ni se refresca:** vale hasta que se retira. `GET /auth/me` (con Bearer) dice quién eres, tu rol y los `scopes` efectivos de este aparato; `POST /auth/logout` retira este aparato (al cerrar sesión, **borra también lo que tengas en caché de esa persona**: un iPad puede ser compartido); `GET /auth/devices` y `DELETE /auth/devices/{id}`, los aparatos de la persona; `PATCH /auth/me` con `{"notify_client_id"}` elige su dispositivo de avisos, uno de sus aparatos personales activos (`422 invalid_notify_device` si no). Una contraseña nunca va en el handshake ni se guarda en el cliente.
+
+### Permisos (scopes, 5.0)
+
+Cada aparato tiene **una sola credencial**, su `token`: el mismo en el handshake (§1) y en `Authorization: Bearer` por HTTP. Lo que puede hacer lo dicen sus permisos:
+
+| Scope | Qué permite |
+|---|---|
+| `conversations:read` | listar las conversaciones que el aparato puede ver y leer su historial |
+| `conversations:write` | crear conversaciones, escribir, parar, quitar un pendiente, la sesión de `/ws/stream` y `/v1`. Incluye `conversations:read` |
+| `home:read` | ver el hogar, sus personas y aparatos y el estado del sistema |
+| `home:admin` | administrar personas, aparatos, emparejamientos y ajustes. Incluye `home:read` |
+
+- **Los pide el aparato** en `POST /auth/login` y `POST /pair` (`scopes`); se le concede lo pedido ∩ su tope. Sin la lista, el login concede `conversations:write` y `/pair`, lo que aprobó el administrador.
+- **Tope:** un aparato personal, el rol de su persona (dueño y administrador, los cuatro; miembro, `conversations:*`); uno del hogar, lo que aprobó el administrador, como mucho `home:read` (`home:admin` exige una persona detrás). El tope se aplica en cada petición: si a una persona le bajan el rol, sus aparatos pierden al momento lo que ya no le toca (una sesión de `/ws/stream`, en la siguiente revalidación).
+- **Pedir más:** un aparato personal inicia sesión otra vez; a uno del hogar se los cambia un administrador.
+- **Sin el permiso:** HTTP `403 {"detail": "missing_scope"}` con `WWW-Authenticate: Bearer error="insufficient_scope", scope="<el que falta>"`; `/ws/stream` cierra con **4011** (§13). Los permisos no cambian qué conversaciones ves: una privada de otra persona nunca, ni siquiera con `home:admin`.
 
 ### Cuando la clave deja de valer
 
-Si al abrir la sesión el gateway cierra con **4010**, o una sesión abierta se cierra con **4200** (§13), la clave ya no vale: el administrador retiró, desactivó o rotó tu cliente o, si es personal, la persona cerró sesión en él, lo retiró desde otro aparato o la desactivaron. Mira el código, no el texto del `reason`. Borra la clave guardada y vuelve a la pantalla de emparejamiento (o, si es personal, a la de iniciar sesión). Ningún otro cierre (handshake mal formado, agente no permitido, conversación no encontrada, conversación abierta en otra sesión) invalida la clave. No reintentes en bucle con la misma clave.
+Si al abrir la sesión el gateway cierra con **4010**, o una sesión abierta se cierra con **4200** (§13), la clave ya no vale: el administrador retiró, desactivó o rotó tu cliente o, si es personal, la persona cerró sesión en él, lo retiró desde otro aparato o la desactivaron. Mira el código, no el texto del `reason`. Borra la clave guardada y vuelve a la pantalla de emparejamiento (o, si es personal, a la de iniciar sesión). Ningún otro cierre (handshake mal formado, 4011 sin permiso, agente no permitido, conversación no encontrada, conversación abierta en otra sesión) invalida la clave. No reintentes en bucle con la misma clave.
 
 ---
 
@@ -139,7 +156,7 @@ El **primer mensaje** que envíes DEBE ser el handshake. Es el único mensaje si
 
 ```json
 {
-  "client_key": "tu-api-key",
+  "token": "tu-api-key",
   "protocol": 5,
   "input_mode": "audio",
   "output_mode": ["audio", "text", "status"],
@@ -149,7 +166,7 @@ El **primer mensaje** que envíes DEBE ser el handshake. Es el único mensaje si
 
 | Campo | Tipo | Requerido | Descripción |
 |-------|------|-----------|-------------|
-| `client_key` | string | ✓ | Clave del dispositivo: la de un dispositivo **emparejado** (`/pair`, del hogar) o el token de uno **con sesión** (`/auth/login`, personal; 4.0). La web entra igual: ya no hay `admin_token` |
+| `token` | string | ✓ | Clave del dispositivo: la de un dispositivo **emparejado** (`/pair`, del hogar) o el token de uno **con sesión** (`/auth/login`, personal; 4.0). La web entra igual: ya no hay `admin_token` |
 | `protocol` | int | ✓ | Versión del protocolo que implementa el cliente: `5`. Sin él, o con otra versión, el gateway cierra con 4003 |
 | `capabilities` | string[] | — | Lo que sabe hacer el aparato (`screen`, `mic`, `speaker`…; minúsculas, cifras, `_` y `-`, hasta 32 de hasta 32 caracteres). El gateway las guarda y las enseña; aún no decide nada con ellas. Sin el campo se conservan las que tenía |
 | `input_mode` | `"audio"` \| `"text"` | ✓ | Cómo enviará datos este cliente |
@@ -161,7 +178,7 @@ El handshake no configura nada de la voz al hablar encima: desde la 5.0 el barge
 
 ### Selección de agente
 
-El agente efectivo de la sesión no es simplemente "el que pediste o el global": el gateway resuelve una cascada server-side (`agent` del handshake si no está vacío → `default_agent` configurado por el admin para tu `client_key` → el agente que el hogar da a tu persona (dispositivo con sesión) o a lo común (dispositivo del hogar; 4.0) → `DEFAULT_AGENT`, el de la instalación (#245) → default global de OpenClaw → `"main"`) y aplica dos comprobaciones de política antes de aceptar la conexión: si tu cliente tiene una lista `allowed_agents`, el agente resultante debe estar en ella (una lista vacía lo deniega todo); y si pediste el agente explícitamente, debe existir en el roster de OpenClaw (`src/fogar_gateway/core/agent_policy.py`). Como cliente necesitas saber tres cosas:
+El agente efectivo de la sesión no es simplemente "el que pediste o el global": el gateway resuelve una cascada server-side (`agent` del handshake si no está vacío → `default_agent` configurado por el admin para tu `token` → el agente que el hogar da a tu persona (dispositivo con sesión) o a lo común (dispositivo del hogar; 4.0) → `DEFAULT_AGENT`, el de la instalación (#245) → default global de OpenClaw → `"main"`) y aplica dos comprobaciones de política antes de aceptar la conexión: si tu cliente tiene una lista `allowed_agents`, el agente resultante debe estar en ella (una lista vacía lo deniega todo); y si pediste el agente explícitamente, debe existir en el roster de OpenClaw (`src/fogar_gateway/core/agent_policy.py`). Como cliente necesitas saber tres cosas:
 
 1. Si omites `agent` en el handshake, el que acabes usando puede venir de una configuración por-cliente que un admin te haya asignado (no siempre el default global) — comprueba siempre `ready.agent`, no asumas cuál será.
 2. Pedir explícitamente un `agent` puede fallar de dos formas distintas (ver tabla siguiente): que ese agente no esté permitido para tu cliente, o que no exista en OpenClaw.
@@ -174,12 +191,12 @@ El código es el contrato; el `reason` es un texto en inglés para logs y person
 
 | Situación | Código WS | `reason` |
 |-----------|-----------|----------|
-| JSON inválido (también un número de más de 4300 cifras, que antes cerraba con 1006; solo con `HANDSHAKE_MAX_BYTES` por encima de ~4300: con el valor por defecto cierra antes con 4002), que no es un objeto, o campos incorrectos (también un `agent` que no es un id de agente válido); sin `client_key`, o unas `capabilities` mal formadas | 4000 | `invalid handshake` |
+| JSON inválido (también un número de más de 4300 cifras, que antes cerraba con 1006; solo con `HANDSHAKE_MAX_BYTES` por encima de ~4300: con el valor por defecto cierra antes con 4002), que no es un objeto, o campos incorrectos (también un `agent` que no es un id de agente válido); sin `token`, o unas `capabilities` mal formadas | 4000 | `invalid handshake` |
 | Falta `protocol` o no es `5` (se mira antes que cualquier otro campo; un JSON que no es objeto sigue siendo 4000) | 4003 | `protocol version not supported` |
 | El primer mensaje es binario, no texto | 4001 | `handshake must be a text frame` |
 | El handshake supera `HANDSHAKE_MAX_BYTES` (4096 caracteres) | 4002 | `handshake too large` |
 | No se recibe el handshake JSON en los primeros `HANDSHAKE_TIMEOUT_S` (5s por defecto) | 4900 | `handshake timeout` |
-| `client_key` inválida, cliente inactivo o retirado, o usuario desactivado (dispositivo con sesión) | 4010 | `invalid or inactive credential` |
+| `token` inválida, cliente inactivo o retirado, o usuario desactivado (dispositivo con sesión) | 4010 | `invalid or inactive credential` |
 | El agente efectivo no está en la lista permitida para este cliente (`allowed_agents`) | 4020 | `agent not permitted` |
 | El agente pedido no existe en OpenClaw | 4021 | `agent not available` |
 | `conversation` no existe o es de otro cliente (no se distingue) | 4100 | `conversation not found` |
@@ -700,13 +717,13 @@ Los errores llegan independientemente de `output_mode`:
 
 ### Códigos de error
 
-> **Nota de precisión:** en la implementación actual, los únicos códigos que el gateway envía de verdad como mensaje `{"type":"error",...}` son `TURN_ERROR` (fallo dentro de un turno ya en marcha) e `INVALID_MESSAGE` (mensaje del cliente mal formado), ambos con `fatal: false`. Los fallos de handshake (`client_key` inválida, agente inexistente, orquestador no disponible al arrancar) **no** se comunican con un mensaje `error` previo — el gateway cierra directamente el WebSocket con el código y `reason` de la tabla de la §1. La tabla siguiente documenta la intención original del formato `code`/`fatal`; trátala como referencia de forma, no como lista exhaustiva de códigos que verás en producción hoy.
+> **Nota de precisión:** en la implementación actual, los únicos códigos que el gateway envía de verdad como mensaje `{"type":"error",...}` son `TURN_ERROR` (fallo dentro de un turno ya en marcha) e `INVALID_MESSAGE` (mensaje del cliente mal formado), ambos con `fatal: false`. Los fallos de handshake (`token` inválida, agente inexistente, orquestador no disponible al arrancar) **no** se comunican con un mensaje `error` previo — el gateway cierra directamente el WebSocket con el código y `reason` de la tabla de la §1. La tabla siguiente documenta la intención original del formato `code`/`fatal`; trátala como referencia de forma, no como lista exhaustiva de códigos que verás en producción hoy.
 
 | Código | Fatal | Cuándo ocurre |
 |--------|-------|---------------|
 | `TURN_ERROR` | false | Fallo en un turno concreto (orquestador caído/reconectando durante una sesión activa, **o** el turno se cuelga sin progreso — `message: "turn_timeout"`, ver §13); la sesión continúa |
 | `INVALID_MESSAGE` | false | Frame de texto del cliente que no es un objeto JSON: texto plano (`hola`), `42`, `[1]`, `"s"`, `true`, `null`; o `send` con `text` que no es cadena (#215). Vale en cualquier `input_mode`: desde 5.0 el texto plano ya no es un prompt (#408), los prompts van en `{"type":"send","text":...}`. La sesión continúa; el mensaje se ignora |
-| `AUTH_FAILED` | true | Documentado para `client_key` inválida o inactiva — en la práctica se señaliza cerrando el WS con 4010, sin este mensaje previo |
+| `AUTH_FAILED` | true | Documentado para `token` inválida o inactiva — en la práctica se señaliza cerrando el WS con 4010, sin este mensaje previo |
 | `AGENT_NOT_FOUND` | true | Documentado para agente inexistente — en la práctica se señaliza cerrando el WS con 4021 (o 4020 si no está permitido), sin este mensaje previo |
 | `ORCHESTRATOR_UNAVAILABLE` | true | Documentado para orquestador no disponible al iniciar — en la práctica se señaliza cerrando el WS con 1011, sin este mensaje previo |
 | `TTS_UNAVAILABLE` | false | Documentado para TTS caído — en la práctica ver `status: {tts, unavailable}` (§8), no este código |
@@ -742,7 +759,7 @@ Si `fatal: true`, no envíes más mensajes — el servidor cerrará la conexión
 
 ### Cierres por conversación (M19)
 
-Los fallos de conversación no llegan como `error`: el gateway cierra el WebSocket con uno de estos códigos (41xx, §13). Ninguno invalida la `client_key`.
+Los fallos de conversación no llegan como `error`: el gateway cierra el WebSocket con uno de estos códigos (41xx, §13). Ninguno invalida la `token`.
 
 | Código | `reason` | Cuándo | Qué hacer |
 |---|---|---|---|
@@ -789,7 +806,7 @@ Un push tiene el mismo tope que un turno normal: si OpenClaw lo abre y deja de m
 
 El cliente no necesita distinguirlos de los turnos normales — el `turn_id` y `turn_seq` siguen la misma secuencia (si quiere, `origin` lo dice). Si `tool_calls_enabled` está activo, también pueden llegar mensajes `tool_call` (§5) intercalados; con `"status"` en `output_mode`, `turn_progress` (§5).
 
-> **`push_enabled` (por defecto `True`, configurable por admin):** si tu `client_key` tiene este flag desactivado, no recibirás **ningún** mensaje de un turno iniciado por el agente — ni `turn_start`, ni `token`, ni audio, ni `tool_call` — para esa sesión. No hay ninguna señal explícita de que se haya suprimido un push; es indistinguible de que OpenClaw simplemente no haya iniciado ninguno. Si tu integración depende de notificaciones proactivas, confirma con el admin que `push_enabled=True` para tu cliente. Desde 5.0 un `send` tuyo no corta el push que esté en curso en la conversación aunque no lo recibas: espera a que termine; con `"interrupt": true`, sí lo corta (y lo aborta en OpenClaw).
+> **`push_enabled` (por defecto `True`, configurable por admin):** si tu `token` tiene este flag desactivado, no recibirás **ningún** mensaje de un turno iniciado por el agente — ni `turn_start`, ni `token`, ni audio, ni `tool_call` — para esa sesión. No hay ninguna señal explícita de que se haya suprimido un push; es indistinguible de que OpenClaw simplemente no haya iniciado ninguno. Si tu integración depende de notificaciones proactivas, confirma con el admin que `push_enabled=True` para tu cliente. Desde 5.0 un `send` tuyo no corta el push que esté en curso en la conversación aunque no lo recibas: espera a que termine; con `"interrupt": true`, sí lo corta (y lo aborta en OpenClaw).
 
 > **Garantía de un único par por respuesta (issue #84):** cuando el agente hace tool use o razonamiento multi-paso, OpenClaw puede emitir varios eventos internos de inicio/fin para una sola respuesta LLM. El gateway los colapsa siempre en exactamente **un** `turn_start`/`turn_end` de cara al cliente — nunca verás duplicados. Si tu cliente implementó algún workaround para deduplicar `turn_end` repetidos (grace period, etc.) porque llegaban 2-3 veces por turno, ya no hace falta; puedes simplificarlo o quitarlo con seguridad.
 
@@ -810,7 +827,7 @@ Los prompts van siempre en mensajes `send`; un frame que no es JSON recibe `INVA
 
 ```json
 // Handshake
-{ "client_key": "...", "protocol": 5, "input_mode": "text", "output_mode": ["text"] }
+{ "token": "...", "protocol": 5, "input_mode": "text", "output_mode": ["text"] }
 
 // Enviar pregunta
 { "type": "send", "text": "¿Qué tiempo hace en Madrid?" }
@@ -826,7 +843,7 @@ Los prompts van siempre en mensajes `send`; un frame que no es JSON recibe `INVA
 
 ```json
 // Handshake
-{ "client_key": "...", "protocol": 5, "input_mode": "audio", "output_mode": ["audio", "text", "status"] }
+{ "token": "...", "protocol": 5, "input_mode": "audio", "output_mode": ["audio", "text", "status"] }
 ```
 
 Flujo: envía PCM Float32 → recibe parciales → envía `end` → recibe `transcription` → envías `send` → recibes `turn_start` + `token` + frames binarios + `turn_end`.
@@ -835,7 +852,7 @@ Flujo: envía PCM Float32 → recibe parciales → envía `end` → recibe `tran
 
 ```json
 // Handshake
-{ "client_key": "...", "protocol": 5, "input_mode": "audio", "output_mode": ["text"] }
+{ "token": "...", "protocol": 5, "input_mode": "audio", "output_mode": ["text"] }
 ```
 
 El transcriptor funciona normalmente pero no se activa TTS. Útil para clientes que quieren transcripción + tokens de texto sin reproducción de audio.
@@ -844,7 +861,7 @@ El transcriptor funciona normalmente pero no se activa TTS. Útil para clientes 
 
 ```json
 // Handshake
-{ "client_key": "...", "protocol": 5, "input_mode": "text", "output_mode": ["text", "audio"] }
+{ "token": "...", "protocol": 5, "input_mode": "text", "output_mode": ["text", "audio"] }
 ```
 
 El cliente escribe; el gateway sintetiza audio con el texto de la respuesta.
@@ -857,7 +874,7 @@ El cliente escribe; el gateway sintetiza audio con el texto de la respuesta.
 
 | Mensaje | Formato | Cuándo |
 |---------|---------|--------|
-| Handshake | `{"client_key":"...","protocol":5,"input_mode":"...","output_mode":[...],"agent":"...","conversation":"...","capabilities":[...]}` | Primer mensaje, obligatorio |
+| Handshake | `{"token":"...","protocol":5,"input_mode":"...","output_mode":[...],"agent":"...","conversation":"...","capabilities":[...]}` | Primer mensaje, obligatorio |
 | Fin de audio | `{"type":"end"}` | `input_mode="audio"` — usuario termina de hablar |
 | Enviar texto | `{"type":"send","text":"...","interrupt":true?}` | Envía texto al orquestador: con un turno en curso espera en la cola; `interrupt: true` corta antes el turno en curso (§4) |
 | Quitar un mensaje | `{"type":"withdraw","message_id":"..."}` | Quita un mensaje `pending` de la conversación, de quien sea (§4). Nuevo en 5.0 |
@@ -905,7 +922,7 @@ Llegan entrelazados con los mensajes JSON. Identifica audio por el magic byte `0
 | `TURN_QUEUE_MAX` | 1000 eventos | Eventos del orquestador que la conversación retiene mientras espera el ack de un `send` o a que se cierre el turno abierto; es un fallo interno raro, no depende de tu lectura del socket | Desde 5.0, el run que no cabe falla con `TURN_ERROR` `internal_error` (abre y cierra su turno, `reason: "error"`) y se aborta en OpenClaw, solo él; el fin de un push nunca se descarta. Antes, `TURN_ERROR` `turn_overflow` |
 | `IDLE_TIMEOUT_S` | 300s (5 min) | No mandas **ningún** mensaje (ni audio ni texto) durante ese tiempo | Cierre WS con código 1000 (`session ended`), **sin ningún mensaje de error o aviso previo** |
 | `silence_timeout_s` (por cliente, default 2 s) | ~2 s con el default | Mientras envías audio, el transcriptor no devuelve nada durante más de `silence_timeout_s`. No cuenta con un turno en curso ni sin audio entrante | Un solo `status` `transcriber` `degraded` (`code: "silence"`) por tramo de silencio, y su `restored` (mismo `code`) con la siguiente transcripción; **la sesión sigue abierta** (no se cierra nunca por silencio). El aviso se rearma tras una transcripción nueva, un turno, una pausa en el audio o una reconexión del transcriptor |
-| `SESSION_REVALIDATE_INTERVAL_S` | 10s | Tu cliente se borra, se desactiva o se le rota la `client_key` con la sesión abierta; o su `allowed_agents` deja de incluir el agente de la conversación | Cierre WS 4200 (4020 si es el agente) en la siguiente revalidación; antes recibes el `turn_end` (`closed`) del turno en curso, que sigue en el canal (§14) |
+| `SESSION_REVALIDATE_INTERVAL_S` | 10s | Tu cliente se borra, se desactiva o se le rota la `token` con la sesión abierta; o su `allowed_agents` deja de incluir el agente de la conversación; o pierde `conversations:write` | Cierre WS 4200 (4020 si es el agente, 4011 si es el permiso) en la siguiente revalidación; antes recibes el `turn_end` (`closed`) del turno en curso, que sigue en el canal (§14) |
 | `SESSION_TEARDOWN_S` | 5s | Interno — tope de cada paso cuando el gateway cierra una sesión (cerrar tu copia del turno en curso, cerrar servicios, mandarte los últimos mensajes). Sustituye a `SHUTDOWN_DRAIN_S`, que ya no se acepta | Ninguno directo. Un turno en curso **no se espera**: recibes su `turn_end` (`closed`) si el socket sigue abierto y el turno sigue en el canal de la conversación (§14; ver «Cierre de la sesión por el gateway» abajo) |
 | `PUSH_TTS_DRAIN_TIMEOUT_S` | 30s, **sin progreso** | El TTS de un turno de push (iniciado por el agente) lleva 30s sin producir audio tras el `end` del agente (se reinicia con cada trozo, así que un push largo sonando a ritmo no se corta) | El audio restante de ese push se corta, el TTS se cierra y el `turn_end` se envía igualmente — la sesión sigue viva. Con el mismo tope se acotan las escrituras de texto al TTS de push y su `end()`: si vencen, el resto de ese push llega solo como `token` de texto, sin más audio, y el `turn_end` se envía igualmente. En los turnos normales el mismo tope acota cada operación con el TTS, y la espera del audio cuenta como tiempo **sin progreso** (se reinicia con cada chunk): si vence, el turno sigue solo con texto y también recibe su `turn_end` |
 | `CLIENT_SEND_TIMEOUT_S` | 10s, **por envío** | El gateway no consigue escribirte un mensaje durante ese tiempo porque tu socket **drena por debajo del ritmo al que el gateway escribe**: o has dejado de leer, o lees muy por debajo del caudal de salida (el audio TTS PCM16 a 24 kHz son 48 KB/s). Es un umbral de caudal de drenado, del orden de unos pocos KB/s (teoría) a unas pocas decenas de KB/s (medidas de laboratorio en macOS), según kernel y tasa de producción, y **solo cuando hay más datos en vuelo que los buffers del sistema** (varios MB); con respuestas de tamaño normal y un cliente que lee, no se activa; un cliente que lee a un ritmo razonable no se corta | Cierre WS con código **1013** (`client too slow`) (mejor esfuerzo) si reanudas la lectura en los 2 s siguientes; si no, o si el close frame se pierde, la conexión se corta sin close frame (1006). Los mensajes pendientes se descartan; reconecta y abre una sesión nueva |
@@ -944,11 +961,12 @@ Los códigos estándar se quedan donde el significado es de transporte y el est�
 | 1011 | `orchestrator unavailable` | Handshake: OpenClaw no responde al health check (antes llega `status` `orchestrator` `unavailable`) | Con espera |
 | 1011 | `internal error` | La sesión termina por un fallo interno del gateway (antes o después del `ready`) | Con espera |
 | 1013 | `client too slow` | No lees al ritmo al que el gateway escribe (`CLIENT_SEND_TIMEOUT_S`); si no reanudas la lectura en 2 s, verás 1006 | Con espera |
-| 4000 | `invalid handshake` | JSON inválido, campos incorrectos o sin `client_key` | No, hay que arreglar algo (bug del cliente) |
+| 4000 | `invalid handshake` | JSON inválido, campos incorrectos o sin `token` | No, hay que arreglar algo (bug del cliente) |
 | 4001 | `handshake must be a text frame` | El primer mensaje es binario | No, hay que arreglar algo (bug del cliente) |
 | 4002 | `handshake too large` | El handshake supera `HANDSHAKE_MAX_BYTES` | No, hay que arreglar algo (bug del cliente) |
 | 4003 | `protocol version not supported` | El handshake no trae `protocol: 5` | No, hay que arreglar algo: actualiza el cliente a la versión 5 |
-| 4010 | `invalid or inactive credential` | `client_key` no válida, o el cliente está desactivado o retirado | No, hay que arreglar algo: vuelve a emparejar (§0) |
+| 4010 | `invalid or inactive credential` | `token` no válido, o el cliente está desactivado o retirado | No, hay que arreglar algo: vuelve a emparejar (§0) |
+| 4011 | `missing scope` | La credencial vale pero el aparato no tiene `conversations:write` (§0, «Permisos»): en el handshake o, con la sesión abierta, porque se lo quitaron o bajaron el rol a su persona (`SESSION_REVALIDATE_INTERVAL_S`; antes recibes el `turn_end` (`closed`) del turno abierto). La clave sigue valiendo | No, hay que arreglar algo: que el administrador le dé el permiso, o iniciar sesión otra vez pidiéndolo |
 | 4020 | `agent not permitted` | El agente no está en `allowed_agents` del cliente, en el handshake o, con la sesión abierta, porque el administrador lo quitó (`SESSION_REVALIDATE_INTERVAL_S`; antes recibes el `turn_end` (`closed`) del turno abierto). La clave sigue valiendo | No, hay que arreglar algo: otro agente, o que el administrador lo permita |
 | 4021 | `agent not available` | El agente pedido no existe en OpenClaw | No, hay que arreglar algo: otro agente |
 | 4100 | `conversation not found` | La conversación pedida no existe o no es tuya | No, hay que arreglar algo: olvida ese id; sin `conversation` o con `"new"` |
@@ -1012,7 +1030,7 @@ Las reglas son las mismas para todos los clientes; el gateway no mira el tipo de
 > **Incompatibilidad de protocolo — 5.0**
 > Una conversación ya no está abierta en una sola sesión: varias sesiones (del mismo cliente o de otros dispositivos que pueden verla) comparten la conversación y cada una recibe su par de cada turno. El 4102 se retiró y no se reutiliza. Un cliente que abre la conversación del día en dos sitios ya no se echa a sí mismo.
 
-**Quién abre qué (4.0).** Una conversación es del hogar o de una persona, según el dispositivo que la crea: la de un dispositivo **personal** (con sesión) es privada de su usuario; la de uno **del hogar** (emparejado), del hogar. Desde un dispositivo del hogar se abren solo las del hogar; desde uno personal, las del hogar y las de su usuario, también las empezadas en otro de sus dispositivos. Pedir una que no se puede ver es 4100, igual que una que no existe. Un aviso (push) de una conversación privada nunca llega a un dispositivo del hogar ni a uno de otra persona: su dispositivo de avisos solo puede ser uno de los aparatos personales de su dueña. La web inicia sesión (`/auth/login`), entra con su token como `client_key`, crea sus conversaciones con `POST /admin/conversations` (o `"conversation": "new"`) y las retoma por su id.
+**Quién abre qué (4.0).** Una conversación es del hogar o de una persona, según el dispositivo que la crea: la de un dispositivo **personal** (con sesión) es privada de su usuario; la de uno **del hogar** (emparejado), del hogar. Desde un dispositivo del hogar se abren solo las del hogar; desde uno personal, las del hogar y las de su usuario, también las empezadas en otro de sus dispositivos. Pedir una que no se puede ver es 4100, igual que una que no existe. Un aviso (push) de una conversación privada nunca llega a un dispositivo del hogar ni a uno de otra persona: su dispositivo de avisos solo puede ser uno de los aparatos personales de su dueña. La web inicia sesión (`/auth/login`), entra con su token como `token`, crea sus conversaciones con `POST /admin/conversations` (o `"conversation": "new"`) y las retoma por su id.
 
 ---
 
