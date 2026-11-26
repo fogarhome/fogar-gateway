@@ -29,7 +29,7 @@ from tests.integration.conftest import (
 )
 
 HANDSHAKE_AUDIO = {
-    "client_key": VALID_KEY,
+    "token": VALID_KEY,
     "protocol": 5,
     "input_mode": "audio",
     "output_mode": ["text"],
@@ -251,7 +251,7 @@ def test_tts_connect_uses_voice_and_speed_from_config(mock_services, db_engine, 
                 # output_mode=["audio"] para que el bridge instancie TTSClient
                 ws.send_json(
                     {
-                        "client_key": VALID_KEY,
+                        "token": VALID_KEY,
                         "protocol": 5,
                         "input_mode": "text",
                         "output_mode": ["audio", "text"],

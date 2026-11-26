@@ -3,7 +3,7 @@ import { computed, ref } from 'vue'
 
 // La sesión de esta web (4.0): el token de este navegador como dispositivo personal (de
 // /auth/login) y quién es su persona. El token va como Bearer a /admin y /auth y como
-// client_key al WebSocket; nunca se enseña.
+// token al WebSocket; nunca se enseña.
 export type Role = 'owner' | 'admin' | 'member'
 
 export interface SessionUser {

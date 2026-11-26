@@ -62,6 +62,9 @@ class Close:
     HANDSHAKE_TOO_LARGE = CloseFrame(4002, "handshake too large", "fix")
     PROTOCOL_UNSUPPORTED = CloseFrame(4003, "protocol version not supported", "fix")
     INVALID_CREDENTIAL = CloseFrame(4010, "invalid or inactive credential", "fix")
+    # La credencial vale pero no lleva `conversations:write` (#410), en el handshake o al
+    # perderlo con la sesión abierta (revalidación).
+    MISSING_SCOPE = CloseFrame(4011, "missing scope", "fix")
     AGENT_NOT_PERMITTED = CloseFrame(4020, "agent not permitted", "fix")
     AGENT_NOT_AVAILABLE = CloseFrame(4021, "agent not available", "fix")
 

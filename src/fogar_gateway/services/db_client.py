@@ -20,6 +20,7 @@ from fogar_gateway.db.models import ClientRecord, HomeRecord, MembershipRecord, 
 from fogar_gateway.models.schemas import Client, ClientConfig
 from fogar_gateway.services.auth import hash_key
 from fogar_gateway.services.notify_device import notify_client_for
+from fogar_gateway.services.scopes import normalize_scopes, scope_cap
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,10 @@ class DbClient:
             # Un dispositivo personal vale lo que su usuario (M20): desactivarlo corta sus
             # sesiones en la siguiente revalidación, también por /v1 y el WebSocket.
             user = session.get(UserRecord, record.user_id) if record and record.user_id else None
+            membership = (
+                session.get(MembershipRecord, (record.user_id, record.home_id))
+                if record and record.user_id else None
+            )
             household_agent = _household_agent(session, record) if record is not None else None
 
         # Sin argumentos: el mensaje de la excepción no lleva ni el hash.
@@ -125,6 +130,7 @@ class DbClient:
             home_id=record.home_id,
             is_active=record.is_active,
             name=record.name,
+            scopes=_effective_scopes(record, membership),
         )
         # `include` explícito: ClientConfig es extra="allow" y no debe recibir id/client_key.
         config = ClientConfig(
@@ -136,6 +142,21 @@ class DbClient:
 
 
 _CONFIG_COLUMNS = set(ClientConfig.model_fields) - {"allowed_agents", "household_agent"}
+
+
+def _effective_scopes(record: ClientRecord, membership: MembershipRecord | None) -> frozenset[str]:
+    """Lo concedido ∩ el tope de hoy (#410): el rol se lee en cada consulta, así que bajárselo a
+    una persona recorta sus aparatos en la siguiente petición o revalidación. Un JSON roto no
+    concede nada (nunca de más)."""
+    try:
+        granted = json.loads(record.scopes)
+    except ValueError:
+        granted = None
+    if not isinstance(granted, list):
+        logger.error("Cliente %s: scopes ilegibles; sin permisos.", record.id)
+        return frozenset()
+    role = membership.role if membership is not None else None
+    return normalize_scopes(str(g) for g in granted) & scope_cap(record.user_id, role)
 
 
 def _household_agent(session: Session, record: ClientRecord) -> str | None:

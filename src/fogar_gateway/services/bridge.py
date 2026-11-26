@@ -23,6 +23,7 @@ from fogar_gateway.services.reconnection import (
     to_wire_state,
     traceback_no_message,
 )
+from fogar_gateway.services.scopes import CONVERSATIONS_WRITE
 from fogar_gateway.services.session_registry import SessionStatus
 from fogar_gateway.services.speech.ports import (
     SpeechToTextProvider,
@@ -492,6 +493,15 @@ class FogarBridge:
                 if current.id != self.client.id:
                     # Borrado y recreado con la MISMA clave: es otro cliente.
                     await self._revoke_session()
+                    return
+                if CONVERSATIONS_WRITE not in current.scopes:
+                    # #410: le quitaron el permiso (o bajaron el rol a su persona); 4011, no 4200:
+                    # la clave sigue valiendo.
+                    logger.warning(f"[{self.client_id}] Sin permiso para conversar; se cierra.")
+                    task = self._start_policy_close(
+                        Close.MISSING_SCOPE, "scope_revoked", "scope_revoked", status="revoked"
+                    )
+                    await asyncio.wait({task})
                     return
                 agent = self.conversation.current.agent.lower()
                 allowed = self.turns.allowed_agents = config.allowed_agents

@@ -15,7 +15,7 @@ from fogar_gateway.main import app
 from fogar_gateway.services.stats import gateway_stats
 from tests.integration.conftest import CLIENT_ID, VALID_KEY
 
-HANDSHAKE = {"client_key": VALID_KEY, "protocol": 5, "input_mode": "text", "output_mode": ["text"]}
+HANDSHAKE = {"token": VALID_KEY, "protocol": 5, "input_mode": "text", "output_mode": ["text"]}
 
 
 def _wait_for(predicate, timeout=5.0):
@@ -120,7 +120,7 @@ def test_slow_client_reason(client, monkeypatch):
 def test_handshake_rejections_counted(client, monkeypatch):
     # clave inválida
     with client.websocket_connect("/ws/stream") as ws:
-        ws.send_json({**HANDSHAKE, "client_key": "nope"})
+        ws.send_json({**HANDSHAKE, "token": "nope"})
         with pytest.raises(WebSocketDisconnect) as exc:
             ws.receive_text()
     assert (exc.value.code, exc.value.reason) == (4010, "invalid or inactive credential")

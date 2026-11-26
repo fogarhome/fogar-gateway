@@ -16,6 +16,7 @@ from fogar_gateway.services.bridge import FogarBridge
 from fogar_gateway.services.conversations import Conversation, SessionConversation
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
 from fogar_gateway.services.outbound import ClientGone, QueuedSender
+from fogar_gateway.services.scopes import DEFAULT_SCOPES
 from tests.fakes.orchestrator import OrchestratorEvent, wire_stream_orchestrator
 from tests.fakes.speech import speech_providers
 
@@ -83,13 +84,13 @@ def make_bridge(
     """
     ws = ws if ws is not None else RecWS()
     kwargs = dict(
-        client=Client(id=client_id, key_hash="k", is_active=True),
+        client=Client(id=client_id, key_hash="k", is_active=True, scopes=DEFAULT_SCOPES),
         config=ClientConfig(),
         client_ws=ws,
         orchestrator=AsyncMock(),
         speech=speech_providers(tts=tts, stt=stt),
         tracker=fake_tracker(),
-        handshake=Handshake(client_key="k", input_mode=input_mode, output_mode=list(output_mode)),
+        handshake=Handshake(token="k", input_mode=input_mode, output_mode=list(output_mode)),
         client_registry=ClientRegistry(),
         turn_registry=TurnRegistry(),
         conversation=fixed_conversation(client_id),

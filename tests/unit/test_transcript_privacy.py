@@ -42,7 +42,7 @@ async def test_final_transcription_event_keeps_only_length(bridge, caplog):
 
 async def test_send_message_is_not_logged_at_info(bridge, caplog):
     bridge.orchestrator.stream_response = tokens("ok")
-    bridge.handshake = Handshake(client_key="k", input_mode="audio", output_mode=["text"])
+    bridge.handshake = Handshake(token="k", input_mode="audio", output_mode=["text"])
     bridge.client_ws.receive = AsyncMock(
         side_effect=[
             {"type": "websocket.message", "text": json.dumps({"type": "send", "text": _SECRET})},

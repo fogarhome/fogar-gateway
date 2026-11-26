@@ -98,7 +98,9 @@ def _get(session: Session, user_id: str) -> tuple[UserRecord, MembershipRecord]:
 
 
 def _is_owner_level(principal: Principal) -> bool:
-    return not isinstance(principal, Caller) or principal.membership.role == "owner"
+    if not isinstance(principal, Caller):
+        return True  # la máquina
+    return principal.membership is not None and principal.membership.role == "owner"
 
 
 def _require_owner_level(principal: Principal) -> None:

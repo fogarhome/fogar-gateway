@@ -28,6 +28,7 @@ from fogar_gateway.services.openclaw.models import GatewayInfo
 from fogar_gateway.services.outbound import ClientGone, QueuedSender
 from fogar_gateway.services.pipeline_tracker import PipelineTracker
 from fogar_gateway.services.reconnection import describe_error, traceback_no_message
+from fogar_gateway.services.scopes import CONVERSATIONS_WRITE
 from fogar_gateway.services.stats import gateway_stats
 from fogar_gateway.services.teardown import Teardown
 
@@ -51,9 +52,9 @@ class _Rejected(Exception):
 
 
 async def _authenticate(handshake: Handshake) -> tuple[Client, ClientConfig, str]:
-    """`(Client, ClientConfig, quién para el log)` de la `client_key` del handshake: un
+    """`(Client, ClientConfig, quién para el log)` del `token` del handshake: un
     dispositivo emparejado o uno con sesión (M20). Lanza ClientNotFound/ClientInactive."""
-    key = handshake.client_key
+    key = handshake.token
     client, config = await db_client.get_session(key)
     await db_client.touch(client.id, handshake.capabilities)
     return client, config, f"fp={fingerprint_key(key)}"
@@ -134,7 +135,7 @@ async def gateway_websocket(websocket: WebSocket):
         # ValueError cubre JSONDecodeError, ValidationError y el límite de 4300 dígitos de un
         # entero; RecursionError, un anidamiento profundo (D-r5-2).
         # G-27b (#216): str(ValidationError) incluye `input_value=` con el dict entero
-        # (la client_key). Solo campo y tipo de error; de JSONDecodeError, su mensaje
+        # (el token). Solo campo y tipo de error; de JSONDecodeError, su mensaje
         # (posición, sin el documento); de lo demás, solo el tipo.
         if isinstance(e, ValidationError):
             detail = ", ".join(
@@ -170,8 +171,8 @@ async def gateway_websocket(websocket: WebSocket):
     try:
         client, config, who = await _authenticate(handshake)
     except (ClientNotFound, ClientInactive):
-        # La client_key solo como huella.
-        who = f"fp={fingerprint_key(handshake.client_key)}"
+        # El token solo como huella.
+        who = f"fp={fingerprint_key(handshake.token)}"
         logger.warning(
             f"request_id={request_id} source_ip={client_ip_for_log(websocket)} "
             f"{who} Handshake rechazado: credencial inválida o cliente inactivo."
@@ -183,6 +184,12 @@ async def gateway_websocket(websocket: WebSocket):
         # C-r7-2: fila con `allowed_agents` corrupto (editada a mano): solo el tipo, nunca el valor.
         logger.error(f"request_id={request_id} Configuración del cliente ilegible: {describe_error(e)}")
         await send_close(websocket, Close.SETUP_FAILED)
+        return
+    if CONVERSATIONS_WRITE not in client.scopes:
+        # #410: la credencial vale, pero este aparato no puede conversar.
+        logger.warning(f"request_id={request_id} client_id={client.id} Handshake rechazado: sin scope.")
+        gateway_stats.handshake_rejected("missing_scope")
+        await send_close(websocket, Close.MISSING_SCOPE)
         return
     logger.info(f"request_id={request_id} client_id={client.id} {who} Handshake verificado.")
 

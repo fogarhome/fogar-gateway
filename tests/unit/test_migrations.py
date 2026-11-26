@@ -307,6 +307,49 @@ def test_migration_adds_notify_device(tmp_path, monkeypatch):
         database.dispose_engine()
 
 
+def test_migration_gives_each_device_its_cap(tmp_path, monkeypatch):
+    """#410: cada aparato existente recibe su tope: los del hogar y los de una persona miembro,
+    `conversations:*`; los de un dueño o administrador, los cuatro. Bajar quita la columna."""
+    import json
+
+    from alembic import command
+    from sqlalchemy import text
+
+    _point_at(monkeypatch, tmp_path / "scopes.db")
+    command.upgrade(database._alembic_config(), "50a0e1f00004")
+    engine = database.get_engine()
+    try:
+        with engine.begin() as c:
+            for uid, role in (("u-sito", "owner"), ("u-eva", "admin"), ("u-ana", "member")):
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, password_hash, is_active, "
+                    f"created_at) VALUES ('{uid}', '{uid}', '{uid}', 'h', 1, '2026-11-26')"
+                ))
+                c.execute(text(
+                    "INSERT INTO memberships (user_id, home_id, role) "
+                    f"VALUES ('{uid}', 'home', '{role}')"
+                ))
+            _insert_client(c, "tv")
+            _insert_client(c, "mac", user="u-sito")
+            _insert_client(c, "pc", user="u-eva")
+            _insert_client(c, "phone", user="u-ana")
+        database.run_migrations()
+        with engine.connect() as c:
+            rows = dict(c.execute(text("SELECT id, scopes FROM clients")).all())
+        converse = ["conversations:read", "conversations:write"]
+        everything = ["conversations:read", "conversations:write", "home:admin", "home:read"]
+        assert {k: json.loads(v) for k, v in rows.items()} == {
+            "tv": converse, "phone": converse, "mac": everything, "pc": everything,
+        }
+        engine.dispose()
+        command.downgrade(database._alembic_config(), "50a0e1f00004")
+        with engine.connect() as c:
+            assert "scopes" not in {col["name"] for col in inspect(c).get_columns("clients")}
+            assert c.execute(text("SELECT COUNT(*) FROM clients")).scalar() == 4
+    finally:
+        database.dispose_engine()
+
+
 def test_a_3x_database_is_refused_untouched(tmp_path, monkeypatch):
     """La 4.0 no convierte una BD 3.x (M20): error claro y el fichero sin tocar."""
     from sqlalchemy import text

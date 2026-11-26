@@ -74,7 +74,7 @@ export function createChatSession(options: ChatSessionOptions) {
     socket.onopen = () => {
       socket.send(
         JSON.stringify({
-          client_key: options.token,
+          token: options.token,
           protocol: 5,
           input_mode: 'text',
           // `status`: el progreso del turno (`turn_progress`); llegan también los `pipeline_event`, que el chat ignora.

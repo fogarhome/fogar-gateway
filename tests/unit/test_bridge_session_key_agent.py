@@ -8,7 +8,7 @@ from tests.fakes.orchestrator import OrchestratorEvent
 async def test_session_key_uses_stripped_resolved_agent(make_bridge):
     """Hallazgo 6: `" main "` valida como `main` y debe dar la misma sesión de OpenClaw."""
     bridge, _ = make_bridge(
-        handshake=Handshake(client_key="k", input_mode="text", output_mode=["text"], agent=" main ")
+        handshake=Handshake(token="k", input_mode="text", output_mode=["text"], agent=" main ")
     )
     captured = {}
 

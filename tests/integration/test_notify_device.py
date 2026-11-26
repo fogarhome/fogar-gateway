@@ -33,9 +33,10 @@ def people(http, admin_headers):
 
 def _login(http, username: str, device_name: str = "d") -> tuple[str, dict[str, str]]:
     r = http.post("/auth/login",
-                  json={"username": username, "password": PW, "device_name": device_name})
+                  json={"username": username, "password": PW, "device_name": device_name,
+                        "scopes": ["conversations:write", "home:admin"]})
     assert r.status_code == 201, r.text
-    return r.json()["client_id"], {"authorization": f"Bearer {r.json()['client_key']}"}
+    return r.json()["client_id"], {"authorization": f"Bearer {r.json()['token']}"}
 
 
 def _home_device(db_engine, name: str = "Tele", home_id: str = "home") -> str:
@@ -128,7 +129,7 @@ def test_admin_sets_home_notify_device(http, people, db_engine, admin_headers):
 
     # Un miembro no toca el hogar, como el resto de /admin.
     r = http.patch("/admin/home", json={"notify_client_id": tv}, headers=ana_auth)
-    assert r.status_code == 403 and r.json() == {"detail": "forbidden"}
+    assert r.status_code == 403 and r.json() == {"detail": "missing_scope"}
 
     with Session(db_engine) as s:
         s.add(HomeRecord(id="h2", name="Otro"))

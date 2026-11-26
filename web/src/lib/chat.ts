@@ -239,6 +239,7 @@ export function closeAction(code: number): CloseAction {
 /** Frases de los cierres que paran el chat (`stop`) y tienen una explicación propia. */
 const STOP_TEXT: Partial<Record<number, string>> = {
   4010: 'Tu sesión en este navegador ya no vale (se retiró o te desactivaron). Vuelve a entrar.',
+  4011: 'Este navegador no tiene permiso para conversar. Vuelve a entrar.',
   4020: 'El agente de esta conversación no está permitido para este navegador.',
   4021: 'El agente de esta conversación no existe en OpenClaw.',
   4100: 'Esta conversación ya no existe en el gateway.',

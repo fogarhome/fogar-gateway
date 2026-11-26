@@ -94,7 +94,7 @@ class Harness:
         ws = await websockets.connect(f"ws://127.0.0.1:{self.port}/ws/stream", **ws_kwargs)
         client = HarnessClient(ws)
         self.clients.append(client)
-        payload = {"client_key": VALID_KEY, "protocol": 5, "input_mode": input_mode, "output_mode": list(output_mode)}
+        payload = {"token": VALID_KEY, "protocol": 5, "input_mode": input_mode, "output_mode": list(output_mode)}
         payload.update(handshake or {})
         await client.send({k: v for k, v in payload.items() if v is not None})
         return client

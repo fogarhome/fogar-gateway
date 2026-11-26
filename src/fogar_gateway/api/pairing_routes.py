@@ -4,7 +4,8 @@ Descubrimiento y emparejamiento de clientes (#317).
 
 Público, sin autenticación:
   GET    /.well-known/fogar-gateway  — «soy un Fogar»: servicio, versión e instance_id (sin nombre)
-  POST   /pair                      — el cliente canjea un código y recibe su client_key (una sola vez)
+  POST   /pair                      — el cliente canjea un código (y pide sus scopes) y recibe su
+                                       token (una sola vez) y los scopes concedidos
 
 Administración (X-Admin-Token):
   POST   /admin/pairing             — abre un código con la plantilla del cliente
@@ -29,7 +30,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlmodel import Session
 
 from fogar_gateway._version import __version__
-from fogar_gateway.api.admin_routes import _check_agent_consistency, create_client_record
+from fogar_gateway.api.admin_routes import (
+    _check_agent_consistency,
+    check_household_scopes,
+    create_client_record,
+)
 from fogar_gateway.api.deps import require_admin
 from fogar_gateway.core.config import settings
 from fogar_gateway.core.logging import fingerprint_key
@@ -39,6 +44,7 @@ from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.models.admin_schemas import ClientCreate, PairingCreate, PairRequest
 from fogar_gateway.services.auth import new_key
 from fogar_gateway.services.pairing import InvalidCode, Pairing, PairingFull, PairingStore
+from fogar_gateway.services.scopes import DEFAULT_SCOPES, normalize_scopes, to_list
 
 logger = logging.getLogger(__name__)
 
@@ -79,11 +85,18 @@ def pair(
     session: Session = Depends(get_db_session),
 ) -> dict[str, Any]:
     offered = body.model_dump(include={"name", "client_type", "output_mode"}, exclude_none=True)
+    granted: frozenset[str] = frozenset()
 
     key = new_key()  # se guarda solo su hash: esta es la única vez que existe en claro
 
     def create(template: dict[str, Any]) -> ClientRecord:
+        nonlocal granted
         fields = {**offered, **template}  # manda lo que fijó el administrador
+        # Lo pedido ∩ lo aprobado en el código (#410); sin pedir, lo aprobado.
+        asked = template.get("scopes")
+        approved = normalize_scopes(asked) if asked is not None else DEFAULT_SCOPES
+        granted = approved & normalize_scopes(body.scopes) if body.scopes is not None else approved
+        fields["scopes"] = to_list(granted)
         fields.setdefault("name", f"{fields.get('client_type') or 'cliente'}-{secrets.token_hex(2)}")
         return create_client_record(session, ClientCreate(**{**fields, "client_key": key}))
 
@@ -102,7 +115,8 @@ def pair(
     return {
         "client_id": record.id,
         "name": record.name,
-        "client_key": key,
+        "token": key,
+        "scopes": to_list(granted),
         "gateway": {"name": gateway_name(), "version": __version__},
     }
 
@@ -127,6 +141,8 @@ def _summary(item: Pairing) -> dict[str, Any]:
 def open_pairing(body: PairingCreate, request: Request) -> dict[str, Any]:
     # Se valida aquí y no al canjear: un error tiene que salir en la CLI, no en la tele.
     _check_agent_consistency(body.default_agent, body.allowed_agents)
+    if body.scopes is not None:
+        check_household_scopes(normalize_scopes(body.scopes))
     try:
         # Sin los null: no deben pisar lo que proponga el cliente (ni dejarlo sin nombre).
         template = body.model_dump(exclude_unset=True, exclude_none=True)

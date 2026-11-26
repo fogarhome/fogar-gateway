@@ -26,7 +26,7 @@ from tests.integration.conftest import (
 )
 
 HANDSHAKE_AUDIO = {
-    "client_key": VALID_KEY,
+    "token": VALID_KEY,
     "protocol": 5,
     "input_mode": "audio",
     "output_mode": ["text"],

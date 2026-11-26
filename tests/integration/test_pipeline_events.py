@@ -3,13 +3,13 @@
 from tests.integration.conftest import VALID_KEY
 
 HANDSHAKE_WITH_STATUS = {
-    "client_key": VALID_KEY,
+    "token": VALID_KEY,
     "protocol": 5,
     "input_mode": "text",
     "output_mode": ["text", "status"],
 }
 HANDSHAKE_TEXT_ONLY = {
-    "client_key": VALID_KEY,
+    "token": VALID_KEY,
     "protocol": 5,
     "input_mode": "text",
     "output_mode": ["text"],

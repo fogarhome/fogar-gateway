@@ -53,6 +53,13 @@ from fogar_gateway.services.auth import hash_key, new_key
 from fogar_gateway.services.notify_device import clear_notify_device
 from fogar_gateway.services.openclaw.models import OrchestratorAccess, access_texts
 from fogar_gateway.services.reconnection import ServiceStatus
+from fogar_gateway.services.scopes import (
+    DEFAULT_SCOPES,
+    HOUSEHOLD_CAP,
+    SCOPE_NOT_ALLOWED,
+    normalize_scopes,
+    to_list,
+)
 from fogar_gateway.services.stats import gateway_stats
 
 _ROTATE_KEY_ATTEMPTS = 3
@@ -96,6 +103,12 @@ def _check_agent_consistency(default_agent: str | None, allowed_agents: list[str
         )
 
 
+def check_household_scopes(scopes: frozenset[str]) -> None:
+    """Un aparato del hogar llega como mucho a `home:read` (#410): 422 si piden más."""
+    if not scopes <= HOUSEHOLD_CAP:
+        raise HTTPException(status_code=422, detail=SCOPE_NOT_ALLOWED)
+
+
 def _lists_to_json(data: dict[str, Any]) -> dict[str, Any]:
     """Serializa a JSON las listas que la BD guarda como texto (si vienen y no son null)."""
     for field in ("allowed_agents", "output_mode"):
@@ -128,7 +141,11 @@ def create_client_record(
     no, uno nuevo. Guarda solo el hash de `body.client_key` (M20): quien necesite enseñar la
     clave la pone en `body` antes."""
     _check_agent_consistency(body.default_agent, body.allowed_agents)
+    scopes = normalize_scopes(body.scopes) if body.scopes is not None else DEFAULT_SCOPES
+    if user_id is None:
+        check_household_scopes(scopes)
     data = _lists_to_json(body.model_dump())
+    data["scopes"] = json.dumps(to_list(scopes))
     data["key_hash"] = hash_key(data.pop("client_key") or new_key())
     data["user_id"] = user_id  # M20: con usuario, un dispositivo personal (un inicio de sesión)
     data["capabilities"] = json.dumps(capabilities) if capabilities is not None else None
@@ -185,6 +202,16 @@ def update_client(
             if "allowed_agents" in patch
             else (json.loads(rec.allowed_agents) if rec.allowed_agents else None),
         )
+    if "scopes" in patch:
+        scopes = normalize_scopes(patch["scopes"])
+        # Uno del hogar, hasta su tope; uno personal solo puede perder lo que pidió (para pedir
+        # más, su persona inicia sesión otra vez).
+        limit = HOUSEHOLD_CAP if rec.user_id is None else normalize_scopes(
+            ClientResponse.from_record(rec).scopes
+        )
+        if not scopes <= limit:
+            raise HTTPException(status_code=422, detail=SCOPE_NOT_ALLOWED)
+        patch["scopes"] = json.dumps(to_list(scopes))
     for field, value in _lists_to_json(patch).items():
         setattr(rec, field, value)
     session.add(rec)

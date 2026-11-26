@@ -26,9 +26,10 @@ def _create(http, headers, username, role="member", **extra):
 
 
 def _bearer(http, username) -> dict[str, str]:
-    r = http.post("/auth/login", json={"username": username, "password": PW, "device_name": "d"})
+    r = http.post("/auth/login", json={"username": username, "password": PW, "device_name": "d",
+                                       "scopes": ["conversations:write", "home:admin"]})
     assert r.status_code == 201, r.text
-    return {"authorization": f"Bearer {r.json()['client_key']}"}
+    return {"authorization": f"Bearer {r.json()['token']}"}
 
 
 @pytest.fixture

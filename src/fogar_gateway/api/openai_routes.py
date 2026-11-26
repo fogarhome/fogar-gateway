@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from fogar_gateway.api.deps import missing_scope
 from fogar_gateway.core.agent_policy import (
     MODEL_ALIAS,
     AgentPolicyError,
@@ -30,6 +31,7 @@ from fogar_gateway.services.openclaw.client import _traceback_no_message
 from fogar_gateway.services.orchestration import OrchestratorError
 from fogar_gateway.services.pipeline_tracker import PipelineTracker
 from fogar_gateway.services.reconnection import describe_error
+from fogar_gateway.services.scopes import CONVERSATIONS_WRITE
 from fogar_gateway.services.session_registry import SessionStatus
 from fogar_gateway.services.text import without_lone_surrogates
 
@@ -84,8 +86,9 @@ class HACaller:
 async def resolve_ha_caller(request: Request) -> HACaller:
     """Dependency de auth para /v1/*.
 
-    - Authorization: Bearer <client_key> presente -> valida contra la BD
-      (igual que el handshake WS). Aplica siempre, sin importar el origen.
+    - Authorization: Bearer <token> presente -> valida contra la BD
+      (igual que el handshake WS) y exige `conversations:write` (403 `missing_scope`).
+      Aplica siempre, sin importar el origen.
     - Sin Authorization -> exige que el origen (ver resolve_client_ip) sea
       confiable (loopback y/o TRUSTED_NETWORKS); si no, 401.
     - Una petición de navegador (`Origin` o `Sec-Fetch-*`) nunca usa la exención de
@@ -105,6 +108,8 @@ async def resolve_ha_caller(request: Request) -> HACaller:
             # D-r8-1: `allowed_agents` corrupto (editado a mano), como en el handshake: solo el tipo.
             logger.error(f"/v1: configuración del cliente ilegible: {describe_error(e)}")
             raise HTTPException(status_code=500, detail="internal_error") from None
+        if CONVERSATIONS_WRITE not in client.scopes:  # #410: hablar por /v1 es escribir
+            raise missing_scope(CONVERSATIONS_WRITE)
         return HACaller(client=client, config=config)
 
     from_browser = "origin" in request.headers or any(

@@ -56,6 +56,7 @@ export const CLOSE_REASON: Record<string, string> = {
   slow_client: 'Cliente lento',
   revoked: 'Acceso retirado',
   agent_revoked: 'Agente retirado',
+  scope_revoked: 'Permiso retirado',
   shutdown: 'Apagado del gateway',
   error: 'Error',
   unknown: 'Desconocido',
@@ -127,6 +128,7 @@ export const STAGE: Record<string, string> = {
   client_slow: 'Cliente lento',
   session_revoked: 'Acceso retirado',
   agent_revoked: 'Agente retirado',
+  scope_revoked: 'Permiso retirado',
   session_end: 'Fin de la sesión',
 }
 
