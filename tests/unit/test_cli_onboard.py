@@ -56,7 +56,7 @@ def gw(monkeypatch, tmp_path, use_api):
     for name in ENV:
         monkeypatch.delenv(name, raising=False)
     st = SimpleNamespace(calls=[], verdicts={}, detected=None, env=base / "config.env",
-                         db=base / "data" / "gateway.db", active=True)
+                         db=base / "data" / "gateway.db", active=True, local_token=None)
     st.db.parent.mkdir()
     st.db.touch()
 
@@ -105,6 +105,12 @@ def gw(monkeypatch, tmp_path, use_api):
     for name in ("verify_openclaw", "verify_fogar_stt", "verify_fogar_tts", "verify_elevenlabs"):
         monkeypatch.setattr(verify, name, verifier(name))
     monkeypatch.setattr(verify, "detect_openclaw", detect)
+
+    def read_token():
+        st.calls.append("read_openclaw_token")
+        return st.local_token
+
+    monkeypatch.setattr(verify, "read_openclaw_token", read_token)
     # Con terminal, el asistente acaba esperando al dashboard: aquí ya hay uno conectado.
     st.api = use_api(FakeApi({("GET", "/home/devices"): [],
                               # M20: ya hay dueño (sus tests propios, abajo, lo quitan).
@@ -527,6 +533,99 @@ def test_interactive_ctrl_c_at_voice_keeps_openclaw(gw, tty):
     env = dotenv_values(gw.env)
     assert env["OPENCLAW_TOKEN"] == OC_TOKEN and "STT_PROVIDER" not in env
     assert installs(gw) == []
+
+
+# --- #436: el token del OpenClaw de este equipo se lee solo ---------------------------------
+
+
+def test_local_openclaw_token_is_read_not_asked(gw, tty):
+    gw.env.write_text(f"ADMIN_TOKEN={ADMIN}\n")
+    gw.detected = ""
+    gw.local_token = OC_TOKEN
+    r = run("onboard")  # y Ctrl+C en el STT
+    assert_cancelled(r)
+    assert "He leído el token de OpenClaw de este equipo." in r.output
+    assert "auth-token" not in r.output and OC_TOKEN not in r.output
+    assert asked(tty, "password", "OpenClaw") == []
+    assert ("verify_openclaw", "127.0.0.1", 18789, OC_TOKEN) in gw.calls
+    assert dotenv_values(gw.env)["OPENCLAW_TOKEN"] == OC_TOKEN
+
+
+def test_local_openclaw_token_unreadable_is_asked(gw, tty):
+    gw.env.write_text(f"ADMIN_TOKEN={ADMIN}\n")
+    gw.detected = ""
+    tty.queue.append(OC_TOKEN)
+    r = run("onboard")
+    assert_cancelled(r)
+    assert gw.calls.count("read_openclaw_token") == 1
+    assert "`openclaw gateway auth-token --show`" in r.output
+    assert len(asked(tty, "password", "OpenClaw")) == 1
+    assert dotenv_values(gw.env)["OPENCLAW_TOKEN"] == OC_TOKEN
+
+
+def test_local_openclaw_token_rejected_then_asked(gw, tty):
+    gw.env.write_text(f"ADMIN_TOKEN={ADMIN}\n")
+    gw.detected = ""
+    gw.local_token = "token-leido-viejo"
+    gw.verdicts["verify_openclaw"] = [Verdict(False, "rejected", "OpenClaw rechazó el token."),
+                                      Verdict(True, "ok", "OpenClaw acepta el token.")]
+    tty.queue.extend(["change", OC_TOKEN])
+    r = run("onboard")
+    assert_cancelled(r)
+    assert gw.calls.count("read_openclaw_token") == 1  # el reintento ya es a mano
+    assert [c[3] for c in gw.calls if isinstance(c, tuple)] == ["token-leido-viejo", OC_TOKEN]
+    assert dotenv_values(gw.env)["OPENCLAW_TOKEN"] == OC_TOKEN
+    assert "token-leido-viejo" not in r.output
+
+
+def test_openclaw_not_found_never_reads_the_token(gw, tty):
+    gw.env.write_text(f"ADMIN_TOKEN={ADMIN}\n")
+    gw.local_token = OC_TOKEN
+    tty.queue.extend(["127.0.0.1", "18789", OC_TOKEN])
+    assert_cancelled(run("onboard"))
+    assert "read_openclaw_token" not in gw.calls
+
+
+def fake_openclaw(tmp_path, monkeypatch, body):
+    """Un `openclaw` en un PATH propio (y un HOME sin ~/.npm-global ni ~/.openclaw)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    exe = bin_dir / "openclaw"
+    exe.write_text(f"#!/bin/sh\n{body}\n")
+    exe.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+
+def test_read_token_runs_openclaw_in_a_terminal(tmp_path, monkeypatch):
+    # Como OpenClaw: se niega sin TTY en stdin y stdout; con TTY, banner, colores y \r\n.
+    fake_openclaw(tmp_path, monkeypatch, '[ -t 0 ] && [ -t 1 ] || exit 1\n'
+                  '[ "$*" = "gateway auth-token --show" ] || exit 2\n'
+                  "printf '\\033[1mOpenClaw 2026.11.7\\033[0m\\n'\nprintf 'tok-AbC_123\\n'")
+    assert verify.read_openclaw_token() == "tok-AbC_123"
+
+
+@pytest.mark.parametrize("body", ["echo 'Gateway auth token failed' && exit 1", "exit 0",
+                                  "echo 'dos palabras'"])
+def test_read_token_failure_is_none(tmp_path, monkeypatch, body):
+    fake_openclaw(tmp_path, monkeypatch, body)
+    assert verify.read_openclaw_token() is None
+
+
+def test_read_token_timeout_is_none(tmp_path, monkeypatch):
+    fake_openclaw(tmp_path, monkeypatch, "sleep 30")
+    monkeypatch.setattr(verify, "TOKEN_READ_TIMEOUT_S", 0.5)
+    assert verify.read_openclaw_token() is None
+
+
+def test_read_token_finds_npm_global(tmp_path, monkeypatch):
+    fake_openclaw(tmp_path, monkeypatch, "echo tok-npm")
+    npm = tmp_path / ".npm-global" / "bin"
+    npm.mkdir(parents=True)
+    (tmp_path / "bin" / "openclaw").rename(npm / "openclaw")
+    assert verify.read_openclaw_token() == "tok-npm"
+    (npm / "openclaw").unlink()
+    assert verify.read_openclaw_token() is None  # ni en el PATH ni en las rutas conocidas
 
 
 def test_menu_entry_runs_onboard(monkeypatch, tty):
