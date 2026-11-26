@@ -154,6 +154,9 @@ async def dictation(websocket: WebSocket) -> None:
             close = Close.SPEECH_UNAVAILABLE  # el STT no contestó
     except WebSocketDisconnect:
         return
+    except Exception as e:  # noqa: BLE001 — frontera: un fallo del STT cierra la toma con 1011
+        logger.error(f"[{client.id}] Dictado: fallo del STT ({describe_error(e)})")
+        close = Close.INTERNAL_ERROR
     finally:
         if run is not None:
             run.cancel()

@@ -15,6 +15,7 @@ from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.services import events as ev
 from tests.fakes.orchestrator import OrchestratorEvent
+from tests.fakes.speech import FakeTts
 from tests.integration.conftest import CLIENT_ID, VALID_KEY
 
 BEARER = {"authorization": f"Bearer {VALID_KEY}"}
@@ -56,46 +57,6 @@ class FakeStt:
         session = FakeSttSession(callbacks, self.answer)
         self.sessions.append(session)
         return session
-
-
-class FakeTtsStream:
-    def __init__(self):
-        self.text = []
-        self.ended = False
-
-    async def send_text_chunk(self, text):
-        self.text.append(text)
-
-    async def end(self):
-        self.ended = True
-
-    async def get_audio_stream(self):
-        while not self.ended:
-            import asyncio
-
-            await asyncio.sleep(0.01)
-        yield b"\x01\x02" * 8
-
-    async def close(self):
-        pass
-
-
-class FakeTts:
-    name = "fake"
-
-    def __init__(self, up=True):
-        self.up = up
-        self.streams = []
-
-    def resolve_voice(self, configured):
-        return configured
-
-    async def connect(self, voice, speed, client_id):
-        if not self.up:
-            return None
-        stream = FakeTtsStream()
-        self.streams.append(stream)
-        return stream
 
 
 @pytest.fixture
@@ -256,3 +217,21 @@ def test_speech_of_a_user_message_or_without_tts(voice, mock_orchestrator):
     voice.client.app.state.speech = SimpleNamespace(stt=voice.stt, tts=FakeTts(up=False))
     r = voice.client.post(f"{path}/a1/speech", headers=BEARER)
     assert r.status_code == 503 and r.json()["detail"] == "tts_unavailable"
+
+
+def test_dictation_stt_failure_closes_1011(voice):
+    class Broken(FakeSttSession):
+        async def send_audio(self, frame):
+            raise RuntimeError("upstream")
+
+    class BrokenStt(FakeStt):
+        def open_session(self, *, client, params, callbacks):
+            return Broken(callbacks)
+
+    voice.client.app.state.speech = SimpleNamespace(stt=BrokenStt(), tts=voice.tts)
+    with voice.client.websocket_connect("/speech/dictation") as ws:
+        ws.send_json(HELLO)
+        ws.send_bytes(b"\x00" * 8)
+        with pytest.raises(WebSocketDisconnect) as exc:
+            ws.receive_text()
+    assert (exc.value.code, exc.value.reason) == (1011, "internal error")

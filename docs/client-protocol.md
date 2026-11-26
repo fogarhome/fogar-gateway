@@ -1145,7 +1145,8 @@ Sin audio 10 s, o pasados 120 s, la toma termina como con `end`. Con el STT apag
 - Llegan al ritmo de reproducción y siempre **antes de su `turn_end`**.
 - No llevan `id` ni se reenvían al reanudar: en un corte se pierde el audio, nunca el texto.
 - Sin `/events` abierto no hay voz. Sin `speak`, el turno es solo texto.
-- **Avisos con voz:** abre el stream con **`/events?audio=1`**. Si tu aparato es el dispositivo de avisos de una conversación (§10), su aviso suena ahí.
+- Como el `turn_end` de un turno con voz espera a su audio, el `turn_start` del siguiente turno de la misma conversación puede llegar antes. Separa por `turn_id` (por WebSocket esto nunca pasa).
+- **Avisos con voz:** abre el stream con **`/events?audio=1`**. Si tu aparato es el dispositivo de avisos de una conversación (§10), su aviso suena ahí. `audio` vale para el aparato: si abre dos streams, manda el último.
 
 **Escuchar una respuesta ya terminada: `POST /conversations/{id}/messages/{message_id}/speech`**, también del historial (el `id` de `GET …/messages`). Devuelve en streaming el audio como cuerpo de la respuesta (`audio/L16;rate=24000;channels=1`, el mismo PCM). No pasa por `/events`. El TTS solo se paga cuando alguien pulsa «escuchar». `404 message_not_found` si no es una respuesta del agente que puedas ver; `503 tts_unavailable` con el TTS `off` o caído.
 

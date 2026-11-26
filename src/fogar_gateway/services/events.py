@@ -551,9 +551,10 @@ class EventHub:
         return device
 
     def sessions_of(self, client_id: str) -> list[ChannelSubscriber]:
-        """Sus adaptadores, para `ChannelHub.sessions_of` (el dispositivo de avisos, 5c)."""
+        """Sus adaptadores, para `ChannelHub.sessions_of` (el dispositivo de avisos, 5c). Solo con
+        `audio=1`: sin audio no compiten con su sesión del WebSocket, que suena (revisión 5c)."""
         device = self._devices.get(client_id)
-        if device is None or device.closed:
+        if device is None or device.closed or not device.audio:
             return []
         return list(device._adapters.values())
 

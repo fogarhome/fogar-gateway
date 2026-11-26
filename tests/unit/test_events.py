@@ -168,7 +168,7 @@ async def test_a_notify_device_with_audio_hears_the_push(hub, monkeypatch):
     # 5c: /events?audio=1 en el dispositivo de avisos: el aviso suena allí (eventos `audio`,
     # sin id), y su turn_end sale detrás del audio.
     from fogar_gateway.core.config import settings
-    from tests.integration.test_voice_http import FakeTts
+    from tests.fakes.speech import FakeTts
 
     monkeypatch.setattr(settings, "AUDIO_PACING_ENABLED", False)
     tts = FakeTts()
@@ -189,3 +189,18 @@ async def test_a_notify_device_with_audio_hears_the_push(hub, monkeypatch):
     assert "audio" in types and types.index("audio") < types.index("turn_end")
     assert tts.streams[0].text == ["suena"]
     assert all(t != "audio" for _, t, _ in _kinds(speaker))  # el audio no entra en el búfer
+
+
+async def test_events_without_audio_never_takes_the_push_from_its_websocket(session, hub):
+    # Revisión 5c: el mismo aparato con /events sin audio en HOME y su WebSocket en OTHER: el
+    # aviso suena en el WebSocket (como invitado), no se lo queda el /events mudo.
+    tv_ws_tts = notify._tts()[0]
+    tv, tv_ws = session("tv", OTHER, output_mode=("text", "audio"), tts=tv_ws_tts)
+    events = ev.EventHub(hub)
+    hub.sessions_of = lambda cid: [b.turns for b in hub.registry.for_client(cid)] + events.sessions_of(cid)
+    events.open(_client("tv"), ClientConfig())  # sin audio
+    hub.notify[HOME.id] = "tv"
+    await push(hub, HOME, "suena")
+    await settle(tv)
+    tv_ws_tts.connect.assert_awaited_once()
+    assert texts(tv_ws) == ["suena"]

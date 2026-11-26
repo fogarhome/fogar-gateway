@@ -36,6 +36,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from fogar_gateway.api.deps import Caller, Principal, require_scope
 from fogar_gateway.core.agent_policy import AgentPolicyError, resolve_agent
@@ -418,20 +419,31 @@ async def message_speech(
         stream = None
     if stream is None:
         raise HTTPException(status_code=503, detail="tts_unavailable")
+    tts = stream
+    closed = False
+
+    async def close() -> None:
+        # Idempotente y también como tarea de fondo: si el cliente se va antes de que empiece
+        # el cuerpo, el `finally` del generador no corre y el TTS (de pago) quedaría abierto.
+        nonlocal closed
+        if not closed:
+            closed = True
+            await tts.close()
 
     async def audio():
         try:
-            async for chunk in stream.get_audio_stream():
+            async for chunk in tts.get_audio_stream():
                 if chunk:
                     yield chunk
         except Exception as e:  # noqa: BLE001 — frontera: el audio se corta, el cliente lo ve
             logger.warning(f"Voz bajo demanda cortada ({describe_error(e)})")
         finally:
-            await stream.close()
+            await close()
 
     return StreamingResponse(
         audio(),
         media_type="audio/L16;rate=24000;channels=1",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        background=BackgroundTask(close),
     )
 
