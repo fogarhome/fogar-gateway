@@ -108,6 +108,14 @@ async def test_audio_resuming_after_idle_starts_a_fresh_silence_window(make_idle
     clock = VClock(monkeypatch)
     bridge, ws = make_idle_bridge(ClientConfig(silence_timeout_s=0.2))
     bridge.close_all = AsyncMock()
+    warned_at: list[float] = []
+    notify = bridge.notify_service_status
+
+    async def stamped(*args, **kwargs):
+        warned_at.append(clock.t)  # #426: when the watchdog warned, in virtual time
+        await notify(*args, **kwargs)
+
+    bridge.notify_service_status = stamped
     loop_task = asyncio.create_task(bridge._client_input_loop())
     wd = asyncio.create_task(bridge._transcription_watchdog())
     try:
@@ -116,6 +124,7 @@ async def test_audio_resuming_after_idle_starts_a_fresh_silence_window(make_idle
         await _feed(clock, ws, keepalive_for=0.6)  # idle phase
         await sent(bridge)
         assert not ws.of("status")
+        resumed_at = clock.t
         await _feed(clock, ws, audio_for=1.0)  # wake word again, then silence in the audio
     finally:
         wd.cancel()
@@ -125,6 +134,9 @@ async def test_audio_resuming_after_idle_starts_a_fresh_silence_window(make_idle
     assert degraded, "continuous audio with no transcription must still be reported"
     bridge.close_all.assert_not_awaited()  # ...but only reported, never closed (#394)
     assert len(degraded) == 1
+    # #227: the window starts when the audio resumes, not at the last transcript: no warning
+    # before `silence_timeout_s` of fresh audio.
+    assert len(warned_at) == 1 and warned_at[0] - resumed_at >= 0.2
 
 
 async def test_watchdog_exits_if_transcriber_degrades_before_any_audio(make_idle_bridge, monkeypatch):

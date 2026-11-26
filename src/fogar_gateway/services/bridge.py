@@ -113,6 +113,7 @@ class FogarBridge:
         self._background_tasks: set[asyncio.Task] = set()
         # True while the transcriber reports `status busy` (GPU saturated, #143).
         self._transcriber_busy: bool = False
+        self._silence_warned = False  # #423: avisado `degraded` `silence` y sin su `restored`
         self._session_start: float = 0.0
         self._last_client_activity: float = 0.0
         # Guards close_all() so it's safe to call more than once (issue #101):
@@ -441,7 +442,9 @@ class FogarBridge:
             if elapsed > timeout and not warned:
                 warned = True
                 logger.warning(f"[{self.client_id}] Watchdog: {elapsed:.1f}s sin transcripción")
-                await self.notify_service_status("transcriber", "degraded")
+                self._silence_warned = True
+                # #423: con su `code`, para distinguirlo de otras causas y emparejar su `restored`.
+                await self.notify_service_status("transcriber", "degraded", code="silence", message="silence")
 
     async def _idle_watchdog(self):
         """Cierra la sesión si el cliente no manda ningún mensaje (audio o texto) durante
@@ -716,18 +719,14 @@ class FogarBridge:
                     text_data = message["text"]
                     try:
                         json_msg = json.loads(text_data)
-                        parsed = True
                     except (ValueError, RecursionError):
                         # No es JSON (RecursionError: anidamiento excesivo, `[[[[…`).
                         json_msg = None
-                        parsed = False
 
-                    if not parsed:
-                        # 5.0: a non-JSON frame is never a prompt, in any input_mode.
-                        await self._send_invalid_message()
-                    elif not isinstance(json_msg, dict):
-                        # G-20: a JSON scalar/list (`42`, `[1]`, `"s"`, `true`, `null`)
-                        # is not a protocol message. Non-fatal error, session goes on.
+                    if not isinstance(json_msg, dict):
+                        # 5.0: a non-JSON frame is never a prompt, in any input_mode; G-20: nor
+                        # is a JSON scalar/list (`42`, `[1]`, `"s"`, `true`, `null`). Non-fatal
+                        # error, the session goes on.
                         await self._send_invalid_message()
                     elif json_msg.get("type") == "end":
                         # Cliente terminó de hablar → señalizar fin al transcriber
@@ -869,6 +868,10 @@ class FogarBridge:
         the client's `send`, which joins the conversation's queue like any message.
         All client_ws sends are guarded — the client may disconnect at any time.
         """
+        if self._silence_warned:
+            # #423: la transcripción volvió tras el aviso de silencio: se anuncia su fin.
+            self._silence_warned = False
+            await self.notify_service_status("transcriber", "restored", code="silence", message="silence")
         if not is_final:
             # Forward partial to client for live display
             try:

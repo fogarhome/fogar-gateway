@@ -45,10 +45,13 @@ def run(*args):
     return CliRunner().invoke(cli, list(args))
 
 
-def test_pair_without_home_name_still_shows_code(use_api):
-    # sin nombre de casa (p. ej. sin permiso): el código se muestra igual, sin la frase «con la casa»
+@pytest.mark.parametrize("home", [pair_mod.api.ApiError("forbidden"), [], {"id": "h"}, {"name": 3}],
+                         ids=["forbidden", "not-a-dict", "no-name", "name-not-text"])
+def test_pair_without_home_name_still_shows_code(use_api, home):
+    # sin nombre de casa (sin permiso, o una respuesta con otra forma, #426): el código se
+    # muestra igual, sin la frase «con la casa»
     use_api(PollingApi([{"state": "used", "client_id": "c0ffee00-1", "client_name": "tele"}],
-                       responses={("GET", "/admin/home"): pair_mod.api.ApiError("forbidden")}))
+                       responses={("GET", "/admin/home"): home}))
     r = run("pair", "--type", "screen")
     assert r.exit_code == 0, r.output
     assert "482 913" in r.output and "con la casa" not in r.output

@@ -66,7 +66,7 @@ async def test_watchdog_notifies_client_after_silence_timeout(make_wd_bridge):
     """After silence_timeout_s with no transcription, client gets degraded notice."""
     config = ClientConfig(silence_timeout_s=1)
     bridge, ws, transcriber = make_wd_bridge(config=config)
-    bridge._last_audio_at = bridge._audio_burst_start = time.monotonic() - 2
+    bridge._audio_burst_start = time.monotonic() - 2
     bridge._last_audio_at = float("inf")  # client streaming audio without gaps (#227)
     transcriber.last_transcript_at = None
     bridge.close_all = AsyncMock()
@@ -93,7 +93,7 @@ async def test_watchdog_exits_if_transcriber_disconnects(make_wd_bridge):
 async def test_silence_never_closes_the_session(make_wd_bridge):
     """#394: audio entrando y el transcriptor sin devolver nada durante 5 sondeos: la sesión sigue abierta."""
     bridge, ws, transcriber = make_wd_bridge(config=ClientConfig(silence_timeout_s=1))
-    bridge._last_audio_at = bridge._audio_burst_start = time.monotonic() - 2
+    bridge._audio_burst_start = time.monotonic() - 2
     bridge._last_audio_at = float("inf")  # client streaming audio without gaps (#227)
     transcriber.last_transcript_at = None
     bridge.close_all = AsyncMock()
@@ -113,7 +113,7 @@ async def test_silence_never_closes_the_session(make_wd_bridge):
 async def test_silence_warns_once_per_burst(make_wd_bridge):
     """#394: un tramo de silencio, un solo `degraded`; llega una transcripción y otro tramo, un segundo."""
     bridge, ws, transcriber = make_wd_bridge(config=ClientConfig(silence_timeout_s=1))
-    bridge._last_audio_at = bridge._audio_burst_start = time.monotonic() - 2
+    bridge._audio_burst_start = time.monotonic() - 2
     bridge._last_audio_at = float("inf")  # client streaming audio without gaps (#227)
     transcriber.last_transcript_at = None
     bridge.close_all = AsyncMock()
@@ -134,7 +134,7 @@ async def test_watchdog_pauses_but_does_not_exit_when_reconnecting(make_wd_bridg
     this task fixes: the old `if not _is_ready: return` treated any drop as final)."""
     config = ClientConfig(silence_timeout_s=1)
     bridge, ws, transcriber = make_wd_bridge(config=config)
-    bridge._last_audio_at = bridge._audio_burst_start = time.monotonic() - 2
+    bridge._audio_burst_start = time.monotonic() - 2
     bridge._last_audio_at = float("inf")  # client streaming audio without gaps (#227)
     transcriber.last_transcript_at = time.monotonic()  # fresh, no silence yet
 
@@ -176,7 +176,7 @@ async def test_watchdog_does_not_close_immediately_after_reconnect_with_stale_ti
     audio frame."""
     config = ClientConfig(silence_timeout_s=1)
     bridge, ws, transcriber = make_wd_bridge(config=config)
-    bridge._last_audio_at = bridge._audio_burst_start = time.monotonic() - 10
+    bridge._audio_burst_start = time.monotonic() - 10
     bridge._last_audio_at = float("inf")  # client streaming audio without gaps (#227)
     # A real transcription happened a while ago, then the transcriber dropped.
     transcriber.last_transcript_at = time.monotonic() - 10
@@ -535,7 +535,6 @@ async def test_watchdog_extends_first_window_after_burst_by_stt_warmup(make_wd_b
     bridge, ws, transcriber = make_wd_bridge(config=config)
     bridge._stt = SimpleNamespace(capabilities=SttCapabilities(warmup_s=0.5))
     t0 = time.monotonic()
-    bridge._last_audio_at = bridge._audio_burst_start = t0
     bridge._audio_burst_start = t0
     bridge._last_audio_at = float("inf")
     transcriber.last_transcript_at = None
@@ -698,3 +697,31 @@ async def test_idle_watchdog_does_not_close_while_push_audio_progresses(make_wd_
         with pytest.raises(RuntimeError, match="stop-test"):
             await asyncio.wait_for(bridge._idle_watchdog(), timeout=2.0)
     assert not close_called
+
+
+@pytest.mark.asyncio
+async def test_silence_notice_has_its_code_and_ends_with_the_next_transcription(make_wd_bridge):
+    """#423: the silence warning carries `code: "silence"`, and the next transcription (a
+    partial is enough) sends its `restored` with the same code, once."""
+    bridge, ws, transcriber = make_wd_bridge(config=ClientConfig(silence_timeout_s=1))
+    bridge._audio_burst_start = time.monotonic() - 2
+    bridge._last_audio_at = float("inf")
+    transcriber.last_transcript_at = None
+    bridge.close_all = AsyncMock()
+    with patch("fogar_gateway.services.bridge._sleep", new=_stop_after(transcriber, 3)):
+        await asyncio.wait_for(bridge._transcription_watchdog(), timeout=3.0)
+
+    await bridge._on_transcription("hola", is_final=False)
+    await bridge._on_transcription("hola", is_final=True)
+    statuses = [m for m in await sent(bridge) if m.get("type") == "status"]
+    assert statuses == [
+        {"type": "status", "service": "transcriber", "state": "degraded", "code": "silence", "message": "silence"},
+        {"type": "status", "service": "transcriber", "state": "restored", "code": "silence", "message": "silence"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_transcription_without_a_silence_notice_sends_no_restored(make_wd_bridge):
+    bridge, ws, _ = make_wd_bridge()
+    await bridge._on_transcription("hola", is_final=True)
+    assert not [m for m in await sent(bridge) if m.get("type") == "status"]
