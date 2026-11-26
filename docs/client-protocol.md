@@ -975,6 +975,7 @@ Los códigos estándar se quedan donde el significado es de transporte y el est�
 | 4102 | — | **4102 — retirado en la 5.0, no se reutiliza** (era `conversation opened elsewhere`: desde la 5.0 una conversación puede estar abierta en varias sesiones, §14) | — |
 | 4200 | `credential revoked` | Con la sesión abierta, tu cliente se borró, se desactivó o se rotó su clave (`SESSION_REVALIDATE_INTERVAL_S`); antes recibes el `turn_end` (`closed`) del turno abierto | No, hay que arreglar algo: vuelve a emparejar (§0) |
 | 4900 | `handshake timeout` | No mandas el handshake en `HANDSHAKE_TIMEOUT_S` (una red lenta, un cliente que se atascó al conectar) | Con espera |
+| 4901 | `speech unavailable` | Solo `/speech/dictation` (§16): el STT está `off`, o no devolvió la final tras `end` | Con espera |
 
 Cierres que no manda el gateway pero verás: **1006** (la conexión se cortó sin close frame: la red, o el abort tras un 1013), **1009** (un frame de más de 1 MiB: lo cierra el servidor WebSocket antes de que llegue al gateway; es un bug del cliente) y **1012** (el gateway se reinicia o se para). Ante 1006 o 1012, reconecta con espera.
 
@@ -1122,4 +1123,29 @@ data: {"type":"turn_start","turn_id":"9f3c…","conversation":"c1","origin":"use
 | `POST /conversations/{id}/cancel` | `200 {"cancelled": bool}`: para el turno en curso para todos o, sin turno, el siguiente mensaje que aún no empezó (como `cancel`, §4) |
 
 El mensaje, su estado (`pending`, `delivered`, `withdrawn`) y el turno que lo responde llegan por `/events`, reconocibles por ese `message_id`.
+
+### Voz sin el WebSocket de conversación (5.0)
+
+Un cliente que chatea por HTTP puede dictar y oír la respuesta sin abrir `/ws/stream` (que sigue siendo la vía para la voz continua, manos libres). Todo pide `conversations:write`: usa el STT y el TTS, que pueden costar dinero.
+
+**Dictar: WebSocket `/speech/dictation`**, abierto solo mientras se graba. Transcribir **no inicia ningún turno ni toca ninguna conversación**: el cliente enseña el texto y, si quiere, lo envía con `POST /conversations/{id}/messages`.
+
+1. Conecta y manda `{"protocol": 5, "token": "…"}`. Los cierres del handshake son los de `/ws/stream` (4000, 4001, 4002, 4003, 4010, 4011, 4900; §13).
+2. Envía el audio en frames binarios (PCM float32 LE mono a 16 kHz, el formato de §3) y `{"type": "end"}` al terminar la toma.
+3. Recibes `transcription_partial` y `transcription` (`{"type", "text"}`, como en §3). Tras la final que sigue a `end`, el gateway cierra con **1000**.
+
+Sin audio 10 s, o pasados 120 s, la toma termina como con `end`. Con el STT apagado (`off`), o si no llega la final en 10 s tras `end`: cierre **4901 `speech unavailable`** (reintenta con espera). Cada conexión es una toma.
+
+**Oír la respuesta: `speak: true`** en `POST /conversations/{id}/messages {"text", "speak": true}`. La voz del turno que responde a ese mensaje va **solo a tu aparato, por tu `/events`**, como eventos `audio` mezclados con sus `token`:
+
+```json
+{"type": "audio", "turn_id": "9f3c…", "conversation": "c1", "data": "<PCM16 LE mono 24 kHz en base64>"}
+```
+
+- Llegan al ritmo de reproducción y siempre **antes de su `turn_end`**.
+- No llevan `id` ni se reenvían al reanudar: en un corte se pierde el audio, nunca el texto.
+- Sin `/events` abierto no hay voz. Sin `speak`, el turno es solo texto.
+- **Avisos con voz:** abre el stream con **`/events?audio=1`**. Si tu aparato es el dispositivo de avisos de una conversación (§10), su aviso suena ahí.
+
+**Escuchar una respuesta ya terminada: `POST /conversations/{id}/messages/{message_id}/speech`**, también del historial (el `id` de `GET …/messages`). Devuelve en streaming el audio como cuerpo de la respuesta (`audio/L16;rate=24000;channels=1`, el mismo PCM). No pasa por `/events`. El TTS solo se paga cuando alguien pulsa «escuchar». `404 message_not_found` si no es una respuesta del agente que puedas ver; `503 tts_unavailable` con el TTS `off` o caído.
 

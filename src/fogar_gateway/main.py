@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from fogar_gateway import paths
 from fogar_gateway.api.auth_routes import router as auth_router
 from fogar_gateway.api.conversation_routes import router as conversation_router
+from fogar_gateway.api.dictation_routes import router as dictation_router
 from fogar_gateway.api.events_routes import router as events_router
 from fogar_gateway.api.health_routes import router as health_router
 from fogar_gateway.api.home_routes import router as home_router
@@ -201,7 +202,13 @@ async def _lifespan_body(app: FastAPI):
     app.state.turn_registry = turn_registry  # read by routes.py for queue depths (#219)
     app.state.client_registry = client_registry
     app.state.channel_hub = channel_hub
-    app.state.events = EventHub(channel_hub)  # /events de cada aparato (5.0, #412)
+    events = EventHub(channel_hub, tts=lambda: speech.tts)  # /events de cada aparato (5.0, #412)
+    app.state.events = events
+    # El dispositivo de avisos puede escuchar por /events?audio=1 (5c): sus adaptadores cuentan.
+    channel_hub.sessions_of = lambda client_id: [
+        *(b.turns for b in client_registry.for_client(client_id)),
+        *events.sessions_of(client_id),
+    ]
     app.state.conversations = conversations
     app.state.conversation_titles = TitleCache()  # títulos de /conversations
     app.state.session_registry = SessionRegistry()
@@ -289,6 +296,7 @@ app.include_router(system_router)  # HTTP /system/* (5.0)
 app.include_router(home_router)  # HTTP /home, /home/users, /home/devices (5.0)
 app.include_router(conversation_router)  # HTTP /conversations
 app.include_router(events_router)  # HTTP /events (5.0, SSE por aparato)
+app.include_router(dictation_router)  # WS /speech/dictation (5.0, dictado)
 app.include_router(pairing_public_router)  # HTTP /.well-known/fogar-gateway, /pair
 app.include_router(pairing_admin_router)  # HTTP /home/pairing
 # La web va la última: su GET /{path} recoge lo que no es de la API (rutas de Vue).

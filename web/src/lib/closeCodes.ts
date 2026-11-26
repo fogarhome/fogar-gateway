@@ -26,6 +26,7 @@ export const CLOSE_CODES = {
   4101: 'fix', // agente distinto del de la conversación
   4200: 'fix', // credencial revocada
   4900: 'backoff', // handshake a destiempo
+  4901: 'backoff', // voz no disponible (dictado)
 } as const satisfies Record<number, Reconnect>
 
 /**

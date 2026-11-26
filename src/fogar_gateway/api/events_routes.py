@@ -8,6 +8,8 @@ pasa en las conversaciones que puede ver. Ver `services/events.py`.
 - Cada evento lleva un `id:` que siempre sube; reconectar con `Last-Event-ID` reenvía lo perdido
   si sigue en el búfer del aparato y, si no, manda `resync` (el cliente vuelve a pedir el estado
   de lo que tenga abierto: `GET /conversations/{id}`).
+- `?audio=1` (5c): los avisos de las conversaciones de las que este aparato es dispositivo de
+  avisos suenan aquí (eventos `audio`, sin id: no se reenvían al reanudar).
 - Cada stream dura como mucho `STREAM_MAX_S` (`retry: 1000`): el navegador reconecta solo y no
   pierde nada. Cortar la conexión nunca para un turno.
 """
@@ -15,7 +17,7 @@ pasa en las conversaciones que puede ver. Ver `services/events.py`.
 import asyncio
 import time
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 from fogar_gateway.api.deps import Caller, Principal, require_scope
@@ -42,6 +44,7 @@ async def get_events(
     request: Request,
     principal: Principal = Depends(require_scope(CONVERSATIONS_READ)),
     last_event_id: str | None = Header(default=None),
+    audio: bool = Query(default=False),
 ) -> StreamingResponse:
     if not isinstance(principal, Caller):
         # Un stream es de un aparato (sus conversaciones visibles): la máquina no tiene ninguno.
@@ -58,7 +61,7 @@ async def get_events(
         # Dentro del generador: si el cliente se va antes de que empiece, no queda un oyente
         # colgado (su `finally` no correría). Sin await hasta registrarlo: nada se pierde entre
         # la reanudación y la cola.
-        device = hub.open(client, config)
+        device = hub.open(client, config, audio=audio)
         replay = device.replay(resume) if resume is not None else None
         listener = device.listen()
         head = ["retry: 1000\n\n"]

@@ -3,6 +3,7 @@ reanudar o `resync`, y la entrega de avisos de la 2c intacta. Canales reales en 
 `test_channel_notify`), sin HTTP: la ruta se prueba en `tests/integration/test_events_route.py`.
 """
 
+import asyncio
 import json
 
 import pytest
@@ -161,3 +162,30 @@ async def test_live_state_mid_turn_and_as_of(hub, events):
     turn = channel.current_turn
     assert turn is not None and turn.text == "lleva esto"
     assert ev.current_id() >= start_id  # as_of incluye el turn_start
+
+
+async def test_a_notify_device_with_audio_hears_the_push(hub, monkeypatch):
+    # 5c: /events?audio=1 en el dispositivo de avisos: el aviso suena allí (eventos `audio`,
+    # sin id), y su turn_end sale detrás del audio.
+    from fogar_gateway.core.config import settings
+    from tests.integration.test_voice_http import FakeTts
+
+    monkeypatch.setattr(settings, "AUDIO_PACING_ENABLED", False)
+    tts = FakeTts()
+    events = ev.EventHub(hub, tts=lambda: tts)
+    hub.sessions_of = events.sessions_of
+    speaker = events.open(_client("speaker"), ClientConfig(), audio=True)
+    listener = speaker.listen()
+    hub.notify[HOME.id] = "speaker"
+    await push(hub, HOME, "suena")
+    for _ in range(50):  # el TTS termina en su tarea
+        if _kinds(speaker)[-1][0] == "turn_end":
+            break
+        await asyncio.sleep(0.01)
+    lines = []
+    while not listener.queue.empty():
+        lines.append(listener.queue.get_nowait()[1])
+    types = [json.loads(line.split("data: ", 1)[1])["type"] for line in lines]
+    assert "audio" in types and types.index("audio") < types.index("turn_end")
+    assert tts.streams[0].text == ["suena"]
+    assert all(t != "audio" for _, t, _ in _kinds(speaker))  # el audio no entra en el búfer

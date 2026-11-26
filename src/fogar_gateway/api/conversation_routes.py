@@ -35,7 +35,7 @@ import logging
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from fogar_gateway.api.deps import Caller, Principal, require_scope
 from fogar_gateway.core.agent_policy import AgentPolicyError, resolve_agent
@@ -68,6 +68,7 @@ from fogar_gateway.services.openclaw.client import (
     ORCHESTRATOR_UNAVAILABLE_ERROR,
     OrchestratorRequestError,
 )
+from fogar_gateway.services.reconnection import describe_error
 from fogar_gateway.services.scopes import CONVERSATIONS_READ, CONVERSATIONS_WRITE
 
 logger = logging.getLogger(__name__)
@@ -257,6 +258,7 @@ async def _send(
     text: str,
     *,
     interrupt: bool = False,
+    speak: bool = False,
 ) -> str:
     """Manda `text` al canal de la conversación como un `send` del WebSocket y devuelve su
     `message_id` (el `runId` del ack). El emisor es el adaptador del `/events` del aparato, o
@@ -287,6 +289,8 @@ async def _send(
             channel.unsubscribe(transient)
             hub.drop_if_idle(channel.session_key, channel)
     if isinstance(result, RunInfo):
+        if speak and device is not None:
+            device.mark_speak(result.run_id, channel)  # 5c: su respuesta suena por su /events
         return result.run_id
     if isinstance(result, str):  # OpenClaw no lo aceptó: su código estable
         raise HTTPException(status_code=502, detail=result)
@@ -330,7 +334,8 @@ async def post_message(
     conversation = await _conversation(request, caller, conversation_id)
     config = await _caller_config(caller)
     message_id = await _send(
-        request, caller, config, conversation, body.text, interrupt=body.interrupt
+        request, caller, config, conversation, body.text, interrupt=body.interrupt,
+        speak=body.speak,
     )
     return JSONResponse({"message_id": message_id}, status_code=status.HTTP_202_ACCEPTED)
 
@@ -369,3 +374,64 @@ async def cancel_turn(
     if current is not None:
         return {"cancelled": await channel.cancel("cancelled", expected=current) is not None}
     return {"cancelled": await channel.cancel_head("cancelled")}
+
+
+@router.post("/{conversation_id}/messages/{message_id}/speech")
+async def message_speech(
+    conversation_id: ConversationIdPath,
+    message_id: ConversationIdPath,
+    request: Request,
+    principal: Principal = Depends(require_scope(CONVERSATIONS_WRITE)),
+) -> StreamingResponse:
+    """La voz de una respuesta del agente ya terminada (5c), también del historial: el TTS se
+    paga solo cuando alguien la pide. PCM16 mono a 24 kHz en streaming, como el audio de un
+    turno. 404 si no es una respuesta que se pueda ver; 503 `tts_unavailable` sin TTS."""
+    caller = _device(principal)  # gasta TTS: de un aparato con `conversations:write`
+    conversation = await _conversation(request, caller, conversation_id)
+    try:
+        payload = await request.app.state.openclaw.request(
+            "chat.history", {"sessionKey": conversation.session_key, "limit": _HISTORY_WINDOW}
+        )
+    except OrchestratorRequestError as e:
+        code = str(e)
+        unavailable = code == ORCHESTRATOR_UNAVAILABLE_ERROR
+        raise HTTPException(status_code=503 if unavailable else 502, detail=code) from None
+    message = next(
+        (m for m in history_messages(payload.get("messages")) if m["id"] == message_id), None
+    )
+    if message is None or message["role"] != "assistant":
+        raise HTTPException(status_code=404, detail="message_not_found")
+    config = await _caller_config(caller)
+    provider = request.app.state.speech.tts
+    try:
+        stream = await asyncio.wait_for(
+            provider.connect(
+                provider.resolve_voice(config.tts_voice), config.tts_speed, caller.device.id
+            ),
+            timeout=settings.PUSH_TTS_DRAIN_TIMEOUT_S,
+        )
+        if stream is not None:
+            await stream.send_text_chunk(message["text"])
+            await stream.end()
+    except Exception as e:  # noqa: BLE001 — frontera: un TTS caído es 503 con código estable
+        logger.warning(f"Voz bajo demanda: TTS no disponible ({describe_error(e)})")
+        stream = None
+    if stream is None:
+        raise HTTPException(status_code=503, detail="tts_unavailable")
+
+    async def audio():
+        try:
+            async for chunk in stream.get_audio_stream():
+                if chunk:
+                    yield chunk
+        except Exception as e:  # noqa: BLE001 — frontera: el audio se corta, el cliente lo ve
+            logger.warning(f"Voz bajo demanda cortada ({describe_error(e)})")
+        finally:
+            await stream.close()
+
+    return StreamingResponse(
+        audio(),
+        media_type="audio/L16;rate=24000;channels=1",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
