@@ -2239,7 +2239,10 @@ class ConversationChannel:
         if run_id is not None:
             self._ended_push_runs.pop(run_id, None)  # un `start` nuevo de su run lo reabre (#84)
         key = self.session_key
-        subscribers = [s.subscriber for s in self._subscriptions]
+        # A passive subscriber (a device's /events, #412) never makes a push abort here.
+        subscribers = [
+            s.subscriber for s in self._subscriptions if not getattr(s.subscriber, "passive", False)
+        ]
         if subscribers and not any(s.agent_allowed(key) for s in subscribers):
             # C-r7-1: push de un agente retirado de allowed_agents de todos los adjuntos: no
             # llega a nadie y se para en OpenClaw.

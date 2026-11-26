@@ -137,3 +137,27 @@ async def test_a_slow_reader_is_cut_and_resumes_from_the_buffer(hub, events, mon
         items.append(listener.queue.get_nowait())
     assert items[-1] is None  # el centinela: el stream termina
     assert len(_events(device)) == 5  # el búfer lo tiene todo
+
+
+async def test_a_device_restricted_to_another_agent_never_aborts_a_push(session, hub, events):
+    # Revisión 5b: sin el adaptador pasivo, «ningún adjunto permite el agente» (C-r7-1)
+    # abortaría el aviso en OpenClaw aunque el dispositivo de avisos pudiera recibirlo.
+    restricted = events.open(_client("tablet"), ClientConfig(allowed_agents=["otro"]))
+    reader, reader_ws = session("reader", OTHER, output_mode=("text",))
+    hub.notify[HOME.id] = "reader"
+    await push(hub, HOME, "aviso")
+    await settle(reader)
+    hub.orchestrator.abort_run.assert_not_awaited()
+    assert texts(reader_ws) == ["aviso"]
+    assert _kinds(restricted) == []
+    channel = hub.get(HOME.session_key)
+    assert channel is None or restricted.adapter_for(channel) is None  # ni se adjunta
+
+
+async def test_live_state_mid_turn_and_as_of(hub, events):
+    device = events.open(_client(), ClientConfig())
+    channel = await push(hub, HOME, "lleva esto", end=False)
+    start_id = _events(device)[0][0]
+    turn = channel.current_turn
+    assert turn is not None and turn.text == "lleva esto"
+    assert ev.current_id() >= start_id  # as_of incluye el turn_start

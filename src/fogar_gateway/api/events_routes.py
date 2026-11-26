@@ -52,23 +52,24 @@ async def get_events(
         raise HTTPException(status_code=401, detail="not_authenticated") from None
     hub: ev.EventHub = request.app.state.events
     resume = _last_id(last_event_id)
-
-    # Sin await desde aquí hasta registrar el oyente: nada se pierde entre la reanudación y la cola.
-    device = hub.open(client, config)
-    replay = device.replay(resume) if resume is not None else None
-    listener = device.listen()
     ready = {"type": "ready", "protocol": PROTOCOL_VERSION, "device_id": client.id}
-    head = ["retry: 1000\n\n"]
-    if resume is not None and replay is not None:
-        head.append(ev.sse(ready))  # sin id: el cliente ya sabe desde dónde va
-        head.extend(replay)
-    else:
-        now = ev.current_id()
-        head.append(ev.sse(ready, now))
-        if resume is not None:
-            head.append(ev.sse({"type": "resync"}, now))
 
     async def stream():
+        # Dentro del generador: si el cliente se va antes de que empiece, no queda un oyente
+        # colgado (su `finally` no correría). Sin await hasta registrarlo: nada se pierde entre
+        # la reanudación y la cola.
+        device = hub.open(client, config)
+        replay = device.replay(resume) if resume is not None else None
+        listener = device.listen()
+        head = ["retry: 1000\n\n"]
+        if resume is not None and replay is not None:
+            head.append(ev.sse(ready))  # sin id: el cliente ya sabe desde dónde va
+            head.extend(replay)
+        else:
+            now = ev.current_id()
+            head.append(ev.sse(ready, now))
+            if resume is not None:
+                head.append(ev.sse({"type": "resync"}, now))
         try:
             for line in head:
                 yield line

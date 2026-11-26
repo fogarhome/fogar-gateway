@@ -236,6 +236,8 @@ class DeviceEvents:
         conversation = channel.conversation
         if not conversation.visible_to(self.client.home_id, self.client.user_id):
             return None
+        if not _agent_allowed(self.config, channel.session_key):
+            return None  # como el 4020 del WebSocket: una conversación de un agente que no puede usar
         adapter = _Adapter(self, channel)
         self._adapters[channel.session_key] = adapter
         if not channel.subscribe(adapter):
@@ -329,7 +331,11 @@ class DeviceEvents:
 
 
 class EventHub:
-    """Los aparatos con `/events` (`app.state.events`)."""
+    """Los aparatos con `/events` (`app.state.events`).
+
+    shortcut: mientras un aparato tenga /events vivo, los canales que ve no se sueltan
+    (`drop_if_idle`) y sus adaptadores no se recalculan si le cambian `allowed_agents` (hasta
+    que caduque). En un hogar son pocos; si crece, soltar adaptadores de canales sin turno."""
 
     def __init__(self, channel_hub: ChannelHub) -> None:
         self.channel_hub = channel_hub
