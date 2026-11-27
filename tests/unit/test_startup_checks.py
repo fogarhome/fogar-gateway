@@ -27,11 +27,38 @@ def _settings(**kw) -> Settings:
     return Settings(_env_file=None, **base)
 
 
-def test_shutdown_drain_s_in_config_env_is_rejected(tmp_path):
-    """5.0: a retired key is an extra key; startup fails and names it."""
+@pytest.fixture
+def _fresh_retired_warning(monkeypatch):
+    from fogar_gateway.core import config as config_module
+
+    monkeypatch.setattr(config_module._logger, "retired_warned", False, raising=False)
+
+
+@pytest.mark.usefixtures("_fresh_retired_warning")
+def test_retired_keys_in_config_env_are_ignored_with_one_warning(tmp_path, caplog):
+    """Un config.env de la 4.x con ajustes retirados arranca: un aviso con los nombres, sin valores."""
     env = tmp_path / ".env"
-    env.write_text("SHUTDOWN_DRAIN_S=10\n", encoding="utf-8")
-    with pytest.raises(ValidationError, match=r"(?i)SHUTDOWN_DRAIN_S"):
+    env.write_text(
+        "SHUTDOWN_DRAIN_S=10\nTRUST_LOOPBACK=true\nTRUSTED_NETWORKS=10.99.0.0/16\n"
+        "ORCHESTRATOR_RECONNECT_MAX_DURATION=60\n",
+        encoding="utf-8",
+    )
+    caplog.set_level(logging.WARNING)
+    Settings(_env_file=env)
+    Settings(_env_file=env)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    for key in ("SHUTDOWN_DRAIN_S", "TRUST_LOOPBACK", "TRUSTED_NETWORKS",
+                "ORCHESTRATOR_RECONNECT_MAX_DURATION"):
+        assert key in warnings[0]
+    assert "ya no se usa desde la 5.0" in warnings[0]
+    assert "10.99" not in warnings[0] and "=10" not in warnings[0]
+
+
+def test_unknown_key_in_config_env_still_fails(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("NO_EXISTE_XYZ=1\n", encoding="utf-8")
+    with pytest.raises(ValidationError, match=r"(?i)NO_EXISTE_XYZ"):
         Settings(_env_file=env)
 
 

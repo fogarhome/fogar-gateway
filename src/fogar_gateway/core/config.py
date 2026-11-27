@@ -1,17 +1,48 @@
-from typing import Annotated, Literal
+import logging
+from typing import Annotated, Any, Literal
 
-from pydantic import Field, SecretStr, StringConstraints, field_validator
+from pydantic import Field, SecretStr, StringConstraints, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from fogar_gateway import paths
 from fogar_gateway.access import parse_public_urls
 from fogar_gateway.core.session_key import AGENT_ID_PATTERN
 
+_logger = logging.getLogger(__name__)
+
+# Ajustes que un config.env de la 4.x aún puede llevar y que ya no hacen nada: se ignoran con un
+# aviso en vez de tumbar el arranque. Cualquier otra clave desconocida sigue siendo un error.
+RETIRED_KEYS = frozenset({
+    "TRUST_LOOPBACK", "TRUSTED_NETWORKS",  # #413: ninguna IP exime de credencial
+    "SHUTDOWN_DRAIN_S",  # #221: el cierre ya no espera al turno en curso
+    "ORCHESTRATOR_RECONNECT_MAX_DURATION",  # #272: un solo bucle sin fin
+})
+
 
 class Settings(BaseSettings):
     # Nunca el .env del directorio actual: <base>/config.env (o --home / FOGAR_GATEWAY_HOME).
     # Ningún plazo admite inf ni nan (D-r7-1): un HANDSHAKE_TIMEOUT_S=inf no caduca nunca.
     model_config = SettingsConfigDict(env_file=paths.config_file(), allow_inf_nan=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_retired_keys(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        # Las claves de config.env llegan en minúsculas. Solo el nombre, nunca el valor.
+        retired = sorted(k for k in data if isinstance(k, str) and k.upper() in RETIRED_KEYS)
+        if not retired:
+            return data
+        # Un aviso por proceso: la CLI construye Settings muchas veces y puede ejecutar este
+        # módulo más de una vez (cli/config._config_module), así que la marca va en el logger.
+        if not getattr(_logger, "retired_warned", False):
+            _logger.retired_warned = True  # type: ignore[attr-defined]
+            _logger.warning(
+                "Config: %s ya no se usa desde la 5.0 y se ignora "
+                "(quítalo con `fogar-gw config unset`).",
+                ", ".join(k.upper() for k in retired),
+            )
+        return {k: v for k, v in data.items() if k not in retired}
 
     # Base de datos interna. Una ruta SQLite relativa cuelga del directorio base, también el
     # default: el engine, Alembic, el candado y `fogar-gw doctor` ven la misma ruta absoluta.

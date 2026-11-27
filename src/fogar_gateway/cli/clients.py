@@ -20,6 +20,10 @@ COLUMNS = [
 ]
 
 
+# Lo que un administrador puede conceder a un aparato del hogar (5.0, #410): nunca home:admin.
+HOUSEHOLD_SCOPES = ("conversations:read", "conversations:write", "home:read")
+
+
 def _out(ctx: click.Context) -> Out:
     return Out(ctx.find_root().obj["json"])
 
@@ -33,9 +37,11 @@ def _show_key(out: Out, data: dict[str, Any]) -> None:
         out.json(data)
         return
     # La clave primero: el servidor ya la ha creado o rotado y no se puede volver a pedir.
-    out.message(f"client_key: {data['client_key']}", ACCENT)
+    # En la 5.0 la credencial de un aparato se llama `token` (como en /pair); la API la sigue
+    # llamando `client_key` en /home/devices.
+    out.message(f"token: {data['client_key']}", ACCENT)
     out.pairs([("nombre", data["name"]), ("id", data["id"]), ("fp", data["key_fp"])])
-    out.message("Guárdala ahora: no se volverá a mostrar.", MUTED)
+    out.message("Guárdalo ahora: no se volverá a mostrar.", MUTED)
 
 
 # Campos que devuelve el gateway pero no se editan.
@@ -115,6 +121,8 @@ def show(ctx: click.Context, ref: str) -> None:
 @click.option("--type", "client_type", help="Tipo: ha, esp32, web, app o screen.")
 @click.option("--agent", help="Agente por defecto.")
 @click.option("--allowed-agent", "allowed", multiple=True, help="Agente permitido (repetible).")
+@click.option("--scope", "scopes", multiple=True, type=click.Choice(HOUSEHOLD_SCOPES),
+              help="Permiso que se le concede (repetible). Sin ninguno, conversations:write.")
 @click.option("--import-key", is_flag=True, help="Importar una clave existente desde stdin.")
 @click.pass_context
 def add(
@@ -123,6 +131,7 @@ def add(
     client_type: str | None,
     agent: str | None,
     allowed: tuple[str, ...],
+    scopes: tuple[str, ...],
     import_key: bool,
 ) -> None:
     """Crea un cliente y enseña su clave una sola vez."""
@@ -133,6 +142,8 @@ def add(
         body["default_agent"] = agent
     if allowed:
         body["allowed_agents"] = list(allowed)
+    if scopes:
+        body["scopes"] = list(scopes)
     if import_key:
         # Por stdin, nunca por argumento: así no acaba en el historial de la shell.
         key = (

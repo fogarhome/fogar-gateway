@@ -28,7 +28,6 @@ DROP = ("DATABASE_URL", "GATEWAY_UID", "GATEWAY_GID", "TZ")
 DOCKER_BASE = "/app"  # FOGAR_GATEWAY_HOME de la imagen
 ADD = ("LOG_FORMAT", "json")  # la imagen lo fijaba con ENV: los logs siguen igual
 
-_DROP_RE = re.compile(rf"\s*(?:export\s+)?({'|'.join(DROP)})\s*=", re.IGNORECASE)
 _ADD_RE = re.compile(rf"\s*(?:export\s+)?{ADD[0]}\s*=", re.IGNORECASE)
 
 
@@ -97,11 +96,15 @@ def _copy_db(src: Path, tmp: Path, dest: Path) -> int:
 
 
 def _convert_env(text: str) -> tuple[str, list[str], list[str]]:
-    """Quita DROP y añade LOG_FORMAT si falta; el resto de líneas, tal cual."""
+    """Quita DROP y los ajustes retirados (RETIRED_KEYS) y añade LOG_FORMAT si falta; el resto
+    de líneas, tal cual."""
+    # Perezoso: importar core.config aquí arriba cargaría pydantic en cada `--help`.
+    drop = (*DROP, *sorted(cfg._config_module().RETIRED_KEYS))
+    drop_re = re.compile(rf"\s*(?:export\s+)?({'|'.join(drop)})\s*=", re.IGNORECASE)
     kept: list[str] = []
     dropped: list[str] = []
     for line in text.splitlines(keepends=True):
-        m = _DROP_RE.match(line)
+        m = drop_re.match(line)
         if m:
             dropped.append(m.group(1))
         else:

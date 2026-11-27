@@ -34,10 +34,26 @@ def test_add_shows_key_once_with_warning(use_api):
             "--allowed-agent", "main", "--allowed-agent", "home")
     assert r.exit_code == 0, r.output
     assert r.output.count(KEY) == 1
+    assert f"token: {KEY}" in r.output and "client_key" not in r.output
     assert "no se volverá a mostrar" in r.output
     assert fake.calls == [("POST", "/home/devices", {
         "name": "Fogar TV", "client_type": "web", "default_agent": "main",
         "allowed_agents": ["main", "home"]})]
+
+
+def test_add_scope_reaches_the_request(use_api):
+    fake = use_api(FakeApi({("POST", "/home/devices"): {**A, "client_key": KEY}}))
+    r = run("clients", "add", "--name", "HA", "--scope", "conversations:write", "--scope", "home:read")
+    assert r.exit_code == 0, r.output
+    assert fake.calls[0][2] == {"name": "HA", "scopes": ["conversations:write", "home:read"]}
+
+
+def test_add_refuses_home_admin(use_api):
+    """Como `pair`: a un aparato del hogar, como mucho home:read."""
+    fake = use_api(FakeApi({}))
+    r = run("clients", "add", "--name", "HA", "--scope", "home:admin")
+    assert r.exit_code == 2
+    assert fake.calls == []
 
 
 def test_add_minimal_sends_only_name(use_api):
@@ -135,6 +151,7 @@ def test_rotate_with_yes_shows_new_key_once(use_api):
     r = run("--yes", "clients", "rotate-key", "Fogar TV")
     assert r.exit_code == 0, r.output
     assert r.output.count(KEY) == 1
+    assert f"token: {KEY}" in r.output
 
 
 def test_rotate_asks_on_tty_and_aborts_on_no(use_api, tty):

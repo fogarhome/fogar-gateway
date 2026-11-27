@@ -572,12 +572,22 @@ def test_set_validates_its_field_ignoring_other_bad_environment(home, monkeypatc
 
 
 @pytest.mark.parametrize("line", ["SHUTDOWN_DRAIN_S=10", "ORCHESTRATOR_RECONNECT_MAX_DURATION=60"])
-def test_config_validate_reports_retired_key(home, line):
+def test_config_validate_warns_about_retired_key(home, line):
+    """5.0: un ajuste retirado se ignora; validate avisa (no falla) y dice qué orden lo quita."""
+    key = line.split("=")[0]
     _env(home).write_text(f"ADMIN_TOKEN={SECRET}\n{line}\n")
     r = run("config", "validate")
-    assert r.exit_code == 1
-    assert line.split("=")[0] in r.output and "bórralo" in r.output
+    assert r.exit_code == 0, r.output
+    assert f"! {key}:" in r.output and f"fogar-gw config unset {key}" in r.output
     assert "Traceback" not in r.output
+
+
+def test_config_validate_unknown_key_says_which_command_fixes_it(home):
+    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nNO_EXISTE_XYZ=1\n")
+    r = run("config", "validate")
+    assert r.exit_code == 1
+    assert "NO_EXISTE_XYZ: extra_forbidden" in r.output
+    assert "fogar-gw config unset NO_EXISTE_XYZ" in r.output
 
 
 def test_config_validate_says_which_values_a_literal_takes(home):
@@ -585,7 +595,8 @@ def test_config_validate_says_which_values_a_literal_takes(home):
     _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nSTT_AUDIO_GATE=auto\n")
     r = run("config", "validate")
     assert r.exit_code == 1
-    assert "STT_AUDIO_GATE: literal_error (usa 'off' o 'energy' o bórralo de config.env)" in r.output
+    assert ("STT_AUDIO_GATE: literal_error (usa 'off' o 'energy' con `fogar-gw config set "
+            "STT_AUDIO_GATE` o quítalo con `fogar-gw config unset STT_AUDIO_GATE`)") in r.output
 
 
 @pytest.mark.parametrize("value", ["0", "inf", "nan"])
@@ -670,14 +681,15 @@ def test_unset_accepts_retired_key(home):
 
 def test_validate_names_a_retired_trusted_networks_line(home):
     # 5.0 (#413): TRUSTED_NETWORKS y TRUST_LOOPBACK ya no existen; como los demás ajustes
-    # retirados, validate los nombra para borrarlos, y `config unset` los quita.
+    # retirados, se ignoran, validate los nombra para quitarlos, y `config unset` los quita.
     (home / "config.env").write_text(
         f"ADMIN_TOKEN={SECRET}\nTRUSTED_NETWORKS=192.168.1.0/24\nTRUST_LOOPBACK=true\n"
     )
     r = run("config", "validate")
-    assert r.exit_code == 1
-    assert "TRUSTED_NETWORKS" in r.output and "TRUST_LOOPBACK" in r.output
-    assert "bórralo de config.env" in r.output
+    assert r.exit_code == 0, r.output
+    assert "fogar-gw config unset TRUSTED_NETWORKS" in r.output
+    assert "fogar-gw config unset TRUST_LOOPBACK" in r.output
+    assert "192.168" not in r.output
     assert run("config", "unset", "TRUSTED_NETWORKS").exit_code == 0
     assert run("config", "unset", "TRUST_LOOPBACK").exit_code == 0
     assert "TRUSTED_NETWORKS" not in _env(home).read_text()

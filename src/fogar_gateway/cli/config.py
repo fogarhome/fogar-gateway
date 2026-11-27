@@ -67,11 +67,13 @@ def _errors(exc: Any) -> list[str]:
     for e in exc.errors():
         loc = ".".join(str(p) for p in e["loc"])
         if e["type"] == "extra_forbidden":  # las claves de config.env llegan en minúsculas
-            out.append(f"{loc.upper()}: {e['type']} (ajuste retirado o desconocido: bórralo de config.env)")
+            out.append(f"{loc.upper()}: {e['type']} (ajuste desconocido: quítalo con "
+                       f"`fogar-gw config unset {loc.upper()}`)")
         elif e["type"] == "literal_error":
             # Los valores válidos son del esquema, no del usuario (#422: STT_AUDIO_GATE=auto, de la 4.x).
             expected = str(e.get("ctx", {}).get("expected", "")).replace(" or ", " o ")
-            out.append(f"{loc}: {e['type']} (usa {expected} o bórralo de config.env)")
+            out.append(f"{loc}: {e['type']} (usa {expected} con `fogar-gw config set {loc}` "
+                       f"o quítalo con `fogar-gw config unset {loc}`)")
         else:
             out.append(f"{loc}: {e['type']}")
     return out
@@ -149,6 +151,9 @@ def validation_checks(settings: Any) -> list[dict[str, str]]:
 
     where = paths.config_file()
     checks: list[dict[str, str]] = []
+    for name in _retired_in_config_env():
+        checks.append(_check("warn", name, "Ya no se usa desde la 5.0 y se ignora: quítalo con "
+                             f"`fogar-gw config unset {name}`."))
     for name in insecure_tokens(settings):
         empty = not getattr(settings, name)
         if name == "ADMIN_TOKEN":
@@ -177,6 +182,18 @@ def validation_checks(settings: Any) -> list[dict[str, str]]:
             checks.append(_check("warn", name, f"{hosts}. El gateway usa la red indicada; "
                                  "escríbela así."))
     return checks
+
+
+def _retired_in_config_env() -> list[str]:
+    """Ajustes retirados que siguen en config.env (el gateway los ignora con un aviso)."""
+    path = paths.config_file()
+    if not path.is_file():
+        return []
+    try:
+        present = api.read_env_file(path)
+    except api.ApiError:
+        return []  # sin permiso: load() ya lo ha dicho
+    return sorted(set(present) & _config_module().RETIRED_KEYS)
 
 
 # Listas de IP/CIDR: sus entradas no son secretas y se muestran (F-r3-1).

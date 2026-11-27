@@ -92,11 +92,13 @@ def test_paths_are_reported(base):
     assert str(base / "data" / "gateway.db") in found["rutas"]["detail"]
 
 
-def test_doctor_reports_retired_key(base):
+def test_doctor_warns_about_a_retired_key(base):
+    """5.0: un ajuste retirado no tumba nada; doctor avisa y dice cómo quitarlo."""
     (base / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nSHUTDOWN_DRAIN_S=10\n")
-    detail = checks(run("--json", "doctor"))["configuración"]
-    assert detail["level"] == "fail"
-    assert "SHUTDOWN_DRAIN_S" in detail["detail"] and "bórralo" in detail["detail"]
+    found = checks(run("--json", "doctor"))
+    assert found["configuración"]["level"] == "ok"
+    assert found["SHUTDOWN_DRAIN_S"]["level"] == "warn"
+    assert "fogar-gw config unset SHUTDOWN_DRAIN_S" in found["SHUTDOWN_DRAIN_S"]["detail"]
 
 
 def test_invalid_config_is_a_failure_naming_the_field_only(base):
