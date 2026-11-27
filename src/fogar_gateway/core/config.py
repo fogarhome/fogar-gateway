@@ -109,6 +109,20 @@ class Settings(BaseSettings):
     # fogar nunca la usa.
     STT_AUDIO_GATE: Literal["off", "energy"] = "energy"
 
+    @field_validator("STT_AUDIO_GATE", mode="before")
+    @classmethod
+    def _retired_auto_gate(cls, v: object) -> object:
+        # #422 quitó "auto" (en la 4.x era "energy"): un config.env viejo arranca igual, con aviso.
+        if not (isinstance(v, str) and v.strip().lower() == "auto"):
+            return v
+        if not getattr(_logger, "auto_gate_warned", False):
+            _logger.auto_gate_warned = True  # type: ignore[attr-defined]
+            _logger.warning(
+                "Config: STT_AUDIO_GATE=auto ya no existe desde la 5.0; uso energy "
+                "(cámbialo con `fogar-gw config set STT_AUDIO_GATE energy`)."
+            )
+        return "energy"
+
     STT_GATE_RMS_DBFS: float = -45.0
     OPENCLAW_HOST: str = "127.0.0.1"
     OPENCLAW_PORT: int = 18789

@@ -173,6 +173,41 @@ def test_cancel_and_withdraw_without_anything_running(client):
     assert r.status_code == 403
 
 
+@pytest.mark.parametrize(
+    ("open_turn", "body", "cancelled", "head"),
+    [
+        ("T1", {"turn_id": "T1"}, True, False),  # el turno que se ve: se para
+        ("T2", {"turn_id": "T1"}, False, False),  # ya es otro: nada
+        (None, {"turn_id": "T1"}, False, False),  # ya acabó: el pendiente no se toca
+        (None, None, True, True),  # sin campo, como antes: el siguiente sin empezar
+        ("T1", None, True, False),
+    ],
+)
+def test_cancel_with_turn_id_only_stops_that_turn(client, monkeypatch, open_turn, body, cancelled, head):
+    """«Enviar ahora» (web): si el turno acaba justo antes del POST, no para el mensaje pendiente."""
+    from types import SimpleNamespace
+
+    conv = _conversation(client)
+    turn = SimpleNamespace(id=open_turn) if open_turn else None
+    channel = SimpleNamespace(
+        current_turn=turn,
+        cancel=AsyncMock(return_value=turn),
+        cancel_head=AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(client.app.state.channel_hub, "get", lambda key: channel)
+    kwargs = {"json": body} if body is not None else {}
+    r = client.post(f"/conversations/{conv['id']}/cancel", headers=BEARER, **kwargs)
+    assert r.status_code == 200 and r.json() == {"cancelled": cancelled}
+    assert channel.cancel_head.await_count == (1 if head else 0)
+    assert channel.cancel.await_count == (1 if open_turn and (body is None or open_turn == "T1") else 0)
+
+
+def test_cancel_rejects_unknown_fields(client):
+    conv = _conversation(client)
+    r = client.post(f"/conversations/{conv['id']}/cancel", headers=BEARER, json={"turn": "T1"})
+    assert r.status_code == 422
+
+
 def test_revoking_the_device_closes_its_events(client, admin_headers):
     with client.stream("GET", "/events", headers=BEARER) as stream:
         _read(stream.iter_lines(), until=lambda e: e["type"] == "ready")

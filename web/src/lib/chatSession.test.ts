@@ -81,7 +81,7 @@ describe('createChatSession', () => {
     h.chat.start()
     await flush()
     await h.chat.cancel()
-    expect(h.deps.cancelTurn).toHaveBeenCalledWith('c1')
+    expect(h.deps.cancelTurn).toHaveBeenCalledWith('c1', undefined) // «Parar»: sin turn_id, lo que haya
     h.deps.withdrawMessage = vi.fn(async () => {
       throw new ApiError('not-found', 404, 'not_pending')
     })
@@ -120,7 +120,18 @@ describe('createChatSession', () => {
     expect(h.deps.cancelTurn).not.toHaveBeenCalled()
     h.emit({ type: 'turn_start', turn_id: 'T', conversation: 'c1', origin: 'user' }, 12)
     await h.chat.sendNow()
-    expect(h.deps.cancelTurn).toHaveBeenCalledWith('c1')
+    // con el turno que ve: si acaba antes de que llegue el POST, el gateway no para el mensaje
+    expect(h.deps.cancelTurn).toHaveBeenCalledWith('c1', 'T')
+  })
+
+  it('«Enviar ahora» con solo un aviso de otra conversación abierto no para nada', async () => {
+    const h = harness()
+    h.chat.start()
+    await flush()
+    h.emit(message('m2'), 11)
+    h.emit({ type: 'turn_start', turn_id: 'P', conversation: 'otra', origin: 'push' }, 12)
+    await h.chat.sendNow()
+    expect(h.deps.cancelTurn).not.toHaveBeenCalled()
   })
 
   it('un resync cierra lo abierto, vuelve a leer el estado y pide releer lo dicho', async () => {

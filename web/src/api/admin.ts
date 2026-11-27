@@ -68,7 +68,12 @@ export const postMessage = (id: string, text: string, interrupt = false) =>
     body: json({ text, interrupt }),
     timeoutMs: 130_000,
   })
-export const cancelTurn = (id: string) => api<{ cancelled: boolean }>(`/conversations/${enc(id)}/cancel`, { method: 'POST' })
+/** Con `turnId` (el `turn_id` de /events), solo ese turno: si ya acabó, no para nada. */
+export const cancelTurn = (id: string, turnId?: string) =>
+  api<{ cancelled: boolean }>(`/conversations/${enc(id)}/cancel`, {
+    method: 'POST',
+    ...(turnId ? { body: json({ turn_id: turnId }) } : {}),
+  })
 export const withdrawMessage = (id: string, messageId: string) =>
   api<void>(`/conversations/${enc(id)}/messages/${enc(messageId)}`, { method: 'DELETE' })
 /** Conversación nueva del panel web; sin agente, el que toque por defecto. */

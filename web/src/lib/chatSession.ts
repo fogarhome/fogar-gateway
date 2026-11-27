@@ -21,7 +21,7 @@ export interface ChatDeps {
   streamState: () => StreamState
   getLive: (id: string) => Promise<ConversationLive>
   postMessage: (id: string, text: string, interrupt: boolean) => Promise<{ message_id: string }>
-  cancelTurn: (id: string) => Promise<{ cancelled: boolean }>
+  cancelTurn: (id: string, turnId?: string) => Promise<{ cancelled: boolean }>
   withdrawMessage: (id: string, messageId: string) => Promise<void>
 }
 
@@ -120,9 +120,9 @@ export function createChatSession(conversationId: string, deps: ChatDeps) {
     }
   }
 
-  async function cancel(): Promise<void> {
+  async function cancel(turnId?: string): Promise<void> {
     try {
-      await deps.cancelTurn(conversationId)
+      await deps.cancelTurn(conversationId, turnId)
     } catch (e) {
       state.notice = errorText(e, 'parar')
     }
@@ -150,15 +150,17 @@ export function createChatSession(conversationId: string, deps: ChatDeps) {
         state.sending = false
       }
     },
-    cancel,
+    cancel: () => cancel(),
     /**
      * «Enviar ahora» en el primero de la cola: para el turno que se está respondiendo, y el mensaje
      * sale detrás. Sin turno abierto no hace nada: el mensaje ya va a salir, y `/cancel` sin turno
      * pararía justo ese (el siguiente pendiente, docs/client-protocol.md §4). `interrupt` no sirve:
      * va en un POST nuevo, así que reenviaría el texto (duplicado) y en ese hueco también para el siguiente.
+     * Lleva el `turn_id`: si ese turno acaba justo antes de que llegue, el gateway no para nada.
      */
     async sendNow(): Promise<void> {
-      if (state.log.turnOpen) await cancel()
+      const turnId = state.log.openTurnId
+      if (turnId) await cancel(turnId)
     },
     async withdraw(messageId: string): Promise<void> {
       try {

@@ -532,7 +532,7 @@ El STT y el TTS pasan por una capa de proveedores (`src/fogar_gateway/services/s
 | `TTS_PROVIDER` | `fogar` | `fogar` (fogar-speaker), `elevenlabs` (stream-input, `eleven_flash_v2_5`) u `off` (sin respuestas en audio: solo en texto) |
 | `ELEVENLABS_API_KEY` | — | Obligatoria si algún proveedor es `elevenlabs` (permisos Text to Speech y Speech to Text) |
 | `ELEVENLABS_TTS_DEFAULT_VOICE` | `gc61tTk93h3LBXPxew2V` | Voz por defecto; las voces de clientes que no son de ElevenLabs (p. ej. `af_heart`) caen en ella o se traducen con `TTS_VOICE_MAP` |
-| `STT_AUDIO_GATE` | `energy` | Puerta de energía del STT de ElevenLabs (solo se envía audio mientras se habla); `off` la quita. fogar no la usa |
+| `STT_AUDIO_GATE` | `energy` | Puerta de energía del STT de ElevenLabs (solo se envía audio mientras se habla); `off` la quita. fogar no la usa. `auto` (4.x) ya no existe: se toma como `energy` con un aviso |
 | `STT_GATE_RMS_DBFS` | `-45` | Umbral de la puerta de energía |
 
 `ELEVENLABS_BASE_URL` y `ELEVENLABS_TTS_MODEL` están en `.env.sample`; el resto de ajustes de ElevenLabs son constantes del adaptador (`src/fogar_gateway/services/speech/elevenlabs/`). El proveedor se elige con `STT_PROVIDER`/`TTS_PROVIDER` al arrancar; cambiarlo exige reiniciar. Con el plan Creator, ElevenLabs conserva el audio y las transcripciones (la retención cero es solo enterprise).

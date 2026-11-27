@@ -202,6 +202,12 @@ export class ChatLog {
     return this.lines.some((line) => line.state === 'streaming')
   }
 
+  /** El `turn_id` del turno abierto de esta conversación (no un aviso de otra que se ve aquí). */
+  get openTurnId(): string | null {
+    const line = this.lines.find((l) => l.role === 'assistant' && l.state === 'streaming' && !l.otherConversation)
+    return line ? line.key.slice(2) : null
+  }
+
   /** Mensajes que esperan en la cola (para «Quitar»). */
   get pending(): ChatLine[] {
     return this.lines.filter((l) => l.messageState === 'pending')

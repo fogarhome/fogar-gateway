@@ -316,6 +316,15 @@ class MessageCreate(BaseModel):
     speak: bool = False
 
 
+class CancelTurn(BaseModel):
+    """`POST /conversations/{id}/cancel`: `turn_id` (el de /events y del estado al entrar) para
+    solo ese turno; si ya no es el abierto, no se para nada (ni el siguiente pendiente)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    turn_id: Annotated[str, StringConstraints(min_length=1, max_length=64)] | None = None
+
+
 class ConversationResponse(BaseModel):
     """Una conversación: sin texto (el título lo pone OpenClaw; null si no se sabe)."""
 

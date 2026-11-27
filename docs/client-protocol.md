@@ -1144,7 +1144,7 @@ data: {"type":"turn_start","turn_id":"9f3c…","conversation":"c1","origin":"use
 | `POST /conversations/{id}/messages {"text", "interrupt"?}` | `202 {"message_id"}` en cuanto OpenClaw lo acepta (el `id` de su `message`). `interrupt: true` es «enviar ahora» (§4). Texto vacío (`""`) → `422` de validación (lista `detail` de FastAPI); solo espacios → `422 empty_message`; agente no permitido → `403 agent_not_permitted`; OpenClaw lo rechaza → `502` con su código (§9); si un `/v1` ocupa la conversación más de `TURN_TIMEOUT_S` → `503 turn_timeout` |
 | `POST /conversations {"agent"?, "message"?}` | `201`, la conversación y, con `message`, su `message_id` |
 | `DELETE /conversations/{id}/messages/{message_id}` | `204`; `404 not_pending` si ya no está pendiente (§4, «Quitar») |
-| `POST /conversations/{id}/cancel` | `200 {"cancelled": bool}`: para el turno en curso para todos o, sin turno, el siguiente mensaje que aún no empezó (como `cancel`, §4) |
+| `POST /conversations/{id}/cancel {"turn_id"?}` | `200 {"cancelled": bool}`: para el turno en curso para todos o, sin turno, el siguiente mensaje que aún no empezó (como `cancel`, §4). Con `turn_id` (el de `/events` y de `GET /conversations/{id}`, no el `t-{n}` del WebSocket) solo para **ese** turno: si ya no es el abierto (acabó, o hay otro), no para nada, tampoco el siguiente pendiente, y responde `200 {"cancelled": false}`. Úsalo para «enviar ahora» un pendiente: si su turno de delante acaba justo antes de que llegue la petición, sin `turn_id` pararías el propio mensaje. Sin cuerpo, como siempre |
 
 El mensaje, su estado (`pending`, `delivered`, `withdrawn`) y el turno que lo responde llegan por `/events`, reconocibles por ese `message_id`.
 
