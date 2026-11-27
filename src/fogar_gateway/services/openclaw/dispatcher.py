@@ -72,6 +72,8 @@ class Channels(Protocol):
 
     def connection_lost(self, code: str) -> None: ...
 
+    def abort_owed(self, session_key: str, run_id: str) -> None: ...
+
 
 class FrameDispatcher:
     """Routes incoming OpenClaw frames to the correct queue or channel.
@@ -135,6 +137,12 @@ class FrameDispatcher:
         run_id = payload.get("runId")
         if self._turns.is_run_aborted(run_id):
             logger.debug("frame of an aborted run dropped (sk=%s)", payload.get("sessionKey"))
+            owed_sk = self._turns.take_owed_abort(run_id)
+            abort_owed = getattr(self._channels, "abort_owed", None)
+            if owed_sk is not None and isinstance(run_id, str) and callable(abort_owed):
+                # Su `chat.abort` pudo no llegar (OpenClaw caído, o su cola aún sin restaurar):
+                # sigue corriendo, se aborta otra vez.
+                abort_owed(owed_sk, run_id)
             return True
         if self._turns.is_run_finished(run_id):
             # A channel's own run that already ended (m5): never a push, even once its

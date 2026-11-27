@@ -17,6 +17,7 @@ against the OpenClaw fake (`steer=True`) and checks the per-socket invariants.
 """
 
 import asyncio
+import json
 import logging
 
 import pytest
@@ -51,6 +52,7 @@ class _Orchestrator:
         self.aborted: list[str] = []
         self.history = history
         self.reads: list[tuple[str, dict]] = []
+        self.connected = True  # False: `abort_run` no sale (como ReconnectingOpenClawClient)
 
     async def send(self, text, session_key, *, queue_mode=None):
         await self.ack.wait()
@@ -58,7 +60,10 @@ class _Orchestrator:
         return f"r{self.sent}"
 
     async def abort_run(self, session_key, run_id):
+        if not self.connected:
+            return False
         self.aborted.append(run_id)
+        return True
 
     async def abort(self, session_key):
         self.aborted.append("THE WHOLE KEY")
@@ -887,3 +892,104 @@ async def test_a_confirmed_queue_leaves_no_deadline_behind(recovery, caplog):
         await wait_until(lambda: channel._lost_deadline is None)
     assert "no confirmó" not in caplog.text
     await hub.aclose(1.0)
+
+
+# ── An abort while OpenClaw is down, and a late frame of a closed push ─────
+
+
+async def test_a_message_withdrawn_while_disconnected_never_runs_when_openclaw_restores_it():
+    """B is pending when OpenClaw drops; it is withdrawn while disconnected (the `chat.abort`
+    cannot go out). On reconnection the abort is sent, but OpenClaw restores its queue ~13 s
+    later (docs/openclaw-protocol.md, the restarts of 2026-11-25), so it may have been a no-op:
+    when B's first frame shows up it is aborted again, and nothing of it reaches anyone."""
+    orchestrator = _Orchestrator(history=_history("r2"))
+    hub, channel, subscriber, dispatcher = _channel(orchestrator)
+    await _a_running_and_b_pending(channel, subscriber, dispatcher)
+    dispatcher.connection_lost("orchestrator_disconnected")
+    await channel.push_idle()
+    orchestrator.connected = False
+    assert await channel.withdraw("r2")
+    assert "r2" not in orchestrator.aborted  # sin conexión no salió
+    subscriber.got.clear()
+
+    # Una caída de más de RUN_ABORT_TOMBSTONE_S: su lápida ya venció al reconectar.
+    del hub.turn_registry._aborted_runs["r2"]
+    del hub.turn_registry._finished_runs["r2"]
+    orchestrator.connected = True
+    hub.reconnected()
+    await wait_until(lambda: "r2" in orchestrator.aborted)
+    orchestrator.aborted.clear()  # un no-op: OpenClaw aún no lo había restaurado
+
+    await feed(dispatcher, channel, run_status("r2"), delta("r2", "luz"), lifecycle("r2", "end"))
+    await wait_until(lambda: orchestrator.aborted == ["r2"])
+    await channel.push_idle()
+    assert subscriber.got == []
+    assert channel.current_turn is None and "r2" not in channel._runs
+    await hub.aclose(1.0)
+
+
+async def test_a_late_frame_of_a_closed_push_opens_nothing_once_its_channel_is_dropped():
+    """A push ends (lifecycle `end`); nobody is attached, so the channel is forgotten. A late
+    frame of that run reaches a fresh channel of the key: it must not open a push (it would
+    hold the conversation until TURN_TIMEOUT_S and end in `turn_timeout`)."""
+    hub, channel, subscriber, dispatcher = _channel()
+    await feed(dispatcher, channel, run_status("run-x"), delta("run-x", "aviso"), lifecycle("run-x", "end"))
+    assert subscriber.got == [("start", "push", "run-x"), ("token", "aviso"), ("end", "done")]
+    channel.unsubscribe(subscriber)
+    hub.drop_if_idle(SK)
+    assert hub.get(SK) is None
+
+    for late in (run_status("run-x"), lifecycle("run-x", "model"), delta("run-x", "tarde")):
+        await dispatcher.dispatch(late)
+        fresh = hub.get(SK)
+        if fresh is not None:
+            await fresh.push_idle()
+            assert fresh.current_turn is None
+    await hub.aclose(1.0)
+
+
+async def test_a_push_open_when_openclaw_drops_ends_with_the_drop():
+    """Like a user turn: a push open when the connection drops ends at once with
+    `orchestrator_disconnected` (instead of holding the conversation until TURN_TIMEOUT_S),
+    its run is tombstoned and aborted by its runId on reconnection."""
+    orchestrator = _Orchestrator(history=_history())
+    hub, channel, subscriber, dispatcher = _channel(orchestrator)
+    await feed(dispatcher, channel, run_status("run-x"), delta("run-x", "aviso"))
+    dispatcher.connection_lost("orchestrator_disconnected")
+    await channel.push_idle()
+    assert subscriber.got == [
+        ("start", "push", "run-x"), ("token", "aviso"), ("error", "orchestrator_disconnected"),
+        ("end", "error"),
+    ]  # fmt: skip
+    assert channel.current_turn is None and hub.turn_registry.is_run_aborted("run-x")
+    hub.reconnected()
+    await wait_until(lambda: orchestrator.aborted == ["run-x"])
+    await hub.aclose(1.0)
+
+
+async def test_a_chat_send_without_ack_is_tombstoned_and_aborted(monkeypatch):
+    """No ack in TURN_TIMEOUT_S: the send fails with `turn_timeout`, but OpenClaw may have taken
+    it. Its runId is its `idempotencyKey` (docs/openclaw-protocol.md): it is tombstoned (its
+    frames never come back as a push) and `chat.abort`ed by it."""
+    from fogar_gateway.core.config import settings
+    from fogar_gateway.services.orchestration import OrchestratorError
+
+    sent: list[dict] = []
+
+    class _Socket:
+        async def send(self, data):
+            sent.append(json.loads(data))
+
+    monkeypatch.setattr(settings, "TURN_TIMEOUT_S", 0.05)
+    turns = TurnRegistry()
+    client = OpenClawClient(
+        host="test", port=1, token="x", turn_registry=turns,
+        dispatcher=FrameDispatcher(turns, ChannelHub()),
+    )  # fmt: skip
+    client._ws = _Socket()  # type: ignore[assignment]
+    with pytest.raises(OrchestratorError, match="turn_timeout"):
+        await client.send("x", SK)
+    run_id = sent[0]["params"]["idempotencyKey"]
+    assert turns.is_run_aborted(run_id)
+    assert sent[1]["method"] == "chat.abort"
+    assert sent[1]["params"] == {"sessionKey": SK, "runId": run_id}
