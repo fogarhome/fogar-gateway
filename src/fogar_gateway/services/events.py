@@ -125,6 +125,12 @@ def _agent_allowed(config: ClientConfig, session_key: str) -> bool:
     return parts[1].lower() in {a.lower() for a in allowed}
 
 
+def push_shown(config: ClientConfig, session_key: str) -> bool:
+    """Si un aviso llega a este aparato: con `push_enabled` y de un agente permitido (como
+    TurnController). Lo comparten /events y la instantánea de `GET /conversations/{id}`."""
+    return config.push_enabled and _agent_allowed(config, session_key)
+
+
 class _SpeechTurn:
     """La voz de un turno por /events (5.0 5c): un TTS, su texto por una cola y su audio como
     eventos `audio` del aparato, al ritmo de reproducción. Toda espera, acotada por
@@ -265,8 +271,7 @@ class _Adapter:
         if turn.origin == "push":
             # Como TurnController: sin avisos (`push_enabled`) o de un agente no permitido, el
             # aviso entero se descarta para este aparato (ni su par).
-            key = turn.session_key or self.channel.session_key
-            if not self.wants_push or not self.agent_allowed(key):
+            if not push_shown(self._device.config, turn.session_key or self.channel.session_key):
                 return
         self._started.add(turn.id)
         self._device.publish(turn_payload(turn, self.client.id))
@@ -373,7 +378,10 @@ class DeviceEvents:
         self._tasks: set[asyncio.Task] = set()
         self._adapters: dict[str, _Adapter] = {}  # session_key → adaptador
         self._buffer: deque[tuple[int, str]] = deque(maxlen=BUFFER_MAX)
-        self._floor = current_id()  # el último id que este aparato ya no puede reenviar
+        # Por debajo, `resync`. Un id propio (nunca emitido): un búfer nuevo no garantiza nada
+        # anterior, ni aunque nadie publicara entre medias (un aparato que caducó mientras solo
+        # hubo WebSocket); el `ready` de su primer stream ya lleva este id o uno mayor.
+        self._floor = _next_id()
         self._listeners: set[_Listener] = set()
         self._expiry: asyncio.TimerHandle | None = None
         self.closed = False

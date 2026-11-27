@@ -40,11 +40,13 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from anyio import from_thread
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, col, select
 
+from fogar_gateway.api import dictation_routes
 from fogar_gateway.api.deps import Caller, Principal, require_admin, require_scope
 from fogar_gateway.core.config import settings
 from fogar_gateway.db.database import get_db_session, get_engine
@@ -452,6 +454,7 @@ def get_client(
 def update_client(
     client_id: str,
     body: ClientUpdate,
+    request: Request,
     session: Session = Depends(get_db_session),
     principal: Principal = Depends(require_admin),
 ) -> ClientResponse:
@@ -481,6 +484,10 @@ def update_client(
     session.add(rec)
     session.commit()
     session.refresh(rec)
+    # Desactivado: fuera ya todo lo vivo. Con otra configuración, su /events se rehace al
+    # reconectar (con `resync`): sus adaptadores no se recalculan en caliente.
+    cut = close_client_sessions if patch.get("is_active") is False else close_client_events
+    from_thread.run_sync(cut, request.app, client_id)  # ruta síncrona: el corte, en el loop
     return ClientResponse.from_record(rec)
 
 
@@ -498,9 +505,15 @@ def retire_client(session: Session, rec: ClientRecord) -> None:
 
 def close_client_sessions(app: FastAPI, client_id: str) -> None:
     """Cierra ya (4200) las sesiones vivas de un cliente, sin esperar a la revalidación, y su
-    `/events` (también el que sigue vivo sin conexión para reanudar, #412)."""
+    `/events` (también el que sigue vivo sin conexión para reanudar, #412) y su dictado."""
     for bridge in app.state.client_registry.for_client(client_id):
         bridge.revoke()
+    dictation_routes.revoke(client_id)
+    close_client_events(app, client_id)
+
+
+def close_client_events(app: FastAPI, client_id: str) -> None:
+    """Corta su `/events` ya: al reconectar se rehace con su configuración de ahora."""
     events = getattr(app.state, "events", None)
     if events is not None:
         events.close_device(client_id)
@@ -522,6 +535,7 @@ async def delete_client(
 @router.post("/devices/{client_id}/rotate-key", response_model=ClientWithKey)
 def rotate_client_key(
     client_id: str,
+    request: Request,
     session: Session = Depends(get_db_session),
     principal: Principal = Depends(require_admin),
 ) -> ClientWithKey:
@@ -542,4 +556,5 @@ def rotate_client_key(
             status_code=status.HTTP_409_CONFLICT, detail="could not generate a unique client_key"
         ) from None
     session.refresh(rec)
+    from_thread.run_sync(close_client_sessions, request.app, client_id)  # la clave vieja ya no vale
     return ClientWithKey.from_record(rec, key)

@@ -311,10 +311,15 @@ async def get_conversation(
     cache = request.app.state.conversation_titles
     titles = await cache.get(request.app.state.openclaw)
     base = _response(row, titles.get(row.record.session_key.lower()))
+    # Su configuración (avisos, agentes): la máquina lo ve todo.
+    config = await _caller_config(principal) if isinstance(principal, Caller) else None
     # Sin await desde aquí: el estado y `as_of` son del mismo instante.
     me = principal.device.id if isinstance(principal, Caller) else ""
     channel = request.app.state.channel_hub.get(conversation.session_key)
     turn = channel.current_turn if channel is not None else None
+    if turn is not None and turn.origin == "push" and config is not None:
+        if not ev.push_shown(config, turn.session_key or conversation.session_key):
+            turn = None  # como por /events: un aviso que este aparato no recibe
     live_turn = None
     if turn is not None and turn.cancel_reason is None:
         live_turn = {**ev.turn_payload(turn, me), "text": turn.text}
@@ -404,18 +409,23 @@ async def message_speech(
         raise HTTPException(status_code=404, detail="message_not_found")
     config = await _caller_config(caller)
     provider = request.app.state.speech.tts
+    # Todo el TTS (de pago) acotado por PUSH_TTS_DRAIN_TIMEOUT_S sin progreso, como el de un aviso.
+    limit = settings.PUSH_TTS_DRAIN_TIMEOUT_S
+    stream = None
     try:
         stream = await asyncio.wait_for(
             provider.connect(
                 provider.resolve_voice(config.tts_voice), config.tts_speed, caller.device.id
             ),
-            timeout=settings.PUSH_TTS_DRAIN_TIMEOUT_S,
+            timeout=limit,
         )
         if stream is not None:
-            await stream.send_text_chunk(message["text"])
-            await stream.end()
+            await asyncio.wait_for(stream.send_text_chunk(message["text"]), timeout=limit)
+            await asyncio.wait_for(stream.end(), timeout=limit)
     except Exception as e:  # noqa: BLE001 — frontera: un TTS caído es 503 con código estable
         logger.warning(f"Voz bajo demanda: TTS no disponible ({describe_error(e)})")
+        if stream is not None:  # conectado y caído a medias: no queda abierto
+            await _close_tts(stream)
         stream = None
     if stream is None:
         raise HTTPException(status_code=503, detail="tts_unavailable")
@@ -428,11 +438,16 @@ async def message_speech(
         nonlocal closed
         if not closed:
             closed = True
-            await tts.close()
+            await _close_tts(tts)
 
     async def audio():
         try:
-            async for chunk in tts.get_audio_stream():
+            chunks = tts.get_audio_stream()
+            while True:
+                try:  # el tope, solo sobre la espera del TTS (nunca alrededor del `yield`)
+                    chunk = await asyncio.wait_for(anext(chunks), timeout=limit)
+                except StopAsyncIteration:
+                    break
                 if chunk:
                     yield chunk
         except Exception as e:  # noqa: BLE001 — frontera: el audio se corta, el cliente lo ve
@@ -447,3 +462,9 @@ async def message_speech(
         background=BackgroundTask(close),
     )
 
+
+async def _close_tts(stream) -> None:
+    try:
+        await stream.close()
+    except Exception as e:  # noqa: BLE001 — limpieza: va a DEBUG
+        logger.debug(f"cierre del TTS bajo demanda: {describe_error(e)}")
