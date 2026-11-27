@@ -36,15 +36,16 @@ Detalles en [Instalación](#instalación). Si integras un aparato nuevo, el prot
 
 ### Web
 
-`http://<host>:8004/` es el panel de Fogar: se entra con el token de administrador (`ADMIN_TOKEN`) y desde ahí se ve el estado en vivo (también con qué acceso está el gateway en OpenClaw), las conversaciones de toda la casa y las sesiones, se habla con Fogar por texto en conversaciones propias del panel, y se emparejan, crean, editan, rotan y borran clientes. Lo sirve el propio gateway desde su paquete, sin Node en la máquina; las rutas de la API de abajo tienen siempre prioridad. Si el paquete no lleva la web compilada (un clon sin build), `/` da 404, el gateway funciona igual y lo avisa una vez en el log. **Desde un clon**, `sh scripts/build-web.sh` (en la raíz; necesita Node y pnpm) la compila y la copia a `src/fogar_gateway/web/`, que es lo que sirve el gateway (con `uv sync` el paquete es editable: basta con reiniciarlo). `pnpm build` solo la deja en `web/dist`, que el gateway no mira. Es el mismo script que usan la release, la CI y el Dockerfile. Para desarrollarla, [`web/README.md`](web/README.md).
+`http://<host>:8004/` es el panel de Fogar: cada persona entra con su usuario y contraseña, y desde ahí se ve el estado en vivo (también con qué acceso está el gateway en OpenClaw), las conversaciones que puede ver y las sesiones, se habla con Fogar por texto en cualquiera de ellas (5.0: la misma conversación puede estar abierta en varios aparatos a la vez), y se emparejan, crean, editan, rotan y retiran aparatos. Lo sirve el propio gateway desde su paquete, sin Node en la máquina; las rutas de la API de abajo tienen siempre prioridad. Si el paquete no lleva la web compilada (un clon sin build), `/` da 404, el gateway funciona igual y lo avisa una vez en el log. **Desde un clon**, `sh scripts/build-web.sh` (en la raíz; necesita Node y pnpm) la compila y la copia a `src/fogar_gateway/web/`, que es lo que sirve el gateway (con `uv sync` el paquete es editable: basta con reiniciarlo). `pnpm build` solo la deja en `web/dist`, que el gateway no mira. Es el mismo script que usan la release, la CI y el Dockerfile. Para desarrollarla, [`web/README.md`](web/README.md).
 
 ### WebSocket
 
 | Endpoint | Auth | Descripción |
 |----------|------|-------------|
 | `ws://<host>:8004/ws/stream` | `token` en handshake JSON (permiso `conversations:write`) | Sesión interactiva de voz/texto |
+| `ws://<host>:8004/speech/dictation` | `token` en handshake JSON (permiso `conversations:write`) | Solo dictado (5.0): audio → transcripciones; no inicia turnos |
 
-Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la guía completa de integración.
+Ver [`docs/client-protocol.md`](docs/client-protocol.md) para la guía completa de integración. Para chatear sin WebSocket (`/events` y `POST`), su §16.
 
 ### Health
 

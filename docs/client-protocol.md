@@ -1,8 +1,31 @@
 # Protocolo de cliente — fogar-gateway
 
-Guía completa para implementar clientes que se conecten a fogar-gateway. Cubre el ciclo de vida de la sesión WebSocket, todos los mensajes posibles en ambas direcciones y el formato de audio binario.
+Guía completa para implementar clientes que se conecten a fogar-gateway: cómo encontrarlo y darse de alta, con qué credencial y permisos, y las tres formas de hablar con Fogar.
 
-> **¿Integras Home Assistant u otro cliente OpenAI-compatible?** Eso va por REST (`/v1/*`), no por este protocolo WebSocket: siempre con `Authorization: Bearer <token>` de un aparato con `conversations:write`, y la conversación con la cabecera `X-Fogar-Conversation` (sin ella, la del día). Detalle en el [README](../README.md#openai-compatible-v1-la-puerta-estándar).
+## La 5.0 de un vistazo
+
+**Una credencial por aparato.** Un aparato se da de alta emparejándose con un código (del hogar: la tele, un altavoz, Home Assistant) o iniciando sesión con la cuenta de una persona (personal: la web, una app). Recibe un **`token`** una sola vez y lo usa siempre igual: como `token` en el handshake de un WebSocket y como `Authorization: Bearer` en HTTP (§0).
+
+**Permisos (scopes).** El aparato los pide al darse de alta y se le concede lo pedido ∩ su tope (§0, «Permisos»): `conversations:read`, `conversations:write`, `home:read`, `home:admin`. La visibilidad no cambia con ellos: un aparato del hogar ve las conversaciones del hogar; uno personal, además las de su persona.
+
+**Tres puertas, un canal, un vocabulario.** Las tres son suscriptores del mismo canal de cada conversación (§14) y hablan el mismo JSON (`message`, `turn_start`, `token`, `tool_call`, `turn_progress`, `error`, `turn_end`):
+
+| Puerta | Para qué | Dónde |
+|---|---|---|
+| WebSocket `/ws/stream` | Voz continua y manos libres (también texto) | §1–§15 |
+| HTTP + SSE: `GET /events` y `POST /conversations/{id}/messages` | Chatear sin una conexión abierta entre mensajes; dictado (`/speech/dictation`) y voz por `/events` | §16 |
+| `/v1` (compatible con OpenAI) | Pregunta y respuesta en una llamada (Home Assistant, scripts) | [README](../README.md#openai-compatible-v1-la-puerta-estándar): siempre con Bearer y `conversations:write`, conversación con `X-Fogar-Conversation` |
+
+**La API por competencias** (la tabla completa, en el [README](../README.md)): `/auth` (yo y mis aparatos), `/conversations` (las conversaciones que puedo ver), `/events` (lo que pasa en ellas), `/home` (el hogar, sus personas, aparatos y emparejamientos), `/system` (estado, sesiones, servicios). `/admin` ya no existe.
+
+### Qué cambia para un cliente de la 4.x
+
+1. **Handshake:** `"protocol": 5` (si no, 4003) y la credencial en **`token`** (antes `client_key`).
+2. **`/pair` y `/auth/login`** devuelven `token` y `scopes`; pide tus `scopes` al darte de alta. Un login que no pide nada solo puede conversar: para administrar, pide `home:admin` (se recorta al rol).
+3. **Cierres nuevos:** 4011 (falta `conversations:write`) y 4901 (dictado sin STT). 4102 se retiró: una conversación puede estar abierta en varios aparatos a la vez (§14).
+4. **Mensajes de C3:** un `send` durante un turno ya no lo corta (espera en la cola; `message` `pending`); `interrupt` para enviar ahora, `withdraw` para quitar un pendiente (§4). Hablar no corta nada (§7).
+5. **HTTP:** `/admin/*` pasa a `/home`, `/system` y `/conversations` (README, «Hogar, sistema y conversaciones»); el Bearer de un aparato del hogar también vale, con su permiso.
+6. **`/v1`:** siempre con Bearer; ninguna IP exime.
 
 ---
 
