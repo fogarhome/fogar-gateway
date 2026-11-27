@@ -38,7 +38,7 @@ export const useEventsStore = defineStore('events', () => {
   function ensure(): void {
     const current = useSessionStore().token
     if (!current) return stop()
-    if (stream && token === current && connection.value !== 'stopped') return
+    if (stream && token === current && stream.state !== 'stopped') return
     stop()
     token = current
     stream = createEventStream({

@@ -244,7 +244,8 @@ watch(firma, () => {
           @keydown="alTeclear"
         />
         <FgBoton v-if="turnoAbierto" icono="parar" @click="chat?.cancel()">Parar</FgBoton>
-        <FgBoton type="submit" variante="principal" icono="enviar" :disabled="!puedeEscribir || !texto.trim()">Enviar</FgBoton>
+        <!-- mousedown.prevent: el botón no se lleva el foco, así la caja lo conserva y el teclado del móvil no se cierra -->
+        <FgBoton type="submit" variante="principal" icono="enviar" :disabled="!puedeEscribir || !texto.trim()" @mousedown.prevent>Enviar</FgBoton>
       </form>
       <FgEstado v-if="lineaEstado" class="linea fg-meta" :tono="lineaEstado.tono" :texto="lineaEstado.texto" :tam="12" />
     </div>
