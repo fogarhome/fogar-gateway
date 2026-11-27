@@ -28,7 +28,8 @@ Reglas:
 - **Siempre queda al menos un dueño activo:** no se borra, degrada ni desactiva al último (409
   `last_owner`).
 - **Un administrador no toca a un dueño** ni da el rol de dueño (403 `owner_only`): solo un dueño o
-  la máquina. Así un administrador no puede quedarse con el hogar.
+  la máquina. Así un administrador no puede quedarse con el hogar. Tampoco sus dispositivos
+  personales: ni editarlos, ni retirarlos, ni rotar su clave.
 - Desactivar o borrar a alguien cierra ya las sesiones vivas de sus aparatos (4200).
 - Borrar se lleva sus conversaciones privadas del gateway (en OpenClaw quedan hasta que se limpie
   su agente) y sus aparatos personales.
@@ -339,6 +340,17 @@ def _get_or_404(session: Session, client_id: str) -> ClientRecord:
     return rec
 
 
+def _get_device_for(session: Session, client_id: str, principal: Principal) -> ClientRecord:
+    """El dispositivo, pero el personal de un dueño solo lo toca un dueño o la máquina (403
+    `owner_only`, como en `/home/users`): rotar su clave sería entrar como él."""
+    rec = _get_or_404(session, client_id)
+    if rec.user_id is not None:
+        m = session.get(MembershipRecord, (rec.user_id, rec.home_id))
+        if m is not None and m.role == "owner":
+            _require_owner_level(principal)
+    return rec
+
+
 def _check_agent_consistency(default_agent: str | None, allowed_agents: list[str] | None) -> None:
     """422 si el estado resultante deja `default_agent` fuera de `allowed_agents`.
 
@@ -436,13 +448,14 @@ def get_client(
     return ClientResponse.from_record(_get_or_404(session, client_id))
 
 
-@router.patch("/devices/{client_id}", response_model=ClientResponse, dependencies=[Depends(require_admin)])
+@router.patch("/devices/{client_id}", response_model=ClientResponse)
 def update_client(
     client_id: str,
     body: ClientUpdate,
     session: Session = Depends(get_db_session),
+    principal: Principal = Depends(require_admin),
 ) -> ClientResponse:
-    rec = _get_or_404(session, client_id)
+    rec = _get_device_for(session, client_id, principal)
     patch = body.model_dump(exclude_unset=True)
     # Solo si el PATCH toca alguno de los dos campos: una fila antigua inconsistente
     # que se edita por otros campos no debe fallar (solo se valida la entrada, #122).
@@ -493,23 +506,26 @@ def close_client_sessions(app: FastAPI, client_id: str) -> None:
         events.close_device(client_id)
 
 
-def _retire_client_record(client_id: str) -> None:
+def _retire_client_record(client_id: str, principal: Principal) -> None:
     with Session(get_engine()) as session:
-        retire_client(session, _get_or_404(session, client_id))
+        retire_client(session, _get_device_for(session, client_id, principal))
 
 
-@router.delete("/devices/{client_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_admin)])
-async def delete_client(client_id: str, request: Request) -> None:
-    await asyncio.to_thread(_retire_client_record, client_id)
+@router.delete("/devices/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_client(
+    client_id: str, request: Request, principal: Principal = Depends(require_admin)
+) -> None:
+    await asyncio.to_thread(_retire_client_record, client_id, principal)
     close_client_sessions(request.app, client_id)
 
 
-@router.post("/devices/{client_id}/rotate-key", response_model=ClientWithKey, dependencies=[Depends(require_admin)])
+@router.post("/devices/{client_id}/rotate-key", response_model=ClientWithKey)
 def rotate_client_key(
     client_id: str,
     session: Session = Depends(get_db_session),
+    principal: Principal = Depends(require_admin),
 ) -> ClientWithKey:
-    rec = _get_or_404(session, client_id)
+    rec = _get_device_for(session, client_id, principal)
     for _ in range(_ROTATE_KEY_ATTEMPTS):
         key = new_key()
         rec.key_hash = hash_key(key)
