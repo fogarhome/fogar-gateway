@@ -113,8 +113,11 @@ export function createEventStream(options: EventStreamOptions) {
       if (stopped) return
     }
     if (stopped) return
-    if (!clean) failures += 1
-    setState(clean ? 'connecting' : 'reconnecting')
+    // Un corte limpio sigue «listo» mientras reabre (el gateway lo hace cada ~25 s): solo un fallo se nota.
+    if (!clean) {
+      failures += 1
+      setState('reconnecting')
+    }
     timer = setTimeout(() => void run(), reconnectDelay(failures))
   }
 

@@ -34,11 +34,11 @@ export const useEventsStore = defineStore('events', () => {
     for (const listener of [...listeners]) listener(event, id)
   }
 
-  /** Abre el stream con el token de la sesión (o lo reabre si cambió). */
+  /** Abre el stream con el token de la sesión (o lo reabre si cambió o se paró: «Reintentar»). */
   function ensure(): void {
     const current = useSessionStore().token
     if (!current) return stop()
-    if (stream && token === current) return
+    if (stream && token === current && stream.state !== 'stopped') return
     stop()
     token = current
     stream = createEventStream({

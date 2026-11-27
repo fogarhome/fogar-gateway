@@ -1,4 +1,4 @@
-import { label, NOT_IN_OPENCLAW, ownText, TURN_ERROR, TURN_PROGRESS } from './labels'
+import { NOT_IN_OPENCLAW, ownText, TURN_PROGRESS, turnErrorText } from './labels'
 import { reconnectClass, type Reconnect } from './closeCodes'
 
 // El chat del panel (docs/client-protocol.md §16): lo que llega por `/events`, cómo queda en pantalla y
@@ -222,7 +222,7 @@ export function endReasonText(line: Pick<ChatLine, 'reason' | 'error'>): string 
   if (reason === 'done') return null
   const text = ownText(REASON, reason)
   if (text) return text
-  return line.error ? `Falló: ${label(TURN_ERROR, line.error).toLowerCase()}.` : 'Falló.'
+  return line.error ? `Falló: ${turnErrorText(line.error).toLowerCase()}.` : 'Falló.'
 }
 
 /**

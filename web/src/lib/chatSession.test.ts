@@ -73,7 +73,7 @@ describe('createChatSession', () => {
     chat.start()
     await flush()
     expect(await chat.send('hola')).toBe(false)
-    expect(chat.state.notice).toContain('OpenClaw no aceptó')
+    expect(chat.state.notice).toBe('OpenClaw rechazó la pregunta.')
   })
 
   it('parar y quitar van por la API; quitar uno que ya no espera no es un error', async () => {
@@ -90,6 +90,37 @@ describe('createChatSession', () => {
     await flush()
     await chat.withdraw('m1')
     expect(chat.state.notice).toBeNull()
+  })
+
+  it('los códigos de error salen en una frase, también los desconocidos', async () => {
+    const h = harness()
+    h.deps.postMessage = vi.fn(async () => {
+      throw new ApiError('server', 502, 'orchestrator_rate_limited')
+    })
+    h.chat.start()
+    await flush()
+    await h.chat.send('hola')
+    expect(h.chat.state.notice).toBe('El modelo está saturado o sin cuota: prueba más tarde.')
+    h.deps.postMessage = vi.fn(async () => {
+      throw new ApiError('server', 502, 'codigo_nuevo')
+    })
+    const chat = createChatSession('c1', h.deps)
+    chat.start()
+    await flush()
+    await chat.send('hola')
+    expect(chat.state.notice).toBe('OpenClaw rechazó la pregunta.')
+  })
+
+  it('«Enviar ahora» solo para si hay un turno abierto: sin él pararía el propio mensaje', async () => {
+    const h = harness()
+    h.chat.start()
+    await flush()
+    h.emit(message('m2'), 11)
+    await h.chat.sendNow()
+    expect(h.deps.cancelTurn).not.toHaveBeenCalled()
+    h.emit({ type: 'turn_start', turn_id: 'T', conversation: 'c1', origin: 'user' }, 12)
+    await h.chat.sendNow()
+    expect(h.deps.cancelTurn).toHaveBeenCalledWith('c1')
   })
 
   it('un resync cierra lo abierto, vuelve a leer el estado y pide releer lo dicho', async () => {
