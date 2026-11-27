@@ -529,8 +529,9 @@ class EventHub:
     """Los aparatos con `/events` (`app.state.events`).
 
     shortcut: mientras un aparato tenga /events vivo, los canales que ve no se sueltan
-    (`drop_if_idle`) y sus adaptadores no se recalculan si le cambian `allowed_agents` (hasta
-    que caduque). En un hogar son pocos; si crece, soltar adaptadores de canales sin turno."""
+    (`drop_if_idle`) y sus adaptadores no se recalculan en caliente: un PATCH de
+    `/home/devices` cierra el aparato y se rehace al reconectar. En un hogar son pocos; si crece,
+    soltar adaptadores de canales sin turno."""
 
     def __init__(
         self,
