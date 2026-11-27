@@ -1553,6 +1553,31 @@ for about 15 s.
   during that window it waits too (capped at `TURN_TIMEOUT_S`, 120 s by default).
 - **Residual risk:** when the window closes, the gateway's `chat.abort` of the failed run may
   still be a no-op if OpenClaw restores it even later; that run would then answer unseen.
+  (Since 2026-11-28 it is aborted again on its first frame: see below.)
+
+### Aborts while OpenClaw is down (2026-11-28, gateway reaction; no new server behaviour)
+
+- **An abort that cannot go out is owed, not lost.** `withdraw`, `cancel` or `cancel_head` while
+  disconnected (the message was `pending` at the drop): `ReconnectingOpenClawClient.abort_run`
+  returns False and the channel keeps the `runId` for the reconnection, like the runs the drop
+  failed. Before, that `chat.abort` was dropped and OpenClaw, restoring its queue ~13 s after
+  the reconnection, ran a message the user had withdrawn.
+- **The abort at the reconnection may be a no-op** (OpenClaw has not restored the run yet, as
+  seen on 2026-11-25), so every such run stays owed (`TurnRegistry.owe_abort`, as long as its
+  tombstone) until a `chat.abort` answer names it in `runIds`. When a frame of it shows up (it
+  was restored and started), the dispatcher drops the frame and the hub sends one more
+  `chat.abort` of that `runId`. The window left: whatever the run does before its first frame.
+- **A push open at the drop ends with it** (`orchestrator_disconnected`, `turn_end` `error`),
+  tombstoned and aborted on reconnection, like a user turn; before, it held the conversation
+  until `TURN_TIMEOUT_S`.
+- **A `chat.send` without ack in `TURN_TIMEOUT_S`** (`turn_timeout`) is tombstoned and
+  `chat.abort`ed by its `idempotencyKey` (= its `runId` for `chat.send`), so a late acceptance
+  never runs unseen nor comes back as a push.
+- **A closed push's late frames stay closed across channels:** the memory of pushes closed by
+  their lifecycle `end`/`error` moved from the channel to the hub's `TurnRegistry`, so a late
+  `run_status`/`model`/delta reaching a fresh channel of the key (after `drop_if_idle`) no
+  longer opens a push that held the conversation until `turn_timeout`. A new lifecycle `start`
+  of the run still reopens it (#84).
 - **A's recovery run** stays a push (its `runId` is nobody's): clients see A's
   `orchestrator_disconnected` and then the whole answer as a push. Linking it to A would be a
   guess.
@@ -1589,6 +1614,10 @@ Each is logged once at INFO as possible drift, and is harmless:
 - **Opening another home device's conversation by id** from a home device worked.
 
 ## Change log of this file
+
+- **2026-11-28**: "Aborts while OpenClaw is down": owed aborts (at the reconnection and on the
+  run's first frame), a push ends with the drop, a `chat.send` without ack is aborted by its
+  `idempotencyKey`, and the closed-push memory survives a dropped channel.
 
 - **2026-11-25**: "Live check of 5.0" gains a second restart and how the gateway now reacts:
   - `pendingInputs` is empty at the reconnection and lists the queued message again ~13 s

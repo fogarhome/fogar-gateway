@@ -123,9 +123,13 @@ class ReconnectingOpenClawClient:
             logger.debug("[%s] send traceback (no message): %s", self._name, traceback_no_message(e))
             raise OrchestratorError(ORCHESTRATOR_ERROR) from None
 
-    async def abort_run(self, session_key: str, run_id: str) -> None:
-        if self.state == ConnectionState.CONNECTED:
-            await self._client.abort_run(session_key, run_id)
+    async def abort_run(self, session_key: str, run_id: str) -> bool:
+        """`OpenClawClient.abort_run`; sin conexión no sale nada y devuelve False (quien
+        llama lo deja para la reconexión, `ConversationChannel._abort`)."""
+        if self.state != ConnectionState.CONNECTED:
+            return False
+        await self._client.abort_run(session_key, run_id)
+        return True
 
     async def request(self, method: str, params: dict, timeout: float = 10.0) -> dict:
         """Petición de lectura (`OpenClawClient.request`); sin conexión, `orchestrator_unavailable`."""

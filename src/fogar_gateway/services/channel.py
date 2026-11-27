@@ -135,9 +135,6 @@ _TERMINAL_CHAT = ("final", "aborted", "error")
 # What a run fails with when its frames overflow TURN_QUEUE_MAX (final 2b review, m3): an
 # internal bound of the gateway, nothing the client can act on; `turn_overflow` stays retired.
 OVERFLOW_CODE = "internal_error"
-# Pushes cerrados por su lifecycle `end`/`error`, recordados: un evento tardío de su run (un
-# `run_status`, una fase) no abre otro push; solo un lifecycle `start` nuevo (#84).
-_ENDED_PUSH_RUNS = 64
 # `session.message` de usuario vistos: id de OpenClaw (`oc_message_id`) → runId de su
 # `chat.send`. La marca de `steer` llega en una copia repetida que puede no traer el enlace.
 _OC_MESSAGES = 64
@@ -580,7 +577,6 @@ class ConversationChannel:
         self._defer_push = False
         self._replaying = False
         self._push: ChannelTurn | None = None
-        self._ended_push_runs: OrderedDict[str, None] = OrderedDict()
         # `session.message` (2b.2): oc_message_id → runId de su `chat.send`.
         self._oc_messages: OrderedDict[str, str] = OrderedDict()
         # Tras una caída: hasta cuándo esperan los runs sin confirmar, y con qué código fallan.
@@ -1307,7 +1303,11 @@ class ConversationChannel:
         if run_id is None:
             logger.warning(f"[{self._tag}] turno cortado sin runId: no se aborta nada en OpenClaw")
             return
-        await self.orchestrator.abort_run(self.session_key, run_id)
+        if await self.orchestrator.abort_run(self.session_key, run_id) is False:
+            # Sin conexión no salió: OpenClaw restaurará el run al volver y lo ejecutaría. Se
+            # aborta al reconectar (`_on_reconnected`); el canal no queda inactivo mientras.
+            logger.info(f"[{self._tag}] OpenClaw caído: chat.abort de {run_id} al reconectar")
+            self._abort_on_reconnect.add(run_id)
 
     def _spawn_abort(self, run_id: str | None) -> None:
         if run_id is None:
@@ -1405,7 +1405,7 @@ class ConversationChannel:
         frames already waiting) ends with `code` (`orchestrator_disconnected`); one still in
         OpenClaw's queue waits, unconfirmed, for the reconnection to say whether it is still
         there (`reconcile_pending`), at most `RECONNECT_GRACE_S`."""
-        if self._runs or self._held:
+        if self._runs or self._held or self._push is not None:
             self._enqueue(("lost", code, None))
 
     @property
@@ -1431,6 +1431,9 @@ class ConversationChannel:
             self._recovery_until = time.monotonic() + RECOVERY_WINDOW_S
         for run_id in sorted(self._abort_on_reconnect):
             self._spawn_abort(run_id)
+            # Puede ser un no-op: OpenClaw restaura su cola ~13 s después de aceptar
+            # conexiones. Su primer frame lo vuelve a abortar (FrameDispatcher).
+            self._turn_registry.owe_abort(self.session_key, run_id)
         self._abort_on_reconnect.clear()
         if self.needs_reconcile:
             self._hub.spawn(self.reconcile_pending(), "pending_inputs")
@@ -1618,7 +1621,7 @@ class ConversationChannel:
         """Este evento de push abriría un push (no hay ninguno abierto): su primer evento."""
         if kind == "turn_start":
             return True
-        if run_id is not None and run_id in self._ended_push_runs:
+        if self._turn_registry.push_ended(run_id):
             return False
         if kind in ("open", "tool", "fallback"):
             return True
@@ -1943,6 +1946,15 @@ class ConversationChannel:
             logger.info(
                 f"[{self._tag}] OpenClaw caído: {len(waiting)} mensaje(s) en cola sin confirmar"
             )
+        push = self._push
+        if push is not None and not push.ended:
+            # Como un turno de usuario: lo que traía se perdió; no retiene la conversación
+            # hasta TURN_TIMEOUT_S. Se entierra ya y se aborta al reconectar.
+            gateway_stats.turn_error(code)
+            self.emit(push, ChannelError(code))
+            self._end_push(push, "error")
+            if push.run_id is not None:
+                self._abort_on_reconnect.add(push.run_id)
         for info in failing:
             # Su cliente sabrá que falló: que no siga corriendo en OpenClaw. Se entierra ya y se
             # aborta por su runId al reconectar (`_on_reconnected`).
@@ -2219,7 +2231,7 @@ class ConversationChannel:
         push = self._push
         if push is not None and not push.ended:
             return push
-        if run_id is not None and run_id in self._ended_push_runs:
+        if self._turn_registry.push_ended(run_id):
             logger.debug(f"[{self._tag}] evento tardío de un push ya cerrado: descartado")
             return None
         self._push_start(run_id)
@@ -2237,7 +2249,7 @@ class ConversationChannel:
 
     def _push_start(self, run_id: str | None = None) -> None:
         if run_id is not None:
-            self._ended_push_runs.pop(run_id, None)  # un `start` nuevo de su run lo reabre (#84)
+            self._turn_registry.reopen_push(run_id)  # un `start` nuevo de su run lo reabre (#84)
         key = self.session_key
         # A passive subscriber (a device's /events, #412) never makes a push abort here.
         subscribers = [
@@ -2357,11 +2369,9 @@ class ConversationChannel:
             self.emit(push, ChannelError(code))
         self._push = None
         if push.run_id is not None:
-            # Lo que llegue tarde de su run (un `run_status`, una fase) no abre otro push.
-            self._ended_push_runs.pop(push.run_id, None)
-            self._ended_push_runs[push.run_id] = None
-            while len(self._ended_push_runs) > _ENDED_PUSH_RUNS:
-                self._ended_push_runs.popitem(last=False)
+            # Lo que llegue tarde de su run (un `run_status`, una fase) no abre otro push, ni
+            # aquí ni en un canal nuevo de la clave si este se suelta (en el registro del hub).
+            self._turn_registry.end_push(push.run_id)
         self.end_turn(push, "done" if failure is None else "error")
 
     def _push_reply(self, message: dict, run_id: object) -> None:
@@ -2575,6 +2585,21 @@ class ChannelHub:
         (`ConversationChannel.reconcile_pending`). Never blocks."""
         for channel in list(self._channels.values()):
             channel.reconnected()
+
+    def abort_owed(self, session_key: str, run_id: str) -> None:
+        """A frame of a run whose `chat.abort` may not have reached OpenClaw (sent while it
+        was down or before it restored its queue, `TurnRegistry.owe_abort`): abort it again,
+        once. Never blocks (called from the dispatcher)."""
+        orchestrator = self.orchestrator
+        if orchestrator is None:
+            return
+        logger.info("OpenClaw trajo de vuelta un run ya abortado: chat.abort de %s", run_id)
+
+        async def abort() -> None:
+            if await orchestrator.abort_run(session_key, run_id) is False:
+                self.turn_registry.owe_abort(session_key, run_id)
+
+        self.spawn(abort(), "chat_abort_owed")
 
     def drop_if_idle(self, session_key: str, channel: ConversationChannel | None = None) -> bool:
         """Forget the channel if nothing keeps it alive (`ConversationChannel.idle`). With

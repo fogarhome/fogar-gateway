@@ -33,6 +33,14 @@ class TurnRegistry:
         self._aborted_runs: dict[str, float] = {}
         # runId -> deadline; see RUN_FINISHED_MEMORY_S.
         self._finished_runs: dict[str, float] = {}
+        # Pushes cerrados por su lifecycle `end`/`error` (runId -> deadline): un evento tardío
+        # de su run no abre otro push, tampoco en un canal nuevo de la clave tras
+        # `ChannelHub.drop_if_idle`; solo un lifecycle `start` nuevo lo reabre (#84).
+        self._ended_pushes: dict[str, float] = {}
+        # Aborts debidos (runId -> (sessionKey, deadline)): un `chat.abort` enviado sin conexión
+        # o tras reconectar puede no haber llegado a nada (OpenClaw restaura su cola ~13 s
+        # después de aceptar conexiones). El primer frame de ese run lo aborta otra vez.
+        self._owed_aborts: dict[str, tuple[str, float]] = {}
 
     def abort_run(self, run_id: str) -> None:
         _prune(self._aborted_runs)
@@ -47,6 +55,33 @@ class TurnRegistry:
         """True while frames of this run (a channel's own, already ended) must be dropped."""
         return isinstance(run_id, str) and _alive(self._finished_runs, run_id)
 
+    def end_push(self, run_id: str) -> None:
+        """A push closed by its lifecycle `end`/`error`: its late frames open nothing (#84)."""
+        _prune(self._ended_pushes)
+        self._ended_pushes[run_id] = time.monotonic() + RUN_FINISHED_MEMORY_S
+
+    def push_ended(self, run_id: object) -> bool:
+        return isinstance(run_id, str) and _alive(self._ended_pushes, run_id)
+
+    def reopen_push(self, run_id: str) -> None:
+        """A new lifecycle `start` of the run: it may open a push again (#84)."""
+        self._ended_pushes.pop(run_id, None)
+
+    def owe_abort(self, session_key: str, run_id: str) -> None:
+        """The `chat.abort` of a tombstoned run may not have reached OpenClaw: abort it again
+        when one of its frames shows up (`take_owed_abort`)."""
+        self._owed_aborts = {
+            r: v for r, v in self._owed_aborts.items() if v[1] > time.monotonic()
+        }
+        self._owed_aborts[run_id] = (session_key, time.monotonic() + RUN_ABORT_TOMBSTONE_S)
+
+    def take_owed_abort(self, run_id: object) -> str | None:
+        """The session key of an owed abort of this run (once), or None."""
+        if not isinstance(run_id, str):
+            return None
+        owed = self._owed_aborts.pop(run_id, None)
+        return owed[0] if owed is not None and owed[1] > time.monotonic() else None
+
     def note_abort_result(self, payload: object) -> None:
         """A `chat.abort` answer (`{ok, aborted, runIds}`) names the runs it aborted."""
         if not isinstance(payload, dict) or payload.get("aborted") is not True:
@@ -56,6 +91,7 @@ class TurnRegistry:
             for run_id in run_ids:
                 if isinstance(run_id, str):
                     self.abort_run(run_id)
+                    self._owed_aborts.pop(run_id, None)  # ya no se debe
 
     def is_run_aborted(self, run_id: object) -> bool:
         """True while frames of this run (aborted by the gateway) must be dropped."""

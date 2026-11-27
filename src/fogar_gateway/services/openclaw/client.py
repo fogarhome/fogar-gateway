@@ -801,10 +801,9 @@ class OpenClawClient:
         req_id = str(uuid.uuid4())
         ack: asyncio.Future = asyncio.get_running_loop().create_future()
         self._send_futures[req_id] = ack
+        idempotency_key = str(uuid.uuid4())
         try:
-            frame = frames.chat_send(
-                req_id, session_key, text, str(uuid.uuid4()), queue_mode=queue_mode
-            )
+            frame = frames.chat_send(req_id, session_key, text, idempotency_key, queue_mode=queue_mode)
             try:
                 await ws.send(json.dumps(frame))
             except Exception as e:  # noqa: BLE001 — frontera: el envío cede orchestrator_send_failed
@@ -815,6 +814,10 @@ class OpenClawClient:
                 res = await asyncio.wait_for(ack, timeout=settings.TURN_TIMEOUT_S)
             except TimeoutError:
                 logger.warning("chat.send: no ack in TURN_TIMEOUT_S=%ss", settings.TURN_TIMEOUT_S)
+                # OpenClaw pudo aceptarlo igualmente; en `chat.send` su runId es la
+                # idempotencyKey: se entierra (#285; nunca llega como push) y se aborta.
+                self._turn_registry.abort_run(idempotency_key)
+                await self.abort_run(session_key, idempotency_key)
                 raise OrchestratorError("turn_timeout") from None
         finally:
             self._send_futures.pop(req_id, None)

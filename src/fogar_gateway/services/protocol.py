@@ -17,8 +17,9 @@ class OrchestratorProtocol(Protocol):
         `OrchestratorError` with a stable code (services/orchestration.py) if it fails."""
         ...
 
-    async def abort_run(self, session_key: str, run_id: str) -> None:
-        """`chat.abort` of that run only (a queued one too). Never raises an Exception."""
+    async def abort_run(self, session_key: str, run_id: str) -> bool:
+        """`chat.abort` of that run only (a queued one too). False if it could not go out (no
+        connection): the caller owes it for the reconnection. Never raises an Exception."""
         ...
 
     async def request(self, method: str, params: dict, timeout: float = ...) -> dict: ...

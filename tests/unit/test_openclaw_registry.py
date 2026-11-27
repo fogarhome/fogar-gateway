@@ -1,6 +1,6 @@
 from unittest.mock import AsyncMock
 
-from fogar_gateway.services.openclaw.registry import ClientRegistry
+from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
 
 
 def test_client_registry_register_get():
@@ -83,3 +83,21 @@ async def test_broadcast_status_one_failure_does_not_block_others():
     await reg.broadcast_status("orchestrator", "unavailable")  # must not raise
 
     bridge_b.notify_service_status.assert_awaited_once_with("orchestrator", "unavailable")
+
+
+def test_an_owed_abort_is_taken_once_and_settled_by_an_abort_answer():
+    turns = TurnRegistry()
+    turns.owe_abort("sk", "r1")
+    turns.owe_abort("sk", "r2")
+    assert turns.take_owed_abort("r1") == "sk"
+    assert turns.take_owed_abort("r1") is None
+    turns.note_abort_result({"ok": True, "aborted": True, "runIds": ["r2"]})
+    assert turns.take_owed_abort("r2") is None
+
+
+def test_an_ended_push_is_remembered_until_a_new_start():
+    turns = TurnRegistry()
+    turns.end_push("r1")
+    assert turns.push_ended("r1") and not turns.push_ended("r2") and not turns.push_ended(None)
+    turns.reopen_push("r1")
+    assert not turns.push_ended("r1")
