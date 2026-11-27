@@ -22,7 +22,7 @@ Guía completa para implementar clientes que se conecten a fogar-gateway: cómo 
 
 1. **Handshake:** `"protocol": 5` (si no, 4003) y la credencial en **`token`** (antes `client_key`).
 2. **`/pair` y `/auth/login`** devuelven `token` y `scopes`; pide tus `scopes` al darte de alta. Un login que no pide nada solo puede conversar: para administrar, pide `home:admin` (se recorta al rol).
-3. **Cierres nuevos:** 4011 (falta `conversations:write`) y 4901 (dictado sin STT). 4102 se retiró: una conversación puede estar abierta en varios aparatos a la vez (§14).
+3. **Cierres nuevos:** 4011 (falta `conversations:write`) y 4901 (dictado sin STT, frase sin su final o un dictado nuevo del mismo aparato). 4102 se retiró: una conversación puede estar abierta en varios aparatos a la vez (§14).
 4. **Mensajes de C3:** un `send` durante un turno ya no lo corta (espera en la cola; `message` `pending`); `interrupt` para enviar ahora, `withdraw` para quitar un pendiente (§4). Hablar no corta nada (§7).
 5. **HTTP:** `/admin/*` pasa a `/home`, `/system` y `/conversations` (README, «Hogar, sistema y conversaciones»); el Bearer de un aparato del hogar también vale, con su permiso.
 6. **`/v1`:** siempre con Bearer; ninguna IP exime.
@@ -996,9 +996,9 @@ Los códigos estándar se quedan donde el significado es de transporte y el est�
 | 4100 | `conversation not found` | La conversación pedida no existe o no es tuya | No, hay que arreglar algo: olvida ese id; sin `conversation` o con `"new"` |
 | 4101 | `conversation agent mismatch` | `agent` distinto del de la conversación pedida | No, hay que arreglar algo: no mandes `agent` al retomar |
 | 4102 | — | **4102 — retirado en la 5.0, no se reutiliza** (era `conversation opened elsewhere`: desde la 5.0 una conversación puede estar abierta en varias sesiones, §14) | — |
-| 4200 | `credential revoked` | Con la sesión abierta, tu cliente se borró, se desactivó o se rotó su clave (`SESSION_REVALIDATE_INTERVAL_S`); antes recibes el `turn_end` (`closed`) del turno abierto | No, hay que arreglar algo: vuelve a emparejar (§0) |
+| 4200 | `credential revoked` | Con la sesión abierta, tu cliente se borró, se desactivó o se rotó su clave (`SESSION_REVALIDATE_INTERVAL_S`; al momento si fue desde el panel o la CLI, también un dictado de `/speech/dictation`, §16); antes recibes el `turn_end` (`closed`) del turno abierto | No, hay que arreglar algo: vuelve a emparejar (§0) |
 | 4900 | `handshake timeout` | No mandas el handshake en `HANDSHAKE_TIMEOUT_S` (una red lenta, un cliente que se atascó al conectar) | Con espera |
-| 4901 | `speech unavailable` | Solo `/speech/dictation` (§16): el STT está `off`, o no devolvió la final tras `end` | Con espera |
+| 4901 | `speech unavailable` | Solo `/speech/dictation` (§16): el STT está `off`, no cerró con su final una frase a medias tras `end`, o el mismo aparato abrió otro dictado | Con espera |
 
 Cierres que no manda el gateway pero verás: **1006** (la conexión se cortó sin close frame: la red, o el abort tras un 1013), **1009** (un frame de más de 1 MiB: lo cierra el servidor WebSocket antes de que llegue al gateway; es un bug del cliente) y **1012** (el gateway se reinicia o se para). Ante 1006 o 1012, reconecta con espera.
 
@@ -1123,6 +1123,7 @@ data: {"type":"turn_start","turn_id":"9f3c…","conversation":"c1","origin":"use
 - **`turn_id`** es el del turno de la conversación: el mismo en todos los aparatos y entre reconexiones (no es el `t-{n}` del WebSocket). Por SSE no hay `turn_seq` ni audio.
 - **Sin carreras ni pérdidas.** Cada stream dura como mucho unos 25 s y el navegador reconecta solo (`retry: 1000`) con `Last-Event-ID`: el gateway reenvía lo que se perdió si sigue en el búfer del aparato (unos minutos, hasta 2000 eventos). Si no (un hueco largo, o el gateway se reinició), manda **`resync`**: vuelve a pedir el estado de las conversaciones que tengas abiertas (`GET /conversations/{id}`). Al reanudar, `ready` llega sin `id`; `ready` y `resync` en una conexión nueva llevan el id actual.
 - Un lector demasiado lento se corta y reanuda igual. Cada ~15 s sin eventos llega un comentario `: ping`.
+- **Cambios del aparato.** Si el administrador cambia la configuración del aparato (agentes permitidos, avisos…), el stream se corta al momento y, al reconectar, llega `resync` con la configuración nueva. Retirarlo, desactivarlo o rotar su clave lo corta igual, y al reconectar recibe `401`.
 - **Cortar la conexión no para ningún turno** (§14). Para parar, `POST /conversations/{id}/cancel`.
 - Los avisos siguen las reglas de §10 (`push_enabled`, agentes permitidos, privadas solo a su dueña). Un `/events` abierto recibe el texto del aviso, pero no cuenta como «alguien lo ve»: el dispositivo de avisos lo sigue recibiendo igual.
 
@@ -1140,7 +1141,7 @@ data: {"type":"turn_start","turn_id":"9f3c…","conversation":"c1","origin":"use
 
 | Petición | Respuesta |
 |---|---|
-| `POST /conversations/{id}/messages {"text", "interrupt"?}` | `202 {"message_id"}` en cuanto OpenClaw lo acepta (el `id` de su `message`). `interrupt: true` es «enviar ahora» (§4). Texto vacío → `422 empty_message`; agente no permitido → `403 agent_not_permitted`; OpenClaw lo rechaza → `502` con su código (§9); si un `/v1` ocupa la conversación más de `TURN_TIMEOUT_S` → `503 turn_timeout` |
+| `POST /conversations/{id}/messages {"text", "interrupt"?}` | `202 {"message_id"}` en cuanto OpenClaw lo acepta (el `id` de su `message`). `interrupt: true` es «enviar ahora» (§4). Texto vacío (`""`) → `422` de validación (lista `detail` de FastAPI); solo espacios → `422 empty_message`; agente no permitido → `403 agent_not_permitted`; OpenClaw lo rechaza → `502` con su código (§9); si un `/v1` ocupa la conversación más de `TURN_TIMEOUT_S` → `503 turn_timeout` |
 | `POST /conversations {"agent"?, "message"?}` | `201`, la conversación y, con `message`, su `message_id` |
 | `DELETE /conversations/{id}/messages/{message_id}` | `204`; `404 not_pending` si ya no está pendiente (§4, «Quitar») |
 | `POST /conversations/{id}/cancel` | `200 {"cancelled": bool}`: para el turno en curso para todos o, sin turno, el siguiente mensaje que aún no empezó (como `cancel`, §4) |
@@ -1153,11 +1154,11 @@ Un cliente que chatea por HTTP puede dictar y oír la respuesta sin abrir `/ws/s
 
 **Dictar: WebSocket `/speech/dictation`**, abierto solo mientras se graba. Transcribir **no inicia ningún turno ni toca ninguna conversación**: el cliente enseña el texto y, si quiere, lo envía con `POST /conversations/{id}/messages`.
 
-1. Conecta y manda `{"protocol": 5, "token": "…"}`. Los cierres del handshake son los de `/ws/stream` (4000, 4001, 4002, 4003, 4010, 4011, 4900; §13).
+1. Conecta y manda `{"protocol": 5, "token": "…"}`. Los cierres del handshake son los de `/ws/stream` (4000, 4001, 4002, 4003, 4010, 4011, 4900; §13), y 1011 `session setup failed` si la configuración del aparato es ilegible.
 2. Envía el audio en frames binarios (PCM float32 LE mono a 16 kHz, el formato de §3) y `{"type": "end"}` al terminar la toma.
-3. Recibes `transcription_partial` y `transcription` (`{"type", "text"}`, como en §3). Tras la final que sigue a `end`, el gateway cierra con **1000**.
+3. Recibes `transcription_partial` y `transcription` (`{"type", "text"}`, como en §3). Una toma larga puede traer varias `transcription` (una por frase): el texto dictado es su concatenación. Tras `end`, el gateway cierra con **1000** en cuanto no queda una frase a medias: si el STT ya había cerrado la última frase antes de `end`, cierra enseguida **sin repetir** esa `transcription`; una toma sin habla cierra 1000 sin ninguna.
 
-Sin audio 10 s, o pasados 120 s, la toma termina como con `end`. Con el STT apagado (`off`), o si no llega la final en 10 s tras `end`: cierre **4901 `speech unavailable`** (reintenta con espera). Cada conexión es una toma.
+Sin audio 10 s, o pasados 120 s, la toma termina como con `end`. Con el STT apagado (`off`), o si una frase a medias (ya con `transcription_partial`) no recibe su final en 10 s tras `end`: cierre **4901 `speech unavailable`** (reintenta con espera). Un fallo del STT a mitad de toma: **1011 `internal error`**. Cada conexión es una toma, y hay **un dictado por aparato**: abrir otro cierra el anterior con 4901. Retirar, desactivar o rotar la clave del aparato cierra su dictado al momento con **4200**.
 
 **Oír la respuesta: `speak: true`** en `POST /conversations/{id}/messages {"text", "speak": true}`. La voz del turno que responde a ese mensaje va **solo a tu aparato, por tu `/events`**, como eventos `audio` mezclados con sus `token`:
 
@@ -1171,5 +1172,5 @@ Sin audio 10 s, o pasados 120 s, la toma termina como con `end`. Con el STT apag
 - Como el `turn_end` de un turno con voz espera a su audio, el `turn_start` del siguiente turno de la misma conversación puede llegar antes. Separa por `turn_id` (por WebSocket esto nunca pasa).
 - **Avisos con voz:** abre el stream con **`/events?audio=1`**. Si tu aparato es el dispositivo de avisos de una conversación (§10), su aviso suena ahí. `audio` vale para el aparato: si abre dos streams, manda el último.
 
-**Escuchar una respuesta ya terminada: `POST /conversations/{id}/messages/{message_id}/speech`**, también del historial (el `id` de `GET …/messages`). Devuelve en streaming el audio como cuerpo de la respuesta (`audio/L16;rate=24000;channels=1`, el mismo PCM). No pasa por `/events`. El TTS solo se paga cuando alguien pulsa «escuchar». `404 message_not_found` si no es una respuesta del agente que puedas ver; `503 tts_unavailable` con el TTS `off` o caído.
+**Escuchar una respuesta ya terminada: `POST /conversations/{id}/messages/{message_id}/speech`**, con el `id` de esa respuesta en el historial (`GET …/messages`): es la única fuente de ese id. El `message_id` de un `POST …/messages` (y el `id` de su `message` por `/events`) es el de tu mensaje, no el de la respuesta, y aquí da 404. Devuelve en streaming el audio como cuerpo de la respuesta (`audio/L16;rate=24000;channels=1`, el mismo PCM). No pasa por `/events`. El TTS solo se paga cuando alguien pulsa «escuchar». `404 message_not_found` si no es una respuesta del agente que puedas ver; `503 tts_unavailable` con el TTS `off` o caído. Si el TTS deja de dar audio 30 s (`PUSH_TTS_DRAIN_TIMEOUT_S`), el cuerpo termina ahí.
 

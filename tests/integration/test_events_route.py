@@ -136,6 +136,33 @@ def test_live_state_and_as_of(client):
     assert client.get("/conversations/nope", headers=BEARER).status_code == 404
 
 
+@pytest.mark.parametrize(("push_enabled", "shown"), [(True, True), (False, False)])
+def test_live_state_hides_a_push_the_device_does_not_get(
+    client, db_engine, monkeypatch, push_enabled, shown
+):
+    """Como por /events: con `push_enabled=false` el aviso en curso no sale en la instantánea."""
+    from types import SimpleNamespace
+
+    from sqlmodel import Session
+
+    from fogar_gateway.db.models import ClientRecord
+
+    conv = _conversation(client)
+    with Session(db_engine) as s:
+        rec = s.get(ClientRecord, CLIENT_ID)
+        rec.push_enabled = push_enabled
+        s.add(rec)
+        s.commit()
+    turn = SimpleNamespace(
+        id="t1", conversation_id=conv["id"], origin="push", by_client_id=None, by_name=None,
+        session_key=None, cancel_reason=None, text="aviso",
+    )
+    channel = SimpleNamespace(current_turn=turn, pending_messages=lambda: [])
+    monkeypatch.setattr(client.app.state.channel_hub, "get", lambda key: channel)
+    body = client.get(f"/conversations/{conv['id']}", headers=BEARER).json()
+    assert (body["turn"] is not None) is shown
+
+
 def test_cancel_and_withdraw_without_anything_running(client):
     conv = _conversation(client)
     r = client.post(f"/conversations/{conv['id']}/cancel", headers=BEARER)
@@ -152,6 +179,49 @@ def test_revoking_the_device_closes_its_events(client, admin_headers):
     events = client.app.state.events
     assert events.device(CLIENT_ID) is not None  # sigue vivo para reanudar
     assert client.delete(f"/home/devices/{CLIENT_ID}", headers=admin_headers).status_code == 204
+    assert events.device(CLIENT_ID) is None
+
+
+def _connect(client, last_id: int | None = None) -> list[tuple[int | None, dict]]:
+    """Un stream entero (hasta `resync` o su fin, ~1 s)."""
+    headers = BEARER if last_id is None else {**BEARER, "last-event-id": str(last_id)}
+    with client.stream("GET", "/events", headers=headers) as s:
+        return _read(s.iter_lines(), until=lambda e: e["type"] == "resync")
+
+
+def test_a_device_that_expired_resyncs_even_without_events_since(client):
+    """Su `DeviceEvents` caduca sin que nadie publique un evento (solo hubo WebSocket): el búfer
+    nuevo no puede garantizar lo de antes, así que el `Last-Event-ID` viejo es `resync`."""
+    ready_id = _connect(client)[0][0]
+    assert ready_id is not None
+    client.app.state.events.close_device(CLIENT_ID)  # lo mismo que caducar a los RESUME_S
+    assert [e["type"] for _, e in _connect(client, ready_id)] == ["ready", "resync"]
+
+
+def test_a_fresh_device_resumes_from_its_own_ready_without_resync(client):
+    ready_id = _connect(client)[0][0]
+    assert [e["type"] for _, e in _connect(client, ready_id)] == ["ready"]
+
+
+@pytest.mark.parametrize("change", [
+    ("patch", {"is_active": False}),
+    ("patch", {"allowed_agents": ["main"]}),
+    ("rotate", None),
+])
+def test_disabling_rotating_or_new_agents_close_its_events_at_once(
+    client, admin_headers, change
+):
+    """Como al retirarlo: su `/events` se corta ya (no a los ~25 s del stream). Con otros
+    `allowed_agents`, al reconectar se rehace con la configuración nueva (y `resync`)."""
+    _connect(client)
+    events = client.app.state.events
+    assert events.device(CLIENT_ID) is not None
+    kind, body = change
+    if kind == "patch":
+        r = client.patch(f"/home/devices/{CLIENT_ID}", json=body, headers=admin_headers)
+    else:
+        r = client.post(f"/home/devices/{CLIENT_ID}/rotate-key", headers=admin_headers)
+    assert r.status_code == 200, r.text
     assert events.device(CLIENT_ID) is None
 
 

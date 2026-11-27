@@ -20,6 +20,7 @@ class FakeTtsStream:
     def __init__(self):
         self.text = []
         self.ended = False
+        self.closed = False
 
     async def send_text_chunk(self, text):
         self.text.append(text)
@@ -33,7 +34,7 @@ class FakeTtsStream:
         yield b"\x01\x02" * 8
 
     async def close(self):
-        pass
+        self.closed = True
 
 
 class FakeTts:
