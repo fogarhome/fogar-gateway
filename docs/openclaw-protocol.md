@@ -920,8 +920,21 @@ OpenClaw channel and resets the session under the **same key**.
 **The shared token.** `openclaw config get gateway.auth.token` always prints it redacted (also with
 `--json`) and does not resolve SecretRefs. The command that shows it is
 **`openclaw gateway auth-token --show`** (resolves `gateway.auth.token`, `OPENCLAW_GATEWAY_TOKEN`
-and SecretRefs; prints only in an interactive terminal on the OpenClaw host). `fogar-gw onboard`
-says so.
+and SecretRefs; prints only in an interactive terminal on the OpenClaw host).
+
+**2026-11-26, server 2026.11.7 (read in `dist/gateway-auth-token-*.mjs` and checked live on
+green-house).** "Interactive" is `process.stdin.isTTY && process.stdout.isTTY`
+(`isTerminalInteractive`); without it the command exits 1 with "Refusing to print the Gateway
+token outside an interactive terminal". It also refuses on a host whose config has
+`gateway.mode: "remote"`. A SecretRef `{source: "store", provider, id}` (green-house's
+`gateway.auth.token`) is resolved through the running gateway (`resolveCommandSecretRefsViaGateway`),
+so `~/.openclaw/openclaw.json` never holds the token in clear there; reading that file is not
+an option. The output is the token alone on one line (`${token}\n`). With OpenClaw found on
+loopback, the interactive `fogar-gw onboard` runs this command itself under a pseudo-terminal
+(`cli/verify.read_openclaw_token`: `PATH`, then `~/.npm-global/bin`, then `~/.openclaw/bin`;
+15 s; it keeps the last output line and never logs the output). If that fails, or the token it
+read does not verify, the wizard shows the command and asks for the token. With `--answers` it
+never runs the command.
 
 ## Reading sessions: `sessions.list` and `chat.history` (2026-11-14, server 2026.10.5)
 

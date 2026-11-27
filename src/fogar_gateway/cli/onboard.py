@@ -162,11 +162,20 @@ def _openclaw(out: Out, answers: Any, settings: Any) -> None:
     if found is not None:  # "" = encontrado, sin versión (OpenClaw 2026.11.1)
         version = f" {found}" if found else ""
         out.note(f"He encontrado OpenClaw{version} en este equipo.")
+    auto = found is not None  # el token de este equipo se lee solo, una vez; si falla, a mano
 
     def ask() -> tuple[str, int, str]:
+        nonlocal auto
         if answers:
             return answers.openclaw_host, answers.openclaw_port, answers.openclaw_token
         host, port = "127.0.0.1", 18789
+        if auto:
+            auto = False
+            with _busy(out, "Leyendo el token de OpenClaw…"):
+                token = verify.read_openclaw_token()
+            if token:
+                out.note("He leído el token de OpenClaw de este equipo.")
+                return host, port, token
         if found is None:
             host = _ask("text", "Host de OpenClaw", default=host, validate=_required).strip()
             port = int(_ask("text", "Puerto de OpenClaw", default=str(port),
