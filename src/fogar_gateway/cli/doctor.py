@@ -138,7 +138,7 @@ def _voice_off(settings: Any) -> set[str]:
 
 
 def _live_off(state: Any, settings: Any) -> set[str]:
-    """Con el gateway en marcha manda el proceso (/admin/state), no config.env: puede no haberse
+    """Con el gateway en marcha manda el proceso (/system/state), no config.env: puede no haberse
     reiniciado tras cambiarla. Si no se puede leer, la config local."""
     try:
         services = state["services"]
@@ -213,7 +213,7 @@ def _access_from_file(settings: Any) -> Check:
 
 
 def _check_openclaw_access(state: Any, settings: Any) -> Check:
-    """Con el gateway en marcha y conectado (o esperando aprobación), lo que dice /admin/state;
+    """Con el gateway en marcha y conectado (o esperando aprobación), lo que dice /system/state;
     si no, la identidad guardada."""
     from fogar_gateway.cli.openclaw_access import describe
 
@@ -296,7 +296,7 @@ def run_checks(url: str, token: str | None) -> list[Check]:
     state = None
     try:
         client.token = api.resolve_token(token)
-        state = client.request("GET", "/admin/state")
+        state = client.request("GET", "/system/state")
         out.append(_c("ok", "token", "El gateway acepta el token de administración."))
     except api.ApiError as e:
         out.append(_c("fail", "token", e.message))

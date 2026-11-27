@@ -14,6 +14,7 @@ import importlib
 import ipaddress
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -24,6 +25,11 @@ VERIFY_TIMEOUT_S = 15.0
 # Cubre los 30 s de reintento de OpenClawClient.connect mientras OpenClaw arranca.
 OPENCLAW_VERIFY_TIMEOUT_S = 35.0
 DETECT_TIMEOUT_S = 3.0
+# `openclaw` arranca node y resuelve un SecretRef `store` contra el gateway en marcha.
+TOKEN_READ_TIMEOUT_S = 15.0
+# Fuera del PATH: npm con prefijo de usuario (green-house, por ssh) y el instalador de OpenClaw.
+OPENCLAW_BINS = ("~/.npm-global/bin/openclaw", "~/.openclaw/bin/openclaw")
+_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
 NOT_LOOPBACK_DETAIL = (
     "El asistente solo configura un OpenClaw en este equipo (o por un túnel SSH: "
@@ -73,6 +79,72 @@ async def detect_openclaw(port: int = 18789) -> str | None:
         logger.debug("detect_openclaw: %s", describe_error(e))
         return None
     return "" if r.is_success else None
+
+
+def read_openclaw_token() -> str | None:
+    """El token compartido del OpenClaw de este equipo, o None si no se puede leer.
+
+    Lo da `openclaw gateway auth-token --show`: resuelve `gateway.auth.token`,
+    `OPENCLAW_GATEWAY_TOKEN` y los SecretRef (en green-house es `source: store`, que el JSON de
+    `~/.openclaw` no tiene en claro). Solo imprime con stdin y stdout en una TTY, así que corre
+    bajo un pty. El onboard solo lo llama en interactivo, con el operador delante, y el token va
+    directo a config.env (0600). Su salida nunca se registra: lleva el token."""
+    import os
+    import pty
+    import select
+    import shutil
+    import subprocess
+    import time
+
+    exe = shutil.which("openclaw") or next(
+        (p for p in map(os.path.expanduser, OPENCLAW_BINS) if os.access(p, os.X_OK)), None)
+    if exe is None:
+        logger.debug("read_openclaw_token: no encuentro el binario de openclaw")
+        return None
+    master, slave = pty.openpty()
+    try:
+        proc = subprocess.Popen([exe, "gateway", "auth-token", "--show"], stdin=slave,
+                                stdout=slave, stderr=subprocess.DEVNULL,
+                                env={**os.environ, "NO_COLOR": "1"})
+    except OSError as e:
+        os.close(master)
+        os.close(slave)
+        logger.debug("read_openclaw_token: %s", type(e).__name__)
+        return None
+    os.close(slave)  # el hijo tiene el suyo: al acabar, leer el master da EOF (o EIO en Linux)
+    chunks: list[bytes] = []
+    deadline = time.monotonic() + TOKEN_READ_TIMEOUT_S
+    try:
+        while (left := deadline - time.monotonic()) > 0 and select.select([master], [], [], left)[0]:
+            try:
+                data = os.read(master, 4096)
+            except OSError:  # EIO: el hijo cerró su lado
+                data = b""
+            if not data:
+                break
+            chunks.append(data)
+        else:
+            logger.debug("read_openclaw_token: sin respuesta en %.0f s", TOKEN_READ_TIMEOUT_S)
+            return None
+        code = proc.wait(timeout=max(deadline - time.monotonic(), 0.1))
+    except subprocess.TimeoutExpired:
+        logger.debug("read_openclaw_token: no termina")
+        return None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        os.close(master)
+    if code != 0:
+        logger.debug("read_openclaw_token: openclaw salió con %s", code)
+        return None
+    # La TTY trae \r\n, quizá el banner y colores: el token es la última línea, de una pieza.
+    text = _ANSI.sub("", b"".join(chunks).decode(errors="replace")).replace("\r", "\n")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines or any(c.isspace() for c in lines[-1]):
+        logger.debug("read_openclaw_token: salida sin token")
+        return None
+    return lines[-1]
 
 
 class _Rejected(Exception):
@@ -186,6 +258,7 @@ async def verify_openclaw(host: str, port: int, token: str) -> Verdict:
     if (bad := _config_problem()) is not None:
         return bad
     from fogar_gateway.cli.openclaw_access import describe, identity_required_text, pending_text
+    from fogar_gateway.services.channel import ChannelHub
     from fogar_gateway.services.openclaw.client import (
         OpenClawClient,
         OrchestratorDeviceIdentityRequired,
@@ -195,7 +268,7 @@ async def verify_openclaw(host: str, port: int, token: str) -> Verdict:
         OrchestratorStartingError,
     )
     from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
-    from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
+    from fogar_gateway.services.openclaw.registry import TurnRegistry
 
     turn_registry = TurnRegistry()
     # use_device_token=False: aunque haya un token de dispositivo guardado para este OpenClaw, se
@@ -206,7 +279,7 @@ async def verify_openclaw(host: str, port: int, token: str) -> Verdict:
         port=port,
         token=token,
         turn_registry=turn_registry,
-        dispatcher=FrameDispatcher(turn_registry, ClientRegistry()),
+        dispatcher=FrameDispatcher(turn_registry, ChannelHub(turn_registry=turn_registry)),
         use_device_token=False,
     )
     granted: dict = {}

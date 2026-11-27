@@ -5,30 +5,63 @@ Se llama al handler directamente para controlar el cierre del stream SSE.
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
-from fogar_gateway.api.openai_routes import HACaller, _ChatCompletionRequest, chat_completions
-from fogar_gateway.services.protocol import OrchestratorEvent
+from fogar_gateway.api.openai_routes import V1Caller, _ChatCompletionRequest, chat_completions
+from fogar_gateway.models.schemas import Client, ClientConfig
+from fogar_gateway.services.channel import ChannelHub
+from fogar_gateway.services.conversations import Conversation
+from fogar_gateway.services.protocol import OrchestratorProtocol
+from fogar_gateway.services.scopes import DEFAULT_SCOPES
 from fogar_gateway.services.session_registry import SessionRegistry
+from tests.fakes.orchestrator import OrchestratorEvent, wire_stream_orchestrator
 
 
-class _Orchestrator:
-    gateway_info = None
+def _orchestrator(abort_delay: float = 0.0):
+    """A turn that never ends; its `chat.abort` (the cut of /v1's run, 5.0 PR 2b.3) takes
+    `abort_delay`."""
 
-    def __init__(self, close_delay: float = 0.0) -> None:
-        self.close_delay = close_delay
+    async def stream_response(text, session_key=None):
+        yield OrchestratorEvent(type="token", content="hola")
+        await asyncio.Event().wait()  # el turno no termina nunca
 
-    async def stream_response(self, text, session_key=None):
-        try:
-            yield OrchestratorEvent(type="token", content="hola")
-            await asyncio.Event().wait()  # el turno no termina nunca
-        finally:
-            await asyncio.sleep(self.close_delay)  # cierre lento del stream
+    orchestrator = MagicMock(spec=OrchestratorProtocol)
+    orchestrator.gateway_info = None
+    orchestrator.stream_response = stream_response
+    hub = ChannelHub(orchestrator=orchestrator)
+    wire_stream_orchestrator(orchestrator, hub)
+    play_abort = orchestrator.abort_run.side_effect
+
+    async def slow_abort(session_key, run_id):
+        await asyncio.sleep(abort_delay)  # un chat.abort lento
+        await play_abort(session_key, run_id)
+
+    orchestrator.abort_run.side_effect = slow_abort
+    return orchestrator, hub
 
 
-def _request(orchestrator) -> tuple[SimpleNamespace, SessionRegistry]:
+def _request(abort_delay: float = 0.0) -> tuple[SimpleNamespace, SessionRegistry]:
+    orchestrator, hub = _orchestrator(abort_delay)
     registry = SessionRegistry()
-    state = SimpleNamespace(openclaw=orchestrator, session_registry=registry)
-    return SimpleNamespace(app=SimpleNamespace(state=state)), registry
+    state = SimpleNamespace(openclaw=orchestrator, session_registry=registry, channel_hub=hub,
+                            conversations=_Conversations())
+    return SimpleNamespace(app=SimpleNamespace(state=state), headers={}), registry
+
+
+class _Conversations:
+    """La conversación del día del aparato, sin BD."""
+
+    async def default_for(self, client_id, agent):
+        return Conversation(id="c1", client_id=client_id, agent=agent,
+                            session_key=f"agent:{agent}:fogar-c1", kind="default")
+
+    async def note_turn(self, conversation_id):
+        pass
+
+
+def _caller() -> V1Caller:
+    client = Client(id="tv", key_hash="h", is_active=True, scopes=DEFAULT_SCOPES)
+    return V1Caller(client=client, config=ClientConfig())
 
 
 def _body(stream: bool) -> _ChatCompletionRequest:
@@ -37,8 +70,8 @@ def _body(stream: bool) -> _ChatCompletionRequest:
 
 async def test_cancelled_stream_closes_session_as_error():
     """G-26: un stream cortado (cliente que se va) no es un turno completado."""
-    request, registry = _request(_Orchestrator())
-    resp = await chat_completions(request, _body(True), HACaller(None, None))
+    request, registry = _request()
+    resp = await chat_completions(request, _body(True), _caller())
     gen = resp.body_iterator
     await gen.__anext__()
     await gen.aclose()
@@ -48,8 +81,8 @@ async def test_cancelled_stream_closes_session_as_error():
 
 
 async def test_cancelled_non_stream_closes_session_as_error():
-    request, registry = _request(_Orchestrator())
-    task = asyncio.create_task(chat_completions(request, _body(False), HACaller(None, None)))
+    request, registry = _request()
+    task = asyncio.create_task(chat_completions(request, _body(False), _caller()))
     for _ in range(5):
         await asyncio.sleep(0)
     task.cancel()
@@ -60,9 +93,10 @@ async def test_cancelled_non_stream_closes_session_as_error():
 
 
 async def test_stream_close_does_not_swallow_caller_cancellation():
-    """Si cancelan a quien cierra el stream mientras espera al turno, la cancelación sigue."""
-    request, _ = _request(_Orchestrator(close_delay=0.2))
-    resp = await chat_completions(request, _body(True), HACaller(None, None))
+    """Si cancelan a quien cierra el stream mientras espera al corte del turno, la cancelación
+    sigue."""
+    request, _ = _request(abort_delay=0.2)
+    resp = await chat_completions(request, _body(True), _caller())
     gen = resp.body_iterator
     await gen.__anext__()
     closer = asyncio.create_task(gen.aclose())

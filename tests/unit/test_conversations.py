@@ -13,9 +13,11 @@ from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord, ConversationRecord
 from fogar_gateway.services import conversations as conv_mod
 from fogar_gateway.services.auth import hash_key
+from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.conversations import (
     Conversation,
     ConversationClientMissing,
+    ConversationIndex,
     ConversationNotFound,
     ConversationService,
     SessionConversation,
@@ -298,7 +300,8 @@ async def test_openclaw_sessions_are_listed_page_by_page_with_titles():
 
 def test_history_is_normalised_to_role_text_and_time():
     raw = [
-        {"role": "user", "content": "hola", "timestamp": 1_794_665_071_190},
+        {"role": "user", "content": "hola", "timestamp": 1_794_665_071_190,
+         "__openclaw": {"id": "m-1", "seq": 1}},
         {"role": "assistant", "content": [{"type": "text", "text": "¿qué tal?"},
                                           {"type": "toolCall", "name": "x"}], "timestamp": 1},
         {"role": "assistant", "content": [{"type": "toolCall", "name": "x"}]},  # sin texto
@@ -307,9 +310,10 @@ def test_history_is_normalised_to_role_text_and_time():
         "basura",
     ]
     assert history_messages(raw) == [
-        {"role": "user", "text": "hola",
+        {"id": "m-1", "role": "user", "text": "hola",
          "timestamp": datetime.fromtimestamp(1_794_665_071.19, UTC)},
-        {"role": "assistant", "text": "¿qué tal?", "timestamp": datetime.fromtimestamp(0.001, UTC)},
+        {"id": None, "role": "assistant", "text": "¿qué tal?",
+         "timestamp": datetime.fromtimestamp(0.001, UTC)},
     ]
     assert history_messages(None) == []
 
@@ -371,25 +375,15 @@ async def test_without_db_the_turn_stays_in_its_conversation(service, clock, cap
 # ── Sesiones vivas y reparto del push ─────────────────────────────────────
 
 
-async def test_a_day_move_frees_the_old_keys_queue_peak_and_keeps_its_value(make_bridge):
-    bridge, _ = make_bridge()
-    old = bridge.conversation.current
-    new = Conversation("d2", old.client_id, "main", session_key_for("main", "d2"), "default", None)
-    bridge._turn_registry._peak[old.session_key] = 3
-    await bridge._on_conversation_move(old, new)
-    assert old.session_key not in bridge._turn_registry._peak
-    assert bridge._session_end_meta("completed")["turn_queue_peak"] == 3
-
-
-async def test_a_session_that_lost_its_conversation_never_aborts_on_that_key(make_bridge):
-    """Red de seguridad del desplazamiento: ya no aborta en la clave que otra sesión tiene."""
+async def test_a_session_that_left_its_channel_never_aborts_on_that_key(make_bridge):
+    """5.0 (#406): una sesión que se va (aquí, revocada) deja el canal; después, ni corta nada en
+    él ni aborta en su clave (solo el canal aborta)."""
     from tests.fakes.bridge import push
 
     bridge, _ = make_bridge()
     await push(bridge, ("turn_start", bridge.conversation.session_key))
-    bridge.conversation.released = True
-    assert (await bridge.turns.cancel("cancelled"))[0] is True
-    bridge.orchestrator.abort.assert_not_awaited()
+    await asyncio.wait_for(bridge.revoke(), 2)
+    assert await bridge.turns.cancel("cancelled") == (False, None)
     await bridge.close_all()
 
 
@@ -397,47 +391,46 @@ def _conv(cid, client="tv", agent="main"):
     return Conversation(cid, client, agent, session_key_for(agent, cid), "default", date(2026, 11, 14))
 
 
-def test_a_conversation_is_open_in_one_session_only():
+def test_several_sessions_of_a_client_share_a_conversation():
+    """5.0 (#406): abrir una conversación en otra sesión ya no desplaza a nadie (4102 retirado):
+    las dos quedan registradas, y la conversación, indexada para su push."""
     reg = ClientRegistry()
     old, new = object(), object()
-    assert reg.register("tv", old, _conv("c1")) is None
-    assert reg.register("tv", new, _conv("c1")) is old  # el llamador cierra la vieja
-    assert reg.holder("c1") is new
+    reg.register("tv", old, _conv("c1"))
+    reg.register("tv", new, _conv("c1"))
+    assert reg.for_client("tv") == [old, new]
+    assert reg.index.get(session_key_for("main", "c1")).id == "c1"
     reg.unregister("tv", old)  # el cierre tardío de la vieja no quita a la nueva
-    assert reg.holder("c1") is new and reg.get("tv") is new
+    assert reg.for_client("tv") == [new] and reg.get("tv") is new
 
 
-def test_push_goes_to_the_session_holding_its_conversation():
-    reg = ClientRegistry()
-    a, b = object(), object()
-    reg.register("web", a, _conv("c1", "web"))
-    reg.register("web", b, _conv("c2", "web"))
-    assert reg.route(session_key_for("main", "c1")) is a
-    assert reg.route(session_key_for("main", "c2")) is b
-    assert sorted(map(id, reg.bridges())) == sorted([id(a), id(b)])
+def _hub(*conversations):
+    index = ConversationIndex()
+    for conversation in conversations:
+        index.add(conversation)
+    return ChannelHub(index=index)
 
 
-def test_push_of_a_conversation_not_open_goes_to_the_clients_last_session():
-    """La conversación de ayer de la tele: su sesión ya está en la de hoy."""
-    reg = ClientRegistry()
-    tv = object()
-    reg.index.add(_conv("yesterday"))
-    reg.register("tv", tv, _conv("today"))
-    assert reg.route(session_key_for("main", "yesterday")) is tv
-    reg.unregister("tv", tv)
-    assert reg.route(session_key_for("main", "yesterday")) is None
+def test_push_goes_to_the_channel_of_its_conversation():
+    """5.0 (#406): el push va al canal de su conversación (el índice, síncrono), que lo reparte
+    a las sesiones adjuntas; ya no a una sesión (`ClientRegistry.route` desaparece)."""
+    hub = _hub(_conv("c1", "web"), _conv("c2", "web"))
+    c1 = hub.channel_for(session_key_for("main", "c1"))
+    assert c1 is not None and c1.conversation.id == "c1"
+    assert hub.channel_for(session_key_for("main", "c1")) is c1  # the live one, not a new one
+    assert hub.channel_for(session_key_for("main", "c2")).conversation.id == "c2"
+
+
+def test_push_of_a_conversation_resolves_its_own_channel_through_the_index():
+    """El push de la conversación de ayer va al canal de esa conversación (resuelto por el
+    índice, aunque ninguna sesión lo tenga abierto), no al de hoy."""
+    hub = _hub(_conv("yesterday"), _conv("today"))
+    channel = hub.channel_for(session_key_for("main", "yesterday"))
+    assert channel is not None and channel.conversation.id == "yesterday"
+    assert channel is not hub.channel_for(session_key_for("main", "today"))
 
 
 def test_push_of_a_key_without_a_conversation_goes_nowhere():
-    reg = ClientRegistry()
-    reg.register("tv", object(), _conv("today"))
-    assert reg.route("agent:main:tv") is None
-
-
-def test_moving_a_session_to_another_conversation():
-    reg = ClientRegistry()
-    tv = object()
-    reg.register("tv", tv, _conv("d1"))
-    reg.close("d1", tv)
-    assert reg.open(_conv("d2"), tv) is None
-    assert reg.holder("d1") is None and reg.holder("d2") is tv
+    hub = _hub(_conv("today"))
+    assert hub.channel_for("agent:main:tv") is None
+    assert len(hub) == 0

@@ -5,12 +5,18 @@ import logging
 import pytest
 from sqlmodel import Session
 
-from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.main import app
 from fogar_gateway.services.auth import hash_key
-from fogar_gateway.services.protocol import OrchestratorEvent
-from tests.integration.conftest import CLIENT_ID, default_conversation_key
+from tests.fakes.orchestrator import OrchestratorEvent
+from tests.integration.conftest import CLIENT_ID, VALID_KEY, default_conversation_key
+
+
+@pytest.fixture
+def client(client):
+    """/v1 exige siempre Bearer (5.0, #413): el del aparato sembrado."""
+    client.headers["authorization"] = f"Bearer {VALID_KEY}"
+    return client
 
 
 def test_get_models_returns_list(client):
@@ -39,9 +45,7 @@ def test_chat_completions_non_streaming_uses_orchestrator(client, mock_orchestra
 
 
 def test_chat_completions_uses_correct_session_key(client, mock_registry, mock_orchestrator):
-    """session_key passed to stream_response matches agent:{default_agent}:ha."""
-    from fogar_gateway.core.session_key import make_session_key
-
+    """El turno va a la conversación del día del aparato (M19; 5.0: siempre con Bearer)."""
     captured = {}
 
     async def _stream(text, session_key=None):
@@ -54,15 +58,14 @@ def test_chat_completions_uses_correct_session_key(client, mock_registry, mock_o
     client.post(
         "/v1/chat/completions",
         json={
-            "model": "openclaw",
+            "model": "fogar-gateway",
             "messages": [{"role": "user", "content": "test"}],
             "stream": False,
         },
     )
 
     # default_agent_id from GatewayInfo mock is "main"
-    expected = make_session_key("main", "ha")
-    assert captured.get("session_key") == expected
+    assert captured.get("session_key", "").startswith("agent:main:fogar-")
 
 
 def test_chat_completions_uses_last_user_message(client):
@@ -373,28 +376,6 @@ def test_streaming_turn_timeout_is_terminal_error(client, mock_orchestrator):
     assert body.rstrip().endswith("data: [DONE]")  # #217: [DONE] también ante error
 
 
-def test_non_streaming_turn_conflict_returns_409(client, mock_orchestrator):
-    """Issue #99: a rejected duplicate-session_key turn must map to HTTP 409,
-    distinguishable from a generic orchestrator failure (502)."""
-    from fogar_gateway.services.openclaw.registry import TURN_IN_PROGRESS_ERROR
-
-    async def _conflict_stream(*args, **kwargs):
-        yield OrchestratorEvent(type="error", content=TURN_IN_PROGRESS_ERROR)
-
-    mock_orchestrator.stream_response = _conflict_stream
-
-    r = client.post(
-        "/v1/chat/completions",
-        json={
-            "model": "openclaw",
-            "messages": [{"role": "user", "content": "Hola"}],
-            "stream": False,
-        },
-    )
-
-    assert r.status_code == 409, f"Esperado 409, recibido {r.status_code}: {r.text}"
-
-
 def test_streaming_done_delivered_when_tracker_close_raises(client, mock_orchestrator, monkeypatch):
     """[DONE] debe llegar aunque tracker.close() lance una excepción.
 
@@ -492,12 +473,20 @@ def test_http_session_appears_in_registry(client):
     sessions = app.state.session_registry.get_all()
     http_sessions = [s for s in sessions if s.session_id.startswith("http:")]
     assert len(http_sessions) >= 1
-    assert http_sessions[0].client_id == "ha"
+    assert http_sessions[0].client_id == CLIENT_ID
 
 
-def test_get_models_from_trusted_loopback_passes(client):
+def test_get_models_with_bearer_passes(client):
     r = client.get("/v1/models")
     assert r.status_code == 200
+
+
+@pytest.mark.parametrize("path", ["/v1/models", "/v1/chat/completions"])
+def test_loopback_without_bearer_is_401(client, path):
+    # 5.0 (#413): ninguna IP exime, tampoco loopback (cierra #356 y #372).
+    del client.headers["authorization"]
+    r = client.get(path) if path.endswith("models") else client.post(path, json=BODY)
+    assert r.status_code == 401
 
 
 def test_get_models_from_untrusted_origin_without_auth_returns_401(client_untrusted):
@@ -600,36 +589,6 @@ def test_chat_completions_with_inactive_client_key_returns_401(client, db_engine
         headers={"authorization": "Bearer inactive-key"},
     )
     assert r.status_code == 401
-
-
-def test_chat_completions_x_real_ip_alone_does_not_grant_trust(client, monkeypatch):
-    """Peer is 127.0.0.1 (a trusted proxy), so X-Real-IP is read — but the IP it
-    names (203.0.113.9) still isn't in TRUSTED_NETWORKS, so it must still fail."""
-    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "")
-    r = client.post(
-        "/v1/chat/completions",
-        json={
-            "model": "openclaw",
-            "messages": [{"role": "user", "content": "Hola"}],
-            "stream": False,
-        },
-        headers={"x-real-ip": "203.0.113.9"},
-    )
-    assert r.status_code == 401
-
-
-def test_chat_completions_trusts_x_real_ip_within_trusted_networks(client, monkeypatch):
-    monkeypatch.setattr(settings, "TRUSTED_NETWORKS", "192.168.50.0/24")
-    r = client.post(
-        "/v1/chat/completions",
-        json={
-            "model": "openclaw",
-            "messages": [{"role": "user", "content": "Hola"}],
-            "stream": False,
-        },
-        headers={"x-real-ip": "192.168.50.7"},
-    )
-    assert r.status_code == 200
 
 
 def test_chat_completions_ignores_x_real_ip_from_untrusted_peer(client_untrusted):
@@ -794,11 +753,8 @@ def test_non_runtime_error_message_never_reaches_logs_stream_and_non_stream(
     marker = "SECRET-USER-TEXT"
     caplog.set_level(logging.DEBUG)
 
-    async def _boom(*args, **kwargs):
-        raise ValueError(marker)
-        yield  # pragma: no cover
-
-    mock_orchestrator.stream_response = _boom
+    # 5.0 PR 2b.3: /v1 goes through the channel; an unexpected failure is its `chat.send`'s.
+    mock_orchestrator.send.side_effect = ValueError(marker)
     r = client.post("/v1/chat/completions", json={**BODY, "model": "openclaw"})
     assert r.status_code == 502
     with client.stream(
@@ -833,12 +789,6 @@ def test_models_lists_alias_and_roster_agents_for_bearer_caller(
     assert all(m["object"] == "model" for m in r.json()["data"])
 
 
-def test_models_for_legacy_trusted_caller_lists_only_alias(client):
-    """Origen confiable SIN Bearer: chat ignora body.model y usa el agente por defecto, así
-    que no se anuncian agentes que no se podrían elegir."""
-    assert _ids(client.get("/v1/models")) == ["fogar-gateway"]
-
-
 def _chat_session_key(c, mock_orchestrator, model, headers=None):
     captured = {}
 
@@ -860,16 +810,6 @@ def test_models_chat_coherence_bearer_every_listed_model_selects_that_agent(
         sk = _chat_session_key(client_untrusted, mock_orchestrator, mid, ha_bearer_headers)
         expected = "main" if mid == "fogar-gateway" else mid
         assert sk.split(":")[1] == expected
-
-
-def test_models_chat_coherence_legacy_listed_model_is_what_chat_uses(
-    client, mock_orchestrator
-):
-    listed = _ids(client.get("/v1/models"))
-    assert listed == ["fogar-gateway"]
-    # Un agente real no listado se ignora en la rama legacy: cae al agente por defecto.
-    assert _chat_session_key(client, mock_orchestrator, "a").split(":")[1] == "main"
-    assert _chat_session_key(client, mock_orchestrator, listed[0]).split(":")[1] == "main"
 
 
 def test_models_respects_allowed_agents_of_authenticated_client(
@@ -987,3 +927,51 @@ def test_corrupt_allowed_agents_in_db_returns_stable_500(
     assert r.status_code == 500
     assert r.json() == {"detail": "internal_error"}
     assert "ValueError" in caplog.text and "lista" not in caplog.text
+
+
+# --- X-Fogar-Conversation (5.0, #413) ---
+
+
+def _new_conversation(c, headers=None) -> dict:
+    r = c.post("/conversations", json={}, headers=headers or {})
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_conversation_header_picks_a_visible_conversation(client, mock_orchestrator):
+    conv = _new_conversation(client)
+    sk = _chat_session_key(client, mock_orchestrator, "fogar-gateway",
+                           {"x-fogar-conversation": conv["id"]})
+    assert sk.endswith(conv["id"])
+
+
+@pytest.mark.parametrize("value", ["no-existe", "x" * 65])
+def test_conversation_header_unknown_is_404(client, value):
+    r = client.post("/v1/chat/completions", json=BODY, headers={"x-fogar-conversation": value})
+    assert r.status_code == 404 and r.json() == {"error": "conversation_not_found"}
+
+
+def test_conversation_header_of_someone_elses_private_conversation_is_404(client, db_engine):
+    from fogar_gateway.db.models import MembershipRecord, UserRecord
+
+    with Session(db_engine) as s:
+        user = UserRecord(username="ana", display_name="Ana", password_hash="h")
+        s.add(user)
+        s.commit()
+        s.add(MembershipRecord(user_id=user.id, home_id="home", role="member"))
+        s.add(ClientRecord(name="Móvil de Ana", key_hash=hash_key("k-ana-" + "x" * 30),
+                           user_id=user.id))
+        s.commit()
+    private = _new_conversation(client, {"authorization": f"Bearer k-ana-{'x' * 30}"})
+    assert private["owner_user_id"] is not None
+    # El aparato del hogar no la ve: como si no existiera.
+    r = client.post("/v1/chat/completions", json=BODY,
+                    headers={"x-fogar-conversation": private["id"]})
+    assert r.status_code == 404
+
+
+def test_conversation_header_fixes_the_agent(client):
+    conv = _new_conversation(client)
+    r = client.post("/v1/chat/completions", json={**BODY, "model": "otro"},
+                    headers={"x-fogar-conversation": conv["id"]})
+    assert r.status_code == 409 and r.json() == {"error": "conversation_agent_mismatch"}

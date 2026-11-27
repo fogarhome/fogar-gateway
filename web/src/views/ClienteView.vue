@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, shallowRef, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
-import { deleteClient, getClient, rotateClientKey, updateClient } from '@/api/admin'
+import { deleteClient, getClient, listUsers, rotateClientKey, updateClient } from '@/api/admin'
 import { ApiError } from '@/api/http'
-import type { ClientResponse, OutputMode } from '@/api/types'
+import type { ClientResponse, OutputMode, UserRow } from '@/api/types'
 import ClaveNueva from '@/components/ClaveNueva.vue'
 import FgBoton from '@/components/FgBoton.vue'
 import FgCampo from '@/components/FgCampo.vue'
@@ -15,6 +15,7 @@ import { CLIENT_TYPE, label } from '@/lib/labels'
 import { toast } from '@/lib/toasts'
 import { useClientsStore } from '@/stores/clients'
 import { useLiveStore } from '@/stores/live'
+import { useSessionStore } from '@/stores/session'
 
 const route = useRoute()
 const router = useRouter()
@@ -41,6 +42,23 @@ async function cargar(): Promise<void> {
   }
 }
 watch(id, () => void cargar(), { immediate: true })
+
+// #441: un administrador no toca el aparato personal de un dueño (el gateway responde 403
+// owner_only). Sin la lista de personas no se oculta nada y lo dice el 403.
+const session = useSessionStore()
+const personas = shallowRef<UserRow[]>([])
+if (session.user?.role === 'admin') {
+  listUsers()
+    .then((u) => (personas.value = u))
+    .catch(() => undefined)
+}
+const dueno = computed(() => {
+  const uid = cliente.value?.user_id
+  if (!uid || session.user?.role !== 'admin') return null
+  return personas.value.find((u) => u.id === uid && u.role === 'owner') ?? null
+})
+const SOLO_DUENO = 'Es un aparato de un dueño: solo lo cambia él.'
+const esSoloDueno = (e: unknown) => e instanceof ApiError && e.message === 'owner_only'
 
 const conectado = computed(() => (live.state?.sessions ?? []).some((s) => s.client_id === id.value))
 const meta = computed(() => {
@@ -75,8 +93,9 @@ async function guardar(): Promise<void> {
     void clients.refresh()
     toast('ok', 'Cambios guardados', conectado.value ? 'La sesión abierta los toma al reconectarse.' : undefined)
   } catch (e) {
-    guardarError.value =
-      e instanceof ApiError && (e.kind === 'invalid' || e.kind === 'conflict')
+    guardarError.value = esSoloDueno(e)
+      ? SOLO_DUENO
+      : e instanceof ApiError && (e.kind === 'invalid' || e.kind === 'conflict')
         ? `El gateway no lo acepta: ${e.message}`
         : 'No he podido guardar. Prueba otra vez.'
   } finally {
@@ -116,7 +135,7 @@ async function rotar(): Promise<void> {
     void clients.refresh()
   } catch (e) {
     if (e instanceof ApiError && e.kind !== 'network') {
-      toast('bad', 'No he podido rotar la clave', 'La clave de antes sigue valiendo.')
+      toast('bad', 'No he podido rotar la clave', esSoloDueno(e) ? SOLO_DUENO : 'La clave de antes sigue valiendo.')
     } else {
       // G-r6-3: sin respuesta, el gateway pudo rotarla: la huella releída lo dice.
       toast('bad', 'No sé si se rotó la clave', 'Lo compruebo con la huella.')
@@ -155,8 +174,8 @@ async function cambiarActivo(): Promise<void> {
     cliente.value = await updateClient(id.value, { is_active: !c.is_active })
     void clients.refresh()
     toast('ok', cliente.value.is_active ? 'Activado' : 'Desactivado', cliente.value.is_active ? 'Ya puede volver a entrar.' : 'Sus sesiones se cierran en menos de 10 s.')
-  } catch {
-    toast('bad', 'No he podido cambiarlo', 'Prueba otra vez.')
+  } catch (e) {
+    toast('bad', 'No he podido cambiarlo', esSoloDueno(e) ? SOLO_DUENO : 'Prueba otra vez.')
   } finally {
     trabajando.value = false
   }
@@ -170,7 +189,7 @@ async function borrar(): Promise<void> {
   } catch (e) {
     // G-r7-4: 404 es que ya no existe (p. ej. un borrado anterior que se quedó sin respuesta)
     if (!(e instanceof ApiError && e.kind === 'not-found')) {
-      toast('bad', 'No he podido borrarlo', 'Prueba otra vez.')
+      toast('bad', 'No he podido borrarlo', esSoloDueno(e) ? SOLO_DUENO : 'Prueba otra vez.')
       trabajando.value = false
       return
     }
@@ -202,6 +221,7 @@ frenarRecarga(() => rotando.value)
           <FgEstado v-if="!cliente.is_active" tono="off" texto="desactivado" />
           <FgEstado v-else-if="conectado" tono="ok" texto="conectado ahora" />
         </p>
+        <p v-if="dueno" class="fg-sub" role="note">Es un aparato de {{ dueno.display_name }}: solo lo cambia él.</p>
       </header>
 
       <ClaveNueva
@@ -215,41 +235,39 @@ frenarRecarga(() => rotando.value)
       <div class="partes" :inert="!!claveNueva" :class="{ inerte: claveNueva }">
         <form novalidate aria-labelledby="h-ajustes" class="ajustes" @submit.prevent="guardar">
           <h2 id="h-ajustes" class="fg-h2">Ajustes</h2>
-          <div class="rejilla">
-            <FgCampo v-model="form.name" etiqueta="Nombre" :error="err('name')" />
-            <div class="campo-select">
-              <label for="tipo">Tipo</label>
-              <select id="tipo" v-model="form.client_type">
-                <option value="">Sin tipo</option>
-                <option v-for="(texto, valor) in CLIENT_TYPE" :key="valor" :value="valor">{{ texto }}</option>
-              </select>
-              <p class="fg-meta">Solo cambia cómo se ve aquí.</p>
+          <fieldset :disabled="!!dueno" class="bloque">
+            <div class="rejilla">
+              <FgCampo v-model="form.name" etiqueta="Nombre" :error="err('name')" />
+              <div class="campo-select">
+                <label for="tipo">Tipo</label>
+                <select id="tipo" v-model="form.client_type">
+                  <option value="">Sin tipo</option>
+                  <option v-for="(texto, valor) in CLIENT_TYPE" :key="valor" :value="valor">{{ texto }}</option>
+                </select>
+                <p class="fg-meta">Solo cambia cómo se ve aquí.</p>
+              </div>
+              <FgCampo v-model="form.default_agent" etiqueta="Agente por defecto" placeholder="El de OpenClaw" pista="Vacío: el agente por defecto de OpenClaw." :error="err('default_agent')" />
+              <FgCampo v-model="form.tts_voice" etiqueta="Voz" pista="El nombre de la voz en el proveedor de voz." :error="err('tts_voice')" />
             </div>
-            <FgCampo v-model="form.default_agent" etiqueta="Agente por defecto" placeholder="El de OpenClaw" pista="Vacío: el agente por defecto de OpenClaw." :error="err('default_agent')" />
-            <FgCampo v-model="form.tts_voice" etiqueta="Voz" pista="El nombre de la voz en el proveedor de voz." :error="err('tts_voice')" />
-          </div>
-          <fieldset class="salidas">
-            <legend>Sabe reproducir</legend>
-            <div class="opciones">
-              <label v-for="s in SALIDAS" :key="s.valor" class="opcion">
-                <input v-model="form.output_mode" type="checkbox" :value="s.valor" />{{ s.texto }}
-              </label>
-            </div>
-            <p class="fg-meta">Lo dice el aparato al emparejarse. En cada sesión manda lo que pida al conectarse.</p>
+            <fieldset class="salidas">
+              <legend>Sabe reproducir</legend>
+              <div class="opciones">
+                <label v-for="s in SALIDAS" :key="s.valor" class="opcion">
+                  <input v-model="form.output_mode" type="checkbox" :value="s.valor" />{{ s.texto }}
+                </label>
+              </div>
+              <p class="fg-meta">Lo dice el aparato al emparejarse. En cada sesión manda lo que pida al conectarse.</p>
           </fieldset>
           <details class="mas">
-            <summary>Conversación y voz: idioma, interrupciones, silencio, mensajes de Fogar y herramientas</summary>
+            <summary>Conversación y voz: idioma, silencio, mensajes de Fogar y herramientas</summary>
             <div class="rejilla">
               <FgCampo v-model="form.stt_language" etiqueta="Idioma al transcribir" pista="Código del idioma: es, en, gl…" :error="err('stt_language')" />
               <FgCampo v-model="form.stt_vad_thold" etiqueta="Umbral de voz" inputmode="decimal" pista="De 0 a 1. 0: el del transcriptor." :error="err('stt_vad_thold')" />
               <FgCampo v-model="form.tts_speed" etiqueta="Velocidad de la voz" inputmode="decimal" pista="1 es la normal." :error="err('tts_speed')" />
               <FgCampo v-model="form.allowed_agents" etiqueta="Agentes permitidos" pista="Separados por comas. Vacío: todos." :error="err('allowed_agents')" />
-              <FgCampo v-model="form.barge_in_min_chars" etiqueta="Letras para interrumpir" inputmode="numeric" pista="Cuánto tiene que decir para cortar a Fogar." :error="err('barge_in_min_chars')" />
               <FgCampo v-model="form.silence_timeout_s" etiqueta="Silencio para cerrar el turno (s)" inputmode="decimal" :error="err('silence_timeout_s')" />
-              <FgCampo v-model="form.max_silence_turns" etiqueta="Turnos en silencio antes de colgar" inputmode="numeric" :error="err('max_silence_turns')" />
             </div>
             <div class="interruptores">
-              <label class="opcion"><input v-model="form.barge_in_enabled" type="checkbox" />Se le puede interrumpir</label>
               <label class="opcion"><input v-model="form.push_enabled" type="checkbox" />Fogar puede hablarle sin que pregunte</label>
               <label class="opcion"><input v-model="form.tool_calls_enabled" type="checkbox" />Ve las herramientas que usa Fogar</label>
             </div>
@@ -262,9 +280,10 @@ frenarRecarga(() => rotando.value)
             <span v-else class="fg-meta">Sin cambios</span>
             <p v-if="guardarError" class="fg-meta" role="alert">{{ guardarError }}</p>
           </div>
+          </fieldset>
         </form>
 
-        <section aria-labelledby="h-acceso" class="acceso">
+        <section v-if="!dueno" aria-labelledby="h-acceso" class="acceso">
           <h2 id="h-acceso" class="fg-h2">Acceso</h2>
           <div class="accion">
             <div><b>Rotar la clave</b><p class="fg-meta">Crea una clave nueva y desconecta el aparato hasta que la use.</p></div>
@@ -361,6 +380,10 @@ legend {
   border: 1px solid var(--veta);
   background: var(--noche);
   color: var(--hueso);
+}
+/* Solo para deshabilitar el formulario de un aparato del dueño: no cambia la maqueta. */
+.bloque {
+  display: contents;
 }
 .salidas {
   margin: 0;

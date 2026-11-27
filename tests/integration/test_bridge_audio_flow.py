@@ -19,6 +19,7 @@ from fogar_gateway.core.config import settings
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.main import app
 from fogar_gateway.services.auth import hash_key
+from tests.fakes.orchestrator import wire_stream_orchestrator
 from tests.integration.conftest import (
     CLIENT_ID,
     CLIENT_NAME,
@@ -28,7 +29,8 @@ from tests.integration.conftest import (
 )
 
 HANDSHAKE_AUDIO = {
-    "client_key": VALID_KEY,
+    "token": VALID_KEY,
+    "protocol": 5,
     "input_mode": "audio",
     "output_mode": ["text"],
 }
@@ -115,7 +117,7 @@ def test_audio_chunk_transcribed_and_forwarded_to_orchestrator(
 ):
     """PCM → transcriber fake emite is_final → cliente recibe transcripción
     → cliente envía {"type":"send"} → orchestrator llamado con el texto."""
-    from fogar_gateway.services.protocol import OrchestratorEvent
+    from tests.fakes.orchestrator import OrchestratorEvent
 
     called_with_text = {}
     mock_orch = make_mock_orchestrator()
@@ -138,6 +140,7 @@ def test_audio_chunk_transcribed_and_forwarded_to_orchestrator(
     mock_reg.close = _AM()
 
     with TestClient(app) as client, client.websocket_connect("/ws/stream") as ws:
+        wire_stream_orchestrator(mock_reg, app.state.channel_hub)  # 5.0 PR 2b
         ws.send_json(HANDSHAKE_AUDIO)
         ws.send_bytes(b"\x00" * 512)  # PCM fake
         # Esperar transcripción final (nuevo protocolo: gateway no auto-despacha)
@@ -194,6 +197,7 @@ def test_transcriber_connect_uses_stt_language_from_config(mock_services, db_eng
 
     with patch("fogar_gateway.services.transcriber_client.TranscriberClient.connect", spy_connect):
         with TestClient(app) as client:
+            wire_stream_orchestrator(mock_reg, app.state.channel_hub)  # 5.0 PR 2b
             with client.websocket_connect("/ws/stream") as ws:
                 ws.send_json(HANDSHAKE_AUDIO)
                 ws.send_bytes(b"\x00" * 512)
@@ -242,20 +246,24 @@ def test_tts_connect_uses_voice_and_speed_from_config(mock_services, db_engine, 
 
     with patch("fogar_gateway.services.tts_client.TTSClient.connect", spy_tts_connect):
         with TestClient(app) as client:
+            wire_stream_orchestrator(mock_reg, app.state.channel_hub)  # 5.0 PR 2b
             with client.websocket_connect("/ws/stream") as ws:
                 # output_mode=["audio"] para que el bridge instancie TTSClient
                 ws.send_json(
                     {
-                        "client_key": VALID_KEY,
+                        "token": VALID_KEY,
+                        "protocol": 5,
                         "input_mode": "text",
                         "output_mode": ["audio", "text"],
                     }
                 )
-                ws.send_text("test")
-                try:
-                    ws.receive_json()
-                except Exception:
-                    pass
+                ws.send_json({"type": "send", "text": "test"})
+                # Desde la 5.0 el turno (y su TTS) se abre con el primer evento del run:
+                # hay que esperar a su turn_end, no al primer mensaje (ready/message).
+                for _ in range(50):
+                    msg = ws.receive()
+                    if "text" in msg and json.loads(msg["text"]).get("type") == "turn_end":
+                        break
 
     assert connect_calls, "TTSClient.connect nunca fue llamado"
     assert connect_calls[0]["voice"] == "bf_emma"

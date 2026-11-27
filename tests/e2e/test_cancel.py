@@ -18,15 +18,19 @@ async def test_cancel_stops_the_active_turn_on_real_openclaw(test_client_record,
                 }
             )
         )
-        # Wait for turn_start to confirm the turn is actually running before cancelling.
+        # Wait for turn_start to confirm the turn is actually running before cancelling
+        # (protocol 5: the send's own `message` echo comes first).
         first = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+        while first["type"] == "message":
+            first = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
         assert first["type"] == "turn_start"
         cancelled_turn_id = first["turn_id"]
 
         await cancel_active_turn(ws)
 
-        # Since #215 (G-10) a cancelled turn is closed with exactly one turn_end
-        # (no `interrupted`: that is only for barge-in). Drain briefly and check.
+        # Since #215 (G-10) a cancelled turn is closed with exactly one turn_end, reason
+        # `cancelled` (`interrupted` is only for a `send` with `interrupt`; 5.0, #406: speaking
+        # never cuts). Drain briefly and check.
         leftover_frames = []
         try:
             while True:
@@ -40,6 +44,7 @@ async def test_cancel_stops_the_active_turn_on_real_openclaw(test_client_record,
             if f.get("turn_id") == cancelled_turn_id and f["type"] == "turn_end"
         ]
         assert len(ends) == 1, f"se esperaba un único turn_end del turno cancelado: {leftover_frames}"
+        assert ends[0]["reason"] == "cancelled"
 
         # A fresh turn afterwards must complete normally — proves the session
         # wasn't left in a broken state by the cancellation.

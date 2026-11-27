@@ -97,15 +97,18 @@ async def test_send_message_dispatches_to_orchestrator(make_loop_bridge):
     )
     await bridge._client_input_loop()
     await asyncio.sleep(0.01)
-    # the disconnect that ends the loop also ends the new turn (G-18)
+    # 5.0 (decision 2): the disconnect no longer ends the channel's turn; the session's
+    # close does, with the session's own turn_end (`closed`).
+    await bridge.close_all()
     assert await _turns(bridge) == [("turn_start", "t-1"), ("turn_end", "t-1")]
-    await _stop(bridge)
+    assert bridge.turns.last_ended.end_reason == "closed"
 
 
-async def test_plain_text_starts_a_turn(make_loop_bridge):
-    """En modo texto, texto plano arranca un turno sin bloquear el bucle de entrada."""
+async def test_plain_text_is_invalid_message_in_text_mode(make_loop_bridge):
+    """Un frame que no es JSON es INVALID_MESSAGE en cualquier input_mode, nunca un turno."""
     bridge, ws, _ = make_loop_bridge(input_mode="text")
     bridge.transcriber = None
+    bridge.turns.start_user_turn = AsyncMock()
 
     ws.receive = AsyncMock(
         side_effect=[
@@ -114,12 +117,14 @@ async def test_plain_text_starts_a_turn(make_loop_bridge):
         ]
     )
 
-    await asyncio.wait_for(bridge._client_input_loop(), 2.0)  # the loop did not block on it
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(bridge._client_input_loop(), 2.0)
+    await sent(bridge)
 
-    # the disconnect that ends the loop also ends the new turn (G-18)
-    assert await _turns(bridge) == [("turn_start", "t-1"), ("turn_end", "t-1")]
-    await _stop(bridge)
+    bridge.turns.start_user_turn.assert_not_awaited()
+    errors = ws.of("error")
+    assert len(errors) == 1
+    assert errors[0]["code"] == "INVALID_MESSAGE" and errors[0]["fatal"] is False
+    assert "hola" not in json.dumps(errors)
 
 
 async def test_receiving_message_updates_last_client_activity(make_loop_bridge):
@@ -142,8 +147,9 @@ async def test_receiving_message_updates_last_client_activity(make_loop_bridge):
     await _stop(bridge)
 
 
-async def test_plain_text_cancels_previous_active_turn(make_loop_bridge):
-    """En modo texto, un segundo mensaje plano debe cancelar el turn en vuelo."""
+async def test_send_cancels_previous_active_turn(make_loop_bridge):
+    """En modo texto, un segundo {type:send} con `interrupt` debe cancelar el turn en vuelo
+    (5.0 PR 2b: sin él, espera en la cola; tests/unit/test_channel_queue.py)."""
     bridge, ws, _ = make_loop_bridge(input_mode="text")
     bridge.transcriber = None
     first_task = await start_turn(bridge, "primero")
@@ -151,7 +157,7 @@ async def test_plain_text_cancels_previous_active_turn(make_loop_bridge):
 
     ws.receive = AsyncMock(
         side_effect=[
-            {"type": "websocket.message", "text": "nuevo mensaje"},
+            {"type": "websocket.message", "text": json.dumps({"type": "send", "text": "nuevo mensaje", "interrupt": True})},
             {"type": "websocket.disconnect"},
         ]
     )
@@ -159,7 +165,8 @@ async def test_plain_text_cancels_previous_active_turn(make_loop_bridge):
     await bridge._client_input_loop()
     await asyncio.sleep(0.01)
 
-    assert first_task.cancelled(), "El turn anterior debe cancelarse al llegar texto plano nuevo"
+    assert first_task.cancelled(), "El turn anterior debe cancelarse al llegar un send nuevo"
+    await bridge.close_all()  # 5.0 (decision 2): the disconnect leaves t-2 to the close
     assert await _turns(bridge) == [
         ("turn_start", "t-1"), ("turn_end", "t-1"), ("turn_start", "t-2"), ("turn_end", "t-2"),
     ]  # fmt: skip
@@ -202,7 +209,8 @@ async def test_cancel_message_with_no_active_turn_is_harmless(make_loop_bridge):
 
 
 async def test_second_send_cancels_first_active_turn(make_loop_bridge):
-    """Un segundo {type:'send'} debe cancelar el turn en vuelo antes de crear uno nuevo."""
+    """Un segundo {type:'send'} con `interrupt` debe cancelar el turn en vuelo antes de crear
+    uno nuevo (5.0 PR 2b)."""
     bridge, ws, _ = make_loop_bridge(input_mode="audio")
 
     # Un turn en vuelo que bloquea indefinidamente
@@ -211,7 +219,7 @@ async def test_second_send_cancels_first_active_turn(make_loop_bridge):
 
     ws.receive = AsyncMock(
         side_effect=[
-            {"type": "websocket.message", "text": json.dumps({"type": "send", "text": "segundo"})},
+            {"type": "websocket.message", "text": json.dumps({"type": "send", "text": "segundo", "interrupt": True})},
             {"type": "websocket.disconnect"},
         ]
     )
@@ -223,6 +231,7 @@ async def test_second_send_cancels_first_active_turn(make_loop_bridge):
     )
     assert bridge.turns.user_task is not first_task
     await asyncio.sleep(0.01)
+    await bridge.close_all()  # 5.0 (decision 2): the disconnect leaves t-2 to the close
     assert await _turns(bridge) == [
         ("turn_start", "t-1"), ("turn_end", "t-1"), ("turn_start", "t-2"), ("turn_end", "t-2"),
     ]  # fmt: skip
@@ -258,7 +267,9 @@ async def test_deeply_nested_json_is_treated_as_unparsed_text(make_bridge):
     ws.inbox.put_nowait(_text("[" * 100_000))
     ws.inbox.put_nowait({"type": "websocket.disconnect"})
     await asyncio.wait_for(bridge._client_input_loop(), 2.0)
-    bridge.turns.start_user_turn.assert_awaited_once()
+    bridge.turns.start_user_turn.assert_not_awaited()
+    await sent(bridge)
+    assert [e["code"] for e in ws.of("error")] == ["INVALID_MESSAGE"]
     assert bridge._close_reason is None
 
 

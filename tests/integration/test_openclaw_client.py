@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from fogar_gateway.services.channel import ChannelHub
 from fogar_gateway.services.openclaw.client import (
     ORCHESTRATOR_HANDSHAKE_FAILED_ERROR,
     OpenClawClient,
@@ -15,11 +16,8 @@ from fogar_gateway.services.openclaw.client import (
 )
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.reconnecting import ReconnectingOpenClawClient
-from fogar_gateway.services.openclaw.registry import (
-    TURN_IN_PROGRESS_ERROR,
-    ClientRegistry,
-    TurnRegistry,
-)
+from fogar_gateway.services.openclaw.registry import TurnRegistry
+from fogar_gateway.services.orchestration import OrchestratorError
 from fogar_gateway.services.reconnection import ConnectionState
 from tests.fakes.openclaw import FakeOpenClawServer
 
@@ -89,6 +87,8 @@ class SmartFakeWS:
         self.tool_calls: dict[str, list[dict]] = tool_calls or {}
         # Flip to False to make agents.list answer ok:false (roster fetch failure, #151).
         self.agents_list_ok: bool = True
+        # Flip to False to leave every chat.send without its ack.
+        self.ack_chat_send: bool = True
         self._to_client: asyncio.Queue = asyncio.Queue()
         self._from_client: asyncio.Queue = asyncio.Queue()
         self.sent_frames: list[dict] = []
@@ -187,6 +187,9 @@ class SmartFakeWS:
                     )
                 )
 
+            elif method == "chat.send" and not self.ack_chat_send:
+                pass
+
             elif method == "chat.send":
                 sk = params.get("sessionKey", "")
                 run_id = str(uuid.uuid4())
@@ -252,8 +255,7 @@ class SmartFakeWS:
 
 def make_client(fake_ws: SmartFakeWS) -> OpenClawClient:
     turn_reg = TurnRegistry()
-    client_reg = ClientRegistry()
-    dispatcher = FrameDispatcher(turn_reg, client_reg)
+    dispatcher = FrameDispatcher(turn_reg, ChannelHub())
     client = OpenClawClient("127.0.0.1", 18789, "test-token", turn_reg, dispatcher)
     return client
 
@@ -405,40 +407,46 @@ async def test_connect_sends_sessions_subscribe(fake_ws):
 
 
 @pytest.mark.asyncio
-async def test_stream_response_tokens(fake_ws):
+async def test_send_returns_the_run_id_of_its_ack(fake_ws):
+    """5.0 (#406): `send` waits only for the ack and returns its runId; `chat.send` carries a
+    flat `sessionKey` and no `queueMode` unless asked (untried live, 2b.3)."""
     client = await connected_client(fake_ws)
-    tokens = []
-    async for event in client.stream_response(
-        "hola", session_key="agent:main:client-a"
-    ):
-        if event.type == "token":
-            tokens.append(event.content)
-    assert tokens == ["Hola ", "mundo"]
+    run_id = await client.send("hola", "agent:main:client-a")
+    (chat_send,) = [f for f in fake_ws.sent_frames if f.get("method") == "chat.send"]
+    assert isinstance(run_id, str) and run_id
+    assert chat_send["params"]["sessionKey"] == "agent:main:client-a"
+    assert "session" not in chat_send["params"]
+    assert "queueMode" not in chat_send["params"]
     await client.close()
 
 
 @pytest.mark.asyncio
-async def test_stream_response_ends_with_status_done(fake_ws):
+async def test_abort_run_frame_schema(fake_ws):
+    """`chat.abort` of one run: flat `sessionKey` and its `runId`, never the whole key."""
     client = await connected_client(fake_ws)
-    events = []
-    async for event in client.stream_response(
-        "hola", session_key="agent:main:client-a"
-    ):
-        events.append(event)
-    assert events[-1].type == "status"
-    assert events[-1].content == "done"
+    await client.abort_run("agent:main:client-a", "run-1", timeout=0.05)  # never answered
+    (abort,) = [f for f in fake_ws.sent_frames if f.get("method") == "chat.abort"]
+    assert abort["params"] == {"sessionKey": "agent:main:client-a", "runId": "run-1"}
     await client.close()
 
 
 @pytest.mark.asyncio
-async def test_stream_response_uses_sessionKey_format(fake_ws):
-    client = await connected_client(fake_ws)
-    async for _ in client.stream_response("hola", session_key="agent:main:client-a"):
-        pass
-    chat_sends = [f for f in fake_ws.sent_frames if f.get("method") == "chat.send"]
-    assert len(chat_sends) == 1
-    assert "sessionKey" in chat_sends[0]["params"]
-    assert "session" not in chat_sends[0]["params"]
+async def test_reconnect_fails_a_send_waiting_for_its_ack():
+    """#103/G-04: a reconnect (here, forced) tears the old connection down; a `chat.send`
+    still waiting for its ack fails with `orchestrator_disconnected` instead of hanging."""
+    silent_ws = SmartFakeWS()
+    silent_ws.ack_chat_send = False
+    client = await connected_client(silent_ws)
+    send = asyncio.create_task(client.send("hola", "agent:main:client-a"))
+    await asyncio.sleep(0.01)  # chat.send on the wire, no ack
+
+    reconnect_ws = SmartFakeWS()
+    await reconnect_ws.start()
+    with patch("websockets.connect", return_value=reconnect_ws):
+        await client.connect()
+
+    with pytest.raises(OrchestratorError, match="orchestrator_disconnected"):
+        await asyncio.wait_for(send, timeout=1.0)
     await client.close()
 
 
@@ -487,7 +495,7 @@ async def test_connect_frame_schema(fake_ws):
 
 def real_ws_client(port: int) -> OpenClawClient:
     turns = TurnRegistry()
-    return OpenClawClient("127.0.0.1", port, "tok", turns, FrameDispatcher(turns, ClientRegistry()))
+    return OpenClawClient("127.0.0.1", port, "tok", turns, FrameDispatcher(turns, ChannelHub()))
 
 
 @pytest.mark.parametrize(
@@ -500,7 +508,7 @@ def real_ws_client(port: int) -> OpenClawClient:
 )
 def test_ipv6_host_is_bracketed_in_uri(host, uri):
     turns = TurnRegistry()
-    client = OpenClawClient(host, 18789, "tok", turns, FrameDispatcher(turns, ClientRegistry()))
+    client = OpenClawClient(host, 18789, "tok", turns, FrameDispatcher(turns, ChannelHub()))
     assert client._uri == uri
 
 
@@ -510,7 +518,7 @@ def test_ipv6_host_is_bracketed_in_uri(host, uri):
 )
 def test_tls_uses_wss(host, uri):
     turns = TurnRegistry()
-    client = OpenClawClient(host, 443, "tok", turns, FrameDispatcher(turns, ClientRegistry()), tls=True)
+    client = OpenClawClient(host, 443, "tok", turns, FrameDispatcher(turns, ChannelHub()), tls=True)
     assert client._uri == uri
 
 
@@ -589,320 +597,6 @@ async def test_close_during_startup_wait_cancels_retry():
             await roc.close()
         assert server.connections == 1
         assert inner._ws is None
-
-
-@pytest.mark.asyncio
-async def test_chat_abort_frame_schema(fake_ws):
-    """chat.abort sent on task cancellation must use flat sessionKey, not nested session.key."""
-    # Create a fake WS with delays so cancellation races an in-flight response (not a completed one).
-    slow_fake_ws = SmartFakeWS(
-        {"agent:main:client-a": ["Hola ", "mundo"]},
-        chat_response_delay=0.15,  # 150ms delay between responses
-    )
-    client = await connected_client(slow_fake_ws)
-
-    async def consume():
-        async for _ in client.stream_response(
-            "hola", session_key="agent:main:client-a"
-        ):
-            pass
-
-    task = asyncio.create_task(consume())
-    await asyncio.sleep(0.01)  # let first chunk queue before cancel
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    await asyncio.sleep(0.05)  # let shield-wrapped abort send complete
-
-    aborts = [f for f in slow_fake_ws.sent_frames if f.get("method") == "chat.abort"]
-    assert len(aborts) >= 1
-    assert "sessionKey" in aborts[0]["params"]
-    assert "session" not in aborts[0]["params"]
-    await client.close()
-
-
-@pytest.mark.asyncio
-async def test_stream_response_completes_without_second_res(fake_ws):
-    """Turn completion must come from chat.state=='final', not a second res frame —
-    the real OpenClaw server (2026.6.11+) never sends one."""
-    client = await connected_client(fake_ws)
-    events = []
-    async for event in client.stream_response(
-        "hola", session_key="agent:main:client-a"
-    ):
-        events.append(event)
-    res_frames_after_started = [f for f in fake_ws.sent_frames if f.get("method") == "chat.send"]
-    assert len(res_frames_after_started) == 1  # only the request itself was sent by us
-    assert events[-1].type == "status"
-    assert events[-1].content == "done"
-    await client.close()
-
-
-@pytest.mark.asyncio
-async def test_stream_response_times_out_when_no_events_arrive(monkeypatch):
-    """#115: if OpenClaw acks chat.send but never sends another frame for this
-    turn, queue.get() must not hang forever — TURN_TIMEOUT_S bounds it, and
-    the existing chat.abort-on-anomalous-exit `finally` fires."""
-    from fogar_gateway.core.config import settings
-
-    monkeypatch.setattr(settings, "TURN_TIMEOUT_S", 0.05)
-
-    fake_ws = SmartFakeWS({"agent:main:client-a": []})  # ack only, never a chat event
-    client = await connected_client(fake_ws)
-
-    async def consume():
-        events = []
-        async for event in client.stream_response(
-            "hola", session_key="agent:main:client-a"
-        ):
-            events.append(event)
-        return events
-
-    events = await asyncio.wait_for(consume(), timeout=1.0)
-
-    assert events[-1].type == "error"
-    assert events[-1].content == "turn_timeout"
-
-    aborts = [f for f in fake_ws.sent_frames if f.get("method") == "chat.abort"]
-    assert len(aborts) == 1
-    await client.close()
-
-
-@pytest.mark.asyncio
-async def test_stream_response_overflow_errors_and_sends_chat_abort(monkeypatch):
-    """#130 S3b: a consumer that falls behind the bounded turn queue gets a
-    `turn_overflow` error and chat.abort is still sent (the error must not mark
-    the turn as finished)."""
-    from fogar_gateway.core.config import settings
-
-    monkeypatch.setattr(settings, "TURN_QUEUE_MAX", 2)
-    fake_ws = SmartFakeWS({"agent:main:client-a": []})
-    client = await connected_client(fake_ws)
-
-    async def consume():
-        return [
-            e
-            async for e in client.stream_response(
-                "hola", session_key="agent:main:client-a"
-            )
-        ]
-
-    task = asyncio.create_task(consume())
-    await asyncio.sleep(0.05)  # blocked at queue.get()
-    for i in range(10):  # no suspension point: the consumer cannot drain meanwhile
-        await client._dispatcher.dispatch(
-            {
-                "type": "event",
-                "event": "chat",
-                "payload": {
-                    "sessionKey": "agent:main:client-a",
-                    "state": "delta",
-                    "deltaText": str(i),
-                },
-            }
-        )
-    events = await asyncio.wait_for(task, timeout=1.0)
-
-    assert events[-1].type == "error"
-    assert events[-1].content == "turn_overflow"
-    await asyncio.sleep(0.05)
-    aborts = [f for f in fake_ws.sent_frames if f.get("method") == "chat.abort"]
-    assert len(aborts) == 1
-    assert client._turn_registry.get_queue_by_session("agent:main:client-a") is None
-    await client.close()
-
-
-@pytest.mark.asyncio
-async def test_stream_response_idle_reset_survives_slow_but_active_turn(monkeypatch):
-    """A turn with gaps below TURN_TIMEOUT_S between events must complete
-    normally even if its total duration exceeds TURN_TIMEOUT_S — the timeout
-    resets on every event, it is not a hard ceiling from turn start."""
-    from fogar_gateway.core.config import settings
-
-    # #206: 0.05 s / 0.03 s left 20 ms of headroom per gap and failed under load. Each gap
-    # is now 0.1 s against a 0.3 s timeout; 4 gaps (0.4 s) still exceed the timeout.
-    monkeypatch.setattr(settings, "TURN_TIMEOUT_S", 0.3)
-
-    fake_ws = SmartFakeWS(
-        {"agent:main:client-a": ["Hola ", "que ", "tal ", "mundo"]},
-        chat_response_delay=0.1,  # each gap < TURN_TIMEOUT_S, total > TURN_TIMEOUT_S
-    )
-    client = await connected_client(fake_ws)
-
-    loop = asyncio.get_running_loop()
-    started = loop.time()
-    events = []
-    async for event in client.stream_response(
-        "hola", session_key="agent:main:client-a"
-    ):
-        events.append(event)
-
-    assert events[-1].type == "status"
-    assert events[-1].content == "done"
-    tokens = [e.content for e in events if e.type == "token"]
-    assert tokens == ["Hola ", "que ", "tal ", "mundo"]
-    assert loop.time() - started > settings.TURN_TIMEOUT_S  # total really exceeded it
-    await client.close()
-
-
-@pytest.mark.asyncio
-async def test_stream_response_yields_tool_call_events():
-    fake_ws = SmartFakeWS(
-        chat_responses={"agent:main:client-a": ["Listo."]},
-        tool_calls={
-            "agent:main:client-a": [
-                {
-                    "phase": "start",
-                    "name": "exec",
-                    "toolCallId": "call-1",
-                    "args": {"command": "ls"},
-                },
-                {
-                    "phase": "result",
-                    "name": "exec",
-                    "toolCallId": "call-1",
-                    "isError": False,
-                    "result": {"content": [{"type": "text", "text": "file.txt"}]},
-                },
-            ]
-        },
-    )
-    client = await connected_client(fake_ws)
-    tool_events = []
-    async for event in client.stream_response(
-        "hola", session_key="agent:main:client-a"
-    ):
-        if event.type == "tool_call":
-            tool_events.append(event.tool_call)
-    assert len(tool_events) == 2
-    assert tool_events[0].phase == "start"
-    assert tool_events[0].name == "exec"
-    assert tool_events[0].args == {"command": "ls"}
-    assert tool_events[1].phase == "result"
-    assert tool_events[1].result == "file.txt"
-    assert tool_events[1].is_error is False
-    await client.close()
-
-
-@pytest.mark.asyncio
-async def test_concurrent_stream_response_same_session_key_rejects_one():
-    """Issue #99: two concurrent stream_response() calls sharing a session_key
-    must not corrupt each other's queue. Reproduced via asyncio.gather, per the
-    issue's repro steps — exactly one call is rejected immediately with the
-    stable TURN_IN_PROGRESS_ERROR content, the other completes normally, and
-    neither hangs."""
-    fake_ws = SmartFakeWS({"agent:main:client-a": ["Hola ", "mundo"]})
-    client = await connected_client(fake_ws)
-
-    async def _consume():
-        events = []
-        async for event in client.stream_response(
-            "hola", session_key="agent:main:client-a"
-        ):
-            events.append(event)
-        return events
-
-    results = await asyncio.wait_for(
-        asyncio.gather(_consume(), _consume()),
-        timeout=1.0,
-    )
-
-    rejected = [r for r in results if r[0].type == "error"]
-    succeeded = [r for r in results if r[0].type != "error"]
-    assert len(rejected) == 1, f"expected exactly one rejected call, got: {results}"
-    assert len(succeeded) == 1, f"expected exactly one successful call, got: {results}"
-
-    assert len(rejected[0]) == 1  # rejected call yields exactly the error event, nothing else
-    assert rejected[0][0].content == TURN_IN_PROGRESS_ERROR
-
-    tokens = [e.content for e in succeeded[0] if e.type == "token"]
-    assert tokens == ["Hola ", "mundo"]
-    assert succeeded[0][-1].type == "status"
-    assert succeeded[0][-1].content == "done"
-
-    await client.close()
-
-
-@pytest.mark.asyncio
-async def test_reconnect_errors_out_in_flight_turn_instead_of_hanging_forever():
-    """Issue #103 follow-up: _cancel_and_close() cancels the old _listener_task
-    on every reconnect (forced via admin trigger_reconnect(), or automatic).
-    _listen()'s CancelledError branch used to skip error_all() entirely (only
-    the sibling `except Exception` branch called it), so any turn still in
-    flight on the old connection was orphaned: its stream_response() consumer
-    hung forever at `await queue.get()` (no timeout anywhere in the chain),
-    and its session_key stayed registered in TurnRegistry, rejecting every
-    subsequent turn on that session with TurnInProgress until the whole WS
-    session was torn down."""
-    slow_fake_ws = SmartFakeWS(
-        {"agent:main:client-a": ["Hola ", "mundo"]},
-        chat_response_delay=0.15,
-    )
-    client = await connected_client(slow_fake_ws)
-
-    events = []
-
-    async def consume():
-        async for event in client.stream_response(
-            "hola", session_key="agent:main:client-a"
-        ):
-            events.append(event)
-
-    task = asyncio.create_task(consume())
-    await asyncio.sleep(0.01)  # let the turn register + send chat.send before reconnecting
-
-    reconnect_ws = SmartFakeWS({"agent:main:client-a": ["Otra"]})
-    await reconnect_ws.start()
-    with patch("websockets.connect", return_value=reconnect_ws):
-        await client.connect()  # forces _cancel_and_close() on the still in-flight turn
-
-    await asyncio.wait_for(task, timeout=1.0)  # must not hang
-
-    assert events, "in-flight turn must be told the connection dropped, not hang silently"
-    assert events[-1].type == "error"
-
-    await client.close()
-
-
-@pytest.mark.asyncio
-async def test_terminal_event_then_generator_close_does_not_send_spurious_chat_abort():
-    """Issue #99 follow-up: stream_response()'s terminal branches used to set
-    _finished=True *after* their yield, not before. call_orchestrator now
-    closes the generator via contextlib.aclosing() instead of abandoning it
-    (see test_orchestration.py) — closing a generator throws GeneratorExit
-    exactly at its suspended yield, skipping any code written *after* that
-    yield. If _finished were still set after the yield, a legitimately
-    terminal turn would look unfinished to the `finally` block and trigger a
-    needless chat.abort."""
-    slow_fake_ws = SmartFakeWS(
-        {"agent:main:client-a": ["Hola ", "mundo"]},
-        chat_response_delay=0.15,
-    )
-    client = await connected_client(slow_fake_ws)
-    session_key = "agent:main:client-a"
-
-    stream = client.stream_response("hola", session_key=session_key)
-
-    async def drive_and_close():
-        event = await stream.__anext__()
-        if event.type == "status":  # M19: the ack announces the turn as accepted first
-            assert event.content == "accepted"
-            event = await stream.__anext__()
-        assert event.type == "error"
-        await stream.aclose()
-
-    task = asyncio.create_task(drive_and_close())
-    await asyncio.sleep(
-        0.01
-    )  # let register() + chat.send happen before erroring it out, ahead of the first (delayed) token
-    client._turn_registry.error_all("boom")
-    await asyncio.wait_for(task, timeout=1.0)
-
-    aborts = [f for f in slow_fake_ws.sent_frames if f.get("method") == "chat.abort"]
-    assert aborts == [], f"turn already ended in error, must not also send chat.abort: {aborts}"
-    await client.close()
 
 
 @pytest.mark.asyncio
@@ -1004,40 +698,3 @@ async def test_admin_trigger_reconnect_coalesces_with_real_background_reconnect(
     assert connect_calls == 1, "admin trigger must coalesce, not open a second socket"
     assert roc.state == ConnectionState.CONNECTED
     await inner.close()
-
-
-@pytest.mark.asyncio
-async def test_concurrent_stream_response_different_session_keys_both_succeed():
-    """Regression guard: rejecting duplicate session_keys must not affect
-    unrelated sessions multiplexed on the same connection — both complete
-    normally when run concurrently via asyncio.gather."""
-    fake_ws = SmartFakeWS(
-        {
-            "agent:main:client-a": ["Hola ", "mundo"],
-            "agent:main:client-b": ["Adios ", "mundo"],
-        }
-    )
-    client = await connected_client(fake_ws)
-
-    async def _consume(session_key):
-        events = []
-        async for event in client.stream_response("hola", session_key=session_key):
-            events.append(event)
-        return events
-
-    events_a, events_b = await asyncio.wait_for(
-        asyncio.gather(
-            _consume("agent:main:client-a"),
-            _consume("agent:main:client-b"),
-        ),
-        timeout=1.0,
-    )
-
-    tokens_a = [e.content for e in events_a if e.type == "token"]
-    tokens_b = [e.content for e in events_b if e.type == "token"]
-    assert tokens_a == ["Hola ", "mundo"]
-    assert tokens_b == ["Adios ", "mundo"]
-    assert events_a[-1].content == "done"
-    assert events_b[-1].content == "done"
-
-    await client.close()

@@ -29,7 +29,7 @@ const MENSAJES: Partial<Record<ApiError['kind'], string>> = {
 
 interface Login {
   client_id: string
-  client_key: string
+  token: string
   user: SessionUser
 }
 
@@ -51,10 +51,12 @@ async function entrar(): Promise<void> {
         device_name: deviceName(navigator.userAgent),
         client_type: 'web',
         capabilities: ['screen'],
+        // Pide todo: el gateway lo recorta al rol de la persona (5.0, #410).
+        scopes: ['conversations:write', 'home:admin'],
       }),
     })
     clave.value = ''
-    session.signIn(r.client_key, r.client_id, r.user, recordar.value)
+    session.signIn(r.token, r.client_id, r.user, recordar.value)
     await router.replace(session.isAdmin ? '/' : '/conversaciones')
   } catch (e) {
     error.value = (e instanceof ApiError && MENSAJES[e.kind]) || 'Algo ha fallado al entrar. Prueba otra vez.'

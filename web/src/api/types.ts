@@ -28,7 +28,6 @@ export interface LiveSession {
   turn: { kind: 'idle' | 'normal' | 'push'; since_s: number | null }
   turn_count: number
   sender: { pending_msgs: number; pending_bytes: number; peak_msgs: number; peak_bytes: number }
-  turn_queue: { depth: number; peak: number }
   push_backlog: { pending: number; peak: number }
   last_activity_s: number | null
   stt_state: ServiceState | null
@@ -99,11 +98,8 @@ export interface ClientResponse {
   stt_vad_thold: number
   tts_voice: string
   tts_speed: number
-  barge_in_enabled: boolean
-  barge_in_min_chars: number
   output_mode: OutputMode[] | null
   silence_timeout_s: number
-  max_silence_turns: number
   push_enabled: boolean
   tool_calls_enabled: boolean
 }
@@ -116,12 +112,14 @@ export interface ClientWithKey extends ClientResponse {
 // Emparejamiento: src/api/pairing_routes.py. Códigos de 6 cifras, 10 min, hasta 5 abiertos.
 export type PairingState = 'open' | 'used' | 'expired' | 'cancelled'
 
-/** Plantilla de `POST /admin/pairing`: los campos de crear un cliente, todos opcionales y sin clave. */
+/** Plantilla de `POST /home/pairing`: los campos de crear un cliente, todos opcionales y sin clave. */
 export type PairingTemplate = Partial<Omit<ClientResponse, 'id' | 'key_fp' | 'is_active' | 'created_at' | 'client_type'>> & {
   client_type?: ClientType | null
+  /** 5.0: los permisos que concede el código (un aparato del hogar llega como mucho a `home:read`). */
+  scopes?: string[]
 }
 
-/** `GET /admin/pairing` y `/{id}`: nunca lleva el código. */
+/** `GET /home/pairing` y `/{id}`: nunca lleva el código. */
 export interface PairingSummary {
   id: string
   state: PairingState
@@ -131,12 +129,12 @@ export interface PairingSummary {
   template: PairingTemplate
 }
 
-/** `POST /admin/pairing`: el código solo llega aquí. */
+/** `POST /home/pairing`: el código solo llega aquí. */
 export interface PairingOpened extends PairingSummary {
   code: string
 }
 
-/** `/admin/orchestrator/status`, `/admin/transcriber/status`, `/admin/tts/status`. */
+/** `/system/services/orchestrator`, `/system/services/transcriber`, `/system/services/tts`. */
 export interface ServiceDetail {
   name: string
   provider?: string
@@ -152,7 +150,7 @@ export interface ReadyResponse {
   services: Record<'orchestrator' | 'transcriber' | 'tts', 'ok' | 'unavailable'>
 }
 
-/** `POST /admin/clients` (sin clave: la genera el gateway) y `PATCH` (solo lo que cambia). */
+/** `POST /home/devices` (sin clave: la genera el gateway) y `PATCH` (solo lo que cambia). */
 export type ClientInput = Partial<Omit<ClientResponse, 'id' | 'key_fp' | 'created_at'>>
 
 // Sesiones en memoria: src/api/admin_routes.py (_session_summary, _session_detail).
@@ -212,9 +210,21 @@ export interface Conversation {
 }
 
 export interface ConversationMessage {
+  /** El de OpenClaw (5.0): estable, también para la voz bajo demanda. */
+  id?: string | null
   role: 'user' | 'assistant'
   text: string
   timestamp: string | null
+}
+
+/** `GET /conversations/{id}` (5.0): la conversación con su estado en vivo. */
+export interface ConversationLive extends Conversation {
+  /** El turno en curso (su `turn_start` de /events más el texto que lleva), o null. */
+  turn: ({ turn_id: string; origin?: 'user' | 'push'; text: string; [key: string]: unknown }) | null
+  /** Sus mensajes pendientes, como los `message` de /events. */
+  pending: Array<Record<string, unknown>>
+  /** El último id de /events que incluye: lo que llegue con id ≤ as_of ya está aquí. */
+  as_of: number
 }
 
 export interface ConversationMessages {
@@ -223,7 +233,7 @@ export interface ConversationMessages {
   has_more: boolean
 }
 
-/** `GET /admin/conversations/agents`: con qué agentes puede empezar el panel y cuál tocaría sin elegir. */
+/** `GET /conversations/agents`: con qué agentes puede empezar el panel y cuál tocaría sin elegir. */
 export interface ConversationAgents {
   agents: string[]
   default: string | null
@@ -261,6 +271,8 @@ export interface Home {
   id: string
   name: string
   agent: string | null
+  /** El dispositivo de avisos del hogar; `null`, ninguno. */
+  notify_client_id?: string | null
 }
 
 export interface MyDevice {
@@ -269,6 +281,21 @@ export interface MyDevice {
   client_type: string | null
   created_at: string
   last_seen_at: string | null
+  /** Falso si un administrador lo desactivó (sin retirarlo). */
+  is_active?: boolean
+  /** Recibe avisos (push); sin ellos no vale como dispositivo de avisos. */
+  push_enabled?: boolean
+  /** Lo que sabe reproducir (de su ficha); `null`, sin fijar. */
+  output_mode?: OutputMode[] | null
   /** Este navegador. */
   current: boolean
+}
+
+/** `GET`/`PATCH /auth/me`: quién soy y dónde suenan mis avisos. */
+export interface Me {
+  user: { id: string; username: string; display_name: string; role: UserRole }
+  home: { id: string; name: string } | null
+  device: MyDevice | null
+  /** Mi dispositivo de avisos (uno de mis aparatos personales); `null`, ninguno. */
+  notify_client_id: string | null
 }

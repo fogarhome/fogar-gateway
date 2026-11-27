@@ -22,7 +22,7 @@ def approve_command(request_id: str | None) -> str:
 
 
 # La causa de `identity_required`, en una frase: la usan la CLI (`cli/openclaw_access.py`) y el
-# panel (`/admin/state`, `identity_error_text`), para que digan lo mismo.
+# panel (`/system/state`, `identity_error_text`), para que digan lo mismo.
 IDENTITY_ERROR_TEXT: dict[str, str] = {
     "identity_file_invalid": "el fichero de identidad del gateway no vale o no se puede crear",
     "challenge_without_nonce": "este OpenClaw no manda nonce en el reto y no hay nada que firmar",
@@ -105,7 +105,7 @@ class GatewayInfo:
 @dataclass
 class OrchestratorAccess:
     """Con qué acceso está (o intenta estar) el gateway en OpenClaw *ahora*: lo enseñan
-    `/admin/state`, `fogar-gw status` y `doctor`. Lo actualiza OpenClawClient en el sitio (nunca
+    `/system/state`, `fogar-gw status` y `doctor`. Lo actualiza OpenClawClient en el sitio (nunca
     se reemplaza): al conectar, con PAIRING_REQUIRED, y vuelve a `unknown` (`reset()`) cuando un
     connect falla o la conexión se cae, para no enseñar como actual un acceso que ya no hay. Sin
     credenciales: el deviceId y el id de la petición de emparejamiento son públicos."""

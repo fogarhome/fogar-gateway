@@ -1,4 +1,4 @@
-"""/admin/users (M20): usuarios del hogar, siempre con un dueño."""
+"""/home/users (M20): usuarios del hogar, siempre con un dueño."""
 
 import pytest
 from sqlmodel import Session, select
@@ -22,13 +22,14 @@ def http(mock_services, mock_registry, monkeypatch):
 def _create(http, headers, username, role="member", **extra):
     body = {"username": username, "display_name": username.title(), "password": PW, "role": role,
             **extra}
-    return http.post("/admin/users", json=body, headers=headers)
+    return http.post("/home/users", json=body, headers=headers)
 
 
 def _bearer(http, username) -> dict[str, str]:
-    r = http.post("/auth/login", json={"username": username, "password": PW, "device_name": "d"})
+    r = http.post("/auth/login", json={"username": username, "password": PW, "device_name": "d",
+                                       "scopes": ["conversations:write", "home:admin"]})
     assert r.status_code == 201, r.text
-    return {"authorization": f"Bearer {r.json()['client_key']}"}
+    return {"authorization": f"Bearer {r.json()['token']}"}
 
 
 @pytest.fixture
@@ -42,7 +43,7 @@ def test_create_list_and_password_is_hashed(http, admin_headers, db_engine, owne
     ana = r.json()
     assert ana["username"] == "ana" and ana["role"] == "member" and ana["agent"] == "ana"
     assert "password" not in str(ana)
-    users = http.get("/admin/users", headers=admin_headers).json()
+    users = http.get("/home/users", headers=admin_headers).json()
     assert [u["username"] for u in users] == ["sito", "ana"]
     with Session(db_engine) as s:
         stored = s.get(UserRecord, ana["id"]).password_hash
@@ -58,7 +59,7 @@ def test_create_list_and_password_is_hashed(http, admin_headers, db_engine, owne
     ],
 )
 def test_invalid_input_is_422(http, admin_headers, body):
-    assert http.post("/admin/users", json=body, headers=admin_headers).status_code == 422
+    assert http.post("/home/users", json=body, headers=admin_headers).status_code == 422
 
 
 def test_duplicate_username_is_409(http, admin_headers, owner_id):
@@ -68,14 +69,14 @@ def test_duplicate_username_is_409(http, admin_headers, owner_id):
 
 def test_the_last_owner_cannot_go(http, admin_headers, owner_id):
     for patch in ({"role": "member"}, {"is_active": False}):
-        r = http.patch(f"/admin/users/{owner_id}", json=patch, headers=admin_headers)
+        r = http.patch(f"/home/users/{owner_id}", json=patch, headers=admin_headers)
         assert r.status_code == 409 and r.json()["detail"] == "last_owner"
-    r = http.delete(f"/admin/users/{owner_id}", headers=admin_headers)
+    r = http.delete(f"/home/users/{owner_id}", headers=admin_headers)
     assert r.status_code == 409
     second = _create(http, admin_headers, "pilar", "owner").json()["id"]
-    assert http.patch(f"/admin/users/{owner_id}", json={"role": "admin"},
+    assert http.patch(f"/home/users/{owner_id}", json={"role": "admin"},
                       headers=admin_headers).status_code == 200
-    assert http.delete(f"/admin/users/{second}", headers=admin_headers).status_code == 409
+    assert http.delete(f"/home/users/{second}", headers=admin_headers).status_code == 409
 
 
 def test_an_admin_never_touches_an_owner(http, admin_headers, owner_id):
@@ -83,31 +84,56 @@ def test_an_admin_never_touches_an_owner(http, admin_headers, owner_id):
     member_id = _create(http, admin_headers, "ana").json()["id"]
     admin = _bearer(http, "admi")
     for call in (
-        lambda: http.patch(f"/admin/users/{owner_id}", json={"display_name": "X"}, headers=admin),
-        lambda: http.put(f"/admin/users/{owner_id}/password", json={"password": "nueva-clave"},
+        lambda: http.patch(f"/home/users/{owner_id}", json={"display_name": "X"}, headers=admin),
+        lambda: http.put(f"/home/users/{owner_id}/password", json={"password": "nueva-clave"},
                          headers=admin),
-        lambda: http.delete(f"/admin/users/{owner_id}", headers=admin),
-        lambda: http.patch(f"/admin/users/{member_id}", json={"role": "owner"}, headers=admin),
+        lambda: http.delete(f"/home/users/{owner_id}", headers=admin),
+        lambda: http.patch(f"/home/users/{member_id}", json={"role": "owner"}, headers=admin),
         lambda: _create(http, admin, "otro", "owner"),
     ):
         r = call()
         assert r.status_code == 403 and r.json()["detail"] == "owner_only"
     # Lo demás, sí.
-    assert http.patch(f"/admin/users/{member_id}", json={"role": "admin"},
+    assert http.patch(f"/home/users/{member_id}", json={"role": "admin"},
                       headers=admin).status_code == 200
     assert _create(http, admin, "nuevo").status_code == 201
-    assert http.patch(f"/admin/users/{admin_id}", json={"display_name": "Yo"},
+    assert http.patch(f"/home/users/{admin_id}", json={"display_name": "Yo"},
                       headers=_bearer(http, "sito")).status_code == 200
+
+
+def test_an_admin_never_touches_an_owners_device(http, admin_headers, owner_id):
+    """El dispositivo personal de un dueño es del dueño: rotar su clave sería entrar como él."""
+    _create(http, admin_headers, "admi", "admin")
+    admin = _bearer(http, "admi")
+    r = http.post("/auth/login", json={"username": "sito", "password": PW, "device_name": "d"})
+    device = r.json()["client_id"]
+    owner = _bearer(http, "sito")
+    for call in (
+        lambda: http.post(f"/home/devices/{device}/rotate-key", headers=admin),
+        lambda: http.patch(f"/home/devices/{device}", json={"name": "X"}, headers=admin),
+        lambda: http.patch(f"/home/devices/{device}", json={"is_active": False}, headers=admin),
+        lambda: http.delete(f"/home/devices/{device}", headers=admin),
+    ):
+        r = call()
+        assert r.status_code == 403 and r.json()["detail"] == "owner_only"
+    # El dueño y la máquina, sí; y el administrador sigue con los del hogar.
+    assert http.patch(f"/home/devices/{device}", json={"name": "Mío"},
+                      headers=owner).status_code == 200
+    assert http.post(f"/home/devices/{device}/rotate-key", headers=admin_headers).status_code == 200
+    home = http.post("/home/devices", json={"name": "tele"}, headers=admin_headers).json()["id"]
+    assert http.post(f"/home/devices/{home}/rotate-key", headers=admin).status_code == 200
+    assert http.patch(f"/home/devices/{home}", json={"name": "TV"}, headers=admin).status_code == 200
+    assert http.delete(f"/home/devices/{home}", headers=admin).status_code == 204
 
 
 def test_a_member_cannot_manage_users(http, admin_headers, owner_id):
     _create(http, admin_headers, "ana")
-    r = http.get("/admin/users", headers=_bearer(http, "ana"))
+    r = http.get("/home/users", headers=_bearer(http, "ana"))
     assert r.status_code == 403
 
 
 def test_reset_password_is_the_recovery(http, admin_headers, owner_id):
-    r = http.put(f"/admin/users/{owner_id}/password", json={"password": "otra-mas-larga"},
+    r = http.put(f"/home/users/{owner_id}/password", json={"password": "otra-mas-larga"},
                  headers=admin_headers)
     assert r.status_code == 204
     bad = http.post("/auth/login", json={"username": "sito", "password": PW, "device_name": "d"})
@@ -119,9 +145,9 @@ def test_reset_password_is_the_recovery(http, admin_headers, owner_id):
 
 def test_patch_rejects_null_and_unknown_fields(http, admin_headers, owner_id):
     for body in ({"display_name": None}, {"role": None}, {"password": "x" * 10}):
-        r = http.patch(f"/admin/users/{owner_id}", json=body, headers=admin_headers)
+        r = http.patch(f"/home/users/{owner_id}", json=body, headers=admin_headers)
         assert r.status_code == 422
-    r = http.patch(f"/admin/users/{owner_id}", json={"agent": None}, headers=admin_headers)
+    r = http.patch(f"/home/users/{owner_id}", json={"agent": None}, headers=admin_headers)
     assert r.status_code == 200 and r.json()["agent"] is None
 
 
@@ -132,7 +158,7 @@ def test_deactivating_cuts_the_users_devices_now(http, admin_headers, owner_id, 
     monkeypatch.setattr(app.state.client_registry, "for_client",
                         lambda cid: [type("B", (), {"revoke": lambda self: revoked.append(cid)})()],
                         raising=False)
-    r = http.patch(f"/admin/users/{member_id}", json={"is_active": False}, headers=admin_headers)
+    r = http.patch(f"/home/users/{member_id}", json={"is_active": False}, headers=admin_headers)
     assert r.status_code == 200 and len(revoked) == 1
     assert http.get("/auth/me", headers=token).status_code == 401
     r = http.post("/auth/login", json={"username": "ana", "password": PW, "device_name": "d"})
@@ -154,14 +180,14 @@ def test_deleting_a_user_takes_their_devices_and_private_conversations(
         s.add(ConversationRecord(client_id=tv.id, agent="main",
                                  session_key="agent:main:fogar-hogar", kind="created"))
         s.commit()
-    assert http.delete(f"/admin/users/{member_id}", headers=admin_headers).status_code == 204
+    assert http.delete(f"/home/users/{member_id}", headers=admin_headers).status_code == 204
     assert http.get("/auth/me", headers=token).status_code == 401
     with Session(db_engine) as s:
         assert s.get(UserRecord, member_id) is None
         assert s.exec(select(ClientRecord).where(ClientRecord.user_id == member_id)).all() == []
         keys = [c.session_key for c in s.exec(select(ConversationRecord)).all()]
     assert keys == ["agent:main:fogar-hogar"]  # la del hogar se queda
-    assert http.delete(f"/admin/users/{member_id}", headers=admin_headers).status_code == 404
+    assert http.delete(f"/home/users/{member_id}", headers=admin_headers).status_code == 404
 
 
 # ── Conversaciones vistas por cada usuario (paso 6) ─────────────────────────
@@ -179,7 +205,7 @@ def test_each_user_sees_the_home_and_their_own(http, admin_headers, db_engine, o
 
     service = app.state.conversations
     home = asyncio.run(service.create(tv_id, "main"))
-    created = http.post("/admin/conversations", json={}, headers=ana)
+    created = http.post("/conversations", json={}, headers=ana)
     assert created.status_code == 201, created.text
     anas = created.json()
     with Session(db_engine) as s:
@@ -187,13 +213,13 @@ def test_each_user_sees_the_home_and_their_own(http, admin_headers, db_engine, o
     assert anas["owner_user_id"] == ana_id  # la crea desde su dispositivo: es suya
 
     def listed(headers):
-        rows = http.get("/admin/conversations", headers=headers).json()
+        rows = http.get("/conversations", headers=headers).json()
         return {r["id"] for r in rows}
 
     assert listed(ana) == {home.id, anas["id"]}
     assert listed(sito) == {home.id}  # ni el dueño lee lo privado de otro
     assert listed(admin_headers) == {home.id, anas["id"]}  # la máquina, todo
-    r = http.get(f"/admin/conversations/{anas['id']}/messages", headers=sito)
+    r = http.get(f"/conversations/{anas['id']}/messages", headers=sito)
     assert r.status_code == 404
 
 
@@ -208,13 +234,14 @@ def test_each_person_talks_to_their_agent_and_the_home_to_its_own(
     _create(http, admin_headers, "ana", agent="openclaw")
     ana = _bearer(http, "ana")
     sito = _bearer(http, "sito")
-    created = http.post("/admin/conversations", json={}, headers=ana).json()
+    created = http.post("/conversations", json={}, headers=ana).json()
     assert created["agent"] == "openclaw"  # el suyo
-    assert http.post("/admin/conversations", json={}, headers=sito).json()["agent"] == "main"
+    assert http.post("/conversations", json={}, headers=sito).json()["agent"] == "main"
 
-    r = http.patch("/admin/home", json={"agent": "A"}, headers=admin_headers)
-    assert r.status_code == 200 and r.json() == {"id": "home", "name": "Mi hogar", "agent": "a"}
-    assert http.post("/admin/conversations", json={}, headers=sito).json()["agent"] == "a"
+    r = http.patch("/home", json={"agent": "A"}, headers=admin_headers)
+    assert r.status_code == 200 and r.json() == {"id": "home", "name": "Mi hogar", "agent": "a",
+                                           "notify_client_id": None}
+    assert http.post("/conversations", json={}, headers=sito).json()["agent"] == "a"
     with Session(db_engine) as s:
         tv = ClientRecord(name="Tele", key_hash="h-tv")
         s.add(tv)
@@ -231,14 +258,14 @@ def test_each_person_talks_to_their_agent_and_the_home_to_its_own(
 def test_the_list_warns_when_people_share_an_agent(http, admin_headers, owner_id):
     _create(http, admin_headers, "ana")
     _create(http, admin_headers, "pilar", agent="openclaw")
-    users = {u["username"]: u for u in http.get("/admin/users", headers=admin_headers).json()}
+    users = {u["username"]: u for u in http.get("/home/users", headers=admin_headers).json()}
     assert (users["sito"]["effective_agent"], users["sito"]["agent_shared"]) == ("main", True)
     assert (users["ana"]["effective_agent"], users["ana"]["agent_shared"]) == ("main", True)
     assert (users["pilar"]["effective_agent"], users["pilar"]["agent_shared"]) == ("openclaw", False)
 
 
 def test_home_patch_validates(http, admin_headers):
-    assert http.patch("/admin/home", json={"name": None}, headers=admin_headers).status_code == 422
-    assert http.patch("/admin/home", json={"x": 1}, headers=admin_headers).status_code == 422
-    r = http.patch("/admin/home", json={"name": "Casa", "agent": None}, headers=admin_headers)
-    assert r.json() == {"id": "home", "name": "Casa", "agent": None}
+    assert http.patch("/home", json={"name": None}, headers=admin_headers).status_code == 422
+    assert http.patch("/home", json={"x": 1}, headers=admin_headers).status_code == 422
+    r = http.patch("/home", json={"name": "Casa", "agent": None}, headers=admin_headers)
+    assert r.json() == {"id": "home", "name": "Casa", "agent": None, "notify_client_id": None}

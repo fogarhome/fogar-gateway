@@ -99,7 +99,7 @@ def _invoke(ctx: click.Context, argv: list[str]) -> None:
 
 def _pick_client(ctx: click.Context) -> dict[str, Any] | None:
     try:
-        rows = api.from_context(ctx).request("GET", "/admin/clients")
+        rows = api.from_context(ctx).request("GET", "/home/devices")
     except api.ApiError as e:
         e.show()
         return None

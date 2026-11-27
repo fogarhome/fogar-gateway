@@ -6,10 +6,9 @@
 /**
  * - `backoff`: reconectar solo, con espera creciente.
  * - `on_input`: no es un fallo; se reabre cuando haga falta (en el panel, al escribir).
- * - `never_auto`: solo si lo pide la persona; reconectar solo echaría a otra sesión.
  * - `fix`: no se arregla reconectando; hay que cambiar algo (la clave, el panel activo, el agente…).
  */
-export type Reconnect = 'backoff' | 'on_input' | 'never_auto' | 'fix'
+export type Reconnect = 'backoff' | 'on_input' | 'fix'
 
 export const CLOSE_CODES = {
   1000: 'on_input', // fin normal: inactividad, silencio
@@ -18,15 +17,24 @@ export const CLOSE_CODES = {
   4000: 'fix', // handshake inválido
   4001: 'fix', // handshake no es texto
   4002: 'fix', // handshake demasiado grande
+  4003: 'fix', // versión de protocolo no admitida
   4010: 'fix', // credencial inválida o inactiva
+  4011: 'fix', // sin el permiso conversations:write
   4020: 'fix', // agente no permitido
   4021: 'fix', // agente no disponible
   4100: 'fix', // conversación no encontrada
   4101: 'fix', // agente distinto del de la conversación
-  4102: 'never_auto', // conversación abierta en otra sesión
   4200: 'fix', // credencial revocada
   4900: 'backoff', // handshake a destiempo
+  4901: 'backoff', // voz no disponible (dictado)
 } as const satisfies Record<number, Reconnect>
+
+/**
+ * Códigos retirados: el gateway ya no los manda y nunca se reutilizan (`RETIRED_CODES` del gateway).
+ * 4102 («conversation opened elsewhere»): retirado en la 5.0, una conversación puede estar abierta en
+ * varias pestañas o aparatos a la vez. Si llega de un gateway viejo, cae en la regla de su rango.
+ */
+export const RETIRED_CLOSE_CODES = [4102] as const
 
 /** La clase de un código: la de la tabla o, si no está, la de su rango (§13). */
 export function reconnectClass(code: number): Reconnect {

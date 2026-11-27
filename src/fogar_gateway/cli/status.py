@@ -1,4 +1,4 @@
-"""`fogar-gw status`: estado del gateway y de sus servicios (GET /admin/state)."""
+"""`fogar-gw status`: estado del gateway y de sus servicios (GET /system/state)."""
 
 from typing import Any
 
@@ -30,11 +30,11 @@ def status(ctx: click.Context) -> None:
     """Estado del gateway y sus servicios."""
     out = Out(ctx.find_root().obj["json"])
     client = api.from_context(ctx)
-    state = client.request("GET", "/admin/state")
+    state = client.request("GET", "/system/state")
     if out.as_json:
         out.json(state)
         return
-    owners = [u for u in client.request("GET", "/admin/users")
+    owners = [u for u in client.request("GET", "/home/users")
               if u["role"] == "owner" and u["is_active"]]
     # .get con valores por defecto: un gateway de otra versión puede traer otra forma.
     gw, services = state.get("gateway", {}), state.get("services", {})

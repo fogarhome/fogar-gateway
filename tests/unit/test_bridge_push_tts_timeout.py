@@ -145,14 +145,14 @@ async def test_audio_ignoring_cancellation_does_not_hang_the_push(make_push_brid
 async def test_enqueue_push_respawns_a_dead_worker(make_push_bridge):
     bridge = make_push_bridge(output_mode=("text",))
     await push(bridge, ("turn_start", SK), ("chat", {"deltaText": "a"}))
-    (first,) = [t for t in bridge.tasks if t.get_name() == "push_worker"]
+    first = bridge.channel._push_worker  # 5.0: the push worker is the channel's
     first.cancel()
     await asyncio.gather(first, return_exceptions=True)
 
     await asyncio.wait_for(push(bridge, ("chat", {"deltaText": "b"})), timeout=2.0)
 
-    workers = [t for t in bridge.tasks if t.get_name() == "push_worker"]
-    assert len(workers) == 2 and not workers[1].done()
+    second = bridge.channel._push_worker
+    assert second is not first and not second.done()
     assert await _tokens(bridge) == ["a", "b"]
     await bridge.close_all()
 
@@ -266,13 +266,13 @@ async def test_turn_counters(make_push_bridge, monkeypatch):
     from fogar_gateway.services.stats import gateway_stats
 
     bridge = make_push_bridge(output_mode=("text",))
-    monkeypatch.setattr(orchestration, "call_orchestrator", AsyncMock())
+    bridge.orchestrator.stream_response = tokens()
     await run_turn(bridge, "hola")
     await push(bridge, *push_reply("x", sk=SK))
-    monkeypatch.setattr(
-        orchestration, "call_orchestrator", AsyncMock(side_effect=orchestration.OrchestratorError("orchestrator_error"))
-    )
-    await run_turn(bridge, "otra")
+    # 5.0 PR 2b: the channel sends (`orchestrator.send`) and reads the run's frames.
+    bridge.orchestrator.send.side_effect = orchestration.OrchestratorError("orchestrator_error")
+    await bridge.turns.start_user_turn("otra")
+    await bridge.turns.idle()
 
     snap = gateway_stats.snapshot()
     assert snap["turns"] == {"normal": 2, "push": 1}
@@ -280,14 +280,12 @@ async def test_turn_counters(make_push_bridge, monkeypatch):
 
 
 async def test_plain_runtime_error_counts_as_internal_error(make_push_bridge, monkeypatch):
-    from fogar_gateway.services import orchestration
     from fogar_gateway.services.stats import gateway_stats
 
     bridge = make_push_bridge(output_mode=("text",))
-    monkeypatch.setattr(
-        orchestration, "call_orchestrator", AsyncMock(side_effect=RuntimeError("texto-arbitrario"))
-    )
-    await run_turn(bridge, "hola")
+    bridge.orchestrator.send.side_effect = RuntimeError("texto-arbitrario")
+    await bridge.turns.start_user_turn("hola")
+    await bridge.turns.idle()
 
     errors = gateway_stats.snapshot()["turn_errors"]
     assert errors == {"internal_error": 1}
@@ -295,12 +293,10 @@ async def test_plain_runtime_error_counts_as_internal_error(make_push_bridge, mo
 
 
 async def test_unexpected_exception_counts_as_internal_error(make_push_bridge, monkeypatch):
-    from fogar_gateway.services import orchestration
     from fogar_gateway.services.stats import gateway_stats
 
     bridge = make_push_bridge(output_mode=("text",))
-    monkeypatch.setattr(
-        orchestration, "call_orchestrator", AsyncMock(side_effect=ValueError("x"))
-    )
-    await run_turn(bridge, "hola")
+    bridge.orchestrator.send.side_effect = ValueError("x")
+    await bridge.turns.start_user_turn("hola")
+    await bridge.turns.idle()
     assert gateway_stats.snapshot()["turn_errors"] == {"internal_error": 1}

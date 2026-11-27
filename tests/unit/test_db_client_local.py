@@ -35,7 +35,7 @@ async def test_get_session_returns_client_and_config():
     assert c.is_active is True
     assert cfg.stt_language == "es"
     assert cfg.tts_voice == "af_heart"
-    assert cfg.barge_in_enabled is True
+    assert cfg.push_enabled is True
 
 
 @pytest.mark.asyncio

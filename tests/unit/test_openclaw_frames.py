@@ -9,7 +9,7 @@ def test_every_frame_is_req_type():
         (frames.sessions_subscribe, ("r",)),
         (frames.health, ("r",)),
         (frames.chat_send, ("r", "sk", "msg", "idem")),
-        (frames.chat_abort, ("r", "sk")),
+        (frames.chat_abort, ("r", "sk", "run-1")),
         (frames.agents_list, ("r",)),
     ]:
         f = fn(*args)
@@ -114,14 +114,13 @@ def test_chat_send_message_and_idempotency_key():
 
 
 def test_chat_abort_method():
-    assert frames.chat_abort("r", "sk")["method"] == "chat.abort"
+    assert frames.chat_abort("r", "sk", "run-1")["method"] == "chat.abort"
 
 
 def test_chat_abort_uses_sessionkey_not_session():
     """Regression: same rename as chat.send — both were broken in the 2026-07-01 incident."""
-    p = frames.chat_abort("r", "agent:main:hab_sito")["params"]
-    assert p["sessionKey"] == "agent:main:hab_sito"
-    assert "session" not in p
+    p = frames.chat_abort("r", "agent:main:hab_sito", "run-1")["params"]
+    assert p == {"sessionKey": "agent:main:hab_sito", "runId": "run-1"}  # only that run (5.0)
 
 
 # ── agents_list ───────────────────────────────────────────────────

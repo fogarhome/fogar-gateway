@@ -52,7 +52,7 @@ class OffSttSession:
 
 class OffSttProvider:
     name = "off"
-    capabilities = SttCapabilities(partials=False, warmup_s=0.0)
+    capabilities = SttCapabilities(warmup_s=0.0)
 
     def __init__(self) -> None:
         self.state = ConnectionState.DEGRADED

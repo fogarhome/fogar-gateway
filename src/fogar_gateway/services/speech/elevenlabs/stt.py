@@ -605,7 +605,7 @@ class ElevenLabsSttSession:
 
 class ElevenLabsSttProvider(ProbedProvider):
     name = "elevenlabs"
-    capabilities = SttCapabilities(partials=True, warmup_s=2.5)
+    capabilities = SttCapabilities(warmup_s=2.5)
 
     state = health_attr("state")
     on_state_change = health_attr("on_state_change")
@@ -614,7 +614,7 @@ class ElevenLabsSttProvider(ProbedProvider):
         self._settings = settings
         self._key = api_key(settings)
         self._base = settings.ELEVENLABS_BASE_URL
-        self.audio_gate = settings.STT_AUDIO_GATE  # lo lee GET /admin/speech
+        self.audio_gate = settings.STT_AUDIO_GATE  # lo lee GET /system/speech
         self._sem = asyncio.Semaphore(MAX_SESSIONS)
         self._health = ServiceHealth("transcriber", ConnectionState.CONNECTED)
         self._sessions: set[ElevenLabsSttSession] = set()

@@ -29,9 +29,9 @@ def cancel_requested() -> bool:
     return task is not None and task.cancelling() > 0
 
 
-def _retrieve(task: asyncio.Task[Any]) -> None:
-    # Done-callback de una tarea abandonada por timeout: recoge su excepción para que
-    # no salga «Task exception was never retrieved» con el texto completo.
+def retrieve_outcome(task: asyncio.Task[Any]) -> None:
+    """Done-callback de una tarea abandonada (cancelada sin esperarla): recoge su excepción
+    para que no salga «Task exception was never retrieved» con el texto completo."""
     if not task.cancelled():
         task.exception()
 
@@ -75,7 +75,7 @@ class Teardown:
     def raise_if_cancelled(self) -> None:
         """Relanza solo la cancelación recibida durante este `Teardown`, no una heredada.
 
-        Para esperas fuera de un cierre (p. ej. el barge-in), donde una cancelación
+        Para esperas fuera de un cierre (p. ej. el `chat.abort` de un run), donde una cancelación
         que otro se tragó antes no debe tumbar la tarea que espera.
         """
         if self.cancelled:
@@ -101,7 +101,7 @@ class Teardown:
         if not task.done():
             # Abandonado por timeout: se cancela sin esperar (ya se esperó el tope).
             task.cancel()
-            task.add_done_callback(_retrieve)
+            task.add_done_callback(retrieve_outcome)
 
     async def cancel(
         self, task: asyncio.Task[Any] | None, what: str, timeout: float | None = None

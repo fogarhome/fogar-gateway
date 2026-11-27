@@ -77,6 +77,13 @@ def test_redeem_marks_used_and_returns_client(store):
         store.redeem(item.code, _create())
 
 
+@pytest.mark.parametrize("sep", [" ", "\u00a0", "-", ".", "·", "\t"])
+def test_redeem_ignores_separators_from_copying_or_dictating(store, sep):
+    item = store.open({})
+    record = store.redeem(f" {item.code[:3]}{sep}{item.code[3:]}\n", _create())
+    assert record.id == "c1"
+
+
 def test_redeem_is_single_use_under_concurrency(store):
     item = store.open({})
     calls: list[dict] = []

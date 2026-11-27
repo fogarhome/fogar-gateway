@@ -67,7 +67,7 @@ def test_rest_default_agent_applied_when_model_missing(
     """default_agent='a' set, body.model='' → 200, session uses agent='a'."""
     _patch_client(db_engine, default_agent="a", allowed_agents=None)
 
-    from fogar_gateway.services.protocol import OrchestratorEvent
+    from tests.fakes.orchestrator import OrchestratorEvent
 
     captured = {}
 
@@ -88,28 +88,3 @@ def test_rest_default_agent_applied_when_model_missing(
     assert captured.get("session_key") == default_conversation_key(db_engine, "a")
 
 
-def test_rest_legacy_trusted_origin_still_uses_gateway_default(client, mock_orchestrator):
-    """Trusted-origin (no Bearer) — body.model ignored, gateway default used.
-
-    Regression check: this path must keep working exactly as before.
-    """
-    from fogar_gateway.core.session_key import make_session_key
-    from fogar_gateway.services.protocol import OrchestratorEvent
-
-    captured = {}
-
-    async def _stream(text, session_key=None):
-        captured["session_key"] = session_key
-        yield OrchestratorEvent(type="token", content="ok")
-        yield OrchestratorEvent(type="status", content="done")
-
-    mock_orchestrator.stream_response = _stream
-
-    r = client.post(
-        "/v1/chat/completions",
-        json={"model": "anything", "messages": [{"role": "user", "content": "hi"}]},
-        # NO auth_headers — trusted origin path
-    )
-    assert r.status_code == 200
-    # gateway_info mock default_agent_id='main', client_id='ha' for legacy
-    assert captured.get("session_key") == make_session_key("main", "ha")

@@ -1,19 +1,38 @@
-import { label, NOT_IN_OPENCLAW, ownText, TURN_ERROR, TURN_PROGRESS } from './labels'
+import { NOT_IN_OPENCLAW, ownText, TURN_PROGRESS, turnErrorText } from './labels'
 import { reconnectClass, type Reconnect } from './closeCodes'
 
-// El chat del panel por el WebSocket (docs/client-protocol.md): lo que llega, cómo queda en pantalla y
-// qué hacer cuando se cierra. Sin Vue ni sockets: lo usa `chatSession.ts` y se prueba solo.
+// El chat del panel (docs/client-protocol.md §16): lo que llega por `/events`, cómo queda en pantalla y
+// qué hacer cuando algo se corta. Sin Vue ni red: lo usa `chatSession.ts` y se prueba solo.
 
 /** Lo que el gateway manda en una sesión de texto (`output_mode: ["text", "status"]`) que el chat usa. */
 export type ServerMessage =
   | { type: 'ready'; session_id: string; agent: string; conversation?: { id: string; agent: string } }
-  | { type: 'turn_start'; turn_id: string; turn_seq: number; conversation?: string | null; origin?: 'user' | 'push' }
+  | {
+      type: 'turn_start'
+      turn_id: string
+      turn_seq?: number
+      conversation?: string | null
+      origin?: 'user' | 'push'
+      /** Quién lo inició (5.0): su aparato, y si es este; `null` en un push. */
+      by?: { device_id: string; name: string; self: boolean } | null
+    }
   | { type: 'token'; turn_id: string; text: string }
   | { type: 'turn_progress'; turn_id: string; phase: string; tool?: string | null }
   | { type: 'turn_end'; turn_id: string; reason?: string }
   | { type: 'error'; code: string; message: string; fatal: boolean; turn_id?: string }
   | { type: 'status'; service: string; state: string }
+  | {
+      type: 'message'
+      id: string
+      conversation: string
+      text: string
+      from: { source: string; device_id: string; name: string; self: boolean }
+      state: MessageState
+    }
   | { type: string; [key: string]: unknown }
+
+/** El estado de un mensaje de una persona (5.0): espera en la cola, ya tiene turno, o se quitó. */
+export type MessageState = 'pending' | 'delivered' | 'withdrawn'
 
 export interface ChatLine {
   key: string
@@ -34,8 +53,10 @@ export interface ChatLine {
   otherConversation?: string | null
   /** Solo en las tuyas: escrita con la conversación dormida y no llegó a salir (falló la reconexión). */
   unsent?: boolean
-  /** Solo en las de Fogar que responden: la clave de la línea tuya a la que responden. */
-  ask?: string
+  /** Solo en las de una persona (5.0): el id de su mensaje, su estado y de qué aparato es. */
+  messageId?: string
+  messageState?: MessageState
+  from?: { name: string; self: boolean }
 }
 
 export interface TurnProgress {
@@ -49,57 +70,37 @@ export function progressText(progress: TurnProgress): string {
   return ownText(TURN_PROGRESS, progress.phase) ?? 'Trabajando…'
 }
 
-/** Las líneas de la conversación en vivo, en el orden en que llegan (el orden total del gateway). */
+/** Las líneas de la conversación en vivo, en el orden en que llegan (el orden de `/events`). */
 export class ChatLog {
   lines: ChatLine[] = []
-  private seq = 0
-  /** Lo que salió hacia el gateway y aún espera su `turn_start`, en orden (el gateway responde en orden). */
-  private awaiting: string[] = []
 
   constructor(private conversationId: string) {}
 
-  /** Añade lo que escribiste; devuelve su clave (para marcarla si no llega a salir). */
-  addUser(text: string, at = new Date().toISOString()): string {
-    const key = `u-${++this.seq}`
-    this.lines.push({ key, role: 'user', text, at, state: 'ended', reason: 'done' })
-    return key
-  }
-
-  /** Lo escrito salió hacia el gateway: su `turn_start` será el siguiente que no sea push. */
-  sent(key: string): void {
-    this.awaiting.push(key)
-  }
-
-  markUnsent(key: string): void {
-    const line = this.lines.find((l) => l.key === key)
-    if (line) line.unsent = true
-  }
-
   /**
-   * Las claves de lo terminado: lo que una lectura de lo dicho pedida ahora ya puede traer. Lo tuyo
-   * sin `turn_start` todavía no cuenta: OpenClaw quizá aún no lo tiene.
+   * Las claves de lo terminado: lo que una lectura de lo dicho pedida ahora ya trae. Un mensaje
+   * pendiente o quitado no cuenta (OpenClaw aún no lo tiene, o nunca lo tendrá).
    */
   endedKeys(): string[] {
-    return this.lines.filter((l) => l.state === 'ended' && !this.awaiting.includes(l.key)).map((l) => l.key)
+    return this.lines
+      .filter((l) => (l.role === 'user' ? l.messageState === 'delivered' : l.state === 'ended'))
+      .map((l) => l.key)
   }
 
   /**
    * Se ha vuelto a leer lo dicho de OpenClaw, que ya trae lo terminado antes de pedirlo (`keys`, de
    * `endedKeys()`): fuera eso, para no enseñarlo dos veces. Se queda lo que OpenClaw no tiene: lo de
-   * otra conversación, lo que no salió (`keep`: además lo que espera a salir) y el turno que no llegó
-   * a OpenClaw (`NOT_IN_OPENCLAW`) con tu mensaje.
+   * otra conversación y el turno que no llegó a OpenClaw (`NOT_IN_OPENCLAW`).
    */
-  dropReloaded(keys: Iterable<string>, keep?: string | null): void {
+  dropReloaded(keys: Iterable<string>): void {
     const drop = new Set(keys)
-    const notInOpenClaw = new Set<string>()
-    for (const l of this.lines) {
-      if (!l.error || !NOT_IN_OPENCLAW.has(l.error)) continue
-      notInOpenClaw.add(l.key)
-      if (l.ask) notInOpenClaw.add(l.ask)
-    }
     this.lines = this.lines.filter(
-      (l) => !drop.has(l.key) || l.otherConversation || l.unsent || l.key === keep || notInOpenClaw.has(l.key) || this.awaiting.includes(l.key),
+      (l) => !drop.has(l.key) || l.otherConversation || (l.error != null && NOT_IN_OPENCLAW.has(l.error)),
     )
+  }
+
+  /** Ya no queda nada en vivo (al entrar de nuevo tras un `resync`). */
+  clear(): void {
+    this.lines = []
   }
 
   private turn(turnId: string): ChatLine | undefined {
@@ -110,17 +111,35 @@ export class ChatLog {
     return undefined
   }
 
-  /** Aplica un mensaje del gateway. Devuelve `true` si cambió algo de la conversación. */
+  /** Aplica un evento. Devuelve `true` si cambió algo de la conversación. */
   apply(msg: ServerMessage, at = new Date().toISOString()): boolean {
     switch (msg.type) {
+      case 'message': {
+        const m = msg as Extract<ServerMessage, { type: 'message' }>
+        if (typeof m.id !== 'string') return false
+        const key = `m-${m.id}`
+        const line = this.lines.find((l) => l.key === key)
+        if (line) {
+          line.messageState = m.state
+          return true
+        }
+        this.lines.push({
+          key,
+          role: 'user',
+          text: m.text,
+          at,
+          state: 'ended',
+          reason: 'done',
+          messageId: m.id,
+          messageState: m.state,
+          from: { name: m.from?.name ?? '', self: m.from?.self ?? false },
+        })
+        return true
+      }
       case 'turn_start': {
         const m = msg as Extract<ServerMessage, { type: 'turn_start' }>
-        // Un turn_id se repite tras reconectar (t-1, t-2… por sesión): el viejo ya terminó.
-        const old = this.turn(m.turn_id)
-        if (old) old.key = `${old.key}-${++this.seq}`
+        if (this.turn(m.turn_id)) return false // ya estaba (lo trajo el estado al entrar)
         const other = m.conversation && m.conversation !== this.conversationId ? m.conversation : null
-        // Responde a tu mensaje más viejo aún sin respuesta (un push no responde a nada).
-        const ask = m.origin === 'push' ? undefined : this.awaiting.shift()
         this.lines.push({
           key: `t-${m.turn_id}`,
           role: 'assistant',
@@ -129,7 +148,6 @@ export class ChatLog {
           origin: m.origin === 'push' ? 'push' : 'user',
           state: 'streaming',
           ...(other ? { otherConversation: other } : {}),
-          ...(ask ? { ask } : {}),
         })
         return true
       }
@@ -169,13 +187,8 @@ export class ChatLog {
     }
   }
 
-  /**
-   * El socket se cerró: lo que seguía abierto ya no va a terminar (su `turn_end` no llegará) y lo
-   * tuyo sin `turn_start` no llegó a empezar.
-   */
+  /** Lo que seguía abierto ya no va a terminar aquí (su `turn_end` no llegará: `resync`). */
   closeOpenTurns(): void {
-    for (const key of this.awaiting) this.markUnsent(key)
-    this.awaiting = []
     for (const line of this.lines) {
       if (line.state === 'streaming') {
         line.state = 'ended'
@@ -188,11 +201,22 @@ export class ChatLog {
   get turnOpen(): boolean {
     return this.lines.some((line) => line.state === 'streaming')
   }
+
+  /** El `turn_id` del turno abierto de esta conversación (no un aviso de otra que se ve aquí). */
+  get openTurnId(): string | null {
+    const line = this.lines.find((l) => l.role === 'assistant' && l.state === 'streaming' && !l.otherConversation)
+    return line ? line.key.slice(2) : null
+  }
+
+  /** Mensajes que esperan en la cola (para «Quitar»). */
+  get pending(): ChatLine[] {
+    return this.lines.filter((l) => l.messageState === 'pending')
+  }
 }
 
 const REASON: Record<string, string> = {
-  cancelled: 'La paraste aquí.',
-  interrupted: 'Se interrumpió: hablaste encima.',
+  cancelled: 'Se paró.',
+  interrupted: 'Se interrumpió: se envió otro mensaje ya.',
   replaced: 'Se cortó: la sustituyó tu siguiente mensaje.',
   timeout: 'Se cortó: OpenClaw dejó de responder.',
   closed: 'Se cortó: se cerró la conexión.',
@@ -204,23 +228,20 @@ export function endReasonText(line: Pick<ChatLine, 'reason' | 'error'>): string 
   if (reason === 'done') return null
   const text = ownText(REASON, reason)
   if (text) return text
-  return line.error ? `Falló: ${label(TURN_ERROR, line.error).toLowerCase()}.` : 'Falló.'
+  return line.error ? `Falló: ${turnErrorText(line.error).toLowerCase()}.` : 'Falló.'
 }
 
 /**
  * Qué hacer al cerrarse el socket, según la clase del código (`closeCodes.ts`, nunca el texto):
- * - `elsewhere` (`never_auto`, 4102): otra sesión abrió esta conversación. Nunca se reconecta solo
- *   (§9): las dos se echarían una a otra sin fin; solo si lo pide la persona.
  * - `stop` (`fix`: el resto de 4000–4899 y 1008): no tiene arreglo reconectando (conversación que ya
  *   no existe, panel desactivado, acceso retirado…). Lo decide la persona, con «Reintentar».
  * - `idle` (`on_input`, 1000): inactividad de 5 min: se reabre al escribir, no antes.
  * - `retry` (`backoff`): caída (1006), fallo del gateway u OpenClaw caído (1011), reinicio (1012),
  *   cliente lento (1013), 49xx (handshake a destiempo…).
  */
-export type CloseAction = 'elsewhere' | 'stop' | 'idle' | 'retry'
+export type CloseAction = 'stop' | 'idle' | 'retry'
 
 const ACTION: Record<Reconnect, CloseAction> = {
-  never_auto: 'elsewhere',
   fix: 'stop',
   on_input: 'idle',
   backoff: 'retry',
@@ -233,6 +254,7 @@ export function closeAction(code: number): CloseAction {
 /** Frases de los cierres que paran el chat (`stop`) y tienen una explicación propia. */
 const STOP_TEXT: Partial<Record<number, string>> = {
   4010: 'Tu sesión en este navegador ya no vale (se retiró o te desactivaron). Vuelve a entrar.',
+  4011: 'Este navegador no tiene permiso para conversar. Vuelve a entrar.',
   4020: 'El agente de esta conversación no está permitido para este navegador.',
   4021: 'El agente de esta conversación no existe en OpenClaw.',
   4100: 'Esta conversación ya no existe en el gateway.',

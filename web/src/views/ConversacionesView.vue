@@ -8,12 +8,16 @@ import FgBoton from '@/components/FgBoton.vue'
 import { conversationKind, conversationScope, conversationTitle } from '@/lib/conversations'
 import { formatRelative } from '@/lib/format'
 import { useConversationsStore } from '@/stores/conversations'
+import { useEventsStore } from '@/stores/events'
 import { useLiveStore } from '@/stores/live'
 
 // Lo que puedes ver (4.0): las del hogar y las tuyas. Lo dicho y el título viven en OpenClaw.
 const router = useRouter()
 const conversations = useConversationsStore()
 const live = useLiveStore()
+// «Respondiendo ahora» (5.0): las que tienen un turno en curso, por el /events de la pestaña.
+const events = useEventsStore()
+events.ensure()
 
 let timer: ReturnType<typeof setInterval> | undefined
 onMounted(() => {
@@ -56,6 +60,7 @@ const filas = computed(() =>
       cuando: c.last_turn_at ? formatRelative(c.last_turn_at, ahora.value) : 'Sin mensajes todavía',
       turnos: c.turn_count,
       abierta: abiertas.value.has(c.id),
+      activa: events.active.has(c.id),
     })),
 )
 
@@ -124,7 +129,7 @@ async function empezar(): Promise<void> {
       <div class="texto">
         <h1 class="fg-h1">{{ titulo }}</h1>
         <p class="fg-sub">
-          Las del hogar (la tele, los altavoces) y las tuyas. Se escribe en las que empiezas aquí; las demás se leen.
+          Las del hogar (la tele, los altavoces) y las tuyas. Puedes escribir en cualquiera: lo que digas aquí lo ven los demás aparatos que la tengan abierta.
         </p>
         <p class="fg-meta privacidad">
           La privacidad es dentro de Fogar: OpenClaw, su panel y sus otros canales (Telegram…) ven todas las conversaciones.
@@ -160,7 +165,8 @@ async function empezar(): Promise<void> {
                 <td>
                   <RouterLink :to="`/conversaciones/${encodeURIComponent(f.id)}`" class="nombre" :class="{ 'sin-titulo': f.sinTitulo }">{{ f.titulo }}</RouterLink>
                   <span class="fg-meta junto"> · {{ f.ambito }}</span>
-                  <span v-if="f.abierta" class="fg-meta junto"> · abierta ahora</span>
+                  <span v-if="f.activa" class="fg-meta junto"> · respondiendo ahora</span>
+                  <span v-else-if="f.abierta" class="fg-meta junto"> · abierta ahora</span>
                   <span v-else-if="f.clase" class="fg-meta junto"> · {{ f.clase }}</span>
                 </td>
                 <td class="fg-suave">{{ f.aparato }}</td>

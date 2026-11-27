@@ -53,7 +53,7 @@ class Pairing:
 class PairingStore:
     def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self._clock = clock
-        self._lock = threading.Lock()  # /pair y /admin/pairing corren en el threadpool
+        self._lock = threading.Lock()  # /pair y /home/pairing corren en el threadpool
         self._items: dict[str, Pairing] = {}
         self._failed = 0
 
@@ -99,7 +99,8 @@ class PairingStore:
         """Canjea `code` llamando a `create(plantilla)` con el candado tomado, así que dos
         canjes del mismo código crean un solo cliente. Si `create` falla, el código sigue
         abierto y no cuenta como fallo: no es culpa de quien lo escribió."""
-        code = "".join(code.split())  # «482 913» vale igual que «482913»
+        # «482 913», «482-913» o «482.913» valen igual que «482913»: copiar o dictar no falla por eso.
+        code = "".join(c for c in code if not (c.isspace() or c in "-.·"))
         with self._lock:
             self._sweep()
             match = None

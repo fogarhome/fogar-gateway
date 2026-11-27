@@ -20,7 +20,7 @@ def _make_live_tracker(app, session_id="sess:111", output_mode=None):
 
 
 def test_list_sessions_empty(client, admin_headers):
-    r = client.get("/admin/sessions", headers=admin_headers)
+    r = client.get("/system/sessions", headers=admin_headers)
     assert r.status_code == 200
     data = r.json()
     assert data["active"] == 0
@@ -29,7 +29,7 @@ def test_list_sessions_empty(client, admin_headers):
 
 
 def test_list_sessions_requires_admin_token(client):
-    r = client.get("/admin/sessions")
+    r = client.get("/system/sessions")
     assert r.status_code == 401
 
 
@@ -38,7 +38,7 @@ def test_list_sessions_shows_active_session(client, admin_headers):
 
     _make_live_tracker(app, "sess:active")
     try:
-        r = client.get("/admin/sessions", headers=admin_headers)
+        r = client.get("/system/sessions", headers=admin_headers)
         assert r.status_code == 200
         data = r.json()
         assert data["active"] == 1
@@ -55,14 +55,14 @@ def test_list_sessions_includes_completed(client, admin_headers):
 
     _make_live_tracker(app, "sess:done")
     app.state.session_registry.close("sess:done", "completed")
-    r = client.get("/admin/sessions", headers=admin_headers)
+    r = client.get("/system/sessions", headers=admin_headers)
     data = r.json()
     ids = [s["session_id"] for s in data["sessions"]]
     assert "sess:done" in ids
 
 
 def test_get_session_not_found(client, admin_headers):
-    r = client.get("/admin/sessions/nope:999", headers=admin_headers)
+    r = client.get("/system/sessions/nope:999", headers=admin_headers)
     assert r.status_code == 404
 
 
@@ -70,7 +70,7 @@ def test_get_session_returns_required_fields(client, admin_headers):
     from fogar_gateway.main import app
 
     _make_live_tracker(app, "sess:fields")
-    r = client.get("/admin/sessions/sess:fields", headers=admin_headers)
+    r = client.get("/system/sessions/sess:fields", headers=admin_headers)
     assert r.status_code == 200
     data = r.json()
     assert data["session_id"] == "sess:fields"
@@ -86,7 +86,7 @@ def test_get_session_last_latencies_fields_present(client, admin_headers):
     from fogar_gateway.main import app
 
     _make_live_tracker(app, "sess:lat")
-    r = client.get("/admin/sessions/sess:lat", headers=admin_headers)
+    r = client.get("/system/sessions/sess:lat", headers=admin_headers)
     data = r.json()
     lat = data["last_latencies"]
     assert "llm_first_token_ms" in lat
@@ -118,7 +118,7 @@ async def test_get_session_avg_latencies_computed_correctly(client, admin_header
     await tracker.record("tts_done")
 
     app.state.session_registry.register(tracker)
-    r = client.get("/admin/sessions/sess:avgs", headers=admin_headers)
+    r = client.get("/system/sessions/sess:avgs", headers=admin_headers)
     assert r.status_code == 200
     data = r.json()
     assert data["summary"]["avg_llm_first_token_ms"] is not None
@@ -155,7 +155,7 @@ async def test_get_session_avg_latencies_exclude_cancelled_turns(client, admin_h
     await tracker.record("tts_done")
 
     app.state.session_registry.register(tracker)
-    r = client.get("/admin/sessions/sess:cancel", headers=admin_headers)
+    r = client.get("/system/sessions/sess:cancel", headers=admin_headers)
     assert r.status_code == 200
     data = r.json()
     assert data["summary"]["avg_llm_first_token_ms"] is not None
@@ -179,6 +179,6 @@ async def test_get_session_events_carry_their_turn(client, admin_headers):
     tracker.start_turn()
     await tracker.record("llm_start")
     app.state.session_registry.register(tracker)
-    r = client.get("/admin/sessions/sess:turns", headers=admin_headers)
+    r = client.get("/system/sessions/sess:turns", headers=admin_headers)
     assert [e["turn"] for e in r.json()["events"] if e["stage"] == "llm_start"] == [1, 2]
     app.state.session_registry.close("sess:turns", "completed")

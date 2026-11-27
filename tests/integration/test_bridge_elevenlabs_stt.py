@@ -74,7 +74,9 @@ async def test_audio_session_delivers_partial_and_final_through_the_gate():
         await fake.stop()
 
 
-async def test_barge_in_on_partial_still_works():
+async def test_partial_never_cuts_the_turn():
+    """5.0 (#406): the barge-in left the gateway; a partial reaches the client and the turn
+    goes on (it used to end `interrupted`)."""
     fake = FakeElevenLabsStt(api_key="fake-el-key", on_audio=[("espera un momento", False)])
     await fake.start()
     try:
@@ -85,8 +87,12 @@ async def test_barge_in_on_partial_still_works():
         await asyncio.wait_for(started.wait(), 2)
         for _ in range(5):
             await ws.inbox.put({"bytes": _speech()})
-        await wait_until(lambda: ws.of("turn_end"), 3.0)
-        assert [m["reason"] for m in ws.of("turn_end")] == ["interrupted"]
+        await wait_until(lambda: ws.of("transcription_partial"), 3.0)
+        await asyncio.sleep(0.05)
+        assert ws.of("transcription_partial")[0]["text"] == "espera un momento"
+        assert ws.of("turn_end") == []
+        assert not bridge.turns.user_task.done()
         await _stop(bridge, ws, runner)
+        assert len(ws.of("turn_end")) == len(ws.of("turn_start")) == 1
     finally:
         await fake.stop()

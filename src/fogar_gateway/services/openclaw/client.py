@@ -4,7 +4,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import websockets
@@ -14,7 +14,6 @@ from websockets.exceptions import ConnectionClosed
 from fogar_gateway.core.config import settings
 from fogar_gateway.core.logging import fingerprint_key, pin_websockets_logging
 from fogar_gateway.services.openclaw import frames
-from fogar_gateway.services.openclaw.chat_text import ChatTextTracker
 from fogar_gateway.services.openclaw.device import (
     DeviceFileError,
     DeviceIdentity,
@@ -23,25 +22,21 @@ from fogar_gateway.services.openclaw.device import (
     build_auth_payload_v3,
 )
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
+from fogar_gateway.services.openclaw.failures import (
+    ORCHESTRATOR_ERROR,
+)
 from fogar_gateway.services.openclaw.models import (
     AuthMethod,
     GatewayInfo,
     IdentityError,
     OrchestratorAccess,
-    ToolCallEvent,
     approve_command,
 )
-from fogar_gateway.services.openclaw.registry import (
-    TURN_IN_PROGRESS_ERROR,
-    TURN_OVERFLOW_ERROR,
-    TurnInProgress,
-    TurnRegistry,
-)
-from fogar_gateway.services.protocol import ACCEPTED, OrchestratorEvent
+from fogar_gateway.services.openclaw.registry import TurnRegistry
+from fogar_gateway.services.orchestration import OrchestratorError
 from fogar_gateway.services.reconnection import describe_error, traceback_no_message
 from fogar_gateway.services.teardown import Teardown
 from fogar_gateway.services.text import without_lone_surrogates
-from fogar_gateway.services.turn_progress import chat_status_phase
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +51,8 @@ ORCHESTRATOR_DISCONNECTED_ERROR = "orchestrator_disconnected"
 # text. They reach WS clients as `TURN_ERROR.message` and /v1 callers as the error body.
 ORCHESTRATOR_SEND_FAILED_ERROR = "orchestrator_send_failed"  # chat.send could not be written
 ORCHESTRATOR_UNAVAILABLE_ERROR = "orchestrator_unavailable"  # not connected / reconnecting
-ORCHESTRATOR_ERROR = "orchestrator_error"  # OpenClaw rejected the turn, or an internal failure
+# ORCHESTRATOR_ERROR and the specific failure codes (#397) live in services/openclaw/failures.py
+# (stdlib, imported here: defining them here would be a circular import).
 ORCHESTRATOR_HANDSHAKE_FAILED_ERROR = "orchestrator_handshake_failed"  # connect() handshake
 # OpenClaw accepted the token but waits for the operator to approve this device (`last_error`).
 ORCHESTRATOR_PAIRING_REQUIRED_ERROR = "orchestrator_pairing_required"
@@ -64,7 +60,6 @@ ORCHESTRATOR_PAIRING_REQUIRED_ERROR = "orchestrator_pairing_required"
 # or a challenge without nonce): approving on OpenClaw would not help.
 ORCHESTRATOR_DEVICE_IDENTITY_REQUIRED_ERROR = "orchestrator_device_identity_required"
 
-_TERMINAL = ("aborted", "final", "error")  # terminal `chat` states
 
 # Métodos que `request()` deja llamar (M19): solo lectura (`operator.read`). Ningún método de
 # admin (`sessions.reset`, `config.*`…) sale del gateway aunque la conexión tenga el permiso.
@@ -307,7 +302,7 @@ class OpenClawClient:
         # False (`fogar-gw onboard`): always the shared token, so it is what gets tested; the
         # identity still signs, so pairing is detected (and a token issued is still stored).
         self._use_device_token = use_device_token
-        # Updated in place (main.py shares it with /admin/state); never replaced.
+        # Updated in place (main.py shares it with /system/state); never replaced.
         self.access = access if access is not None else OrchestratorAccess()
         self._pairing_logged: str | None = None  # last pending request logged at WARNING
         self._identity_warned = False
@@ -323,6 +318,8 @@ class OpenClawClient:
         self._keepalive_task: asyncio.Task | None = None
         self._connect_lock = asyncio.Lock()
         self._health_futures: dict[str, asyncio.Future] = {}
+        # `chat.send` waiting for their ack (send()): failed at once when the connection drops.
+        self._send_futures: dict[str, asyncio.Future] = {}
         self.gateway_info: GatewayInfo | None = None
         # Called only on unexpected disconnect (not on clean close()).
         # Set by ReconnectingOrchestrator after wrapping this client.
@@ -786,170 +783,77 @@ class OpenClawClient:
         payload = res.get("payload")
         return payload if isinstance(payload, dict) else {}
 
-    async def abort(self, session_key: str, timeout: float = 1.0) -> None:
-        """Abort the run in flight on `session_key` and swallow its own `aborted`.
+    async def send(self, text: str, session_key: str, *, queue_mode: str | None = None) -> str:
+        """`chat.send` and its ack: the run's `runId` (5.0, #406). The run's frames reach the
+        conversation's channel through the dispatcher; this only waits for the ack, never for
+        the reply. `queue_mode` goes as `queueMode` only when given (not tried live).
 
-        A run already tombstoned (#285; the caller does it when it knows the run, e.g. a
-        cut push) has its frames dropped by the dispatcher, `aborted` included. Otherwise
-        holding the key until the terminal `chat` arrives keeps it from closing the next
-        turn empty. The answer's `runIds` are tombstoned afterwards. No-op if a normal turn
-        owns the key. Never raises an Exception.
+        Raises:
+            OrchestratorError: a stable code: `orchestrator_unavailable` (not connected),
+                `orchestrator_send_failed` (the frame could not be written),
+                `orchestrator_disconnected` (the connection dropped before the ack),
+                `turn_timeout` (no ack in TURN_TIMEOUT_S) or `orchestrator_error` (OpenClaw
+                refused it, or acked without a runId). Never OpenClaw's own text.
         """
-        if not self._ws:
-            return
+        ws = self._ws
+        if ws is None:
+            raise OrchestratorError(ORCHESTRATOR_UNAVAILABLE_ERROR)
         req_id = str(uuid.uuid4())
+        ack: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._send_futures[req_id] = ack
+        idempotency_key = str(uuid.uuid4())
         try:
-            # by_run=False: its answer is caught by id below, never acked through the
-            # dispatcher, so it takes every frame of the key.
-            queue = self._turn_registry.register(req_id, session_key, by_run=False)
-        except TurnInProgress:
-            return
-        # The ok:true `res` never reaches the turn queue (the dispatcher only routes
-        # ok:false): catch it by id, as ping() does.
-        res: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._health_futures[req_id] = res
-        payload: object = None
-        try:
-            await self._ws.send(json.dumps(frames.chat_abort(req_id, session_key)))
-            async with asyncio.timeout(timeout):
-                payload = (await res).get("payload")
-                if not (isinstance(payload, dict) and payload.get("aborted")):
-                    return  # nothing was running: no `aborted` will follow
-                run_ids = payload.get("runIds")
-                if (
-                    isinstance(run_ids, list)
-                    and run_ids
-                    and all(self._turn_registry.is_run_aborted(r) for r in run_ids)
-                ):
-                    return  # their `aborted` is dropped by the dispatcher: nothing to wait for
-                # The `aborted` usually comes before the `res`: it is already queued.
-                while True:
-                    kind, data = await queue.get()
-                    if kind == "tool" or (kind == "chat" and data.get("state") not in _TERMINAL):
-                        continue
-                    return
-        except Exception as e:  # noqa: BLE001 — frontera: el abort es best-effort, el turno siguiente sigue
-            logger.debug("chat.abort failed (%s)", describe_error(e))
-        finally:
-            self._health_futures.pop(req_id, None)
-            self._turn_registry.unregister(session_key, req_id)
-            # After swallowing its `aborted` (a tombstone first would drop it): the runs it
-            # names are tombstoned for whatever of them is still in flight.
-            self._turn_registry.note_abort_result(payload)
-
-    async def stream_response(
-        self,
-        text: str,
-        session_key: str,
-    ) -> AsyncGenerator[OrchestratorEvent, None]:
-        if not self._ws:
-            yield OrchestratorEvent(type="error", content=ORCHESTRATOR_UNAVAILABLE_ERROR)
-            return
-
-        req_id = str(uuid.uuid4())
-        try:
-            queue = self._turn_registry.register(req_id, session_key, announce=True)
-        except TurnInProgress:
-            yield OrchestratorEvent(type="error", content=TURN_IN_PROGRESS_ERROR)
-            return
-        _sent = False
-        _finished = False
-        text_tracker = ChatTextTracker()
-
-        try:
+            frame = frames.chat_send(req_id, session_key, text, idempotency_key, queue_mode=queue_mode)
             try:
-                await self._ws.send(
-                    json.dumps(frames.chat_send(req_id, session_key, text, str(uuid.uuid4())))
-                )
-                _sent = True
-            except Exception as e:  # noqa: BLE001 — frontera: el turno cede orchestrator_send_failed
+                await ws.send(json.dumps(frame))
+            except Exception as e:  # noqa: BLE001 — frontera: el envío cede orchestrator_send_failed
                 logger.warning("chat.send failed (%s)", type(e).__name__)
                 logger.debug("chat.send traceback (no message): %s", _traceback_no_message(e))
-                yield OrchestratorEvent(type="error", content=ORCHESTRATOR_SEND_FAILED_ERROR)
-                _finished = True
-                return
-
-            while True:
-                try:
-                    kind, data = await asyncio.wait_for(
-                        queue.get(), timeout=settings.TURN_TIMEOUT_S
-                    )
-                except TimeoutError:
-                    # _finished stays False on purpose: the turn did not
-                    # complete, it's being aborted — the `finally` below must
-                    # still send chat.abort, same as any other anomalous exit.
-                    yield OrchestratorEvent(type="error", content="turn_timeout")
-                    break
-                if kind == "chat":
-                    # #254: a `state:"status"` carries no text, only a startup phase; it goes
-                    # out mapped to the gateway's vocabulary, never as OpenClaw's string.
-                    phase = chat_status_phase(data)
-                    if phase is not None:
-                        yield OrchestratorEvent(type="progress", phase=phase)
-                        continue
-                    # Only frames of this turn's own run get here (#285, TurnRegistry).
-                    # #241: OpenClaw 2026.10.5 sends the full text only in `final`
-                    # (no deltaText); emit just what the deltas did not cover.
-                    delta = text_tracker.feed(data)
-                    if delta:
-                        yield OrchestratorEvent(type="token", content=delta)
-                    if data.get("state") == "final":
-                        # Set *before* yielding: closing the generator right at
-                        # this suspended yield (contextlib.aclosing in
-                        # call_orchestrator) throws GeneratorExit here, skipping
-                        # any code written after the yield — _finished must
-                        # already be true by then or the `finally` below wrongly
-                        # sends a chat.abort for a turn that already ended.
-                        _finished = True
-                        yield OrchestratorEvent(type="status", content="done")
-                        break
-                    if data.get("state") == "error":
-                        # #300: the agent failed after accepting the turn (no `final`
-                        # follows). errorMessage stays out of the client and the logs.
-                        _finished = True
-                        logger.warning("OpenClaw agent failed mid-turn (chat state=error)")
-                        yield OrchestratorEvent(type="error", content=ORCHESTRATOR_ERROR)
-                        break
-                elif kind == "accepted":
-                    yield OrchestratorEvent(type="status", content=ACCEPTED)
-                elif kind == "tool":
-                    tool_call = ToolCallEvent.from_session_tool_payload(data)
-                    if tool_call is not None:
-                        yield OrchestratorEvent(type="tool_call", tool_call=tool_call)
-                elif kind == "done":
-                    # Only a rejected `res` (ok:false) reaches the queue (see dispatcher).
-                    # OpenClaw's own error text stays out of the client and the logs;
-                    # the operator gets only the short code.
-                    _finished = True
-                    logger.warning(
-                        "OpenClaw rejected the turn (code=%s)",
-                        _safe_error_code(data.get("error")),
-                    )
-                    yield OrchestratorEvent(type="error", content=ORCHESTRATOR_ERROR)
-                    break
-                elif kind == "overflow":
-                    # Consumer fell behind the bounded queue (#130 S3b). _finished
-                    # stays False on purpose, like turn_timeout: the `finally`
-                    # must still send chat.abort.
-                    yield OrchestratorEvent(type="error", content=TURN_OVERFLOW_ERROR)
-                    break
-                elif kind == "error":
-                    _finished = True
-                    yield OrchestratorEvent(type="error", content=str(data))
-                    break
+                raise OrchestratorError(ORCHESTRATOR_SEND_FAILED_ERROR) from None
+            try:
+                res = await asyncio.wait_for(ack, timeout=settings.TURN_TIMEOUT_S)
+            except TimeoutError:
+                logger.warning("chat.send: no ack in TURN_TIMEOUT_S=%ss", settings.TURN_TIMEOUT_S)
+                # OpenClaw pudo aceptarlo igualmente; en `chat.send` su runId es la
+                # idempotencyKey: se entierra (#285; nunca llega como push) y se aborta.
+                self._turn_registry.abort_run(idempotency_key)
+                await self.abort_run(session_key, idempotency_key)
+                raise OrchestratorError("turn_timeout") from None
         finally:
-            if _sent and not _finished:
-                # #285: whatever of this run is still in flight never reaches the next turn
-                # nor comes back as a push (also if its ack has not arrived yet).
-                self._turn_registry.abandon(req_id)
-            self._turn_registry.unregister(session_key, req_id)
-            if _sent and not _finished and self._ws:
-                try:
-                    await asyncio.shield(
-                        self._ws.send(json.dumps(frames.chat_abort(str(uuid.uuid4()), session_key)))
-                    )
-                except Exception as e:  # noqa: BLE001 — limpieza: el turno ya terminó
-                    logger.debug("chat.abort failed (%s)", describe_error(e))
+            self._send_futures.pop(req_id, None)
+        if not isinstance(res, dict) or not res.get("ok"):
+            error = res.get("error") if isinstance(res, dict) else None
+            logger.warning(
+                "OpenClaw rejected the turn (code=%s, %s)", _safe_error_code(error), ORCHESTRATOR_ERROR
+            )
+            raise OrchestratorError(ORCHESTRATOR_ERROR)
+        payload = res.get("payload")
+        run_id = payload.get("runId") if isinstance(payload, dict) else None
+        if not isinstance(run_id, str) or not run_id:
+            logger.warning("chat.send acked without a runId (%s)", ORCHESTRATOR_ERROR)
+            raise OrchestratorError(ORCHESTRATOR_ERROR)
+        return run_id
+
+    async def abort_run(self, session_key: str, run_id: str, timeout: float = 1.0) -> None:
+        """`chat.abort` of one run (`runId`): only that one, a queued one too; the others on
+        the key go on. The caller tombstones the run first (#285), so its `aborted` is dropped
+        by the dispatcher. The answer's `runIds` are tombstoned too. Never raises an
+        Exception."""
+        ws = self._ws
+        if ws is None:
+            return
+        req_id = str(uuid.uuid4())
+        res: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._health_futures[req_id] = res
+        try:
+            await ws.send(json.dumps(frames.chat_abort(req_id, session_key, run_id)))
+            answer = await asyncio.wait_for(res, timeout=timeout)
+            if answer.get("ok"):
+                self._turn_registry.note_abort_result(answer.get("payload"))
+        except Exception as e:  # noqa: BLE001 — frontera: el abort es best-effort
+            logger.debug("chat.abort of a run failed (%s)", describe_error(e))
+        finally:
+            self._health_futures.pop(req_id, None)
 
     async def _listen(self) -> None:
         try:
@@ -976,11 +880,15 @@ class OpenClawClient:
             logger.error("_listen error (%s)", type(e).__name__)
             logger.debug("_listen error traceback (no message): %s", _traceback_no_message(e))
         finally:
-            # Single teardown for every way out (clean close 1000, error, cancel): any
-            # turn still in flight on THIS connection has no one left to deliver its
-            # response — without error_all() it would wait TURN_TIMEOUT_S and keep its
-            # session_key occupied (G-04). Stable message: no raw exception text.
-            self._turn_registry.error_all(ORCHESTRATOR_DISCONNECTED_ERROR)
+            # Single teardown for every way out (clean close 1000, error, cancel; G-04): a
+            # `chat.send` still waiting for its ack, and every run a channel still waits for
+            # (/v1's too, 5.0 PR 2b.3), will never hear from this connection again. Stable
+            # message: no raw exception text.
+            for ack in self._send_futures.values():
+                if not ack.done():
+                    ack.set_exception(OrchestratorError(ORCHESTRATOR_DISCONNECTED_ERROR))
+            self._send_futures.clear()
+            self._dispatcher.connection_lost(ORCHESTRATOR_DISCONNECTED_ERROR)
             self.access.reset()  # the connection is gone: its access no longer applies
         # A cancellation (clean close()/reconnect) propagates from the `finally` above and
         # never gets here: on_disconnect would wrongly start the reconnect loop (#103).
@@ -996,8 +904,8 @@ class OpenClawClient:
         if not isinstance(frame, dict):
             raise TypeError("frame is not an object")
         fid = frame.get("id", "")
-        if fid in self._health_futures:
-            fut = self._health_futures.pop(fid)
+        if fid in self._health_futures or fid in self._send_futures:
+            fut = self._health_futures.pop(fid, None) or self._send_futures.pop(fid)
             if not fut.done():
                 fut.set_result(frame)
             return

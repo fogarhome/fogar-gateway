@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from fogar_gateway import paths
 from fogar_gateway.cli.app import cli
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -164,7 +165,7 @@ def test_set_invalid_writes_nothing(home):
     assert [p.name for p in home.iterdir()] == ["config.env"]
 
 
-@pytest.mark.parametrize("field", ["TRUSTED_PROXIES", "TRUSTED_NETWORKS"])
+@pytest.mark.parametrize("field", ["TRUSTED_PROXIES"])
 @pytest.mark.parametrize(
     "value",
     [
@@ -182,7 +183,7 @@ def test_set_invalid_network_list_writes_nothing(home, field, value):
 
 
 def test_set_valid_network_list(home):
-    r = run("config", "set", "TRUSTED_NETWORKS", " 192.168.1.0/24 , fd12:3456::/48 ")
+    r = run("config", "set", "TRUSTED_PROXIES", " 192.168.1.0/24 , fd12:3456::/48 ")
     assert r.exit_code == 0, r.output
 
 
@@ -192,20 +193,20 @@ def test_validate_marks_invalid_network_list(home):
     r = run("config", "validate")
     assert r.exit_code == 1
     assert "TRUSTED_PROXIES" in r.output and "«127.0.0.1;::1»" in r.output
-    assert "fallo cerrado" in r.output
+    assert "ningún peer cuenta como proxy" in r.output
 
 
 def test_validate_fails_on_wide_networks(home):
-    (home / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nTRUSTED_NETWORKS=0.0.0.0/1,128.0.0.0/1\n")
+    (home / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nTRUSTED_PROXIES=0.0.0.0/1,128.0.0.0/1\n")
     r = run("--json", "config", "validate")
     assert r.exit_code == 1
-    checks = [c for c in json.loads(r.output) if c["check"] == "TRUSTED_NETWORKS"]
+    checks = [c for c in json.loads(r.output) if c["check"] == "TRUSTED_PROXIES"]
     assert [c["level"] for c in checks] == ["fail"]
     assert "«0.0.0.0/1»" in checks[0]["detail"] and "«128.0.0.0/1»" in checks[0]["detail"]
 
 
 def test_host_bits_hint_only_for_host_bits(home):
-    r = run("config", "set", "TRUSTED_NETWORKS", "192.168.1.5/24,localhost")
+    r = run("config", "set", "TRUSTED_PROXIES", "192.168.1.5/24,localhost")
     assert r.exit_code == 1
     assert "«192.168.1.5/24» (bits de host: 192.168.1.0/24)" in r.output
     assert "«localhost» (no es una IP ni un CIDR)" in r.output
@@ -213,10 +214,10 @@ def test_host_bits_hint_only_for_host_bits(home):
 
 def test_validate_only_warns_on_host_bits(home):
     # El gateway acepta 192.168.1.5/24 (= 192.168.1.0/24): aviso, no fallo; `config set` sí lo rechaza.
-    (home / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nTRUSTED_NETWORKS=192.168.1.5/24\n")
+    (home / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nTRUSTED_PROXIES=192.168.1.5/24\n")
     r = run("--json", "config", "validate")
     assert r.exit_code == 0, r.output
-    checks = [c for c in json.loads(r.output) if c["check"] == "TRUSTED_NETWORKS"]
+    checks = [c for c in json.loads(r.output) if c["check"] == "TRUSTED_PROXIES"]
     assert [c["level"] for c in checks] == ["warn"] and "192.168.1.5/24" in checks[0]["detail"]
     assert "válid" not in checks[0]["detail"]
 
@@ -339,7 +340,7 @@ def test_set_warns_when_environment_wins(home, monkeypatch):
 
 
 @pytest.fixture()
-def systemd(monkeypatch, tmp_path):
+def systemd(monkeypatch, tmp_path, home):
     from types import SimpleNamespace
 
     from fogar_gateway.cli import output, service
@@ -347,7 +348,7 @@ def systemd(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     unit = service.unit_path()
     unit.parent.mkdir(parents=True)
-    unit.write_text("[Unit]\n")
+    unit.write_text(service.render_unit(Path("/opt/fogar-gw"), paths.home()))
     st = SimpleNamespace(calls=[], active=True, tty=False, healthy=True, fail=False)
     monkeypatch.setattr(service, "require_systemd", lambda: None)
     monkeypatch.setattr(service, "_probe", lambda url: st.healthy)
@@ -384,6 +385,15 @@ def test_set_offers_restart_when_active(home, systemd):
 def test_set_no_restart_when_inactive_or_no_unit(home, systemd):
     systemd.active = False
     run("--yes", "config", "set", "LOG_FORMAT", "text")
+    assert ("restart", "fogar-gateway.service") not in systemd.calls
+
+
+def test_set_never_restarts_the_unit_of_another_base(home, systemd, tmp_path):
+    from fogar_gateway.cli import service
+
+    service.unit_path().write_text(service.render_unit(Path("/opt/fogar-gw"), tmp_path / "prod"))
+    r = run("--yes", "config", "set", "LOG_FORMAT", "text")
+    assert r.exit_code == 0, r.output
     assert ("restart", "fogar-gateway.service") not in systemd.calls
 
 
@@ -561,16 +571,41 @@ def test_set_validates_its_field_ignoring_other_bad_environment(home, monkeypatc
     assert os.environ["TTS_VOICE_MAP"] == "bad"  # el entorno queda como estaba
 
 
-@pytest.mark.parametrize("extra", ["", "TURN_TIMEOUT_S=0\n"])
-def test_retired_key_warning_once_per_command(home, extra):
-    """F-r7-3: el WARNING de la clave obsoleta sale una vez, también con la configuración
-    inválida (la CLI ejecuta entonces el módulo otra vez). En un proceso nuevo."""
-    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nORCHESTRATOR_RECONNECT_MAX_DURATION=5\n{extra}")
-    r = subprocess.run([sys.executable, "-m", "fogar_gateway.cli", "config", "set",
-                        "TURN_TIMEOUT_S", "10"], cwd=ROOT, capture_output=True, text=True,
-                       env=os.environ)
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert (r.stdout + r.stderr).count("is obsolete and ignored") == 1
+@pytest.mark.parametrize("line", ["SHUTDOWN_DRAIN_S=10", "ORCHESTRATOR_RECONNECT_MAX_DURATION=60"])
+def test_config_validate_warns_about_retired_key(home, line):
+    """5.0: un ajuste retirado se ignora; validate avisa (no falla) y dice qué orden lo quita."""
+    key = line.split("=")[0]
+    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\n{line}\n")
+    r = run("config", "validate")
+    assert r.exit_code == 0, r.output
+    assert f"! {key}:" in r.output and f"fogar-gw config unset {key}" in r.output
+    assert "Traceback" not in r.output
+
+
+def test_config_validate_unknown_key_says_which_command_fixes_it(home):
+    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nNO_EXISTE_XYZ=1\n")
+    r = run("config", "validate")
+    assert r.exit_code == 1
+    assert "NO_EXISTE_XYZ: extra_forbidden" in r.output
+    assert "fogar-gw config unset NO_EXISTE_XYZ" in r.output
+
+
+def test_config_validate_warns_about_stt_audio_gate_auto(home):
+    """#422: `STT_AUDIO_GATE=auto` (4.x) ya no tumba nada: se usa energy y validate avisa con la orden."""
+    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nSTT_AUDIO_GATE=auto\n")
+    r = run("config", "validate")
+    assert r.exit_code == 0, r.output
+    assert "! STT_AUDIO_GATE:" in r.output
+    assert "fogar-gw config set STT_AUDIO_GATE energy" in r.output
+
+
+def test_config_validate_says_which_values_a_literal_takes(home):
+    """#422: a value outside the Literal names the valid values, not only `literal_error`."""
+    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nSTT_AUDIO_GATE=loud\n")
+    r = run("config", "validate")
+    assert r.exit_code == 1
+    assert ("STT_AUDIO_GATE: literal_error (usa 'off' o 'energy' con `fogar-gw config set "
+            "STT_AUDIO_GATE` o quítalo con `fogar-gw config unset STT_AUDIO_GATE`)") in r.output
 
 
 @pytest.mark.parametrize("value", ["0", "inf", "nan"])
@@ -645,9 +680,25 @@ def test_set_non_fatal_problem_restarts_and_warns_before(home, systemd, monkeypa
 
 
 def test_unset_accepts_retired_key(home):
-    """F-r8-4: el log pide quitar ORCHESTRATOR_RECONNECT_MAX_DURATION; `unset` lo hace."""
+    """`unset` quita un ajuste retirado que sigue en config.env, aunque ya no sea un campo."""
     _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nORCHESTRATOR_RECONNECT_MAX_DURATION=5\n")
     r = run("config", "unset", "orchestrator_reconnect_max_duration")
     assert r.exit_code == 0, r.output
     assert _env(home).read_text() == f"ADMIN_TOKEN={SECRET}\n"
     assert run("config", "set", "ORCHESTRATOR_RECONNECT_MAX_DURATION", "5").exit_code == 2
+
+
+def test_validate_names_a_retired_trusted_networks_line(home):
+    # 5.0 (#413): TRUSTED_NETWORKS y TRUST_LOOPBACK ya no existen; como los demás ajustes
+    # retirados, se ignoran, validate los nombra para quitarlos, y `config unset` los quita.
+    (home / "config.env").write_text(
+        f"ADMIN_TOKEN={SECRET}\nTRUSTED_NETWORKS=192.168.1.0/24\nTRUST_LOOPBACK=true\n"
+    )
+    r = run("config", "validate")
+    assert r.exit_code == 0, r.output
+    assert "fogar-gw config unset TRUSTED_NETWORKS" in r.output
+    assert "fogar-gw config unset TRUST_LOOPBACK" in r.output
+    assert "192.168" not in r.output
+    assert run("config", "unset", "TRUSTED_NETWORKS").exit_code == 0
+    assert run("config", "unset", "TRUST_LOOPBACK").exit_code == 0
+    assert "TRUSTED_NETWORKS" not in _env(home).read_text()

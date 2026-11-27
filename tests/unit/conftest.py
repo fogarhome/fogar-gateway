@@ -36,6 +36,8 @@ async def make_bridge():
 
     yield _make
     for bridge in built:
+        if bridge._own_hub:  # its channels' tasks (a turn the session left) end with the test
+            await bridge.channel_hub.aclose(1.0)
         await bridge._sender.aclose(1.0)
 
 

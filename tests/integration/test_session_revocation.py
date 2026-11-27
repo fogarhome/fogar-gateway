@@ -25,7 +25,7 @@ from tests.integration.conftest import (
     _configure_app_mocks,
 )
 
-HANDSHAKE = {"client_key": VALID_KEY, "input_mode": "text", "output_mode": ["text"]}
+HANDSHAKE = {"token": VALID_KEY, "protocol": 5, "input_mode": "text", "output_mode": ["text"]}
 INTERVAL_S = 0.2
 # La puerta de salida de la issue es ≤ 15 s; con intervalos cortos debe cerrar mucho antes.
 CLOSE_DEADLINE_S = 5.0
@@ -89,13 +89,13 @@ async def test_revoking_a_client_closes_its_live_session(server, revocation):
     ws = await _open(server)
     async with _admin(server) as admin:
         if revocation == "delete":
-            r = await admin.delete(f"/admin/clients/{CLIENT_ID}")
+            r = await admin.delete(f"/home/devices/{CLIENT_ID}")
             assert r.status_code == 204
         elif revocation == "deactivate":
-            r = await admin.patch(f"/admin/clients/{CLIENT_ID}", json={"is_active": False})
+            r = await admin.patch(f"/home/devices/{CLIENT_ID}", json={"is_active": False})
             assert r.status_code == 200
         else:
-            r = await admin.post(f"/admin/clients/{CLIENT_ID}/rotate-key")
+            r = await admin.post(f"/home/devices/{CLIENT_ID}/rotate-key")
             assert r.status_code == 200
 
     await _expect_revoked(ws)
@@ -135,7 +135,7 @@ async def test_transient_db_error_does_not_close_the_session(server, monkeypatch
     assert ws.close_code is None  # sigue abierta
 
     async with _admin(server) as admin:  # y una revocación posterior sí la corta
-        assert (await admin.delete(f"/admin/clients/{CLIENT_ID}")).status_code == 204
+        assert (await admin.delete(f"/home/devices/{CLIENT_ID}")).status_code == 204
     await _expect_revoked(ws)
 
 
@@ -173,11 +173,11 @@ async def test_narrowing_allowed_agents_closes_the_live_session_with_4020(server
     clave sigue valiendo); ampliarlo o mantenerlo (en otras mayúsculas) no la toca."""
     ws = await _open(server)
     async with _admin(server) as admin:
-        r = await admin.patch(f"/admin/clients/{CLIENT_ID}", json={"allowed_agents": ["MAIN", "a"]})
+        r = await admin.patch(f"/home/devices/{CLIENT_ID}", json={"allowed_agents": ["MAIN", "a"]})
         assert r.status_code == 200, r.text
         await asyncio.sleep(INTERVAL_S * 3)
         assert ws.close_code is None
-        r = await admin.patch(f"/admin/clients/{CLIENT_ID}", json={"allowed_agents": allowed})
+        r = await admin.patch(f"/home/devices/{CLIENT_ID}", json={"allowed_agents": allowed})
         assert r.status_code == 200, r.text
     with pytest.raises(websockets.ConnectionClosed) as exc:
         while True:
@@ -185,8 +185,22 @@ async def test_narrowing_allowed_agents_closes_the_live_session_with_4020(server
     assert exc.value.rcvd is not None
     assert (exc.value.rcvd.code, exc.value.rcvd.reason) == (4020, "agent not permitted")
     await asyncio.sleep(0.2)  # deja terminar el teardown del lado del servidor
-    # Distinto de una clave revocada en /admin/sessions (evento) y en las estadísticas.
+    # Distinto de una clave revocada en /system/sessions (evento) y en las estadísticas.
     [record] = app.state.session_registry.get_all()
     assert "agent_revoked" in [e.stage for e in record.events]
     assert "session_revoked" not in [e.stage for e in record.events]
     assert gateway_stats.snapshot()["sessions_closed"] == {"agent_revoked": 1}
+
+
+async def test_losing_write_closes_the_session_with_4011(server):
+    """#410: quitarle `conversations:write` a un aparato con la sesión abierta la cierra con 4011
+    (no 4200: su clave sigue valiendo) en la siguiente revalidación."""
+    ws = await _open(server)
+    async with _admin(server) as admin:
+        r = await admin.patch(f"/home/devices/{CLIENT_ID}", json={"scopes": ["conversations:read"]})
+        assert r.status_code == 200, r.text
+    with pytest.raises(websockets.ConnectionClosed) as exc:
+        while True:
+            await asyncio.wait_for(ws.recv(), timeout=CLOSE_DEADLINE_S)
+    assert exc.value.rcvd is not None
+    assert (exc.value.rcvd.code, exc.value.rcvd.reason) == (4011, "missing scope")

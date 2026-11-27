@@ -11,10 +11,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from fogar_gateway.services import turn_progress, turns
+from fogar_gateway.services import channel as channel_module
+from fogar_gateway.services import turn_progress
 from fogar_gateway.services.openclaw.models import ToolCallEvent
-from fogar_gateway.services.protocol import OrchestratorEvent
 from tests.fakes.bridge import run_turn, sent, start_turn
+from tests.fakes.orchestrator import OrchestratorEvent
 
 SK = "agent:main:hab_sito"
 WITH_PROGRESS = ("text", "status")
@@ -101,8 +102,9 @@ async def test_no_new_progress_once_the_turn_is_marked_cancelled(make_bridge, in
     bridge.orchestrator.stream_response = stream
     await start_turn(bridge)
     await asyncio.wait_for(started.wait(), 2)
-    turn = bridge.turns._user_turn
-    bridge.turns._mark_cancel(turn.task, "interrupted")
+    # 5.0: the channel marks its turn cancelled; the session's turn sees it at once.
+    (turn,) = bridge.turns._live
+    bridge.channel._mark_cancel(turn.channel, "interrupted")
     await bridge.turns._offer_progress(turn, turn_progress.Progress("thinking"))
     await bridge.turns.cancel("interrupted")
     assert progress(await sent(bridge)) == [("preparing", None)]
@@ -111,7 +113,9 @@ async def test_no_new_progress_once_the_turn_is_marked_cancelled(make_bridge, in
 # ── 2. Un toolCallId raro no rompe el turno ─────────────────────────────────
 
 
-@pytest.mark.parametrize("call_id", [{"id": 1}, ["c1"], None, 3.5])
+# (5.0 PR 2b: a tool call without a `toolCallId` no longer reaches a session's turn: it is
+# dropped when its `session.tool` frame is parsed, `ToolCallEvent.from_session_tool_payload`.)
+@pytest.mark.parametrize("call_id", [{"id": 1}, ["c1"], 3.5])
 async def test_a_malformed_tool_call_id_never_fails_the_turn(make_bridge, interval, call_id):
     interval(0)
     bridge, _ = make_bridge(output_mode=WITH_PROGRESS)
@@ -198,10 +202,32 @@ def _status(run_id, phase):
     return {"sessionKey": SK, "runId": run_id, "state": "status", "phase": phase}
 
 
+async def test_phases_before_agent_start_open_the_push(make_bridge, interval):
+    """5.0 PR 2b.2: a push opens on its run's first event (a run drained from OpenClaw's queue
+    never gets `agent start`): its startup phases open it and go out in order; the later
+    `start` opens nothing more (#84)."""
+    interval(0)
+    bridge, _ = make_bridge(client_id="hab_sito", output_mode=WITH_PROGRESS)
+    channel = bridge.channel
+    channel.enqueue_push("chat", _status("r1", "preparing_workspace"), "r1")
+    channel.enqueue_push("chat", _status("r1", "starting_model"), "r1")
+    channel.enqueue_push("turn_start", SK, "r1")
+    channel.enqueue_push("chat", {"sessionKey": SK, "runId": "r1", "deltaText": "hola"}, "r1")
+    channel.enqueue_push("turn_end", SK, "r1")
+    await bridge.push_idle()
+    msgs = await sent(bridge)
+    assert kinds(msgs) == ["turn_start", "turn_progress", "turn_progress", "token", "turn_end"]
+    assert progress(msgs) == [("preparing", None), ("thinking", None)]
+
+
 async def _push_with_early_phases(bridge, run_id="r1"):
-    turns_ = bridge.turns
+    """The phases of `run_id` arrive while another push (`r0`) is open: they wait (#254) for
+    `run_id`'s own push, which opens once `r0` ends."""
+    turns_ = bridge.channel  # 5.0: the push (and its early phases) is the channel's
+    turns_.enqueue_push("turn_start", SK, "r0")
     turns_.enqueue_push("chat", _status(run_id, "preparing_workspace"), run_id)
     turns_.enqueue_push("chat", _status(run_id, "starting_model"), run_id)
+    turns_.enqueue_push("turn_end", SK, "r0")
     turns_.enqueue_push("turn_start", SK, run_id)
     turns_.enqueue_push("chat", {"sessionKey": SK, "runId": run_id, "deltaText": "hola"}, run_id)
     turns_.enqueue_push("turn_end", SK, run_id)
@@ -213,13 +239,13 @@ async def test_the_last_early_phase_of_a_push_goes_out_when_it_opens(make_bridge
     bridge, _ = make_bridge(client_id="hab_sito", output_mode=WITH_PROGRESS)
     await _push_with_early_phases(bridge)
     msgs = await sent(bridge)
-    assert kinds(msgs) == ["turn_start", "turn_progress", "token", "turn_end"]
+    assert kinds(msgs) == ["turn_start", "turn_end", "turn_start", "turn_progress", "token", "turn_end"]
     assert progress(msgs) == [("thinking", None)]
 
 
 async def test_early_phases_expire(make_bridge, interval, monkeypatch):
     interval(0)
-    monkeypatch.setattr(turns, "_EARLY_PHASE_TTL_S", -1.0)
+    monkeypatch.setattr(channel_module, "_EARLY_PHASE_TTL_S", -1.0)
     bridge, _ = make_bridge(client_id="hab_sito", output_mode=WITH_PROGRESS)
     await _push_with_early_phases(bridge)
     assert progress(await sent(bridge)) == []
@@ -227,28 +253,28 @@ async def test_early_phases_expire(make_bridge, interval, monkeypatch):
 
 async def test_early_phases_are_bounded(make_bridge):
     bridge, _ = make_bridge(client_id="hab_sito", output_mode=WITH_PROGRESS)
-    for i in range(turns._EARLY_PHASE_RUNS + 5):
-        bridge.turns.enqueue_push("chat", _status(f"r{i}", "preparing_context"), f"r{i}")
+    for i in range(channel_module._EARLY_PHASE_RUNS + 5):
+        bridge.channel.enqueue_push("chat", _status(f"r{i}", "preparing_context"), f"r{i}")
     await bridge.push_idle()
-    early = bridge.turns._early_phases
-    assert len(early) == turns._EARLY_PHASE_RUNS
-    assert "r0" not in early and f"r{turns._EARLY_PHASE_RUNS + 4}" in early
+    early = bridge.channel._early_phases
+    assert len(early) == channel_module._EARLY_PHASE_RUNS
+    assert "r0" not in early and f"r{channel_module._EARLY_PHASE_RUNS + 4}" in early
 
 
 @pytest.mark.parametrize("output_mode", [("text",)])
 async def test_early_phases_are_not_kept_for_clients_without_status(make_bridge, output_mode):
     bridge, _ = make_bridge(client_id="hab_sito", output_mode=output_mode)
-    bridge.turns.enqueue_push("chat", _status("r1", "preparing_context"), "r1")
+    bridge.channel.enqueue_push("chat", _status("r1", "preparing_context"), "r1")
     await bridge.push_idle()
-    assert not bridge.turns._early_phases
+    assert not bridge.channel._early_phases
 
 
 async def test_a_phase_of_another_run_does_not_land_on_the_open_push(make_bridge, interval):
     """Con un push abierto (r1), la fase de un run nuevo (r2) se guarda para r2."""
     interval(0)
     bridge, _ = make_bridge(client_id="hab_sito", output_mode=WITH_PROGRESS)
-    bridge.turns.enqueue_push("turn_start", SK, "r1")
-    bridge.turns.enqueue_push("chat", _status("r2", "preparing_context"), "r2")
+    bridge.channel.enqueue_push("turn_start", SK, "r1")
+    bridge.channel.enqueue_push("chat", _status("r2", "preparing_context"), "r2")
     await bridge.push_idle()
     assert progress(await sent(bridge)) == []
-    assert "r2" in bridge.turns._early_phases
+    assert "r2" in bridge.channel._early_phases

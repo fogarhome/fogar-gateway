@@ -1,29 +1,18 @@
 """
-admin_routes.py
-~~~~~~~~~~~~~~~
-/admin/* — gestión y observabilidad del gateway.
+system_routes.py
+~~~~~~~~~~~~~~~~
+El sistema (5.0, #411; antes en `/admin`): estado en vivo, sesiones, servicios, voz y vías de
+acceso. Leer exige `home:read`; reconectar OpenClaw, `home:admin`.
 
-Auth (M20, api/deps.require_admin): X-Admin-Token = ADMIN_TOKEN (la CLI) o Bearer de un dueño o administrador.
-
-Clientes:
-  GET    /admin/clients              — lista clientes (sin client_key; huella key_fp)
-  POST   /admin/clients              — crear cliente (devuelve client_key generada)
-  GET    /admin/clients/{id}         — detalle de un cliente
-  PATCH  /admin/clients/{id}         — actualizar campos (nombre, config, etc.)
-  DELETE /admin/clients/{id}         — borrar cliente
-  POST   /admin/clients/{id}/rotate-key — regenerar client_key
-
-Observabilidad:
-  GET    /admin/sessions             — sesiones en memoria
-  GET    /admin/sessions/{id}        — detalle de sesión
-  GET    /admin/orchestrator/status
-  POST   /admin/orchestrator/reconnect  (202)
-  GET    /admin/transcriber/status
-  GET    /admin/tts/status
-  GET    /admin/state                — instantánea viva (gateway con `dashboards`, servicios con el acceso
-                                        a OpenClaw: permisos, token y emparejamiento; totales, sesiones)
-  GET    /admin/state/stream         — la misma instantánea por SSE cada STATE_STREAM_INTERVAL_S
-  GET    /admin/access               — vías para llegar al gateway, verificadas (caché 15 s)
+  GET    /system/state               — instantánea viva (gateway con `dashboards`, servicios con el
+                                       acceso a OpenClaw: permisos, token y emparejamiento; totales,
+                                       sesiones)
+  GET    /system/state/stream        — la misma instantánea por SSE cada STATE_STREAM_INTERVAL_S
+  GET    /system/sessions[/{id}]     — sesiones en memoria
+  GET    /system/services/orchestrator | transcriber | tts — estado de cada servicio
+  POST   /system/services/orchestrator/reconnect (202)
+  GET    /system/speech              — proveedores de voz
+  GET    /system/access              — vías para llegar al gateway, verificadas (caché 15 s)
 """
 
 import asyncio
@@ -31,216 +20,32 @@ import json
 import logging
 import time
 from collections import defaultdict
-from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, select
 
 from fogar_gateway._version import __version__
-from fogar_gateway.api.deps import require_admin
-from fogar_gateway.db.database import get_db_session, get_engine
-from fogar_gateway.db.models import ClientRecord
-from fogar_gateway.models.admin_schemas import (
-    ClientCreate,
-    ClientResponse,
-    ClientUpdate,
-    ClientWithKey,
-)
-from fogar_gateway.services.auth import hash_key, new_key
+from fogar_gateway.api.deps import require_admin, require_scope
 from fogar_gateway.services.openclaw.models import OrchestratorAccess, access_texts
 from fogar_gateway.services.reconnection import ServiceStatus
+from fogar_gateway.services.scopes import (
+    HOME_READ,
+)
 from fogar_gateway.services.stats import gateway_stats
 
-_ROTATE_KEY_ATTEMPTS = 3
 STATE_STREAM_INTERVAL_S = 1.0
 # Vida máxima de cada stream: por debajo del --timeout-graceful-shutdown (35 s) de la
 # imagen, para que un panel abierto no bloquee el apagado; el panel reconecta.
 STATE_STREAM_MAX_S = 25.0
-# Flujos /admin/state/stream abiertos ahora: el dashboard abre uno al entrar en Estado, y
+# Flujos /system/state/stream abiertos ahora: el dashboard abre uno al entrar en Estado, y
 # `fogar-gw onboard` lo usa para confirmar que te has conectado. La CLI nunca abre ninguno.
 _open_streams = 0
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _get_or_404(session: Session, client_id: str) -> ClientRecord:
-    rec = session.get(ClientRecord, client_id)
-    if rec is None or rec.retired_at is not None:
-        raise HTTPException(status_code=404, detail="Client not found")
-    return rec
-
-
-def _check_agent_consistency(default_agent: str | None, allowed_agents: list[str] | None) -> None:
-    """422 si el estado resultante deja `default_agent` fuera de `allowed_agents`.
-
-    `allowed_agents is None` = sin restricción; `[]` = todo denegado (#105), así que
-    un `default_agent` con `[]` es inconsistente.
-    """
-    if default_agent is None or allowed_agents is None:
-        return
-    if default_agent.lower() not in [a.lower() for a in allowed_agents]:  # filas de la 2.x (C-1)
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="default_agent must be one of allowed_agents",
-        )
-
-
-def _lists_to_json(data: dict[str, Any]) -> dict[str, Any]:
-    """Serializa a JSON las listas que la BD guarda como texto (si vienen y no son null)."""
-    for field in ("allowed_agents", "output_mode"):
-        if data.get(field) is not None:
-            data[field] = json.dumps(data[field])
-    return data
-
-
-# ---------------------------------------------------------------------------
-# Client CRUD
-# ---------------------------------------------------------------------------
-
-
-@router.get("/clients", response_model=list[ClientResponse])
-def list_clients(session: Session = Depends(get_db_session)) -> list[ClientResponse]:
-    records = session.exec(select(ClientRecord).where(ClientRecord.retired_at.is_(None))).all()  # type: ignore[union-attr]
-    return [ClientResponse.from_record(r) for r in records]
-
-
-def create_client_record(
-    session: Session,
-    body: ClientCreate,
-    *,
-    client_id: str | None = None,
-    user_id: str | None = None,
-    capabilities: list[str] | None = None,
-) -> ClientRecord:
-    """Crea el cliente: la única vía, la usan `POST /admin/clients`, el emparejamiento (#317) y
-    el cliente «Panel web» (M19, el único con `client_id` fijo). Guarda solo el hash de
-    `body.client_key` (M20): quien necesite enseñar la clave la pone en `body` antes."""
-    _check_agent_consistency(body.default_agent, body.allowed_agents)
-    data = _lists_to_json(body.model_dump())
-    data["key_hash"] = hash_key(data.pop("client_key") or new_key())
-    data["user_id"] = user_id  # M20: con usuario, un dispositivo personal (un inicio de sesión)
-    data["capabilities"] = json.dumps(capabilities) if capabilities is not None else None
-    if client_id is not None:
-        data["id"] = client_id
-    record = ClientRecord(**data)
-    session.add(record)
-    try:
-        session.commit()
-    except IntegrityError:
-        # client_key duplicada (única restricción alcanzable tras validar la entrada).
-        # `from None` y sin loguear la excepción: su mensaje/parámetros contienen la
-        # client_key completa (credencial bearer, G-27a).
-        session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="client_key already exists"
-        ) from None
-    session.refresh(record)
-    return record
-
-
-@router.post("/clients", response_model=ClientWithKey, status_code=status.HTTP_201_CREATED)
-def create_client(
-    body: ClientCreate,
-    session: Session = Depends(get_db_session),
-) -> ClientWithKey:
-    key = body.client_key or new_key()
-    record = create_client_record(session, body.model_copy(update={"client_key": key}))
-    return ClientWithKey.from_record(record, key)
-
-
-@router.get("/clients/{client_id}", response_model=ClientResponse)
-def get_client(
-    client_id: str,
-    session: Session = Depends(get_db_session),
-) -> ClientResponse:
-    return ClientResponse.from_record(_get_or_404(session, client_id))
-
-
-@router.patch("/clients/{client_id}", response_model=ClientResponse)
-def update_client(
-    client_id: str,
-    body: ClientUpdate,
-    session: Session = Depends(get_db_session),
-) -> ClientResponse:
-    rec = _get_or_404(session, client_id)
-    patch = body.model_dump(exclude_unset=True)
-    # Solo si el PATCH toca alguno de los dos campos: una fila antigua inconsistente
-    # que se edita por otros campos no debe fallar (solo se valida la entrada, #122).
-    if "default_agent" in patch or "allowed_agents" in patch:
-        _check_agent_consistency(
-            patch.get("default_agent", rec.default_agent),
-            patch["allowed_agents"]
-            if "allowed_agents" in patch
-            else (json.loads(rec.allowed_agents) if rec.allowed_agents else None),
-        )
-    for field, value in _lists_to_json(patch).items():
-        setattr(rec, field, value)
-    session.add(rec)
-    session.commit()
-    session.refresh(rec)
-    return ClientResponse.from_record(rec)
-
-
-def retire_client(session: Session, rec: ClientRecord) -> None:
-    """Retirar, no borrar (M20): sus conversaciones conservan hogar y dispositivo. La clave pasa
-    a un valor que nadie conoce. Sus sesiones vivas las corta `close_client_sessions`."""
-    rec.retired_at = datetime.now(UTC)
-    rec.is_active = False
-    rec.key_hash = hash_key(new_key())  # nadie conoce la clave: ya no vale
-    session.add(rec)
-    session.commit()
-
-
-def close_client_sessions(app: FastAPI, client_id: str) -> None:
-    """Cierra ya (4200) las sesiones vivas de un cliente, sin esperar a la revalidación."""
-    for bridge in app.state.client_registry.for_client(client_id):
-        bridge.revoke()
-
-
-def _retire_client_record(client_id: str) -> None:
-    with Session(get_engine()) as session:
-        retire_client(session, _get_or_404(session, client_id))
-
-
-@router.delete("/clients/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_client(client_id: str, request: Request) -> None:
-    await asyncio.to_thread(_retire_client_record, client_id)
-    close_client_sessions(request.app, client_id)
-
-
-@router.post("/clients/{client_id}/rotate-key", response_model=ClientWithKey)
-def rotate_client_key(
-    client_id: str,
-    session: Session = Depends(get_db_session),
-) -> ClientWithKey:
-    rec = _get_or_404(session, client_id)
-    for _ in range(_ROTATE_KEY_ATTEMPTS):
-        key = new_key()
-        rec.key_hash = hash_key(key)
-        session.add(rec)
-        try:
-            session.commit()
-            break
-        except IntegrityError:
-            # Colisión de client_key: reintento con otra. Sin loguear ni encadenar la
-            # excepción (su mensaje lleva la clave, G-27a).
-            session.rollback()
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="could not generate a unique client_key"
-        ) from None
-    session.refresh(rec)
-    return ClientWithKey.from_record(rec, key)
+# Leer es `home:read`; reconectar OpenClaw, `home:admin` (5.0, #411).
+router = APIRouter(prefix="/system", dependencies=[Depends(require_scope(HOME_READ))])
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +146,7 @@ async def get_session(session_id: str, request: Request) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@router.get("/orchestrator/status")
+@router.get("/services/orchestrator")
 async def get_orchestrator_status(request: Request) -> dict:
     s = request.app.state.openclaw.status()
     return {
@@ -353,7 +158,9 @@ async def get_orchestrator_status(request: Request) -> dict:
     }
 
 
-@router.post("/orchestrator/reconnect", status_code=202)
+@router.post(
+    "/services/orchestrator/reconnect", status_code=202, dependencies=[Depends(require_admin)]
+)
 async def post_orchestrator_reconnect(request: Request) -> dict:
     """Retry now: cuts the reconnect loop's wait short (#272). Does not block on the handshake.
 
@@ -367,7 +174,7 @@ async def post_orchestrator_reconnect(request: Request) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@router.get("/transcriber/status")
+@router.get("/services/transcriber")
 async def get_transcriber_status(request: Request) -> dict:
     """Transcriber has no process-level connection (one instance per audio
     session) — this reports live readiness via the STT provider's probe, wrapped
@@ -389,7 +196,7 @@ async def get_transcriber_status(request: Request) -> dict:
     return body
 
 
-@router.get("/tts/status")
+@router.get("/services/tts")
 async def get_tts_status(request: Request) -> dict:
     tts = request.app.state.speech.tts
     s = tts.status()

@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from fogar_gateway.models.schemas import ClientConfig, Handshake
-from tests.fakes.bridge import blocking
+from tests.fakes.bridge import blocking, tokens
 
 _SECRET = "TOP-SECRET-PHRASE"
 
@@ -20,7 +20,7 @@ async def bridge(make_bridge, mock_tracker):
         input_mode="audio",
         output_mode=("text", "status"),
         transcriber=MagicMock(),
-        config=ClientConfig(barge_in_enabled=True, barge_in_min_chars=3),
+        config=ClientConfig(),
         tracker=mock_tracker,
     )
     return b
@@ -41,7 +41,8 @@ async def test_final_transcription_event_keeps_only_length(bridge, caplog):
 
 
 async def test_send_message_is_not_logged_at_info(bridge, caplog):
-    bridge.handshake = Handshake(client_key="k", input_mode="audio", output_mode=["text"])
+    bridge.orchestrator.stream_response = tokens("ok")
+    bridge.handshake = Handshake(token="k", input_mode="audio", output_mode=["text"])
     bridge.client_ws.receive = AsyncMock(
         side_effect=[
             {"type": "websocket.message", "text": json.dumps({"type": "send", "text": _SECRET})},
@@ -51,12 +52,14 @@ async def test_send_message_is_not_logged_at_info(bridge, caplog):
 
     with caplog.at_level(logging.INFO):
         await bridge._client_input_loop()
+        await asyncio.wait_for(bridge.turns.sends_idle(), 2)  # 2b.3: sent from its own task
     await asyncio.wait({bridge.turns.user_task}, timeout=2)
 
     assert not any(_SECRET in m for m in _info_messages(caplog))
 
 
-async def test_barge_in_partial_is_not_logged_at_info(bridge, caplog):
+async def test_partial_during_a_turn_is_not_logged_at_info(bridge, caplog):
+    """A partial during a turn (it no longer cuts it, #406) keeps only its length."""
     started = asyncio.Event()
     bridge.orchestrator.stream_response = blocking(started)
     await bridge.turns.start_user_turn("x")
@@ -65,5 +68,6 @@ async def test_barge_in_partial_is_not_logged_at_info(bridge, caplog):
     with caplog.at_level(logging.INFO):
         await bridge._on_transcription(_SECRET, False)
 
-    assert any("Barge-in" in m for m in _info_messages(caplog))
     assert not any(_SECRET in m for m in _info_messages(caplog))
+    event = next(e for e in bridge.tracker.events if e.stage == "transcription_partial")
+    assert event.meta == {"text_len": len(_SECRET)}

@@ -10,10 +10,13 @@ from fogar_gateway.core.session_key import AGENT_ID_PATTERN
 
 _logger = logging.getLogger(__name__)
 
-# Keys that older installs still carry in config.env: accepted and ignored (with one WARNING per
-# process, F-r7-3: the CLI builds Settings many times and may run this module more than once)
-# so an upgrade does not turn them into "Extra inputs are not permitted".
-RETIRED_KEYS = frozenset({"ORCHESTRATOR_RECONNECT_MAX_DURATION"})  # #272: single endless loop
+# Ajustes que un config.env de la 4.x aún puede llevar y que ya no hacen nada: se ignoran con un
+# aviso en vez de tumbar el arranque. Cualquier otra clave desconocida sigue siendo un error.
+RETIRED_KEYS = frozenset({
+    "TRUST_LOOPBACK", "TRUSTED_NETWORKS",  # #413: ninguna IP exime de credencial
+    "SHUTDOWN_DRAIN_S",  # #221: el cierre ya no espera al turno en curso
+    "ORCHESTRATOR_RECONNECT_MAX_DURATION",  # #272: un solo bucle sin fin
+})
 
 
 class Settings(BaseSettings):
@@ -26,15 +29,20 @@ class Settings(BaseSettings):
     def _drop_retired_keys(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
+        # Las claves de config.env llegan en minúsculas. Solo el nombre, nunca el valor.
         retired = sorted(k for k in data if isinstance(k, str) and k.upper() in RETIRED_KEYS)
-        if retired and not getattr(_logger, "retired_warned", False):
-            _logger.retired_warned = True  # type: ignore[attr-defined]  # shared by every copy
+        if not retired:
+            return data
+        # Un aviso por proceso: la CLI construye Settings muchas veces y puede ejecutar este
+        # módulo más de una vez (cli/config._config_module), así que la marca va en el logger.
+        if not getattr(_logger, "retired_warned", False):
+            _logger.retired_warned = True  # type: ignore[attr-defined]
             _logger.warning(
-                "Config: %s is obsolete and ignored (remove it from config.env).", ", ".join(retired)
+                "Config: %s ya no se usa desde la 5.0 y se ignora "
+                "(quítalo con `fogar-gw config unset`).",
+                ", ".join(k.upper() for k in retired),
             )
-        if retired:
-            data = {k: v for k, v in data.items() if k not in retired}
-        return data
+        return {k: v for k, v in data.items() if k not in retired}
 
     # Base de datos interna. Una ruta SQLite relativa cuelga del directorio base, también el
     # default: el engine, Alembic, el candado y `fogar-gw doctor` ven la misma ruta absoluta.
@@ -74,11 +82,8 @@ class Settings(BaseSettings):
     # Admin API
     ADMIN_TOKEN: str = ""
 
-    # /v1/* trusted-origin auth (issue #52)
-    TRUST_LOOPBACK: bool = True
-    TRUSTED_NETWORKS: str = (
-        ""  # CSV of CIDRs, e.g. "192.168.1.0/24". Empty = only loopback trusted.
-    )
+    # Proxies cuyo X-Real-IP es la IP real de quien llama (los logs). Desde la 5.0 (#413) ninguna IP
+    # exime de credencial: fuera TRUST_LOOPBACK y TRUSTED_NETWORKS.
     TRUSTED_PROXIES: str = "127.0.0.1,::1"  # CSV of IPs/CIDRs allowed to set X-Real-IP
 
     # Servicios externos
@@ -104,11 +109,19 @@ class Settings(BaseSettings):
     # fogar nunca la usa.
     STT_AUDIO_GATE: Literal["off", "energy"] = "energy"
 
-    # shortcut: "auto" (default until #264) == "energy"; drop once no .env in production carries it.
     @field_validator("STT_AUDIO_GATE", mode="before")
     @classmethod
-    def _legacy_auto_gate(cls, v: object) -> object:
-        return "energy" if v == "auto" else v
+    def _retired_auto_gate(cls, v: object) -> object:
+        # #422 quitó "auto" (en la 4.x era "energy"): un config.env viejo arranca igual, con aviso.
+        if not (isinstance(v, str) and v.strip().lower() == "auto"):
+            return v
+        if not getattr(_logger, "auto_gate_warned", False):
+            _logger.auto_gate_warned = True  # type: ignore[attr-defined]
+            _logger.warning(
+                "Config: STT_AUDIO_GATE=auto ya no existe desde la 5.0; uso energy "
+                "(cámbialo con `fogar-gw config set STT_AUDIO_GATE energy`)."
+            )
+        return "energy"
 
     STT_GATE_RMS_DBFS: float = -45.0
     OPENCLAW_HOST: str = "127.0.0.1"
@@ -149,9 +162,6 @@ class Settings(BaseSettings):
     # Tope de cada paso del cierre de una sesión (cancelar el turno, el push, las tareas,
     # cerrar el transcriber y el tracker) y del drenado de su cola de salida (#221).
     SESSION_TEARDOWN_S: float = Field(default=5.0, gt=0)
-    # Obsoleto e ignorado (#221): el cierre ya no espera al turno en curso. Se acepta para
-    # que un .env antiguo no impida arrancar (avisa con un WARNING al arrancar).
-    SHUTDOWN_DRAIN_S: float | None = None
     LOG_FORMAT: Literal["text", "json"] = "text"
 
     # Drenado del audio TTS de un push al cerrar su turno (issue #130 S3a): tope de tiempo
@@ -167,9 +177,10 @@ class Settings(BaseSettings):
     # conexión (issue #130 S2). Es por envío, no acumulado.
     CLIENT_SEND_TIMEOUT_S: float = Field(default=10.0, gt=0)
 
-    # Eventos máximos en la cola de un turno de OpenClaw (issue #130 S3b). Si el
-    # consumidor se atrasa y se llena, el turno se aborta (chat.abort + TURN_ERROR
-    # "turn_overflow") en vez de bloquear _listen y a las demás sesiones.
+    # Eventos de OpenClaw que una conversación retiene mientras espera el ack de un
+    # `send` o a que se cierre el turno abierto (issue #130 S3b, 5.0). El run que no cabe
+    # falla con TURN_ERROR "internal_error" y se aborta (solo él); el fin de un push nunca
+    # se descarta.
     TURN_QUEUE_MAX: int = Field(default=1000, gt=0)
 
 

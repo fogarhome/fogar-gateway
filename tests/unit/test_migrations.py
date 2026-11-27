@@ -84,10 +84,9 @@ def _insert_client(c, client_id: str, home: str = "home", user: str | None = Non
 
     c.execute(text(
         "INSERT INTO clients (id, home_id, user_id, name, key_hash, is_active, created_at, "
-        "stt_language, stt_vad_thold, tts_voice, tts_speed, barge_in_enabled, "
-        "barge_in_min_chars, silence_timeout_s, max_silence_turns, push_enabled, "
+        "stt_language, stt_vad_thold, tts_voice, tts_speed, silence_timeout_s, push_enabled, "
         "tool_calls_enabled) VALUES (:id, :home, :user, 'X', :id, 1, '2026-11-21', 'es', 0, "
-        "'v', 1, 1, 5, 2, 3, 1, 0)"
+        "'v', 1, 2, 1, 0)"
     ), {"id": client_id, "home": home, "user": user})
 
 
@@ -133,6 +132,220 @@ def test_4_0_schema_keeps_every_conversation_with_its_home_and_device(tmp_path, 
         with engine.connect() as c:
             assert c.execute(text("SELECT id FROM conversations")).scalars().all() == ["c-tv"]
             assert c.execute(text("SELECT id FROM clients")).scalars().all() == ["tv"]
+    finally:
+        database.dispose_engine()
+
+
+def test_migration_drops_max_silence_turns(tmp_path, monkeypatch):
+    """#394: una base 4.0.1 (con `max_silence_turns`) arranca la 5.0 sin perder clientes ni las
+    conversaciones que cuelgan de ellos (la copia por lotes de `clients` no las borra en cascada)."""
+    from alembic import command
+    from sqlalchemy import text
+
+    _point_at(monkeypatch, tmp_path / "old.db")
+    command.upgrade(database._alembic_config(), "40a0e1f00001")
+    engine = database.get_engine()
+    try:
+        with engine.begin() as c:
+            assert "max_silence_turns" in {col["name"] for col in inspect(c).get_columns("clients")}
+            c.execute(text(
+                "INSERT INTO clients (id, home_id, name, key_hash, is_active, created_at, "
+                "stt_language, stt_vad_thold, tts_voice, tts_speed, barge_in_enabled, "
+                "barge_in_min_chars, silence_timeout_s, max_silence_turns, push_enabled, "
+                "tool_calls_enabled) VALUES ('tv', 'home', 'TV', 'k', 1, '2026-11-21', 'es', 0, "
+                "'v', 1, 1, 5, 7, 3, 1, 0)"
+            ))
+            _insert_conversation(c, "c-tv", "tv")
+        database.run_migrations()
+        with engine.connect() as c:
+            assert "max_silence_turns" not in {col["name"] for col in inspect(c).get_columns("clients")}
+            row = c.execute(text("SELECT id, silence_timeout_s FROM clients")).one()
+            assert tuple(row) == ("tv", 7.0)
+            assert c.execute(text("SELECT id FROM conversations")).scalars().all() == ["c-tv"]
+            assert c.execute(text("PRAGMA foreign_key_check")).all() == []
+    finally:
+        database.dispose_engine()
+
+
+def test_migration_drops_barge_in(tmp_path, monkeypatch):
+    """#406: el barge-in sale del gateway. Una base con `barge_in_enabled`/`barge_in_min_chars`
+    los pierde sin perder clientes ni sus conversaciones; bajar de versión los devuelve con sus
+    valores por defecto de antes (True, 5)."""
+    from alembic import command
+    from sqlalchemy import text
+
+    barge = {"barge_in_enabled", "barge_in_min_chars"}
+    _point_at(monkeypatch, tmp_path / "barge.db")
+    command.upgrade(database._alembic_config(), "50a0e1f00002")
+    engine = database.get_engine()
+    try:
+        with engine.begin() as c:
+            assert barge <= {col["name"] for col in inspect(c).get_columns("clients")}
+            c.execute(text(
+                "INSERT INTO clients (id, home_id, name, key_hash, is_active, created_at, "
+                "stt_language, stt_vad_thold, tts_voice, tts_speed, barge_in_enabled, "
+                "barge_in_min_chars, silence_timeout_s, push_enabled, "
+                "tool_calls_enabled) VALUES ('tv', 'home', 'TV', 'k', 1, '2026-11-21', 'es', 0, "
+                "'v', 1, 0, 9, 7, 1, 0)"
+            ))
+            _insert_conversation(c, "c-tv", "tv")
+            # A person, their membership and a personal device with a private conversation.
+            c.execute(text(
+                "INSERT INTO users (id, username, display_name, password_hash, is_active, "
+                "created_at) VALUES ('u-ana', 'ana', 'Ana', 'h', 1, '2026-11-21')"
+            ))
+            c.execute(text(
+                "INSERT INTO memberships (user_id, home_id, role, agent) "
+                "VALUES ('u-ana', 'home', 'owner', 'ana')"
+            ))
+            c.execute(text(
+                "INSERT INTO clients (id, home_id, user_id, name, key_hash, is_active, created_at, "
+                "stt_language, stt_vad_thold, tts_voice, tts_speed, barge_in_enabled, "
+                "barge_in_min_chars, silence_timeout_s, push_enabled, "
+                "tool_calls_enabled) VALUES ('phone', 'home', 'u-ana', 'Móvil', 'k2', 1, "
+                "'2026-11-21', 'es', 0, 'v', 1, 1, 5, 2, 1, 0)"
+            ))
+            _insert_conversation(c, "c-phone", "phone", owner="u-ana")
+        database.run_migrations()
+        with engine.connect() as c:
+            assert not barge & {col["name"] for col in inspect(c).get_columns("clients")}
+            rows = c.execute(text("SELECT id, user_id, silence_timeout_s FROM clients ORDER BY id"))
+            assert [tuple(r) for r in rows] == [("phone", "u-ana", 2.0), ("tv", None, 7.0)]
+            assert c.execute(text("SELECT id, username FROM users")).all() == [("u-ana", "ana")]
+            assert c.execute(text("SELECT user_id, home_id, role, agent FROM memberships")).all() == [
+                ("u-ana", "home", "owner", "ana")
+            ]
+            convs = c.execute(text("SELECT id, owner_user_id FROM conversations ORDER BY id")).all()
+            assert convs == [("c-phone", "u-ana"), ("c-tv", None)]
+            assert c.execute(text("PRAGMA foreign_key_check")).all() == []
+        engine.dispose()
+        command.downgrade(database._alembic_config(), "50a0e1f00002")
+        with engine.connect() as c:
+            assert barge <= {col["name"] for col in inspect(c).get_columns("clients")}
+            row = c.execute(text(
+                "SELECT id, barge_in_enabled, barge_in_min_chars, silence_timeout_s FROM clients "
+                "WHERE id = 'tv'"
+            )).one()
+            assert tuple(row) == ("tv", 1, 5, 7.0)
+            assert c.execute(text("SELECT user_id FROM clients WHERE id = 'phone'")).scalar() == "u-ana"
+            assert c.execute(text("SELECT COUNT(*) FROM memberships")).scalar() == 1
+            assert c.execute(text("SELECT id FROM conversations ORDER BY id")).scalars().all() == [
+                "c-phone", "c-tv"
+            ]
+            assert c.execute(text("PRAGMA foreign_key_check")).all() == []
+    finally:
+        database.dispose_engine()
+
+
+def test_migration_adds_notify_device(tmp_path, monkeypatch):
+    """#407 (Review Focus 5): una base de la PR 1/2b gana el dispositivo de avisos del hogar y de
+    cada persona sin perder clientes, personas ni conversaciones; la columna queda NULL (no se
+    rellena), su FK pone NULL al borrar el aparato y bajar de versión la quita."""
+    from alembic import command
+    from sqlalchemy import text
+
+    _point_at(monkeypatch, tmp_path / "notify.db")
+    command.upgrade(database._alembic_config(), "50a0e1f00003")
+    engine = database.get_engine()
+    try:
+        with engine.begin() as c:
+            assert "notify_client_id" not in {col["name"] for col in inspect(c).get_columns("homes")}
+            c.execute(text(
+                "INSERT INTO users (id, username, display_name, password_hash, is_active, "
+                "created_at) VALUES ('u-ana', 'ana', 'Ana', 'h', 1, '2026-11-21')"
+            ))
+            c.execute(text(
+                "INSERT INTO memberships (user_id, home_id, role, agent) "
+                "VALUES ('u-ana', 'home', 'owner', 'ana')"
+            ))
+            _insert_client(c, "tv")
+            _insert_client(c, "phone", user="u-ana")
+            _insert_conversation(c, "c-tv", "tv")
+            _insert_conversation(c, "c-phone", "phone", owner="u-ana")
+        database.run_migrations()
+        with engine.connect() as c:
+            for table in ("homes", "memberships"):
+                assert "notify_client_id" in {col["name"] for col in inspect(c).get_columns(table)}
+            assert c.execute(text("SELECT id, notify_client_id FROM homes")).all() == [
+                ("home", None)
+            ]
+            assert c.execute(text(
+                "SELECT user_id, role, agent, notify_client_id FROM memberships"
+            )).all() == [("u-ana", "owner", "ana", None)]
+            rows = c.execute(text("SELECT id, user_id FROM clients ORDER BY id")).all()
+            assert rows == [("phone", "u-ana"), ("tv", None)]
+            convs = c.execute(text("SELECT id, owner_user_id FROM conversations ORDER BY id")).all()
+            assert convs == [("c-phone", "u-ana"), ("c-tv", None)]
+            assert c.execute(text("PRAGMA foreign_key_check")).all() == []
+        # ON DELETE SET NULL (foreign_keys=ON, como en producción). Los aparatos se retiran, no se
+        # borran; uno sin conversaciones sí se puede borrar y la elección no queda colgando.
+        with engine.begin() as c:
+            _insert_client(c, "spare")
+            _insert_client(c, "spare-phone", user="u-ana")
+            c.execute(text("UPDATE homes SET notify_client_id = 'spare'"))
+            c.execute(text("UPDATE memberships SET notify_client_id = 'spare-phone'"))
+        with engine.begin() as c:
+            c.execute(text("DELETE FROM clients WHERE id IN ('spare', 'spare-phone')"))
+        with engine.connect() as c:
+            assert c.execute(text("SELECT notify_client_id FROM homes")).scalar() is None
+            assert c.execute(text("SELECT notify_client_id FROM memberships")).scalar() is None
+        engine.dispose()
+        command.downgrade(database._alembic_config(), "50a0e1f00003")
+        with engine.connect() as c:
+            for table in ("homes", "memberships"):
+                cols = {col["name"] for col in inspect(c).get_columns(table)}
+                assert "notify_client_id" not in cols
+            assert c.execute(text("SELECT COUNT(*) FROM memberships")).scalar() == 1
+            assert c.execute(text("SELECT id FROM clients ORDER BY id")).scalars().all() == [
+                "phone", "tv"
+            ]
+            assert c.execute(text("SELECT id FROM conversations ORDER BY id")).scalars().all() == [
+                "c-phone", "c-tv"
+            ]
+            assert c.execute(text("PRAGMA foreign_key_check")).all() == []
+    finally:
+        database.dispose_engine()
+
+
+def test_migration_gives_each_device_its_cap(tmp_path, monkeypatch):
+    """#410: cada aparato existente recibe su tope: los del hogar y los de una persona miembro,
+    `conversations:*`; los de un dueño o administrador, los cuatro. Bajar quita la columna."""
+    import json
+
+    from alembic import command
+    from sqlalchemy import text
+
+    _point_at(monkeypatch, tmp_path / "scopes.db")
+    command.upgrade(database._alembic_config(), "50a0e1f00004")
+    engine = database.get_engine()
+    try:
+        with engine.begin() as c:
+            for uid, role in (("u-sito", "owner"), ("u-eva", "admin"), ("u-ana", "member")):
+                c.execute(text(
+                    "INSERT INTO users (id, username, display_name, password_hash, is_active, "
+                    f"created_at) VALUES ('{uid}', '{uid}', '{uid}', 'h', 1, '2026-11-26')"
+                ))
+                c.execute(text(
+                    "INSERT INTO memberships (user_id, home_id, role) "
+                    f"VALUES ('{uid}', 'home', '{role}')"
+                ))
+            _insert_client(c, "tv")
+            _insert_client(c, "mac", user="u-sito")
+            _insert_client(c, "pc", user="u-eva")
+            _insert_client(c, "phone", user="u-ana")
+        database.run_migrations()
+        with engine.connect() as c:
+            rows = dict(c.execute(text("SELECT id, scopes FROM clients")).all())
+        converse = ["conversations:read", "conversations:write"]
+        everything = ["conversations:read", "conversations:write", "home:admin", "home:read"]
+        assert {k: json.loads(v) for k, v in rows.items()} == {
+            "tv": converse, "phone": converse, "mac": everything, "pc": everything,
+        }
+        engine.dispose()
+        command.downgrade(database._alembic_config(), "50a0e1f00004")
+        with engine.connect() as c:
+            assert "scopes" not in {col["name"] for col in inspect(c).get_columns("clients")}
+            assert c.execute(text("SELECT COUNT(*) FROM clients")).scalar() == 4
     finally:
         database.dispose_engine()
 

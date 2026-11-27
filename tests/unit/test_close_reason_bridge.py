@@ -8,14 +8,12 @@ import pytest
 
 from fogar_gateway.core.config import settings
 from fogar_gateway.core.exceptions import ClientInactive
-from fogar_gateway.core.session_key import make_session_key
 from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.openclaw.registry import TurnRegistry
 from fogar_gateway.services.pipeline_tracker import PipelineTracker
-from fogar_gateway.services.protocol import OrchestratorEvent
-from fogar_gateway.services.reconnection import ConnectionState
 from fogar_gateway.services.stats import gateway_stats
-from tests.fakes.bridge import DirectSender
+from tests.fakes.bridge import DirectSender, enqueue_push
+from tests.fakes.orchestrator import OrchestratorEvent
 
 
 @pytest.fixture
@@ -60,27 +58,6 @@ async def test_idle_timeout_reason(make_reason_bridge, monkeypatch):
     await asyncio.wait_for(bridge._idle_watchdog(), timeout=1.0)
     assert _end_meta(bridge)["reason"] == "idle_timeout"
     assert _closed() == {"idle_timeout": 1}
-
-
-async def test_silence_timeout_reason(make_reason_bridge, monkeypatch):
-    bridge = make_reason_bridge(ClientConfig(silence_timeout_s=1, max_silence_turns=1), "audio")
-    transcriber = MagicMock()
-    transcriber.state = ConnectionState.CONNECTED
-    transcriber.last_transcript_at = None
-    transcriber.close = AsyncMock()
-    bridge.transcriber = transcriber
-    now = time.monotonic()
-    bridge._last_audio_at = now
-    bridge._audio_burst_start = now - 5
-    bridge._last_audio_at = bridge._audio_burst_start = now - 5
-
-    async def _fast_sleep(_):
-        bridge._last_audio_at = time.monotonic()  # cliente enviando audio sin transcripción
-
-    monkeypatch.setattr("fogar_gateway.services.bridge._sleep", _fast_sleep)
-    await asyncio.wait_for(bridge._transcription_watchdog(), timeout=2.0)
-    assert _end_meta(bridge)["reason"] == "silence_timeout"
-    assert _closed() == {"silence_timeout": 1}
 
 
 async def test_revoked_reason(make_reason_bridge, monkeypatch):
@@ -193,31 +170,21 @@ async def test_turn_in_flight_flag(make_reason_bridge):
 
 
 async def test_queue_peaks_in_session_end(make_reason_bridge):
-    turns = TurnRegistry()
-    bridge = make_reason_bridge(turn_registry=turns)
-    sk = make_session_key("main", bridge.client_id)
-    q = turns.register("req-1", sk)
-    turns.deliver_by_session(sk, ("token", "a"))
-    turns.deliver_by_session(sk, ("token", "b"))
-    turns.unregister(sk, "req-1")
-    assert q.qsize() == 2
-    await bridge.turns._lock.acquire()  # a turn being replaced: the push worker waits
-    for kind in ("turn_start", "chat", "chat"):
-        bridge.enqueue_push(kind, {})
+    bridge = make_reason_bridge()
+    for kind in ("chat", "chat", "chat"):  # 3 at once in the worker's queue (no push opens:
+        enqueue_push(bridge, kind, {"state": "final"})  # a terminal is never a first event)
     await asyncio.sleep(0.01)
     await bridge.close_all()
-    bridge.turns._lock.release()
     meta = _end_meta(bridge)
-    assert meta["turn_queue_peak"] == 2
+    assert "turn_queue_peak" not in meta  # 5.0 PR 2b.3: no per-key turn queue any more
     assert meta["push_backlog_peak"] == 3
     assert meta["sender_peak_msgs"] == 0 and meta["sender_peak_bytes"] == 0
-    assert turns.depth(sk) == (0, 0)  # pop_peak consumido
 
 
 async def test_queue_peaks_default_to_zero_without_a_turn(make_reason_bridge):
     bridge = make_reason_bridge()
     await bridge.close_all()
-    assert _end_meta(bridge)["turn_queue_peak"] == 0
+    assert _end_meta(bridge)["push_backlog_peak"] == 0
 
 
 async def test_server_shutdown_disconnect_1012_records_shutdown(make_reason_bridge):

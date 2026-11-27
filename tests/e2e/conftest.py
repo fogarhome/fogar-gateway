@@ -48,7 +48,7 @@ def admin_headers() -> dict:
 
 def _create_test_client(admin_headers: dict, suffix: str, tool_calls_enabled: bool = False) -> dict:
     resp = httpx.post(
-        f"{GATEWAY_HTTP_URL}/admin/clients",
+        f"{GATEWAY_HTTP_URL}/home/devices",
         json={
             "name": f"e2e-smoke-{suffix}",
             "client_type": "app",
@@ -64,7 +64,7 @@ def _create_test_client(admin_headers: dict, suffix: str, tool_calls_enabled: bo
 
 def _delete_test_client(admin_headers: dict, client_id: str) -> None:
     httpx.delete(
-        f"{GATEWAY_HTTP_URL}/admin/clients/{client_id}",
+        f"{GATEWAY_HTTP_URL}/home/devices/{client_id}",
         headers=admin_headers,
         timeout=10.0,
     )

@@ -68,7 +68,7 @@ async def test_oversized_valid_handshake_is_rejected_before_parsing(make_server,
     monkeypatch.setattr(settings, "HANDSHAKE_MAX_BYTES", 4096)
     port = make_server()
     payload = json.dumps(
-        {"client_key": "k", "input_mode": "text", "output_mode": ["text"], "agent": "a" * 10_000}
+        {"token": "k", "protocol": 5, "input_mode": "text", "output_mode": ["text"], "agent": "a" * 10_000}
     )
     close = await _first_close(port, payload)
     assert close is not None

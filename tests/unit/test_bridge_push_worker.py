@@ -7,7 +7,7 @@ import pytest
 
 from fogar_gateway.core.config import settings
 from fogar_gateway.models.schemas import ClientConfig
-from tests.fakes.bridge import push, push_reply, sent
+from tests.fakes.bridge import enqueue_push, push, push_reply, sent
 
 SK = "agent:main:hab_sito"
 
@@ -30,7 +30,9 @@ def make_push_bridge(make_bridge):
 
 
 def _workers(bridge):
-    return [t for t in bridge.tasks if t.get_name() == "push_worker"]
+    """The channel's push worker (5.0: the push belongs to the channel), then the session's."""
+    workers = [t for t in bridge.channel_hub._tasks if t.get_name() == "push_worker"]
+    return workers + [t for t in bridge.tasks if t.get_name() == "turn_worker"]
 
 
 def _backlog(bridge):
@@ -53,7 +55,7 @@ async def test_worker_is_lazy_and_supervised(make_push_bridge):
     bridge = make_push_bridge()
     assert _workers(bridge) == []
 
-    bridge.enqueue_push("chat", {"deltaText": "x"})
+    enqueue_push(bridge, "chat", {"deltaText": "x"})
 
     (worker,) = _workers(bridge)
     assert not worker.done()
@@ -65,7 +67,7 @@ async def test_worker_is_lazy_and_supervised(make_push_bridge):
 async def test_enqueue_push_runs_events_in_fifo_order_and_is_non_blocking(make_push_bridge):
     bridge = make_push_bridge()
     for event in (*push_reply("a", "b", sk=SK, end=False), ("tool", _TOOL), ("turn_end", SK)):
-        bridge.enqueue_push(*event)
+        enqueue_push(bridge, *event)
 
     assert _backlog(bridge)["pending"] == 5  # enqueue_push did not run anything synchronously
     await bridge.push_idle()
@@ -96,9 +98,9 @@ async def test_slow_handler_does_not_block_the_caller_and_keeps_order(make_push_
     bridge = make_push_bridge(stream=stream)
     await push(bridge, *push_reply("uno", sk=SK, end=False))
 
-    bridge.enqueue_push("turn_end", SK)  # blocks in the TTS end()
+    enqueue_push(bridge, "turn_end", SK)  # blocks in the TTS end()
     for event in push_reply("dos", sk=SK):
-        bridge.enqueue_push(*event)
+        enqueue_push(bridge, *event)
     await asyncio.sleep(0.02)  # the worker is inside the slow end
     assert _backlog(bridge)["pending"] == 4
 
@@ -161,7 +163,7 @@ async def test_close_all_cancels_worker_before_closing_push_tts(make_push_bridge
     stream.close = tts_close
     bridge = make_push_bridge(stream=stream)
     await push(bridge, ("turn_start", SK))
-    bridge.enqueue_push("turn_end", SK)
+    enqueue_push(bridge, "turn_end", SK)
     await blocked.wait()
 
     await asyncio.wait_for(bridge.close_all(), timeout=2.0)
@@ -193,7 +195,7 @@ async def test_close_all_completes_while_worker_waits_for_audio_drain(make_push_
     stream.get_audio_stream = stuck_audio
     bridge = make_push_bridge(stream=stream)
     await push(bridge, ("turn_start", SK))
-    bridge.enqueue_push("turn_end", SK)
+    enqueue_push(bridge, "turn_end", SK)
     for _ in range(100):  # until the worker is inside the drain
         if stream.end.await_count:
             break
@@ -209,9 +211,10 @@ async def test_close_all_completes_while_worker_waits_for_audio_drain(make_push_
 async def test_enqueue_push_after_close_is_a_noop(make_push_bridge):
     """Review focus 2: a late frame for an already closed/unregistered bridge."""
     bridge = make_push_bridge()
+    channel = bridge.channel
     await bridge.close_all()
 
-    bridge.enqueue_push("chat", {"deltaText": "late"})
+    channel.enqueue_push("chat", {"deltaText": "late"})  # its (private) channel is closed too
 
     assert _workers(bridge) == []
     assert _backlog(bridge)["pending"] == 0
@@ -224,8 +227,8 @@ async def test_close_all_discards_backlog(make_push_bridge):
         await gate.wait()
 
     bridge = make_push_bridge(connect=AsyncMock(side_effect=slow_connect))
-    bridge.enqueue_push("turn_start", SK)
-    bridge.enqueue_push("chat", {"deltaText": "never"})
+    enqueue_push(bridge, "turn_start", SK)
+    enqueue_push(bridge, "chat", {"deltaText": "never"})
     await asyncio.sleep(0.01)
 
     await asyncio.wait_for(bridge.close_all(), timeout=2.0)
@@ -240,7 +243,7 @@ async def test_run_ends_when_client_disconnects_even_if_push_worker_spawned_firs
     worker into self.tasks[0]; run() must still await the client input loop."""
     bridge = make_push_bridge()
     bridge.client_ws.inbox.put_nowait({"type": "websocket.disconnect"})
-    bridge.enqueue_push("chat", {"deltaText": "x"})
+    enqueue_push(bridge, "chat", {"deltaText": "x"})
 
     loop = asyncio.get_running_loop()
     started = loop.time()
@@ -259,10 +262,10 @@ async def test_push_pending_peak(make_push_bridge):
         await gate.wait()
 
     bridge = make_push_bridge(connect=AsyncMock(side_effect=slow_connect))
-    bridge.enqueue_push("turn_start", SK)
+    enqueue_push(bridge, "turn_start", SK)
     await asyncio.sleep(0.01)  # the worker holds the first event
     for _ in range(3):
-        bridge.enqueue_push("chat", {"deltaText": "x"})
+        enqueue_push(bridge, "chat", {"deltaText": "x"})
     assert _backlog(bridge) == {"pending": 4, "peak": 4}
     gate.set()
     await bridge.push_idle()

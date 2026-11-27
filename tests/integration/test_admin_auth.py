@@ -3,12 +3,12 @@
 
 def test_admin_missing_token_returns_401(client):
     """No X-Admin-Token header → 401 (M20: X-Admin-Token or Bearer, neither required)."""
-    r = client.get("/admin/sessions")
+    r = client.get("/system/sessions")
     assert r.status_code == 401
 
 
 def test_admin_wrong_token_returns_401(client):
-    r = client.get("/admin/sessions", headers={"x-admin-token": "wrong"})
+    r = client.get("/system/sessions", headers={"x-admin-token": "wrong"})
     assert r.status_code == 401
 
 
@@ -16,7 +16,7 @@ def test_admin_no_token_configured_returns_503(client, monkeypatch):
     from fogar_gateway.core.config import settings
 
     monkeypatch.setattr(settings, "ADMIN_TOKEN", "")
-    r = client.get("/admin/sessions", headers={"x-admin-token": "anything"})
+    r = client.get("/system/sessions", headers={"x-admin-token": "anything"})
     assert r.status_code == 503
 
 
@@ -32,7 +32,7 @@ def test_admin_token_compared_in_constant_time(client, admin_headers, monkeypatc
         return real(a, b)
 
     monkeypatch.setattr(secrets, "compare_digest", spy)
-    assert client.get("/admin/sessions", headers=admin_headers).status_code == 200
+    assert client.get("/system/sessions", headers=admin_headers).status_code == 200
     assert len(calls) == 1
 
 
@@ -50,5 +50,5 @@ def test_admin_token_matches_is_the_one_check(monkeypatch):
 
 def test_admin_non_ascii_token_returns_401_not_500(client):
     # compare_digest(str, str) raises TypeError on non-ASCII; we compare bytes.
-    r = client.get("/admin/sessions", headers={"x-admin-token": "tökén".encode("latin-1")})
+    r = client.get("/system/sessions", headers={"x-admin-token": "tökén".encode("latin-1")})
     assert r.status_code == 401

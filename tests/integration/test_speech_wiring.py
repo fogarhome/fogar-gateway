@@ -88,35 +88,35 @@ def test_provider_start_failure_does_not_abort_startup(failing_stt_start, client
 
 def test_admin_status_includes_provider(client):
     h = {"X-Admin-Token": "test-admin-token"}
-    assert client.get("/admin/transcriber/status", headers=h).json()["provider"] == "fogar"
-    assert client.get("/admin/tts/status", headers=h).json()["provider"] == "fogar"
+    assert client.get("/system/services/transcriber", headers=h).json()["provider"] == "fogar"
+    assert client.get("/system/services/tts", headers=h).json()["provider"] == "fogar"
 
 
 def test_admin_speech_requires_token(client):
-    assert client.get("/admin/speech").status_code == 401
+    assert client.get("/system/speech").status_code == 401
     bad = {"X-Admin-Token": "wrong"}
-    assert client.get("/admin/speech", headers=bad).status_code == 401
+    assert client.get("/system/speech", headers=bad).status_code == 401
 
 
 def test_admin_speech_get_is_read_only(client):
     """#269: el proveedor se elige al arrancar; no hay cambio en caliente."""
     h = {"X-Admin-Token": "test-admin-token"}
-    body = client.get("/admin/speech", headers=h).json()
+    body = client.get("/system/speech", headers=h).json()
     assert body["stt"]["provider"] == "fogar" and body["tts"]["provider"] == "fogar"
     assert body["audio_gate"] == "off"
-    assert client.put("/admin/speech", json={}, headers=h).status_code == 405
+    assert client.put("/system/speech", json={}, headers=h).status_code == 405
 
 
 def test_admin_tts_status_exposes_counters_only_for_providers_that_have_them(client, monkeypatch):
     from pydantic import SecretStr
 
     h = {"X-Admin-Token": "test-admin-token"}
-    assert "counters" not in client.get("/admin/tts/status", headers=h).json()
+    assert "counters" not in client.get("/system/services/tts", headers=h).json()
     monkeypatch.setattr(settings, "ELEVENLABS_API_KEY", SecretStr("k"))
     monkeypatch.setattr(settings, "ELEVENLABS_BASE_URL", "ws://127.0.0.1:1")  # nada escucha
     speech = client.app.state.speech
     client.app.state.speech = SpeechProviders(speech.stt, ElevenLabsTtsProvider(settings))
-    body = client.get("/admin/tts/status", headers=h).json()
+    body = client.get("/system/services/tts", headers=h).json()
     assert body["provider"] == "elevenlabs"
     assert body["counters"] == {"capacity_refusals": 0, "provider_429": 0, "auth_errors": 0}
 
@@ -127,12 +127,12 @@ def test_admin_transcriber_status_exposes_counters_only_for_providers_that_have_
     from pydantic import SecretStr
 
     h = {"X-Admin-Token": "test-admin-token"}
-    assert "counters" not in client.get("/admin/transcriber/status", headers=h).json()
+    assert "counters" not in client.get("/system/services/transcriber", headers=h).json()
     monkeypatch.setattr(settings, "ELEVENLABS_API_KEY", SecretStr("k"))
     monkeypatch.setattr(settings, "ELEVENLABS_BASE_URL", "ws://127.0.0.1:1")  # nada escucha
     speech = client.app.state.speech
     client.app.state.speech = SpeechProviders(ElevenLabsSttProvider(settings), speech.tts)
-    body = client.get("/admin/transcriber/status", headers=h).json()
+    body = client.get("/system/services/transcriber", headers=h).json()
     assert body["provider"] == "elevenlabs"
     assert body["counters"] == {
         "capacity_refusals": 0,

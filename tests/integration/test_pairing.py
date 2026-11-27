@@ -1,4 +1,4 @@
-"""Descubrimiento y emparejamiento (#317): /.well-known/fogar-gateway, POST /pair y /admin/pairing."""
+"""Descubrimiento y emparejamiento (#317): /.well-known/fogar-gateway, POST /pair y /home/pairing."""
 
 import json
 import logging
@@ -41,7 +41,7 @@ def http(make_client) -> TestClient:
 
 
 def _open(http: TestClient, **template) -> dict:
-    r = http.post("/admin/pairing", json=template, headers=ADMIN)
+    r = http.post("/home/pairing", json=template, headers=ADMIN)
     assert r.status_code == 201, r.text
     return r.json()
 
@@ -62,9 +62,8 @@ def test_well_known_shape(http):
     r = http.get("/.well-known/fogar-gateway")
     assert r.status_code == 200
     body = r.json()
-    assert set(body) == {"service", "version", "name", "instance_id"}
+    assert set(body) == {"service", "version", "instance_id"}
     assert body["service"] == "fogar-gateway"
-    assert body["name"]  # nombre del equipo por defecto
 
 
 def test_well_known_instance_id_stable_per_process(http):
@@ -73,18 +72,18 @@ def test_well_known_instance_id_stable_per_process(http):
     assert a == b and re.fullmatch(r"[0-9a-f]{16}", a)
 
 
-def test_well_known_uses_gateway_name(http, monkeypatch):
+def test_well_known_does_not_expose_name(http, monkeypatch):
     monkeypatch.setattr(settings, "GATEWAY_NAME", "green-house")
-    assert http.get("/.well-known/fogar-gateway").json()["name"] == "green-house"
+    assert set(http.get("/.well-known/fogar-gateway").json()) == {"service", "version", "instance_id"}
 
 
-# --- /admin/pairing ---
+# --- /home/pairing ---
 
 
 @pytest.mark.parametrize(
     "method,path",
-    [("post", "/admin/pairing"), ("get", "/admin/pairing"), ("get", "/admin/pairing/x"),
-     ("delete", "/admin/pairing/x")],
+    [("post", "/home/pairing"), ("get", "/home/pairing"), ("get", "/home/pairing/x"),
+     ("delete", "/home/pairing/x")],
 )
 def test_admin_pairing_requires_token(http, method, path):
     kwargs = {"json": {}} if method == "post" else {}
@@ -93,35 +92,41 @@ def test_admin_pairing_requires_token(http, method, path):
 
 def test_admin_pairing_validates_template_upfront(http):
     r = http.post(
-        "/admin/pairing", json={"default_agent": "a", "allowed_agents": ["b"]}, headers=ADMIN
+        "/home/pairing", json={"default_agent": "a", "allowed_agents": ["b"]}, headers=ADMIN
     )
     assert r.status_code == 422
-    assert http.post("/admin/pairing", json={"tts_speed": 0}, headers=ADMIN).status_code == 422
-    assert http.post("/admin/pairing", json={"client_key": "x" * 40}, headers=ADMIN).status_code == 422
+    assert http.post("/home/pairing", json={"tts_speed": 0}, headers=ADMIN).status_code == 422
+    assert http.post("/home/pairing", json={"client_key": "x" * 40}, headers=ADMIN).status_code == 422
 
 
 def test_admin_pairing_open_returns_code_once(http):
     item = _open(http, name="tele", client_type="screen")
     assert len(item["code"]) == 6 and item["code"].isdigit()
     assert item["template"] == {"name": "tele", "client_type": "screen"}
-    listed = http.get("/admin/pairing", headers=ADMIN).json()
-    one = http.get(f"/admin/pairing/{item['id']}", headers=ADMIN).json()
+    listed = http.get("/home/pairing", headers=ADMIN).json()
+    one = http.get(f"/home/pairing/{item['id']}", headers=ADMIN).json()
     assert [p["id"] for p in listed] == [item["id"]]
     assert "code" not in listed[0] and "code" not in one
     assert item["code"] not in json.dumps(listed) + json.dumps(one)
 
 
+def test_admin_pairing_ignores_legacy_barge_in_fields(http):
+    """#406: a template with the old barge-in fields is accepted (201) and they are dropped."""
+    item = _open(http, name="tele", barge_in_enabled=False, barge_in_min_chars=9)
+    assert item["template"] == {"name": "tele"}
+
+
 def test_admin_pairing_limit(http):
     for _ in range(pairing.MAX_OPEN):
         _open(http)
-    assert http.post("/admin/pairing", json={}, headers=ADMIN).status_code == 409
+    assert http.post("/home/pairing", json={}, headers=ADMIN).status_code == 409
 
 
 def test_admin_pairing_cancel(http):
     item = _open(http)
-    assert http.delete(f"/admin/pairing/{item['id']}", headers=ADMIN).status_code == 204
-    assert http.get(f"/admin/pairing/{item['id']}", headers=ADMIN).json()["state"] == "cancelled"
-    assert http.delete(f"/admin/pairing/{item['id']}", headers=ADMIN).status_code == 404
+    assert http.delete(f"/home/pairing/{item['id']}", headers=ADMIN).status_code == 204
+    assert http.get(f"/home/pairing/{item['id']}", headers=ADMIN).json()["state"] == "cancelled"
+    assert http.delete(f"/home/pairing/{item['id']}", headers=ADMIN).status_code == 404
     r = http.post("/pair", json={"code": item["code"]})
     assert r.status_code == 400
 
@@ -132,17 +137,18 @@ def test_admin_pairing_cancel(http):
 def test_pair_creates_client_with_template(http, db_engine):
     item = _open(
         http, name="tele", client_type="screen", default_agent="j-assistant",
-        allowed_agents=["j-assistant"], tts_voice="ef_dora", barge_in_enabled=False,
+        allowed_agents=["j-assistant"], tts_voice="ef_dora", push_enabled=False,
     )
     r = http.post("/pair", json={"code": item["code"]})
     assert r.status_code == 201, r.text
     body = r.json()
-    assert set(body) == {"client_id", "name", "client_key", "gateway"}
+    assert set(body) == {"client_id", "name", "token", "scopes", "gateway"}
     assert body["name"] == "tele"
     assert set(body["gateway"]) == {"name", "version"}
+    assert body["gateway"]["name"]  # el nombre solo sale al canjear un código, nunca en el well-known
     [row] = _rows(db_engine)
-    assert row.id == body["client_id"] and row.key_hash == hash_key(body["client_key"])
-    assert (row.client_type, row.default_agent, row.tts_voice, row.barge_in_enabled) == (
+    assert row.id == body["client_id"] and row.key_hash == hash_key(body["token"])
+    assert (row.client_type, row.default_agent, row.tts_voice, row.push_enabled) == (
         "screen", "j-assistant", "ef_dora", False,
     )
     assert json.loads(row.allowed_agents) == ["j-assistant"]
@@ -222,7 +228,7 @@ def test_failed_attempts_burn_all_codes(http):
     a, b = _open(http), _open(http)
     for _ in range(pairing.MAX_FAILED):
         assert http.post("/pair", json={"code": _wrong(a["code"])}).status_code == 400
-    assert http.get("/admin/pairing", headers=ADMIN).json() == []
+    assert http.get("/home/pairing", headers=ADMIN).json() == []
     assert http.post("/pair", json={"code": b["code"]}).status_code == 400
 
 
@@ -240,20 +246,20 @@ def test_create_failure_keeps_code_open(http, monkeypatch, db_engine):
     for _ in range(pairing.MAX_FAILED):
         assert http.post("/pair", json={"code": item["code"]}).status_code == 409
     monkeypatch.undo()
-    assert http.get(f"/admin/pairing/{item['id']}", headers=ADMIN).json()["state"] == "open"
+    assert http.get(f"/home/pairing/{item['id']}", headers=ADMIN).json()["state"] == "open"
 
 
 def test_pairing_state_after_use(http):
     item = _open(http, name="tele")
     client_id = http.post("/pair", json={"code": item["code"]}).json()["client_id"]
-    state = http.get(f"/admin/pairing/{item['id']}", headers=ADMIN).json()
+    state = http.get(f"/home/pairing/{item['id']}", headers=ADMIN).json()
     assert (state["state"], state["client_id"], state["client_name"]) == ("used", client_id, "tele")
 
 
 def test_paired_key_authenticates(make_client):
     http = make_client(("203.0.113.5", 54321))  # fuera de la LAN de confianza: exige clave
     item = _open(http)
-    key = http.post("/pair", json={"code": item["code"]}).json()["client_key"]
+    key = http.post("/pair", json={"code": item["code"]}).json()["token"]
     assert http.get("/v1/models").status_code == 401
     assert http.get("/v1/models", headers={"authorization": f"Bearer {key}"}).status_code == 200
 
@@ -262,7 +268,7 @@ def test_pair_logs_never_contain_code_or_key(http, caplog):
     caplog.set_level(logging.DEBUG)
     item = _open(http)
     http.post("/pair", json={"code": _wrong(item["code"])})
-    key = http.post("/pair", json={"code": item["code"]}).json()["client_key"]
+    key = http.post("/pair", json={"code": item["code"]}).json()["token"]
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "Emparejamiento: cliente" in text
     assert item["code"] not in text and key not in text

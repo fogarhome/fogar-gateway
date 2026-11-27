@@ -39,7 +39,7 @@ def _config_module() -> Any:
 
     `fogar_gateway.core.config` construye un `Settings()` global al importarse: un valor inválido
     (entorno o config.env) lo rompe. Entonces se ejecuta el módulo aparte, sin registrarlo, y se
-    toman la clase y RETIRED_KEYS, definidas antes de esa línea: la CLI sigue pudiendo validar
+    toma la clase, definida antes de esa línea: la CLI sigue pudiendo validar
     y corregir el valor (`config set`/`unset`, #359) sin traceback.
     """
     import importlib
@@ -63,7 +63,20 @@ def _config_module() -> Any:
 
 def _errors(exc: Any) -> list[str]:
     # Campo y tipo de error, nunca el valor (podría ser un secreto).
-    return [f"{'.'.join(str(p) for p in e['loc'])}: {e['type']}" for e in exc.errors()]
+    out = []
+    for e in exc.errors():
+        loc = ".".join(str(p) for p in e["loc"])
+        if e["type"] == "extra_forbidden":  # las claves de config.env llegan en minúsculas
+            out.append(f"{loc.upper()}: {e['type']} (ajuste desconocido: quítalo con "
+                       f"`fogar-gw config unset {loc.upper()}`)")
+        elif e["type"] == "literal_error":
+            # Los valores válidos son del esquema, no del usuario (#422).
+            expected = str(e.get("ctx", {}).get("expected", "")).replace(" or ", " o ")
+            out.append(f"{loc}: {e['type']} (usa {expected} con `fogar-gw config set {loc}` "
+                       f"o quítalo con `fogar-gw config unset {loc}`)")
+        else:
+            out.append(f"{loc}: {e['type']}")
+    return out
 
 
 def _settings_error(exc: Exception) -> list[str]:
@@ -133,12 +146,17 @@ def validation_checks(settings: Any) -> list[dict[str, str]]:
         ADMIN_TOKEN_MIN_LEN,
         SpeechConfigError,
         check_speech_settings,
-        deprecated_settings,
         insecure_tokens,
     )
 
     where = paths.config_file()
     checks: list[dict[str, str]] = []
+    for name in _retired_in_config_env():
+        checks.append(_check("warn", name, "Ya no se usa desde la 5.0 y se ignora: quítalo con "
+                             f"`fogar-gw config unset {name}`."))
+    if _auto_gate_in_config_env():
+        checks.append(_check("warn", "STT_AUDIO_GATE", "«auto» ya no existe desde la 5.0 y se usa "
+                             "energy: cámbialo con `fogar-gw config set STT_AUDIO_GATE energy`."))
     for name in insecure_tokens(settings):
         empty = not getattr(settings, name)
         if name == "ADMIN_TOKEN":
@@ -166,15 +184,32 @@ def validation_checks(settings: Any) -> list[dict[str, str]]:
         if hosts := _host_bit_entries(csv):
             checks.append(_check("warn", name, f"{hosts}. El gateway usa la red indicada; "
                                  "escríbela así."))
-    for name in deprecated_settings(settings):
-        checks.append(_check("warn", name, "Obsoleto e ignorado; bórralo de la configuración."))
     return checks
+
+
+def _config_env() -> dict[str, str]:
+    path = paths.config_file()
+    if not path.is_file():
+        return {}
+    try:
+        return api.read_env_file(path)
+    except api.ApiError:
+        return {}  # sin permiso: load() ya lo ha dicho
+
+
+def _retired_in_config_env() -> list[str]:
+    """Ajustes retirados que siguen en config.env (el gateway los ignora con un aviso)."""
+    return sorted(set(_config_env()) & _config_module().RETIRED_KEYS)
+
+
+def _auto_gate_in_config_env() -> bool:
+    """`STT_AUDIO_GATE=auto` de la 4.x (#422): el gateway usa energy con un aviso."""
+    return _config_env().get("STT_AUDIO_GATE", "").strip().lower() == "auto"
 
 
 # Listas de IP/CIDR: sus entradas no son secretas y se muestran (F-r3-1).
 _NETWORK_FIELDS = {
-    "TRUSTED_PROXIES": "Mientras tanto ningún origen queda exento de Bearer en /v1 (fallo cerrado).",
-    "TRUSTED_NETWORKS": "El gateway las ignora.",
+    "TRUSTED_PROXIES": "Mientras tanto ningún peer cuenta como proxy (los logs enseñan su IP).",
 }
 
 
@@ -372,8 +407,10 @@ def _resolve_name(name: str, *, retired: bool = False) -> str:
     module = _config_module()
     fields = module.Settings.model_fields
     key = name.upper()
-    if retired and key in module.RETIRED_KEYS:  # `unset` las quita, como pide el log (F-r8-4)
-        return key
+    if retired and key not in fields and paths.config_file().is_file() and any(
+        _line_re(key).match(line) for line in paths.config_file().read_text().splitlines()
+    ):
+        return key  # `unset` quita un ajuste retirado que sigue en config.env
     if key not in fields:
         close = difflib.get_close_matches(key, list(fields), n=1)
         hint = f" ¿Querías decir {close[0]}?" if close else ""
@@ -443,6 +480,10 @@ def _offer_restart(ctx: click.Context, out: Out) -> bool:
         return False
     if not service.unit_path().exists() or service.systemctl(
             "is-active", "--quiet", service.UNIT_NAME, check=False).returncode != 0:
+        return False
+    try:  # la unidad de otra base (p. ej. producción) no se reinicia por un cambio de esta
+        service.own_unit_or_fail()
+    except api.ApiError:
         return False
     # No `output.confirm`: sale con 2 al decir que no y aquí el cambio ya está hecho.
     # --json no es interactivo: solo reinicia con --yes.

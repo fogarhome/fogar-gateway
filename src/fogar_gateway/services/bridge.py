@@ -10,6 +10,7 @@ from fogar_gateway.core.config import settings
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
 from fogar_gateway.models.close_codes import Close, CloseFrame, send_close
 from fogar_gateway.models.schemas import Client, ClientConfig, Handshake
+from fogar_gateway.services.channel import ChannelHub, ConversationChannel
 from fogar_gateway.services.conversations import Conversation, SessionConversation
 from fogar_gateway.services.db_client import db_client
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
@@ -22,6 +23,7 @@ from fogar_gateway.services.reconnection import (
     to_wire_state,
     traceback_no_message,
 )
+from fogar_gateway.services.scopes import CONVERSATIONS_WRITE
 from fogar_gateway.services.session_registry import SessionStatus
 from fogar_gateway.services.speech.ports import (
     SpeechToTextProvider,
@@ -38,32 +40,22 @@ from fogar_gateway.services.turns import TurnController
 
 logger = logging.getLogger(__name__)
 
-# Silence-watchdog poll interval (issue #129). Each tick with no transcription for
-# longer than `silence_timeout_s` is one strike (and one `degraded` notice), so
-# `max_silence_turns` counts ticks, not whole `silence_timeout_s` windows.
+# Silence-watchdog poll interval (issue #129). A tick with no transcription for longer than
+# `silence_timeout_s` warns the client (`degraded`), once per stretch of silence (#394).
 _WATCHDOG_POLL_S = 2
 # Tests swap this name for a virtual clock; patching asyncio.sleep would change it process-wide.
 _sleep = asyncio.sleep
 
 
-# Lo que espera una sesión nueva a que la que desplaza suelte su clave (M19): SESSION_TEARDOWN_S
-# para que su turno suelte la clave, más esto para sus chat.abort (cada uno con tope de 1 s).
-_ABORT_SLACK_S = 3.0
-# Revocada o desplazada, la sesión solo manda ya los turn_start/turn_end de sus turnos (G-18):
-# el turn_start pasa también (A-r2-1), o uno aún en la cola se tiraría y su turn_end saldría solo.
+# Revocada o con el agente retirado, la sesión solo manda ya los turn_start/turn_end de sus
+# turnos (G-18): el turn_start pasa también (A-r2-1), o uno aún en la cola se tiraría y su
+# turn_end saldría solo.
 _ONLY_TURN_END = frozenset({"turn_start", "turn_end"})
 
 _REASON_BY_STATUS: dict[str, CloseReason] = {
     "revoked": "revoked",
     "error": "error",
 }
-
-
-async def _take_over(other: "FogarBridge | None") -> None:
-    """La sesión que tenía abierta la conversación (si había otra) se cierra (M19), y se
-    espera, acotado, a que suelte sus turnos: ningún chat.abort suyo sale después."""
-    if other is not None:
-        await other.displace()
 
 
 class FogarBridge:
@@ -86,6 +78,7 @@ class FogarBridge:
         conversation: SessionConversation,
         sender: OutboundSender,
         turn_registry: TurnRegistry,
+        channel_hub: ChannelHub | None = None,
     ):
         # Contada al crearse: toda sesión que luego cierra close_all() cuenta como abierta,
         # también la que falla antes de run() (1011, ready fallido…).
@@ -103,17 +96,14 @@ class FogarBridge:
         self._stt: SpeechToTextProvider = speech.stt
         self.tracker: PipelineTracker = tracker
         self._client_registry = client_registry
-        # Máximo de la cola de turno (#219) y runs de OpenClaw: lápidas y activos (#285).
-        self._turn_registry = turn_registry
         # La conversación de la sesión (M19): su sessionKey y su cambio de día.
         self.conversation = conversation
         conversation.bind(self._spawn_background)
         conversation.on_move = self._on_conversation_move
-        # Desplazada por otra sesión (M19): su cierre, y el aviso de que ya soltó sus turnos.
+        # Su cierre por política (4200 revocada, 4020 agente retirado, 1011 configuración
+        # ilegible): uno por sesión.
         self._policy_close: asyncio.Task | None = None
-        self._released = asyncio.Event()
         # Máximo de la cola de turno de las conversaciones que la sesión ya dejó (#219).
-        self._turn_queue_peak = 0
         self.transcriber: SttSession | None = None
 
         self.tasks: list[asyncio.Task] = []
@@ -124,6 +114,7 @@ class FogarBridge:
         self._background_tasks: set[asyncio.Task] = set()
         # True while the transcriber reports `status busy` (GPU saturated, #143).
         self._transcriber_busy: bool = False
+        self._silence_warned = False  # #423: avisado `degraded` `silence` y sin su `restored`
         self._session_start: float = 0.0
         self._last_client_activity: float = 0.0
         # Guards close_all() so it's safe to call more than once (issue #101):
@@ -141,18 +132,29 @@ class FogarBridge:
         # first frame of the current burst (a frame after an idle gap starts a new one).
         self._last_audio_at: float | None = None
         self._audio_burst_start: float | None = None
+        # Los canales de las conversaciones (5.0, #406): el de la app. Sin él (tests), uno
+        # propio, que se cierra con la sesión (su turno no le sobrevive).
+        self._own_hub = channel_hub is None
+        if channel_hub is None:
+            channel_hub = ChannelHub(
+                index=client_registry.index,
+                orchestrator=orchestrator,
+                turn_registry=turn_registry,
+                note_turn=lambda conversation_id: self.conversation.note_turn(conversation_id),
+                sessions_of=lambda cid: [b.turns for b in client_registry.for_client(cid)],
+            )
+        self.channel_hub = channel_hub
         self.turns = TurnController(
-            client_id=self.client_id,
+            client=client,
             config=config,
             handshake=handshake,
-            orchestrator=orchestrator,
             tts=self.tts,
             tracker=tracker,
             sender=sender,
             conversation=conversation,
+            channels=channel_hub,
             spawn=self._spawn,
             supervise=self._supervise,
-            turn_registry=turn_registry,
         )
 
     async def connect_internal_services(self):
@@ -182,28 +184,34 @@ class FogarBridge:
         self._client_registry.register(self.client_id, self)
 
     async def claim_conversation(self) -> None:
-        """Abre la conversación de la sesión (M19). Tras el health check y antes de `ready`:
-        una sesión que no llega a abrirse nunca cierra la que la tenía."""
-        await _take_over(self._client_registry.open(self.conversation.current, self))
+        """Abre la conversación de la sesión (M19) y se adjunta a su canal (5.0, #406). Tras el
+        health check y justo antes de `ready`: ningún turno llega antes de `ready`. Nunca
+        cierra otra sesión (el 4102 se retiró): las que ya la tenían abierta siguen en el mismo
+        canal. Solo se adjunta si la conversación es visible para su dispositivo
+        (`Conversation.visible_to`, en `TurnController.attach`)."""
+        self._client_registry.index.add(self.conversation.current)
+        self.turns.attach()
+
+    @property
+    def channel(self) -> ConversationChannel | None:
+        """El canal de la conversación al que está adjunta la sesión, si lo está."""
+        return self.turns.channel
 
     def _session_key(self) -> str:
         return self.conversation.session_key
 
     async def _on_conversation_move(self, old: Conversation, new: Conversation) -> None:
-        """Cambio de día (M19): la sesión deja la conversación de ayer y abre la de hoy."""
-        self._client_registry.close(old.id, self)
-        self._turn_queue_peak = max(
-            self._turn_queue_peak, self._turn_registry.pop_peak(old.session_key)
-        )
-        await _take_over(self._client_registry.open(new, self))
+        """Cambio de día (M19): la conversación de hoy se indexa (su push llega a su canal). El
+        cambio de canal lo hace `TurnController` en ese mismo `send` (decisión 6: deja el de
+        ayer, donde su turno sigue para los demás, y se adjunta al de hoy)."""
+        self._client_registry.index.add(new)
 
     def snapshot(self) -> dict[str, Any]:
-        """Estado vivo de la sesión para /admin/state (#219): solo números, estados e
+        """Estado vivo de la sesión para /system/state (#219): solo números, estados e
         IDs, nunca texto ni client_key. `started_at` y `last_latencies` los añade la ruta
         desde el SessionRecord (aquí van a None)."""
         now = time.monotonic()
         turns = self.turns.snapshot(now)
-        depth, peak = self._turn_registry.depth(self._session_key())
         return {
             "session_id": self.tracker.session_id,
             "client_id": self.client_id,
@@ -216,7 +224,6 @@ class FogarBridge:
             "turn": turns["turn"],
             "turn_count": self.tracker.turn_count,
             "sender": self._sender.queue_stats(),
-            "turn_queue": {"depth": depth, "peak": peak},
             "push_backlog": turns["push_backlog"],
             "last_activity_s": (
                 round(now - self._last_client_activity, 3) if self._last_client_activity else None
@@ -243,7 +250,6 @@ class FogarBridge:
             "turn_in_flight": bool(self._turn_in_flight_at_close),
             "sender_peak_msgs": 0,
             "sender_peak_bytes": 0,
-            "turn_queue_peak": 0,
             "push_backlog_peak": self.turns.push_backlog_peak,
         }
         # Una métrica nunca debe impedir el cierre.
@@ -253,12 +259,6 @@ class FogarBridge:
             meta["sender_peak_bytes"] = int(q["peak_bytes"])
         except Exception as e:  # noqa: BLE001 — una métrica nunca impide el cierre
             logger.debug(f"[{self.client_id}] sender_peak no disponible: {type(e).__name__}")
-        try:
-            meta["turn_queue_peak"] = max(
-                self._turn_queue_peak, self._turn_registry.pop_peak(self._session_key())
-            )
-        except Exception as e:  # noqa: BLE001 — una métrica nunca impide el cierre
-            logger.debug(f"[{self.client_id}] turn_queue_peak no disponible: {type(e).__name__}")
         return meta
 
     async def close_all(
@@ -294,9 +294,13 @@ class FogarBridge:
             self._client_registry.unregister(self.client_id, self)
             limit = settings.SESSION_TEARDOWN_S
             async with Teardown(f"[{self.client_id}] close_all") as td:
-                # The turns first: the one in flight is cancelled (never drained) and every
-                # open turn gets its turn_end while the socket is still open (G-10, G-23).
+                # The turns first: the session leaves its channel (the turn in flight goes on
+                # there, decision 2) and every open turn gets its turn_end while the socket is
+                # still open (G-10, G-23).
                 await self.turns.close(td, limit)
+                if self._own_hub:
+                    # A hub of its own (tests): nobody else is on it, its turn ends with it.
+                    await td.step(self.channel_hub.aclose(limit), "canales propios", limit)
 
                 # Never the calling task: the watchdogs call close_all() on themselves.
                 # Cancel them all first, then wait them under one shared limit.
@@ -355,22 +359,19 @@ class FogarBridge:
             tts_live = False
 
         return {
-            "barge_in": bool(self.config.barge_in_enabled)
-            and transcriber_live
-            and self._stt.capabilities.partials,
             "tts": tts_live,
             "transcriber": transcriber_live,
         }
 
     async def _transcription_watchdog(self):
-        """Notifica al cliente si hay silencio prolongado; cierra tras max_silence_turns consecutivos."""
+        """Avisa al cliente (`degraded`) de un silencio prolongado, una vez por tramo; nunca cierra la sesión (#394)."""
         # Esperar a que el cliente empiece a enviar audio antes de vigilar
         while self._last_audio_at is None:
             await _sleep(0.5)
             if not self.transcriber or self.transcriber.state == ConnectionState.DEGRADED:
                 return
 
-        silence_count = 0
+        warned = False
         last_seen_transcription_at = self.transcriber.last_transcript_at
         was_connected = True
         recovery_baseline: float | None = None
@@ -391,7 +392,7 @@ class FogarBridge:
 
             current_transcription_at = self.transcriber.last_transcript_at
             if current_transcription_at != last_seen_transcription_at:
-                silence_count = 0
+                warned = False
                 last_seen_transcription_at = current_transcription_at
                 recovery_baseline = None
             elif not was_connected:
@@ -400,16 +401,16 @@ class FogarBridge:
                 # so it still predates the outage — restart the silence clock from
                 # the recovery moment instead of blaming the client for however
                 # long the reconnect took (issue #149).
-                silence_count = 0
+                warned = False
                 recovery_baseline = time.monotonic()
             was_connected = True
 
             now = time.monotonic()
             if self.turns.in_flight():
                 # Decision of Sito (#215): a turn in progress is activity, not silence.
-                # Strikes reset and the window restarts from now, so the first window
-                # after the turn is a fresh one (no strike on the first tick after it).
-                silence_count = 0
+                # The warning resets and the window restarts from now, so the first window
+                # after the turn is a fresh one (no warning on the first tick after it).
+                warned = False
                 recovery_baseline = now
                 continue
 
@@ -417,8 +418,8 @@ class FogarBridge:
             if now - last_audio > self._audio_gap_s():
                 # #227: the client is not sending audio (wake-word client idle between
                 # turns, keepalive only). Silence is only counted while audio flows:
-                # no strikes, no `degraded`, accumulated strikes are forgotten.
-                silence_count = 0
+                # no `degraded`, and the warning state is forgotten.
+                warned = False
                 continue
 
             burst_start = self._audio_burst_start
@@ -430,7 +431,7 @@ class FogarBridge:
             if last_audio <= last:
                 # No audio since the window's reference point (the last transcription):
                 # the client already said its piece and went quiet. Nothing to blame it for.
-                silence_count = 0
+                warned = False
                 continue
             elapsed = now - last
             timeout = self.config.silence_timeout_s
@@ -439,17 +440,12 @@ class FogarBridge:
                 # return its first result (`warmup_s`; fogar = 0) isn't blamed for it.
                 timeout += self._stt.capabilities.warmup_s
 
-            if elapsed > timeout:
-                silence_count += 1
-                logger.warning(
-                    f"[{self.client_id}] Watchdog: {elapsed:.1f}s sin transcripción "
-                    f"({silence_count}/{self.config.max_silence_turns})"
-                )
-                await self.notify_service_status("transcriber", "degraded")
-                if silence_count >= self.config.max_silence_turns:
-                    self.note_close_reason("silence_timeout")
-                    await self.close_all()
-                    return
+            if elapsed > timeout and not warned:
+                warned = True
+                logger.warning(f"[{self.client_id}] Watchdog: {elapsed:.1f}s sin transcripción")
+                self._silence_warned = True
+                # #423: con su `code`, para distinguirlo de otras causas y emparejar su `restored`.
+                await self.notify_service_status("transcriber", "degraded", code="silence", message="silence")
 
     async def _idle_watchdog(self):
         """Cierra la sesión si el cliente no manda ningún mensaje (audio o texto) durante
@@ -498,6 +494,15 @@ class FogarBridge:
                     # Borrado y recreado con la MISMA clave: es otro cliente.
                     await self._revoke_session()
                     return
+                if CONVERSATIONS_WRITE not in current.scopes:
+                    # #410: le quitaron el permiso (o bajaron el rol a su persona); 4011, no 4200:
+                    # la clave sigue valiendo.
+                    logger.warning(f"[{self.client_id}] Sin permiso para conversar; se cierra.")
+                    task = self._start_policy_close(
+                        Close.MISSING_SCOPE, "scope_revoked", "scope_revoked", status="revoked"
+                    )
+                    await asyncio.wait({task})
+                    return
                 agent = self.conversation.current.agent.lower()
                 allowed = self.turns.allowed_agents = config.allowed_agents
                 if allowed is not None and agent not in {a.lower() for a in allowed}:
@@ -541,30 +546,6 @@ class FogarBridge:
         # no debe cancelar el cierre.
         await asyncio.wait({self.revoke()})
 
-    async def displace(self) -> None:
-        """Otra sesión abrió la conversación de esta (M19): se cierra con
-        `Close.CONVERSATION_OPENED_ELSEWHERE` (4102). El cierre corre en una tarea propia de esta sesión; quien la desplaza
-        espera solo a su primer paso, los chat.abort en la clave (`turns.let_go`), acotado; desde
-        ahí esta sesión ya no aborta nada en esa clave."""
-        if self._policy_close is None:
-            logger.info(
-                f"[{self.client_id}] Conversación {self.conversation.id} abierta en otra sesión."
-            )
-        self._start_policy_close(
-            Close.CONVERSATION_OPENED_ELSEWHERE, "displaced", "session_displaced"
-        )
-        wait_s = settings.SESSION_TEARDOWN_S + _ABORT_SLACK_S
-        try:
-            await asyncio.wait_for(self._released.wait(), timeout=wait_s)
-        except TimeoutError:
-            logger.warning(
-                f"[{self.client_id}] La sesión desplazada no soltó su clave en {wait_s}s; "
-                "la nueva sigue."
-            )
-        finally:
-            # Red de seguridad: pase lo que pase, ya no aborta en la clave que ha perdido.
-            self.conversation.released = True
-
     def _start_policy_close(
         self,
         frame: CloseFrame,
@@ -573,7 +554,7 @@ class FogarBridge:
         status: SessionStatus | None = None,
     ) -> asyncio.Task:
         """Un solo cierre por política por sesión: el primero gana (motivo incluido) y quien
-        llegue después (una revocación durante un desplazamiento) espera a ese."""
+        llegue después (una revocación durante un agente retirado) espera a ese."""
         if self._policy_close is None:
             task = asyncio.create_task(
                 self._policy_close_run(frame, close_reason, event, status), name=close_reason
@@ -591,24 +572,20 @@ class FogarBridge:
         event: str,
         status: SessionStatus | None = None,
     ) -> None:
-        """Cierre por política (4200 revocada, 4102 conversación abierta en otra sesión).
+        """Cierre por política (4200 revocada, 4020 agente retirado, 1011 configuración ilegible).
 
         1. Desde ya no sale nada más que turn_start/turn_end (G-18: ni audio, ni tokens, ni
            avisos); el par entero, nunca un turn_end sin su turn_start (A-r2-1).
-        2. Antes que nada, que nada suyo siga corriendo en OpenClaw en su clave (`let_go`): lo
-           espera quien la desplaza (`_released`), pase lo que pase.
-        3. Exactamente un turn_end por turn_start (G-10): el turno abierto y el push se cierran
-           con `closed` y su turn_end sale, acotado, antes del cierre. Después, el cierre de siempre.
+        2. La sesión deja el canal de su conversación y cierra lo suyo: exactamente un turn_end
+           por turn_start (G-10), con `closed`, acotado, antes del cierre. Nunca aborta nada:
+           el turno del canal sigue para las demás sesiones adjuntas (decisión 2 de la 5.0).
+        3. Después, el cierre de la tabla y el cierre de siempre.
         """
         limit = settings.SESSION_TEARDOWN_S
-        try:
-            self.note_close_reason(close_reason)
-            self._sender.restrict(_ONLY_TURN_END)
-            if self._turn_in_flight_at_close is None:
-                self._turn_in_flight_at_close = self.turns.in_flight()
-            await self.turns.let_go(limit)
-        finally:
-            self._released.set()
+        self.note_close_reason(close_reason)
+        self._sender.restrict(_ONLY_TURN_END)
+        if self._turn_in_flight_at_close is None:
+            self._turn_in_flight_at_close = self.turns.in_flight()
         try:
             await self.tracker.record(event)
         except Exception as e:  # noqa: BLE001 — una métrica nunca impide el cierre
@@ -668,7 +645,7 @@ class FogarBridge:
 
     async def run(self):
         if self._policy_close is not None:
-            # Desplazada o revocada antes de arrancar (durante claim_conversation, A-4): nada
+            # Revocada antes de arrancar (A-4): nada
             # que lanzar. Se espera a su cierre, que manda (su código y su status), en vez de
             # dejar que el close_all(status="error") de routes.py gane.
             await asyncio.wait({self._policy_close})
@@ -747,24 +724,19 @@ class FogarBridge:
                         self._last_audio_at = now
                         await self.transcriber.send_audio(message["bytes"])
 
-                # TEXTO → Orchestrator (prompt directo desde un cliente de texto)
+                # Text frames are protocol JSON messages (non-JSON → INVALID_MESSAGE)
                 elif "text" in message:
                     text_data = message["text"]
                     try:
                         json_msg = json.loads(text_data)
-                        parsed = True
                     except (ValueError, RecursionError):
                         # No es JSON (RecursionError: anidamiento excesivo, `[[[[…`).
                         json_msg = None
-                        parsed = False
 
-                    if not parsed:
-                        if self.handshake.input_mode == "text":
-                            # Texto plano en modo texto — compatibilidad con clientes de texto puro
-                            await self.turns.start_user_turn(text_data)
-                    elif not isinstance(json_msg, dict):
-                        # G-20: a JSON scalar/list (`42`, `[1]`, `"s"`, `true`, `null`)
-                        # is not a protocol message. Non-fatal error, session goes on.
+                    if not isinstance(json_msg, dict):
+                        # 5.0: a non-JSON frame is never a prompt, in any input_mode; G-20: nor
+                        # is a JSON scalar/list (`42`, `[1]`, `"s"`, `true`, `null`). Non-fatal
+                        # error, the session goes on.
                         await self._send_invalid_message()
                     elif json_msg.get("type") == "end":
                         # Cliente terminó de hablar → señalizar fin al transcriber
@@ -772,20 +744,42 @@ class FogarBridge:
                             await self.transcriber.send_end()
 
                     elif json_msg.get("type") == "cancel":
-                        # Cliente cancela el turn activo (o el push que suena) sin lanzar uno nuevo
+                        # Para el turno de la conversación (o el push que suena), lo iniciara
+                        # quien lo iniciara, sin lanzar uno nuevo (C3)
+                        # N2: también sus `send` aún sin respuesta de OpenClaw.
+                        self.turns.cancel_sends()
                         await self.turns.cancel("cancelled")
 
                     elif json_msg.get("type") == "send":
-                        # Cliente confirma/edita la transcripción y la envía al orquestador
+                        # Cliente confirma/edita la transcripción y la envía al orquestador:
+                        # entra en la cola de OpenClaw; `interrupt` corta antes el turno activo
                         raw_text = json_msg.get("text", "")
-                        if not isinstance(raw_text, str):
+                        interrupt = json_msg.get("interrupt", False)
+                        if not isinstance(raw_text, str) or not isinstance(interrupt, bool):
                             await self._send_invalid_message()
                         else:
                             # G-r3-1: sin surrogates sueltos, que OpenClaw guardaría tal cual.
                             text = without_lone_surrogates(raw_text).strip()
                             if text:
-                                logger.info(f"[{self.client_id}] send recibido: len={len(text)}")
-                                await self.turns.start_user_turn(text)
+                                logger.info(
+                                    f"[{self.client_id}] send recibido: len={len(text)}"
+                                    f"{' interrupt' if interrupt else ''}"
+                                )
+                                # 2b.3: el bucle no espera al envío (puede esperar detrás
+                                # del turno de /v1); un `interrupt` corta ya lo que está
+                                # abierto y el envío ya no corta nada más (N1).
+                                if interrupt:
+                                    await self.turns.interrupt_now()
+                                self.turns.submit_send(text)
+
+                    elif json_msg.get("type") == "withdraw":
+                        # Quita un mensaje pendiente de la conversación (2b): si ya no lo está,
+                        # no pasa nada (otra sesión lo quitó, o ya le tocó su turno)
+                        message_id = json_msg.get("message_id")
+                        if not isinstance(message_id, str) or not message_id:
+                            await self._send_invalid_message()
+                        elif not await self.turns.withdraw(message_id):
+                            logger.debug(f"[{self.client_id}] withdraw ignorado: no está pendiente")
 
         except WebSocketDisconnect as e:
             logger.info(f"[{self.client_id}] Cliente físico desconectado.")
@@ -878,10 +872,16 @@ class FogarBridge:
     async def _on_transcription(self, text: str, is_final: bool):
         """Callback dispatched by TranscriberClient on every transcription event.
 
-        Partials: trigger barge-in if text is substantial and a turn is active.
-        Finals: cancel any running turn, notify the client, start a new turn.
+        Neither a partial nor a final cuts anything (5.0, #406: speaking never cuts; pausing
+        or silencing the voice is the client's local decision, and cutting is always explicit,
+        `cancel` or a `send` with `interrupt`). Both go to the client; the final waits for
+        the client's `send`, which joins the conversation's queue like any message.
         All client_ws sends are guarded — the client may disconnect at any time.
         """
+        if self._silence_warned:
+            # #423: la transcripción volvió tras el aviso de silencio: se anuncia su fin.
+            self._silence_warned = False
+            await self.notify_service_status("transcriber", "restored", code="silence", message="silence")
         if not is_final:
             # Forward partial to client for live display
             try:
@@ -890,24 +890,9 @@ class FogarBridge:
                 self._log_send_failed("transcription_partial", e)
                 return
             await self.tracker.record("transcription_partial", text_len=len(text))
-
-            # Barge-in: interrupt active turn if enabled and partial is substantial enough
-            if self.config.barge_in_enabled and len(text) >= self.config.barge_in_min_chars:
-                # The turn or the push open now: one the worker opens after the cancel stays.
-                # Su turn_end lleva `reason: "interrupted"` (M19: ya no hay mensaje aparte).
-                cancelled, _ = await self.turns.cancel("interrupted")
-                if cancelled:
-                    logger.info(
-                        f"[{self.client_id}] Barge-in: turno cancelado por parcial len={len(text)}"
-                    )
-                    await self.tracker.record("barge_in")
             return  # partials never reach the orchestrator
 
         await self.tracker.record("transcription_final", text_len=len(text))
-
-        # Final: cancel any running turn (not a push: the `send` that follows cuts it),
-        # notify client. El orquestador se llama cuando el cliente envíe {"type": "send"}.
-        await self.turns.cancel("interrupted", push=False)
         logger.debug(f"[{self.client_id}] Transcripción final: '{text[:40]}'")
         try:
             await self._sender.send_json({"type": "transcription", "text": text})
@@ -915,10 +900,6 @@ class FogarBridge:
             logger.warning(
                 f"[{self.client_id}] send_json(transcription) falló: {describe_error(e)}"
             )
-
-    def enqueue_push(self, kind: str, arg: Any, run_id: str | None = None) -> None:
-        """Entry point of FrameDispatcher for push events (synchronous, never blocks)."""
-        self.turns.enqueue_push(kind, arg, run_id)
 
     async def push_idle(self) -> None:
         """Wait until every queued push event has been handled (for tests)."""

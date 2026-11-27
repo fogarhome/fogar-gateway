@@ -1,6 +1,5 @@
 """FogarBridge consume los puertos de voz (spec 2026-10-20, fase 1)."""
 
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -43,8 +42,8 @@ class FakeStt:
     state = ConnectionState.CONNECTED
     on_state_change = None
 
-    def __init__(self, partials=True, emit_in_start=None):
-        self.capabilities = SttCapabilities(partials=partials, warmup_s=0.0)
+    def __init__(self, emit_in_start=None):
+        self.capabilities = SttCapabilities(warmup_s=0.0)
         self.emit_in_start = emit_in_start
         self.opened = []
         self.session = None
@@ -99,15 +98,7 @@ async def test_bridge_uses_injected_stt_provider(make_ports_bridge):
 async def test_stt_callbacks_available_before_run(make_ports_bridge):
     """Foco 5: un evento emitido dentro de start() llega al bridge, sin run()."""
     stt = FakeStt(emit_in_start=("hola", False))
-    bridge = make_ports_bridge(stt, barge_in_enabled=False)
+    bridge = make_ports_bridge(stt)
     await bridge.connect_internal_services()
     assert {"type": "transcription_partial", "text": "hola"} in await sent(bridge)
 
-
-async def test_barge_in_capability_false_without_partials(make_ports_bridge):
-    bridge = make_ports_bridge(FakeStt(partials=False))
-    bridge.transcriber = MagicMock(state=ConnectionState.CONNECTED)
-    bridge.tts.probe = AsyncMock(return_value=True)
-    bridge.orchestrator.ping = AsyncMock(return_value=True)
-    result = await bridge.health_check()
-    assert result == {"barge_in": False, "tts": True, "transcriber": True}

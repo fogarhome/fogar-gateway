@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue'
 import { cancelPairing, getPairing, listPairings, openPairing } from '@/api/admin'
 import { ApiError } from '@/api/http'
 import type { PairingOpened, PairingState } from '@/api/types'
+import { copyText } from '@/lib/clipboard'
 import { toast } from '@/lib/toasts'
 import { useClientsStore } from '@/stores/clients'
 import FgBoton from './FgBoton.vue'
@@ -20,6 +21,9 @@ const abierto = shallowRef<PairingOpened | null>(null)
 const estado = ref<PairingState | 'abriendo' | 'error'>('abriendo')
 const error = ref('')
 const lleno = ref(false) // 409: ya hay 5 códigos abiertos
+// 5.0: lo que concede el código. Siempre conversar; ver el hogar y su estado, si se marca (una tablet
+// en la pared). Nunca administrar: un aparato del hogar no tiene persona detrás.
+const verHogar = ref(false)
 const clients = useClientsStore()
 const ahora = ref(performance.now())
 let recibido = 0
@@ -82,7 +86,9 @@ async function abrir(): Promise<void> {
   estado.value = 'abriendo'
   const mio = ++intento
   try {
-    const p = await openPairing()
+    const p = await openPairing({
+      scopes: verHogar.value ? ['conversations:write', 'home:read'] : ['conversations:write'],
+    })
     if (fuera || mio !== intento) {
       void cancelPairing(p.id).catch(() => undefined)
       return
@@ -99,6 +105,12 @@ async function abrir(): Promise<void> {
       ? 'Ya hay 5 códigos abiertos. Espera a que caduquen o anúlalos.'
       : 'No he podido abrir un código. Prueba otra vez.'
   }
+}
+
+/** El permiso va en el código: cambiarlo abre otro y anula el que ya se veía. */
+async function cambiarPermiso(): Promise<void> {
+  await abrir()
+  if (estado.value === 'open') toast('ok', 'Código nuevo', 'Al cambiar el permiso, el anterior ya no vale: usa este.')
 }
 
 async function comprobar(): Promise<void> {
@@ -122,7 +134,13 @@ const restante = computed(() => {
 const cuenta = computed(() => `${Math.floor(restante.value / 60)}:${String(restante.value % 60).padStart(2, '0')}`)
 const progreso = computed(() => `${Math.min(100, ((restante.value * 1000) / (DURACION_MS - MARGEN_MS)) * 100)}%`)
 const codigo = computed(() => abierto.value?.code ?? '')
-const codigoVisible = computed(() => `${codigo.value.slice(0, 3)} ${codigo.value.slice(3)}`)
+// Las dos mitades van en dos spans y el hueco lo pone el CSS: al seleccionarlo se copian solo las cifras.
+const mitades = computed(() => (estado.value === 'abriendo' ? ['···', '···'] : [codigo.value.slice(0, 3), codigo.value.slice(3)]))
+
+async function copiarCodigo(): Promise<void> {
+  if (await copyText(codigo.value)) toast('ok', 'Código copiado')
+  else toast('warn', 'No he podido copiarlo', 'Selecciónalo y cópialo con el teclado.')
+}
 
 async function cerrar(): Promise<void> {
   fuera = true
@@ -158,15 +176,22 @@ onBeforeUnmount(() => {
     </div>
     <template v-if="estado === 'open' || estado === 'abriendo'">
       <p class="fg-suave">Escribe este código en el aparato nuevo, o díselo en voz alta si te lo pide.</p>
-      <p class="codigo" :aria-label="`Código ${codigo.split('').join(' ')}`">{{ estado === 'abriendo' ? '··· ···' : codigoVisible }}</p>
+      <div class="fila-codigo">
+        <p class="codigo" :aria-label="`Código ${codigo.split('').join(' ')}`"><span>{{ mitades[0] }}</span><span>{{ mitades[1] }}</span></p>
+        <FgBoton tam="sm" icono="copiar" :disabled="estado !== 'open'" @click="copiarCodigo">Copiar</FgBoton>
+      </div>
       <div class="tiempo">
         <div class="pista" aria-hidden="true"><div class="barra" :style="{ width: progreso }" /></div>
         <p class="fg-meta pie"><span>Esperando al aparato…</span><span>caduca en {{ cuenta }}</span></p>
       </div>
+      <label class="permiso fg-meta">
+        <input v-model="verHogar" type="checkbox" :disabled="estado === 'abriendo'" @change="cambiarPermiso" />
+        Que también pueda ver el hogar y su estado (personas, aparatos, servicios). Nunca administrarlo.
+      </label>
       <p class="fg-meta nota">El aparato pondrá su nombre y su tipo; después puedes cambiarlos. Un código vale una sola vez.</p>
     </template>
     <template v-else-if="estado === 'expired' || estado === 'cancelled'">
-      <p class="fg-suave">El código ha caducado sin que ningún aparato lo usara.</p>
+      <p class="fg-suave">{{ estado === 'cancelled' ? 'El código está anulado: ya no vale.' : 'El código ha caducado sin que ningún aparato lo usara.' }}</p>
       <FgBoton variante="principal" @click="abrir">Otro código</FgBoton>
     </template>
     <template v-else-if="estado === 'error'">
@@ -179,6 +204,11 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.permiso {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
 .emparejar {
   position: relative;
   display: flex;
@@ -202,7 +232,15 @@ onBeforeUnmount(() => {
 .cab h2 {
   flex: 1;
 }
+.fila-codigo {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+}
 .codigo {
+  display: flex;
+  gap: 0.35em;
   font: 500 56px/1 var(--font-texto);
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.06em;

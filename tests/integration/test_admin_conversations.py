@@ -1,4 +1,4 @@
-"""`/admin/conversations*` (M19) con un OpenClaw simulado: auth, validación, OpenClaw caído,
+"""`/conversations*` (M19) con un OpenClaw simulado: auth, validación, OpenClaw caído,
 la conversación nueva del panel (agente por la cascada, #245) y el borrado de un cliente."""
 
 from datetime import datetime
@@ -34,8 +34,8 @@ def conversations(client):
 
 
 def test_admin_conversations_needs_the_admin_token(client):
-    assert client.get("/admin/conversations").status_code == 401  # sin cabecera
-    r = client.get("/admin/conversations", headers={"x-admin-token": "nope"})
+    assert client.get("/conversations").status_code == 401  # sin cabecera
+    r = client.get("/conversations", headers={"x-admin-token": "nope"})
     assert r.status_code == 401
 
 
@@ -47,22 +47,23 @@ def test_list_has_titles_from_openclaw(client, admin_headers, conversations, moc
         {"key": conv.session_key, "derivedTitle": "La cena"}, {"key": "agent:x:other"}
     ))
     # La del día en la que nunca se habló no sale (un cliente que conectó y calló).
-    assert client.get("/admin/conversations", headers=admin_headers).json() == []
+    assert client.get("/conversations", headers=admin_headers).json() == []
     asyncio.run(conversations.note_turn(conv.id))
-    r = client.get("/admin/conversations", headers=admin_headers)
+    r = client.get("/conversations", headers=admin_headers)
     assert r.status_code == 200
     (row,) = r.json()
     assert row == {
         "id": conv.id, "client_id": CLIENT_ID, "client_name": "Test Client", "agent": "main",
         "kind": "default", "day": conv.day.isoformat(), "created_at": row["created_at"],
         "last_turn_at": row["last_turn_at"], "turn_count": 1, "title": "La cena", "owner_user_id": None,
+        "message_id": None,
     }
     assert row["last_turn_at"] is not None
-    client.get("/admin/conversations", headers=admin_headers)
+    client.get("/conversations", headers=admin_headers)
     # Títulos cacheados (TITLES_TTL_S): una sola lectura de sessions.list para dos listas.
     assert mock_orchestrator.request.await_count == 1
     assert client.get(
-        "/admin/conversations", headers=admin_headers, params={"client_id": "otro"}
+        "/conversations", headers=admin_headers, params={"client_id": "otro"}
     ).json() == []
 
 
@@ -79,7 +80,7 @@ def test_list_finds_the_title_of_a_row_saved_with_an_uppercase_agent(
     mock_orchestrator.request = AsyncMock(wraps=_sessions(
         {"key": record.session_key.lower(), "derivedTitle": "La cena"}
     ))
-    (row,) = client.get("/admin/conversations", headers=admin_headers).json()
+    (row,) = client.get("/conversations", headers=admin_headers).json()
     assert (row["agent"], row["title"]) == ("main", "La cena")
 
 
@@ -88,7 +89,7 @@ def test_list_never_fails_when_openclaw_is_down(client, admin_headers, conversat
 
     asyncio.run(conversations.create(CLIENT_ID, "main"))
     mock_orchestrator.request = _down()
-    r = client.get("/admin/conversations", headers=admin_headers)
+    r = client.get("/conversations", headers=admin_headers)
     assert r.status_code == 200
     assert [row["title"] for row in r.json()] == [None]
 
@@ -103,12 +104,12 @@ def test_messages_with_openclaw_down_is_a_stable_error(
 
     conv = asyncio.run(conversations.create(CLIENT_ID, "main"))
     mock_orchestrator.request = _down(code)
-    r = client.get(f"/admin/conversations/{conv.id}/messages", headers=admin_headers)
+    r = client.get(f"/conversations/{conv.id}/messages", headers=admin_headers)
     assert (r.status_code, r.json()) == (status, {"detail": code})
 
 
 def test_messages_of_an_unknown_conversation_is_404(client, admin_headers):
-    r = client.get("/admin/conversations/nope/messages", headers=admin_headers)
+    r = client.get("/conversations/nope/messages", headers=admin_headers)
     assert r.status_code == 404
 
 
@@ -119,7 +120,7 @@ def test_messages_limit_is_validated_and_passed_to_chat_history(
 
     conv = asyncio.run(conversations.create(CLIENT_ID, "main"))
     mock_orchestrator.request = AsyncMock(return_value={"messages": [], "hasMore": True})
-    url = f"/admin/conversations/{conv.id}/messages"
+    url = f"/conversations/{conv.id}/messages"
     assert client.get(url, headers=admin_headers, params={"limit": 0}).status_code == 422
     assert client.get(url, headers=admin_headers, params={"limit": 1001}).status_code == 422
     r = client.get(url, headers=admin_headers, params={"limit": 5})
@@ -159,12 +160,12 @@ def _set_device(db_engine, **fields):
 
 
 def test_create_uses_the_cascade_and_the_installation_default(client, user, monkeypatch):
-    r = client.post("/admin/conversations", headers=user, json={})
+    r = client.post("/conversations", headers=user, json={})
     assert r.status_code == 201
     assert (r.json()["agent"], r.json()["kind"]) == ("main", "created")  # el de OpenClaw
 
     monkeypatch.setattr(settings, "DEFAULT_AGENT", "a")  # #245: también de una conversación nueva
-    r = client.post("/admin/conversations", headers=user, json={})
+    r = client.post("/conversations", headers=user, json={})
     assert (r.json()["agent"], r.json()["client_id"], r.json()["client_name"]) == (
         "a", "mac", "Mac de Sito"
     )
@@ -172,43 +173,43 @@ def test_create_uses_the_cascade_and_the_installation_default(client, user, monk
 
 
 def test_the_machine_has_no_device_to_create_one(client, admin_headers):
-    r = client.post("/admin/conversations", headers=admin_headers, json={})
+    r = client.post("/conversations", headers=admin_headers, json={})
     assert (r.status_code, r.json()) == (403, {"detail": "user_required"})
 
 
 def test_create_validates_the_agent_like_the_handshake(client, user, db_engine):
-    r = client.post("/admin/conversations", headers=user, json={"agent": "openclaw"})
+    r = client.post("/conversations", headers=user, json={"agent": "openclaw"})
     assert r.status_code == 201 and r.json()["agent"] == "openclaw"
-    r = client.post("/admin/conversations", headers=user, json={"agent": "nope"})
+    r = client.post("/conversations", headers=user, json={"agent": "nope"})
     assert (r.status_code, r.json()) == (422, {"detail": "agent_not_available"})
     _set_device(db_engine, allowed_agents='["a"]')
-    r = client.post("/admin/conversations", headers=user, json={"agent": "openclaw"})
+    r = client.post("/conversations", headers=user, json={"agent": "openclaw"})
     assert (r.status_code, r.json()) == (422, {"detail": "agent_not_permitted"})
-    r = client.post("/admin/conversations", headers=user, json={"agent": "", "x": 1})
+    r = client.post("/conversations", headers=user, json={"agent": "", "x": 1})
     assert r.status_code == 422
 
 
 def test_agents_for_a_new_conversation_follow_the_device_policy(
     client, user, admin_headers, db_engine, mock_orchestrator, monkeypatch
 ):
-    r = client.get("/admin/conversations/agents", headers=user)
+    r = client.get("/conversations/agents", headers=user)
     assert (r.status_code, r.json()) == (200, {"agents": ["main", "a", "openclaw"], "default": "main"})
     monkeypatch.setattr(settings, "DEFAULT_AGENT", "a")
-    assert client.get("/admin/conversations/agents", headers=user).json()["default"] == "a"
+    assert client.get("/conversations/agents", headers=user).json()["default"] == "a"
     _set_device(db_engine, allowed_agents='["openclaw"]')
     # El de la cascada ("a") no le está permitido a su dispositivo: no hay agente por defecto.
-    r = client.get("/admin/conversations/agents", headers=user)
+    r = client.get("/conversations/agents", headers=user)
     assert r.json() == {"agents": ["openclaw"], "default": None}
     # La máquina: sin política de ningún dispositivo.
-    assert client.get("/admin/conversations/agents", headers=admin_headers).json() == {
+    assert client.get("/conversations/agents", headers=admin_headers).json() == {
         "agents": ["main", "a", "openclaw"], "default": "a"
     }
     mock_orchestrator.gateway_info = None  # OpenClaw sin conectar: sin roster, sus permitidos
-    assert client.get("/admin/conversations/agents", headers=user).json() == {
+    assert client.get("/conversations/agents", headers=user).json() == {
         "agents": ["openclaw"], "default": None
     }
     _set_device(db_engine, is_active=False)
-    assert client.get("/admin/conversations/agents", headers=user).status_code == 401
+    assert client.get("/conversations/agents", headers=user).status_code == 401
 
 
 def test_conversation_dates_carry_their_utc_offset(client, admin_headers, user, conversations):
@@ -216,11 +217,11 @@ def test_conversation_dates_carry_their_utc_offset(client, admin_headers, user, 
 
     conv = asyncio.run(conversations.create(CLIENT_ID, "main"))
     asyncio.run(conversations.note_turn(conv.id))
-    (row,) = client.get("/admin/conversations", headers=admin_headers).json()
+    (row,) = client.get("/conversations", headers=admin_headers).json()
     # SQLite las guarda sin zona; salen en UTC con su desplazamiento, no como hora local.
     for field in ("created_at", "last_turn_at"):
         assert datetime.fromisoformat(row[field]).utcoffset() is not None, field
-    created = client.post("/admin/conversations", headers=user, json={}).json()
+    created = client.post("/conversations", headers=user, json={}).json()
     assert datetime.fromisoformat(created["created_at"]).utcoffset() is not None
 
 
@@ -233,7 +234,7 @@ def test_removing_a_client_retires_it_and_keeps_its_conversations(
     from fogar_gateway.db.models import ClientRecord
 
     conv = asyncio.run(conversations.default_for(CLIENT_ID, "main"))
-    assert client.delete(f"/admin/clients/{CLIENT_ID}", headers=admin_headers).status_code == 204
+    assert client.delete(f"/home/devices/{CLIENT_ID}", headers=admin_headers).status_code == 204
     with Session(db_engine) as s:
         (kept,) = s.exec(select(ConversationRecord)).all()
         retired = s.get(ClientRecord, CLIENT_ID)
@@ -241,8 +242,8 @@ def test_removing_a_client_retires_it_and_keeps_its_conversations(
     assert retired.retired_at is not None and not retired.is_active
     assert retired.key_hash != hash_key(VALID_KEY)  # su clave ya no vale
     assert conversations.index.get(conv.session_key) is not None
-    assert client.get(f"/admin/clients/{CLIENT_ID}", headers=admin_headers).status_code == 404
-    assert all(c["id"] != CLIENT_ID for c in client.get("/admin/clients", headers=admin_headers).json())
+    assert client.get(f"/home/devices/{CLIENT_ID}", headers=admin_headers).status_code == 404
+    assert all(c["id"] != CLIENT_ID for c in client.get("/home/devices", headers=admin_headers).json())
 
 
 # ── /v1 (Home Assistant): la misma regla diaria ──────────────────────────────
@@ -251,7 +252,7 @@ def test_removing_a_client_retires_it_and_keeps_its_conversations(
 def test_v1_follows_the_daily_default_conversation(
     client_untrusted, mock_orchestrator, db_engine, monkeypatch
 ):
-    from fogar_gateway.services.protocol import OrchestratorEvent
+    from tests.fakes.orchestrator import OrchestratorEvent
 
     keys = []
 
@@ -281,16 +282,14 @@ def test_v1_follows_the_daily_default_conversation(
 
 
 def test_v1_counts_a_turn_only_once_it_started(client_untrusted, mock_orchestrator, db_engine):
-    from fogar_gateway.services.protocol import OrchestratorEvent
+    from fogar_gateway.services.orchestration import OrchestratorError
 
-    async def busy(text, session_key=None):
-        yield OrchestratorEvent(type="error", content="turn_in_progress")
-
-    mock_orchestrator.stream_response = busy
+    # 5.0 PR 2b.3: OpenClaw refuses the `chat.send` (no ack): the turn never started.
+    mock_orchestrator.send.side_effect = OrchestratorError("orchestrator_error")
     body = {"messages": [{"role": "user", "content": "hola"}]}
     headers = {"authorization": f"Bearer {VALID_KEY}"}
     r = client_untrusted.post("/v1/chat/completions", json=body, headers=headers)
-    assert (r.status_code, r.json()) == (409, {"error": "turn_in_progress"})
+    assert (r.status_code, r.json()) == (502, {"error": "orchestrator_error"})
     with Session(db_engine) as s:
         (row,) = s.exec(select(ConversationRecord)).all()
     assert row.turn_count == 0 and row.last_turn_at is None
@@ -300,7 +299,7 @@ def test_v1_counts_the_turn_once_openclaw_accepted_it(
     client_untrusted, mock_orchestrator, db_engine
 ):
     """Aceptado el chat.send, el turno cuenta aunque luego falle (o el cliente se vaya)."""
-    from fogar_gateway.services.protocol import OrchestratorEvent
+    from tests.fakes.orchestrator import OrchestratorEvent
 
     async def accepted_then_dropped(text, session_key=None):
         yield OrchestratorEvent(type="status", content="accepted")
@@ -319,7 +318,7 @@ def test_v1_counts_the_turn_once_openclaw_accepted_it(
 def test_v1_streaming_closes_its_session_and_counts_the_turn(
     client_untrusted, mock_orchestrator, db_engine, admin_headers
 ):
-    from fogar_gateway.services.protocol import OrchestratorEvent
+    from tests.fakes.orchestrator import OrchestratorEvent
 
     async def stream(text, session_key=None):
         yield OrchestratorEvent(type="status", content="accepted")
@@ -331,7 +330,7 @@ def test_v1_streaming_closes_its_session_and_counts_the_turn(
     headers = {"authorization": f"Bearer {VALID_KEY}"}
     r = client_untrusted.post("/v1/chat/completions", json=body, headers=headers)
     assert r.status_code == 200 and "data: [DONE]" in r.text
-    sessions = client_untrusted.get("/admin/sessions", headers=admin_headers).json()
+    sessions = client_untrusted.get("/system/sessions", headers=admin_headers).json()
     (http,) = [s for s in sessions["sessions"] if s["session_id"].startswith("http:")]
     assert http["status"] == "completed" and http["ended_at"] is not None
     assert sessions["active"] == 0
@@ -352,31 +351,10 @@ def test_v1_database_failure_is_a_stable_error(client_untrusted, monkeypatch, ca
     assert "/secret/path" not in caplog.text
 
 
-def test_v1_legacy_trusted_origin_keeps_its_key_and_uses_default_agent(
-    client, mock_orchestrator, monkeypatch
-):
-    """Sin Bearer no hay ficha de cliente, ni conversación: conserva `agent:{agent}:ha`, y su
-    agente sale de la cascada, con DEFAULT_AGENT (#245)."""
-    from fogar_gateway.services.protocol import OrchestratorEvent
-
-    keys = []
-
-    async def stream(text, session_key=None):
-        keys.append(session_key)
-        yield OrchestratorEvent(type="status", content="done")
-
-    mock_orchestrator.stream_response = stream
-    monkeypatch.setattr(settings, "DEFAULT_AGENT", "jota")
-    body = {"messages": [{"role": "user", "content": "hola"}]}
-    assert client.post("/v1/chat/completions", json=body).status_code == 200
-    assert keys == ["agent:jota:ha"]
-    assert client.app.state.conversations.index.get("agent:jota:ha") is None
-
-
 def test_ws_uses_default_agent_when_nothing_else_says(client, monkeypatch):
     monkeypatch.setattr(settings, "DEFAULT_AGENT", "a")
     with client.websocket_connect("/ws/stream") as ws:
-        ws.send_json({"client_key": VALID_KEY, "input_mode": "text", "output_mode": ["text"]})
+        ws.send_json({"token": VALID_KEY, "protocol": 5, "input_mode": "text", "output_mode": ["text"]})
         ready = ws.receive_json()
     assert ready["type"] == "ready"
     assert ready["agent"] == ready["conversation"]["agent"] == "a"

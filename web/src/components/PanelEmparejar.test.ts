@@ -108,6 +108,31 @@ describe('PanelEmparejar: ningún código queda abierto sin verse', () => {
     expect(cancelPairing).toHaveBeenCalledWith('c2')
   })
 
+  it('un código anulado dice «anulado», no «caducado»', async () => {
+    openPairing.mockResolvedValue(codigo('c1'))
+    getPairing.mockResolvedValue({ ...codigo('c1'), state: 'cancelled' })
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    const { el } = mount()
+    await flush()
+    vi.advanceTimersByTime(2000)
+    await flush()
+    expect(el.textContent).toContain('anulado')
+    expect(el.textContent).not.toContain('caducado')
+  })
+
+  it('cambiar el permiso abre otro código y lo avisa', async () => {
+    openPairing.mockResolvedValueOnce(codigo('c1')).mockResolvedValueOnce(codigo('c2'))
+    const { el } = mount()
+    await flush()
+    const casilla = el.querySelector('input[type=checkbox]') as HTMLInputElement
+    casilla.checked = true
+    casilla.dispatchEvent(new Event('change'))
+    await flush()
+    expect(cancelPairing).toHaveBeenCalledWith('c1')
+    expect(openPairing).toHaveBeenLastCalledWith({ scopes: ['conversations:write', 'home:read'] })
+    expect(toast).toHaveBeenCalledWith('ok', 'Código nuevo', expect.any(String))
+  })
+
   it('usado: no se anula', async () => {
     openPairing.mockResolvedValue(codigo('c1'))
     getPairing.mockResolvedValue({ ...codigo('c1'), state: 'used', client_id: 'x', client_name: 'Tele' })
@@ -226,6 +251,23 @@ describe('PanelEmparejar: ningún código queda abierto sin verse', () => {
     await flush()
     expect(cancelPairing).toHaveBeenCalledWith('c6')
     expect(cancelPairing).not.toHaveBeenCalledWith('c7', expect.anything())
-    expect(el.querySelector('.codigo')!.textContent).toBe('123 456')
+    expect(el.querySelector('.codigo')!.textContent).toBe('123456')
+  })
+})
+
+describe('PanelEmparejar: el código se copia sin espacios', () => {
+  it('seleccionarlo da solo las cifras y «Copiar» copia las seis', async () => {
+    const writeText = vi.fn(() => Promise.resolve())
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+    Object.defineProperty(window, 'isSecureContext', { value: true, configurable: true })
+    openPairing.mockResolvedValue(codigo('c1'))
+    const { el, boton, app } = mount()
+    await flush()
+    expect(el.querySelector('.codigo')!.textContent).toBe('123456')
+    boton('Copiar').click()
+    await flush()
+    expect(writeText).toHaveBeenCalledWith('123456')
+    expect(toast).toHaveBeenCalledWith('ok', 'Código copiado')
+    app.unmount()
   })
 })

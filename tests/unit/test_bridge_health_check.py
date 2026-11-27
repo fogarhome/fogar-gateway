@@ -41,7 +41,7 @@ async def test_health_check_returns_full_snapshot_when_audio_and_tts_ok(make_hc_
     bridge.tts.probe = AsyncMock(return_value=True)
     result = await bridge.health_check()
 
-    assert result == {"barge_in": True, "tts": True, "transcriber": True}
+    assert result == {"tts": True, "transcriber": True}
 
 
 async def test_health_check_returns_tts_false_when_ping_fails(make_hc_bridge):
@@ -52,7 +52,7 @@ async def test_health_check_returns_tts_false_when_ping_fails(make_hc_bridge):
     bridge.tts.probe = AsyncMock(return_value=False)
     result = await bridge.health_check()
 
-    assert result == {"barge_in": True, "tts": False, "transcriber": True}
+    assert result == {"tts": False, "transcriber": True}
     await sent(bridge)
     assert {"type": "status", "service": "tts", "state": "unavailable"} in ws.of("status")
 
@@ -64,7 +64,7 @@ async def test_health_check_returns_transcriber_false_when_degraded(make_hc_brid
 
     result = await bridge.health_check()
 
-    assert result == {"barge_in": False, "tts": False, "transcriber": False}
+    assert result == {"tts": False, "transcriber": False}
     await sent(bridge)
     assert {"type": "status", "service": "transcriber", "state": "unavailable"} in ws.of("status")
 
@@ -75,7 +75,7 @@ async def test_health_check_returns_all_false_for_text_only_handshake(make_hc_br
 
     result = await bridge.health_check()
 
-    assert result == {"barge_in": False, "tts": False, "transcriber": False}
+    assert result == {"tts": False, "transcriber": False}
 
 
 async def test_health_check_returns_none_when_orchestrator_unavailable(make_hc_bridge):

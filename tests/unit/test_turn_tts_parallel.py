@@ -45,17 +45,17 @@ async def test_text_does_not_wait_for_a_slow_tts_connect(make_bridge):
     bridge, ws = make_bridge(output_mode=("audio", "text"), tts=_slow_tts(stream, release))
     bridge.orchestrator.stream_response = tokens("a", "b")
 
-    task = await start_turn(bridge)
+    await start_turn(bridge)
     for _ in range(50):
         await asyncio.sleep(0.01)
-        await sent(bridge)
+        await bridge._sender.flush()
         if len(ws.of("token")) == 2:
             break
     assert [m["text"] for m in ws.of("token")] == ["a", "b"]  # sin esperar al TTS
-    assert not task.done()  # el turno espera a la voz, que aún no conectó
+    assert not ws.of("turn_end")  # el turno de la sesión espera a la voz, que aún no conectó
 
     release.set()
-    await asyncio.wait_for(task, 2)
+    await asyncio.wait_for(bridge.turns.idle(), 2)
     assert fed == ["a", "b"]  # lo que llegó antes de conectar, en orden
     stream.end.assert_awaited_once()
     stream.close.assert_awaited()
@@ -68,11 +68,10 @@ async def test_cancel_while_tts_connects_cancels_the_connect(make_bridge):
     bridge, _ws = make_bridge(output_mode=("audio", "text"), tts=_slow_tts(stream, release))
     bridge.orchestrator.stream_response = tokens("a")
 
-    task = await start_turn(bridge)
-    await asyncio.sleep(0.05)  # el texto ya salió; el turno espera a la voz
-    task.cancel()  # barge-in
-    await asyncio.wait({task}, timeout=2)
-    assert task.cancelled()  # no esperó a que el TTS conectase
+    await start_turn(bridge)
+    await asyncio.sleep(0.05)  # el texto ya salió; el turno de la sesión espera a la voz
+    assert (await bridge.turns.cancel("cancelled"))[0]
+    await asyncio.wait_for(bridge.turns.idle(), 2)  # no esperó a que el TTS conectase
     release.set()
     await asyncio.sleep(0.01)
     stream.close.assert_not_awaited()  # la conexión se canceló: no quedó ningún stream abierto

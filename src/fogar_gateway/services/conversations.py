@@ -10,9 +10,9 @@ Reglas, iguales para todos los clientes (el gateway no mira el tipo de cliente):
 - Quien no elige cae en la **conversación por defecto**: una por cliente, agente y día. El día
   empieza a las `CONVERSATION_DAY_START_HOUR` (hora local del host) y se evalúa al empezar cada
   turno: una sesión abierta días (la tele) pasa a la del día nuevo en su primer turno tras el corte.
-- Una conversación está abierta en una sola sesión (`ClientRegistry`): abrirla en otra cierra la
-  anterior con 4102 «conversation opened elsewhere».
-- El push se enruta por su `sessionKey`: índice → conversación → sesión viva (`ClientRegistry`).
+- Una conversación puede estar abierta en varias sesiones a la vez (5.0, #406): cada una se
+  adjunta a su canal (services/channel.py). El 4102 «conversation opened elsewhere» se retiró.
+- El push se enruta por su `sessionKey`: índice → conversación → su canal, que lo reparte.
 
 Nada de esto guarda ni registra texto del usuario.
 """
@@ -103,7 +103,7 @@ class _Requester(Protocol):
 
 class ConversationIndex:
     """`session_key` → conversación, en memoria: cargado de la BD al arrancar y al día con cada
-    alta. Lo usa el reparto de push (`ClientRegistry.route`). Solo se toca desde el hilo del
+    alta. Lo usa el reparto de push (`ChannelHub.channel_for`). Solo se toca desde el hilo del
     loop (los métodos async de ConversationService lo actualizan al volver del hilo de la BD)."""
 
     def __init__(self) -> None:
@@ -124,7 +124,7 @@ class ConversationIndex:
 
 @dataclass(frozen=True)
 class ConversationRow:
-    """Una fila de `/admin/conversations` (sin título: lo pone la ruta desde OpenClaw)."""
+    """Una fila de `/conversations` (sin título: lo pone la ruta desde OpenClaw)."""
 
     record: ConversationRecord
     client_name: str
@@ -362,7 +362,7 @@ async def list_openclaw_sessions(orchestrator: _Requester) -> list[dict]:
     return rows
 
 
-# Vida de los títulos leídos de OpenClaw (como la caché de /admin/access): la lista de
+# Vida de los títulos leídos de OpenClaw (como la caché de /system/access): la lista de
 # conversaciones no recorre `sessions.list` entero en cada petición.
 TITLES_TTL_S = 20.0
 # Lo que se recuerda un fallo al leerlos (OpenClaw caído o colgado).
@@ -419,8 +419,9 @@ def session_title(row: dict) -> str | None:
 
 
 def history_messages(raw: object) -> list[dict]:
-    """Los mensajes de `chat.history` normalizados a `{role, text, timestamp}`: solo `user` y
-    `assistant` con texto (sin herramientas, avisos ni filas vacías), del más antiguo al último."""
+    """Los mensajes de `chat.history` normalizados a `{id, role, text, timestamp}`: solo `user` y
+    `assistant` con texto (sin herramientas, avisos ni filas vacías), del más antiguo al último.
+    `id` es el de OpenClaw (`__openclaw.id`, el mismo que su `session.message`; 5.0)."""
     out = []
     for message in raw if isinstance(raw, list) else []:
         if not isinstance(message, dict) or message.get("role") not in ("user", "assistant"):
@@ -428,7 +429,12 @@ def history_messages(raw: object) -> list[dict]:
         text = extract_message_text(message).strip()
         if text:
             timestamp = _ms_to_datetime(message.get("timestamp"))
-            out.append({"role": message["role"], "text": text, "timestamp": timestamp})
+            meta = message.get("__openclaw")
+            oc_id = meta.get("id") if isinstance(meta, dict) else None
+            out.append({
+                "id": oc_id if isinstance(oc_id, str) else None,
+                "role": message["role"], "text": text, "timestamp": timestamp,
+            })
     return out
 
 
@@ -453,8 +459,6 @@ class SessionConversation:
         self._service = service
         self._index = index if index is not None else (service.index if service else None)
         self.on_move: Callable[[Conversation, Conversation], Awaitable[None]] | None = None
-        # La sesión perdió su conversación (otra la abrió): ya no aborta nada en su clave.
-        self.released = False
         self._spawn: Callable[[Coroutine[Any, Any, None], str], None] | None = None
 
     @property

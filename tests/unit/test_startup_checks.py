@@ -6,16 +6,15 @@ import sys
 import textwrap
 
 import pytest
+from pydantic import ValidationError
 
 from fogar_gateway.core.config import Settings
 from fogar_gateway.core.startup_checks import (
     LOCK_FILENAME,
     SingleProcessLockError,
     acquire_single_process_lock,
-    deprecated_settings,
     insecure_tokens,
     release_single_process_lock,
-    warn_deprecated_settings,
     warn_insecure_tokens,
 )
 
@@ -28,21 +27,39 @@ def _settings(**kw) -> Settings:
     return Settings(_env_file=None, **base)
 
 
-def test_obsolete_shutdown_drain_s_is_accepted_and_warned(tmp_path, caplog):
-    """#221: SHUTDOWN_DRAIN_S is ignored, but an old .env that still sets it must not
-    stop the gateway from starting (pydantic-settings rejects unknown .env keys)."""
+@pytest.fixture
+def _fresh_retired_warning(monkeypatch):
+    from fogar_gateway.core import config as config_module
+
+    monkeypatch.setattr(config_module._logger, "retired_warned", False, raising=False)
+
+
+@pytest.mark.usefixtures("_fresh_retired_warning")
+def test_retired_keys_in_config_env_are_ignored_with_one_warning(tmp_path, caplog):
+    """Un config.env de la 4.x con ajustes retirados arranca: un aviso con los nombres, sin valores."""
     env = tmp_path / ".env"
-    env.write_text("SHUTDOWN_DRAIN_S=30.0\n", encoding="utf-8")
+    env.write_text(
+        "SHUTDOWN_DRAIN_S=10\nTRUST_LOOPBACK=true\nTRUSTED_NETWORKS=10.99.0.0/16\n"
+        "ORCHESTRATOR_RECONNECT_MAX_DURATION=60\n",
+        encoding="utf-8",
+    )
     caplog.set_level(logging.WARNING)
+    Settings(_env_file=env)
+    Settings(_env_file=env)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    for key in ("SHUTDOWN_DRAIN_S", "TRUST_LOOPBACK", "TRUSTED_NETWORKS",
+                "ORCHESTRATOR_RECONNECT_MAX_DURATION"):
+        assert key in warnings[0]
+    assert "ya no se usa desde la 5.0" in warnings[0]
+    assert "10.99" not in warnings[0] and "=10" not in warnings[0]
 
-    assert warn_deprecated_settings(Settings(_env_file=env)) == ["SHUTDOWN_DRAIN_S"]
-    assert any("SHUTDOWN_DRAIN_S" in r.getMessage() for r in caplog.records)
 
-
-def test_no_deprecation_warning_by_default(caplog):
-    caplog.set_level(logging.WARNING)
-    assert warn_deprecated_settings(_settings()) == []
-    assert caplog.records == []
+def test_unknown_key_in_config_env_still_fails(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("NO_EXISTE_XYZ=1\n", encoding="utf-8")
+    with pytest.raises(ValidationError, match=r"(?i)NO_EXISTE_XYZ"):
+        Settings(_env_file=env)
 
 
 def test_no_warning_when_tokens_are_set(caplog):
@@ -213,11 +230,4 @@ def test_insecure_tokens_lists_names_without_logging(caplog):
     caplog.set_level(logging.DEBUG)
     s = Settings(_env_file=None, ADMIN_TOKEN="", OPENCLAW_TOKEN="changeme", TTS_TOKEN="changeme")
     assert insecure_tokens(s) == ["ADMIN_TOKEN", "OPENCLAW_TOKEN", "TTS_TOKEN"]
-    assert caplog.records == []
-
-
-def test_deprecated_settings_lists_names_without_logging(caplog):
-    caplog.set_level(logging.DEBUG)
-    s = Settings(_env_file=None, SHUTDOWN_DRAIN_S=3.0)
-    assert deprecated_settings(s) == ["SHUTDOWN_DRAIN_S"]
     assert caplog.records == []

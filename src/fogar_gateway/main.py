@@ -10,16 +10,17 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from fogar_gateway import paths
-from fogar_gateway.api.admin_routes import router as admin_router
 from fogar_gateway.api.auth_routes import router as auth_router
 from fogar_gateway.api.conversation_routes import router as conversation_router
+from fogar_gateway.api.dictation_routes import router as dictation_router
+from fogar_gateway.api.events_routes import router as events_router
 from fogar_gateway.api.health_routes import router as health_router
+from fogar_gateway.api.home_routes import router as home_router
 from fogar_gateway.api.openai_routes import router as openai_router
 from fogar_gateway.api.pairing_routes import admin_router as pairing_admin_router
 from fogar_gateway.api.pairing_routes import public_router as pairing_public_router
 from fogar_gateway.api.routes import router as stream_router
-from fogar_gateway.api.user_routes import home_router
-from fogar_gateway.api.user_routes import router as user_router
+from fogar_gateway.api.system_routes import router as system_router
 from fogar_gateway.api.web_routes import WEB_DIR, web_available
 from fogar_gateway.api.web_routes import router as web_router
 from fogar_gateway.core.body_limit import BodySizeLimitMiddleware
@@ -31,13 +32,15 @@ from fogar_gateway.core.startup_checks import (
     acquire_single_process_lock,
     check_speech_settings,
     release_single_process_lock,
-    warn_deprecated_settings,
     warn_insecure_tokens,
 )
 from fogar_gateway.core.transport import TransportCaptureMiddleware
 from fogar_gateway.db.database import dispose_engine, require_database, run_migrations
 from fogar_gateway.services.auth import LoginLimiter
-from fogar_gateway.services.conversations import ConversationService, TitleCache
+from fogar_gateway.services.channel import ChannelHub
+from fogar_gateway.services.conversations import ConversationService, TitleCache, note_turn_safely
+from fogar_gateway.services.db_client import db_client
+from fogar_gateway.services.events import EventHub
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.dispatcher import FrameDispatcher
 from fogar_gateway.services.openclaw.models import OrchestratorAccess
@@ -93,7 +96,6 @@ async def _lifespan_body(app: FastAPI):
     logger.info("BD inicializada")
     warn_if_open_proxy_config()
     warn_insecure_tokens(settings)
-    warn_deprecated_settings(settings)
     # B-r4-2: `websockets` a DEBUG volcaría las tramas de OpenClaw (el connect lleva el token),
     # no solo las de ElevenLabs.
     pin_websockets_logging()
@@ -107,8 +109,26 @@ async def _lifespan_body(app: FastAPI):
     await conversations.load()
     turn_registry = TurnRegistry()
     client_registry = ClientRegistry(conversations.index)
-    dispatcher = FrameDispatcher(turn_registry, client_registry)
-    # Acceso a OpenClaw (permisos, emparejamiento): lo actualiza el cliente, lo lee /admin/state.
+    # Un canal por conversación (5.0, #406): el único dueño de sus runs; reparte cada turno a
+    # las sesiones adjuntas. Su orquestador se pone en cuanto existe (el cliente necesita el
+    # dispatcher, y el dispatcher los canales).
+    channel_hub = ChannelHub(
+        index=conversations.index,
+        turn_registry=turn_registry,
+        note_turn=lambda conversation_id: _count_turn(conversation_id),
+        # 2c.3: dónde suena un aviso. Su dispositivo de avisos, leído de la BD en cada aviso
+        # (en un hilo), y las sesiones vivas de ese aparato (la más reciente al final).
+        notify_device=lambda conversation: db_client.notify_device(
+            conversation.home_id, conversation.owner_user_id
+        ),
+        sessions_of=lambda client_id: [b.turns for b in client_registry.for_client(client_id)],
+    )
+
+    def _count_turn(conversation_id: str) -> None:
+        channel_hub.spawn(note_turn_safely(conversations, conversation_id), "conversation_turn")
+
+    dispatcher = FrameDispatcher(turn_registry, channel_hub)
+    # Acceso a OpenClaw (permisos, emparejamiento): lo actualiza el cliente, lo lee /system/state.
     openclaw_access = OrchestratorAccess()
     inner = OpenClawClient(
         host=settings.OPENCLAW_HOST,
@@ -125,6 +145,7 @@ async def _lifespan_body(app: FastAPI):
         initial_backoff=settings.ORCHESTRATOR_RECONNECT_INITIAL_BACKOFF,
         max_backoff=settings.ORCHESTRATOR_RECONNECT_MAX_BACKOFF,
     )
+    channel_hub.orchestrator = openclaw
     # Never raises: a failed first connect is logged and retried in the background.
     await openclaw.connect()
 
@@ -154,6 +175,9 @@ async def _lifespan_body(app: FastAPI):
         return _on_state_change
 
     openclaw.on_state_change = _broadcaster("orchestrator")
+    # 5.0 PR 2b.2: tras una reconexión, cada canal relee los mensajes en cola de OpenClaw
+    # (`chat.history` `pendingInputs`) y confirma o da por perdidos los suyos.
+    openclaw.on_connected = channel_hub.reconnected
 
     # Proveedores de voz singleton (STT_PROVIDER / TTS_PROVIDER), inyectados al bridge.
     stt = build_stt_provider(settings)
@@ -177,8 +201,16 @@ async def _lifespan_body(app: FastAPI):
     app.state.speech = speech
     app.state.turn_registry = turn_registry  # read by routes.py for queue depths (#219)
     app.state.client_registry = client_registry
+    app.state.channel_hub = channel_hub
+    events = EventHub(channel_hub, tts=lambda: speech.tts)  # /events de cada aparato (5.0, #412)
+    app.state.events = events
+    # El dispositivo de avisos puede escuchar por /events?audio=1 (5c): sus adaptadores cuentan.
+    channel_hub.sessions_of = lambda client_id: [
+        *(b.turns for b in client_registry.for_client(client_id)),
+        *events.sessions_of(client_id),
+    ]
     app.state.conversations = conversations
-    app.state.conversation_titles = TitleCache()  # títulos de /admin/conversations
+    app.state.conversation_titles = TitleCache()  # títulos de /conversations
     app.state.session_registry = SessionRegistry()
     app.state.pairing = PairingStore()  # códigos de emparejamiento, en memoria (#317)
     app.state.login_limiter = LoginLimiter()  # intentos de inicio de sesión, en memoria (M20)
@@ -191,14 +223,21 @@ async def _lifespan_body(app: FastAPI):
         # 1. Unhook the state-change broadcasts first (G-68): nothing closing below
         #    may schedule a new notification task.
         openclaw.on_state_change = None
+        openclaw.on_connected = None
         stt.on_state_change = None
         tts.on_state_change = None
+        # The devices' /events let go of their channels before those close.
+        app.state.events.close_all()
         # Every step runs even if the lifespan is cancelled; failures go to DEBUG (#221).
         async with Teardown("apagado") as td:
             # 2. Speech providers, then OpenClaw.
             for provider in (speech.stt, speech.tts):
                 await td.step(provider.aclose(), f"cierre del proveedor {provider.name}")
             await td.step(app.state.conversation_titles.aclose(), "títulos de conversaciones")
+            # Los turnos que siguen en los canales (sin nadie adjunto) antes que OpenClaw.
+            await td.step(
+                channel_hub.aclose(settings.SESSION_TEARDOWN_S), "canales de conversación"
+            )
             await td.step(openclaw.close(), "cierre de OpenClaw")
             # 3. Notification tasks still in flight.
             for task in list(_notification_tasks):
@@ -211,7 +250,7 @@ app = FastAPI(
     title="Fogar Gateway",
     description="Puerta de entrada de Fogar en casa: aparatos, OpenClaw, voz y administración.",
     lifespan=lifespan,
-    # Sin /docs, /redoc ni /openapi.json: el mapa de /admin no se publica y Swagger no carga
+    # Sin /docs, /redoc ni /openapi.json: el mapa de la API no se publica y Swagger no carga
     # scripts de un CDN en el origen del panel (auditoría 3.0, D-4).
     docs_url=None,
     redoc_url=None,
@@ -252,12 +291,13 @@ app.add_middleware(BodySizeLimitMiddleware)
 app.include_router(stream_router)  # WS /ws/stream
 app.include_router(openai_router)  # HTTP /v1/*
 app.include_router(health_router)  # HTTP /healthz, /ready
-app.include_router(admin_router)  # HTTP /admin/*
 app.include_router(auth_router)  # HTTP /auth/* (M20)
-app.include_router(user_router)  # HTTP /admin/users (M20)
-app.include_router(home_router)  # HTTP /admin/home (M20)
-app.include_router(conversation_router)  # HTTP /admin/conversations
+app.include_router(system_router)  # HTTP /system/* (5.0)
+app.include_router(home_router)  # HTTP /home, /home/users, /home/devices (5.0)
+app.include_router(conversation_router)  # HTTP /conversations
+app.include_router(events_router)  # HTTP /events (5.0, SSE por aparato)
+app.include_router(dictation_router)  # WS /speech/dictation (5.0, dictado)
 app.include_router(pairing_public_router)  # HTTP /.well-known/fogar-gateway, /pair
-app.include_router(pairing_admin_router)  # HTTP /admin/pairing
+app.include_router(pairing_admin_router)  # HTTP /home/pairing
 # La web va la última: su GET /{path} recoge lo que no es de la API (rutas de Vue).
 app.include_router(web_router)  # HTTP / (panel)

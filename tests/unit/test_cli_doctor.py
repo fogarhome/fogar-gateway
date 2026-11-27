@@ -92,6 +92,24 @@ def test_paths_are_reported(base):
     assert str(base / "data" / "gateway.db") in found["rutas"]["detail"]
 
 
+def test_doctor_warns_about_a_retired_key(base):
+    """5.0: un ajuste retirado no tumba nada; doctor avisa y dice cómo quitarlo."""
+    (base / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nSHUTDOWN_DRAIN_S=10\n")
+    found = checks(run("--json", "doctor"))
+    assert found["configuración"]["level"] == "ok"
+    assert found["SHUTDOWN_DRAIN_S"]["level"] == "warn"
+    assert "fogar-gw config unset SHUTDOWN_DRAIN_S" in found["SHUTDOWN_DRAIN_S"]["detail"]
+
+
+def test_doctor_warns_about_stt_audio_gate_auto(base):
+    """#422: `STT_AUDIO_GATE=auto` (4.x) no tumba nada; doctor avisa y dice cómo cambiarlo."""
+    (base / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nSTT_AUDIO_GATE=auto\n")
+    found = checks(run("--json", "doctor"))
+    assert found["configuración"]["level"] == "ok"
+    assert found["STT_AUDIO_GATE"]["level"] == "warn"
+    assert "fogar-gw config set STT_AUDIO_GATE energy" in found["STT_AUDIO_GATE"]["detail"]
+
+
 def test_invalid_config_is_a_failure_naming_the_field_only(base):
     (base / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nSTT_PROVIDER=valor-raro-xyz\n")
     r = run("--json", "doctor")
@@ -187,7 +205,7 @@ class _Gateway(BaseHTTPRequestHandler):
 
 
 def _state(stt: str, tts: str) -> tuple[int, dict]:
-    """/admin/state con los proveedores que ha cargado el proceso en marcha."""
+    """/system/state con los proveedores que ha cargado el proceso en marcha."""
     return 200, {"gateway": {"version": "1.23.0"}, "services": {
         "stt": {"provider": stt, "state": "connected"},
         "tts": {"provider": tts, "state": "connected"}}}
@@ -199,7 +217,7 @@ def gateway():
     threading.Thread(target=srv.serve_forever, args=(0.01,), daemon=True).start()
     _Gateway.routes = {
         "/healthz": (200, {"status": "ok"}),
-        "/admin/state": _state("fogar", "fogar"),
+        "/system/state": _state("fogar", "fogar"),
         "/ready": (200, {"status": "ok", "services": {
             "orchestrator": "ok", "transcriber": "ok", "tts": "ok"}}),
     }
@@ -221,7 +239,7 @@ def test_everything_ok_exits_0(base, gateway):
 
 
 def test_wrong_token_is_a_failure(base, gateway):
-    _Gateway.routes["/admin/state"] = (401, {"detail": "Invalid admin token"})
+    _Gateway.routes["/system/state"] = (401, {"detail": "Invalid admin token"})
     r = run_at(gateway, "--json", "doctor")
     assert checks(r)["token"]["level"] == "fail" and r.exit_code == 1
 
@@ -248,7 +266,7 @@ def test_voice_off_is_info_not_a_failure(base, gateway, online):
     with open(base / "config.env", "a") as f:
         f.write("STT_PROVIDER=off\nTTS_PROVIDER=off\n")
     # En marcha, /ready da los proveedores `off` como no disponibles (probe() es False).
-    _Gateway.routes["/admin/state"] = _state("off", "off")
+    _Gateway.routes["/system/state"] = _state("off", "off")
     _Gateway.routes["/ready"] = VOICE_OFF_READY
     r = run_at(gateway, "--json", "doctor") if online else run("--json", "doctor")
     found = checks(r)
@@ -273,7 +291,7 @@ def test_running_gateway_decides_off_not_local_config(base, gateway, ready):
 
 
 def test_running_gateway_with_voice_off_is_info_whatever_the_config(base, gateway):
-    _Gateway.routes["/admin/state"] = _state("off", "fogar")  # config.env: fogar (por defecto)
+    _Gateway.routes["/system/state"] = _state("off", "fogar")  # config.env: fogar (por defecto)
     _Gateway.routes["/ready"] = (200, {"status": "ok", "services": {
         "orchestrator": "ok", "transcriber": "unavailable", "tts": "ok"}})
     r = run_at(gateway, "--json", "doctor")
@@ -291,7 +309,7 @@ def test_running_gateway_with_voice_off_is_info_whatever_the_config(base, gatewa
 def test_unreadable_state_falls_back_to_local_config(base, gateway, state):
     with open(base / "config.env", "a") as f:
         f.write("STT_PROVIDER=off\nTTS_PROVIDER=off\n")
-    _Gateway.routes["/admin/state"] = state
+    _Gateway.routes["/system/state"] = state
     _Gateway.routes["/ready"] = VOICE_OFF_READY
     found = checks(run_at(gateway, "--json", "doctor"))
     for name in ("STT", "TTS"):
@@ -415,7 +433,7 @@ def _state_with_access(**orch) -> tuple[int, dict]:
 
 
 def test_running_gateway_with_admin_is_ok(base, gateway):
-    _Gateway.routes["/admin/state"] = _state_with_access(
+    _Gateway.routes["/system/state"] = _state_with_access(
         scopes=["operator.read", "operator.write", "operator.admin"], admin=True,
         auth_method="shared_token", pairing="not_required")
     r = run_at(gateway, "--json", "doctor")
@@ -426,7 +444,7 @@ def test_running_gateway_with_admin_is_ok(base, gateway):
 
 
 def test_running_gateway_without_admin_is_info(base, gateway):
-    _Gateway.routes["/admin/state"] = _state_with_access(
+    _Gateway.routes["/system/state"] = _state_with_access(
         scopes=["operator.read"], admin=False, auth_method="device_token", pairing="paired")
     found = checks(run_at(gateway, "--json", "doctor"))
     assert found[ACCESS]["level"] == "info"
@@ -435,7 +453,7 @@ def test_running_gateway_without_admin_is_info(base, gateway):
 
 
 def test_pending_pairing_is_a_warning_with_the_command(base, gateway):
-    _Gateway.routes["/admin/state"] = _state_with_access(pairing="pending", pairing_request_id="req-9")
+    _Gateway.routes["/system/state"] = _state_with_access(pairing="pending", pairing_request_id="req-9")
     r = run_at(gateway, "--json", "doctor")
     found = checks(r)
     assert found[ACCESS]["level"] == "warn"
@@ -491,7 +509,7 @@ def test_loose_identity_file_permissions_are_flagged(base):
 
 
 def test_identity_required_is_a_warning_without_approve(base, gateway):
-    _Gateway.routes["/admin/state"] = _state_with_access(
+    _Gateway.routes["/system/state"] = _state_with_access(
         pairing="identity_required", identity_error="identity_file_invalid")
     found = checks(run_at(gateway, "--json", "doctor"))
     assert found[ACCESS]["level"] == "warn"
@@ -501,7 +519,7 @@ def test_identity_required_is_a_warning_without_approve(base, gateway):
 
 def test_unknown_access_while_running_falls_back_to_the_file(base, gateway):
     """Desconectado (`unknown`): no se presenta un acceso viejo como actual."""
-    _Gateway.routes["/admin/state"] = _state_with_access(pairing="unknown", scopes=None, admin=False)
+    _Gateway.routes["/system/state"] = _state_with_access(pairing="unknown", scopes=None, admin=False)
     found = checks(run_at(gateway, "--json", "doctor"))
     assert found[ACCESS]["level"] == "info" and "Sin identidad" in found[ACCESS]["detail"]
 

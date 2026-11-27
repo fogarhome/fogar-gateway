@@ -368,7 +368,7 @@ jobs:
             echo "GATEWAY_UID=$(id -u)"
             echo "GATEWAY_GID=$(id -g)"
             echo "DATABASE_URL=sqlite:///data/gateway.db"
-            echo "export TRUST_LOOPBACK=true"
+            echo "export TRUSTED_PROXIES=127.0.0.1,::1"
           } > "$D/.env"
           rm "$D/config.env"
           ls -l "$D" "$D/data"
@@ -409,7 +409,7 @@ jobs:
           grep -qx 'LOG_FORMAT=json' "$NATIVE_HOME/config.env"
           grep -q '^ADMIN_TOKEN=' "$NATIVE_HOME/config.env"
           grep -q '^# \.env de compose' "$NATIVE_HOME/config.env"  # el resto del fichero, tal cual
-          grep -q '^export TRUST_LOOPBACK=true' "$NATIVE_HOME/config.env"
+          grep -q '^export TRUSTED_PROXIES=127.0.0.1,::1' "$NATIVE_HOME/config.env"
           sha256sum -c "$RUNNER_TEMP/src.sha"  # el origen, intacto
 
       - name: install nativo tras migrate y el cliente sigue
@@ -695,7 +695,7 @@ jobs:
             -H 'Content-Type: application/json' -d "{\"code\": \"$1\"}" http://127.0.0.1:8004/pair; }
           [ "$(post "$wrong")" = 400 ]
           [ "$(post "$code")" = 201 ]
-          PAIRED_KEY=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['client_key'])" "$RUNNER_TEMP/paired.json")
+          PAIRED_KEY=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['token'])" "$RUNNER_TEMP/paired.json")
           export PAIRED_KEY
           [ "$(post "$code")" = 400 ]  # de un solo uso (sobrescribe paired.json: la clave ya está leída)
           uv run --no-sync python - <<'EOF'
@@ -704,7 +704,7 @@ jobs:
 
           async def main():
               async with websockets.connect("ws://127.0.0.1:8004/ws/stream") as ws:
-                  await ws.send(json.dumps({"client_key": os.environ["PAIRED_KEY"],
+                  await ws.send(json.dumps({"protocol": 5, "token": os.environ["PAIRED_KEY"],
                                             "input_mode": "text", "output_mode": ["text"]}))
                   for _ in range(5):
                       msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))

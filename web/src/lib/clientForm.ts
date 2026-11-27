@@ -13,10 +13,7 @@ export interface ClientForm {
   stt_language: string
   stt_vad_thold: string
   tts_speed: string
-  barge_in_enabled: boolean
-  barge_in_min_chars: string
   silence_timeout_s: string
-  max_silence_turns: string
   push_enabled: boolean
   tool_calls_enabled: boolean
 }
@@ -34,10 +31,7 @@ export function toForm(c: ClientResponse): ClientForm {
     stt_language: c.stt_language,
     stt_vad_thold: num(c.stt_vad_thold),
     tts_speed: num(c.tts_speed),
-    barge_in_enabled: c.barge_in_enabled,
-    barge_in_min_chars: String(c.barge_in_min_chars),
     silence_timeout_s: num(c.silence_timeout_s),
-    max_silence_turns: String(c.max_silence_turns),
     push_enabled: c.push_enabled,
     tool_calls_enabled: c.tool_calls_enabled,
   }
@@ -58,9 +52,7 @@ export function validate(f: ClientForm): Partial<Record<keyof ClientForm, string
   if (!f.stt_language.trim()) e.stt_language = 'Pon un idioma, por ejemplo «es».'
   rango('stt_vad_thold', 0, 1, false)
   rango('tts_speed', 0, 10, false, true)
-  rango('barge_in_min_chars', 1, 10_000, true)
   rango('silence_timeout_s', 0, 86_400, false, true)
-  rango('max_silence_turns', 1, 10_000, true)
   const permitidos = agents(f.allowed_agents)
   if (f.default_agent.trim() && permitidos && !permitidos.includes(f.default_agent.trim()))
     e.default_agent = 'Tiene que estar entre los agentes permitidos.'
@@ -87,10 +79,7 @@ export function diff(c: ClientResponse, f: ClientForm): ClientInput {
     stt_language: f.stt_language.trim(),
     stt_vad_thold: parse(f.stt_vad_thold),
     tts_speed: parse(f.tts_speed),
-    barge_in_enabled: f.barge_in_enabled,
-    barge_in_min_chars: parse(f.barge_in_min_chars),
     silence_timeout_s: parse(f.silence_timeout_s),
-    max_silence_turns: parse(f.max_silence_turns),
     push_enabled: f.push_enabled,
     tool_calls_enabled: f.tool_calls_enabled,
   }

@@ -1,188 +1,190 @@
-import { reactive } from 'vue'
-import { backoffMs, ChatLog, closeAction, stopText, type ServerMessage } from './chat'
+import { computed, reactive } from 'vue'
+import { ApiError } from '@/api/http'
+import type { ConversationLive } from '@/api/types'
+import { ChatLog, type ServerMessage } from './chat'
+import type { GatewayEvent, StreamState } from './events'
+import { turnErrorText } from './labels'
 
-// Una conversación en vivo: abre /ws/stream con el token de este navegador (un dispositivo
-// personal, 4.0) en esa conversación, manda texto y sigue la respuesta token a token.
-// El token va solo en el handshake: nunca se registra ni se enseña.
+// Una conversación en vivo (5.0, docs/client-protocol.md §16): su estado al entrar
+// (`GET /conversations/{id}`, con `as_of`) y, desde ahí, lo que llega por el `/events` de la
+// pestaña. Escribir es un POST; parar y quitar, también. Sin Vue Router ni store: se prueba solo.
 
 export type Connection =
-  | 'connecting' // abriendo, hasta el `ready`
+  | 'connecting' // abriendo /events o leyendo el estado al entrar
   | 'ready'
-  | 'reconnecting' // se cayó: reintenta solo, con espera creciente
-  | 'idle' // cerrada sin error (inactividad): se reabre al escribir
-  | 'elsewhere' // otra pestaña o ventana abrió la conversación: solo vuelve si lo pide la persona
-  | 'stopped' // no tiene arreglo reconectando (ver `notice`)
+  | 'reconnecting' // /events se cortó: reconecta solo
+  | 'stopped' // el token ya no vale o no tiene permiso (ver `notice`)
 
-export interface ChatSessionOptions {
-  conversationId: string
-  token: string
-  /** Para las pruebas. */
-  WebSocketImpl?: typeof WebSocket
-  url?: string
+export interface ChatDeps {
+  /** El `/events` de la pestaña: escuchar y su estado. */
+  subscribe: (listener: (event: GatewayEvent, id: number | null) => void) => () => void
+  streamState: () => StreamState
+  getLive: (id: string) => Promise<ConversationLive>
+  postMessage: (id: string, text: string, interrupt: boolean) => Promise<{ message_id: string }>
+  cancelTurn: (id: string, turnId?: string) => Promise<{ cancelled: boolean }>
+  withdrawMessage: (id: string, messageId: string) => Promise<void>
 }
 
 export interface ChatSessionState {
-  connection: Connection
-  /** El agente de la conversación, de `ready`. */
-  agent: string | null
-  /** OpenClaw se está reconectando (avisos `status` de la sesión). */
-  orchestratorDown: boolean
-  /** Por qué se paró (`stopped`). */
+  readonly connection: Connection
+  /** El estado al entrar ya está leído: lo siguiente llega por /events. */
+  loaded: boolean
+  /** Algo que no salió (un envío, parar, quitar), en una frase. */
   notice: string | null
-  /** Reintentos seguidos sin llegar a `ready`. */
-  failures: number
+  /** Un envío en marcha (esperando el `202`). */
+  sending: boolean
+  /** Sube con cada `resync`: hay que volver a leer lo dicho. */
+  epoch: number
   log: ChatLog
 }
 
-function defaultUrl(): string {
-  return `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/stream`
+/** Lo que el gateway quita a los extremos (str.strip(), más los surrogates sueltos, G-r4-1). */
+export function cleanText(text: string): string {
+  return text.replace(/\p{Cs}/gu, '').replace(/^[\s\x1c-\x1f\x85]+|[\s\x1c-\x1f\x85]+$/g, '')
 }
 
-export function createChatSession(options: ChatSessionOptions) {
-  const Impl = options.WebSocketImpl ?? WebSocket
-  const state = reactive<ChatSessionState>({
-    connection: 'connecting',
-    agent: null,
-    orchestratorDown: false,
-    notice: null,
-    failures: 0,
-    log: new ChatLog(options.conversationId),
-  })
-  let ws: WebSocket | null = null
-  let retry: ReturnType<typeof setTimeout> | null = null
-  // Escrito con la conversación dormida: sale al llegar `ready` (su línea, por si no sale).
-  let pending: { text: string; key: string } | null = null
+function errorText(e: unknown, what: string): string {
+  if (e instanceof ApiError) {
+    if (e.status === 403) return `No tienes permiso para ${what} aquí.`
+    if (e.status === 404) return 'Esta conversación ya no existe.'
+    if (e.status === 502) return `${turnErrorText(e.message)}.`
+    if (e.status === 503) return 'La conversación está ocupada o OpenClaw no responde: prueba otra vez.'
+    if (e.kind === 'network') return 'No llego al gateway.'
+  }
+  return `No se pudo ${what}.`
+}
+
+export function createChatSession(conversationId: string, deps: ChatDeps) {
+  let asOf = Number.POSITIVE_INFINITY // hasta leer el estado: nada se aplica
+  let held: Array<[GatewayEvent, number | null]> = []
+  let unsubscribe: (() => void) | null = null
   let disposed = false
+  let loads = 0
 
-  function connect(): void {
-    if (disposed) return
-    if (retry) clearTimeout(retry)
-    retry = null
-    if (state.connection !== 'reconnecting') state.connection = 'connecting'
-    state.notice = null
-    const socket = new Impl(options.url ?? defaultUrl())
-    ws = socket
-    socket.onopen = () => {
-      socket.send(
-        JSON.stringify({
-          client_key: options.token,
-          input_mode: 'text',
-          // `status`: el progreso del turno (`turn_progress`); llegan también los `pipeline_event`, que el chat ignora.
-          output_mode: ['text', 'status'],
-          conversation: options.conversationId,
-        }),
-      )
+  const state = reactive({
+    loaded: false,
+    notice: null as string | null,
+    sending: false,
+    epoch: 0,
+    log: new ChatLog(conversationId),
+    connection: computed<Connection>(() => {
+      const stream = deps.streamState()
+      if (stream === 'stopped') return 'stopped'
+      if (stream === 'reconnecting') return 'reconnecting'
+      return stream === 'ready' && state.loaded ? 'ready' : 'connecting'
+    }),
+  }) as ChatSessionState
+
+  function mine(event: GatewayEvent): boolean {
+    return event.conversation === conversationId
+  }
+
+  function onEvent(event: GatewayEvent, id: number | null): void {
+    if (event.type === 'resync') {
+      // Lo perdido ya no está en el gateway: se vuelve a leer todo.
+      state.log.closeOpenTurns()
+      state.epoch += 1
+      void load()
+      return
     }
-    socket.onmessage = (event) => {
-      if (ws !== socket || typeof event.data !== 'string') return
-      let msg: ServerMessage
+    if (!mine(event)) return
+    if (!state.loaded) {
+      held.push([event, id])
+      return
+    }
+    if (id != null && id <= asOf) return // ya venía en el estado al entrar
+    state.log.apply(event as ServerMessage)
+  }
+
+  /** Lee el estado al entrar y aplica lo que llegó mientras tanto con id > `as_of`. */
+  async function load(): Promise<void> {
+    const mineLoad = ++loads
+    state.loaded = false
+    try {
+      const live = await deps.getLive(conversationId)
+      if (disposed || mineLoad !== loads) return
+      asOf = live.as_of
+      state.log.clear()
+      for (const message of live.pending) state.log.apply(message as ServerMessage)
+      if (live.turn) {
+        state.log.apply({ ...live.turn, type: 'turn_start' } as ServerMessage)
+        if (live.turn.text) state.log.apply({ type: 'token', turn_id: live.turn.turn_id, text: live.turn.text })
+      }
+      state.loaded = true
+      const pending = held
+      held = []
+      for (const [event, id] of pending) onEvent(event, id)
+    } catch (e) {
+      if (disposed || mineLoad !== loads) return
+      state.notice = errorText(e, 'abrir la conversación')
+    }
+  }
+
+  async function cancel(turnId?: string): Promise<void> {
+    try {
+      await deps.cancelTurn(conversationId, turnId)
+    } catch (e) {
+      state.notice = errorText(e, 'parar')
+    }
+  }
+
+  return {
+    state,
+    start(): void {
+      unsubscribe = deps.subscribe(onEvent)
+      void load()
+    },
+    /** Escribe. `interrupt`: enviar ahora (para el turno en curso y responde a este). */
+    async send(text: string, interrupt = false): Promise<boolean> {
+      const clean = cleanText(text)
+      if (!clean || state.sending || state.connection !== 'ready') return false
+      state.sending = true
+      state.notice = null
       try {
-        msg = JSON.parse(event.data) as ServerMessage
-      } catch {
-        return
+        await deps.postMessage(conversationId, clean, interrupt)
+        return true // su línea llega por /events (`message`)
+      } catch (e) {
+        state.notice = errorText(e, 'enviar el mensaje')
+        return false
+      } finally {
+        state.sending = false
       }
-      onMessage(msg)
-    }
-    socket.onclose = (event) => {
-      if (ws !== socket) return
-      ws = null
-      onClose(event.code)
-    }
-  }
-
-  function onMessage(msg: ServerMessage): void {
-    if (msg.type === 'ready') {
-      const m = msg as Extract<ServerMessage, { type: 'ready' }>
-      state.connection = 'ready'
-      state.failures = 0
-      // Un `restored` solo llega a quien estaba conectado al volver OpenClaw: al entrar, se parte de cero.
-      state.orchestratorDown = false
-      state.agent = m.conversation?.agent ?? m.agent
-      if (pending != null) {
-        ws?.send(JSON.stringify({ type: 'send', text: pending.text }))
-        state.log.sent(pending.key)
-        pending = null
+    },
+    cancel: () => cancel(),
+    /**
+     * «Enviar ahora» en el primero de la cola: para el turno que se está respondiendo, y el mensaje
+     * sale detrás. Sin turno abierto no hace nada: el mensaje ya va a salir, y `/cancel` sin turno
+     * pararía justo ese (el siguiente pendiente, docs/client-protocol.md §4). `interrupt` no sirve:
+     * va en un POST nuevo, así que reenviaría el texto (duplicado) y en ese hueco también para el siguiente.
+     * Lleva el `turn_id`: si ese turno acaba justo antes de que llegue, el gateway no para nada.
+     */
+    async sendNow(): Promise<void> {
+      const turnId = state.log.openTurnId
+      if (turnId) await cancel(turnId)
+    },
+    async withdraw(messageId: string): Promise<void> {
+      try {
+        await deps.withdrawMessage(conversationId, messageId)
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 404) return // ya no estaba pendiente
+        state.notice = errorText(e, 'quitar el mensaje')
       }
-      return
-    }
-    if (msg.type === 'status' && msg.service === 'orchestrator') {
-      state.orchestratorDown = msg.state !== 'restored'
-      return
-    }
-    state.log.apply(msg)
+    },
+    /** Lo dicho se ha vuelto a leer: fuera lo terminado antes de pedirlo (`keys`). */
+    historyReloaded(keys: string[]): void {
+      state.log.dropReloaded(keys)
+    },
+    /** «Reintentar»: vuelve a leer el estado. */
+    reconnect(): void {
+      state.notice = null
+      void load()
+    },
+    dispose(): void {
+      disposed = true
+      unsubscribe?.()
+      unsubscribe = null
+    },
   }
-
-  function onClose(code: number): void {
-    state.log.closeOpenTurns()
-    if (disposed) return
-    const action = closeAction(code)
-    if (action === 'retry') {
-      state.connection = 'reconnecting'
-      state.failures += 1
-      retry = setTimeout(connect, backoffMs(state.failures))
-      return
-    }
-    if (pending) state.log.markUnsent(pending.key) // no se envió: que se vea
-    pending = null
-    if (action === 'stop') state.notice = stopText(code)
-    state.connection = action === 'stop' ? 'stopped' : action
-  }
-
-  /** Manda un mensaje. Con la conversación dormida, la reabre y lo manda al entrar. */
-  function send(text: string): boolean {
-    // Aproxima el str.strip() del gateway (que también quita \x1c-\x1f y \x85; el \s de JS
-    // quita además U+FEFF, que el gateway conserva): lo que allí queda vacío no se manda (no tendría turn_start y descolocaría la cola de mensajes). Antes, los
-    // surrogates sueltos, que el gateway también quita (G-r4-1).
-    const clean = text.replace(/\p{Cs}/gu, '').replace(/^[\s\x1c-\x1f\x85]+|[\s\x1c-\x1f\x85]+$/g, '')
-    if (!clean) return false
-    if (state.connection === 'ready' && ws) {
-      ws.send(JSON.stringify({ type: 'send', text: clean }))
-      state.log.sent(state.log.addUser(clean))
-    } else if (state.connection === 'idle') {
-      pending = { text: clean, key: state.log.addUser(clean) }
-      connect()
-    } else return false
-    return true
-  }
-
-  function cancel(): void {
-    if (state.connection === 'ready' && state.log.turnOpen) ws?.send(JSON.stringify({ type: 'cancel' }))
-  }
-
-  /**
-   * Empieza. Si la conversación estaba abierta en otra pestaña, esa recibe el 4102 («conversation
-   * opened elsewhere») y se queda con su aviso (no vuelve sola): nunca se echan una a otra.
-   */
-  function start(): void {
-    connect()
-  }
-
-  /**
-   * Lo dicho se ha vuelto a leer de OpenClaw: fuera lo que ya estaba terminado al pedirlo (`keys`, de
-   * `state.log.endedKeys()` antes de pedir), que ya viene en ello. Lo que espera a salir se queda.
-   */
-  function historyReloaded(keys: string[]): void {
-    state.log.dropReloaded(keys, pending?.key)
-  }
-
-  /** «Seguir aquí» (o reintentar tras un `stopped`): vuelve a abrir la conversación, que se cierra en el otro sitio. */
-  function retake(): void {
-    if (ws || disposed) return
-    state.log = new ChatLog(options.conversationId)
-    state.failures = 0
-    state.connection = 'connecting'
-    connect()
-  }
-
-  function dispose(): void {
-    disposed = true
-    if (retry) clearTimeout(retry)
-    const socket = ws
-    ws = null
-    socket?.close(1000)
-  }
-
-  return { state, start, send, cancel, retake, historyReloaded, dispose }
 }
 
 export type ChatSession = ReturnType<typeof createChatSession>

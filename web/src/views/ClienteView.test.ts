@@ -1,10 +1,11 @@
-import { createPinia } from 'pinia'
+import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, nextTick } from 'vue'
 import { createMemoryHistory, createRouter, RouterView } from 'vue-router'
 import { ApiError } from '@/api/http'
-import type { ClientResponse, ClientWithKey } from '@/api/types'
+import type { ClientResponse, ClientWithKey, UserRow } from '@/api/types'
 import { clearToasts, toasts } from '@/lib/toasts'
+import { useSessionStore, type Role } from '@/stores/session'
 import ClienteView from './ClienteView.vue'
 
 vi.mock('@/api/admin', () => ({
@@ -13,11 +14,14 @@ vi.mock('@/api/admin', () => ({
   updateClient: vi.fn(),
   deleteClient: vi.fn(),
   listClients: vi.fn(() => Promise.resolve([])),
+  listUsers: vi.fn(() => Promise.resolve([])),
 }))
 const admin = await import('@/api/admin')
 const getClient = vi.mocked(admin.getClient)
 const rotateClientKey = vi.mocked(admin.rotateClientKey)
 const deleteClient = vi.mocked(admin.deleteClient)
+const updateClient = vi.mocked(admin.updateClient)
+const listUsers = vi.mocked(admin.listUsers)
 
 const cliente: ClientResponse = {
   id: 'c1',
@@ -32,11 +36,8 @@ const cliente: ClientResponse = {
   stt_vad_thold: 0.5,
   tts_voice: 'v',
   tts_speed: 1,
-  barge_in_enabled: true,
-  barge_in_min_chars: 3,
   output_mode: null,
   silence_timeout_s: 10,
-  max_silence_turns: 2,
   push_enabled: false,
   tool_calls_enabled: false,
 }
@@ -44,7 +45,7 @@ const cliente: ClientResponse = {
 const flush = async () => {
   for (let i = 0; i < 5; i++) await nextTick()
 }
-async function mount() {
+async function mount(role?: Role) {
   const router = createRouter({
     history: createMemoryHistory(),
     routes: [
@@ -55,7 +56,10 @@ async function mount() {
   })
   await router.push('/clientes/c1')
   const el = document.createElement('div')
-  createApp(RouterView).use(createPinia()).use(router).mount(el)
+  const pinia = createPinia()
+  setActivePinia(pinia)
+  if (role) useSessionStore().user = { id: 'yo', username: 'yo', display_name: 'Yo', role }
+  createApp(RouterView).use(pinia).use(router).mount(el)
   await flush()
   const boton = (texto: string) =>
     [...el.querySelectorAll('button')].find((b) => b.textContent?.includes(texto)) as HTMLButtonElement
@@ -233,5 +237,45 @@ describe('ClienteView: acciones que no se repiten ni engañan (G-r6-2..4)', () =
     await new Promise((r) => setTimeout(r, 0))
     expect(toasts.map((t) => t.title)).toEqual(['«Tele» borrado'])
     expect(router.currentRoute.value.path).toBe('/clientes')
+  })
+})
+
+describe('ClienteView: el aparato personal de un dueño (#441)', () => {
+  const persona = (id: string, role: Role): UserRow => ({
+    id, username: id, display_name: id === 'u-ana' ? 'Ana' : 'Luis', role, agent: null, is_active: true,
+    created_at: '2026-11-17T10:00:00Z', effective_agent: null, agent_shared: null,
+  })
+  beforeEach(() => {
+    listUsers.mockResolvedValue([persona('u-ana', 'owner'), persona('u-luis', 'member')])
+  })
+
+  it('a un administrador no le ofrece cambiarlo y le dice de quién es', async () => {
+    getClient.mockResolvedValue({ ...cliente, user_id: 'u-ana' })
+    const { el, boton } = await mount('admin')
+    expect(el.textContent).toContain('Es un aparato de Ana: solo lo cambia él.')
+    expect(boton('Rotar clave')).toBeUndefined()
+    expect(boton('Borrar…')).toBeUndefined()
+    expect(boton('Desactivar')).toBeUndefined()
+    expect(el.querySelector('form input')!.matches(':disabled')).toBe(true)
+  })
+
+  it('al dueño, y al administrador con un aparato del hogar o de un miembro, sí', async () => {
+    for (const [role, userId] of [['owner', 'u-ana'], ['admin', null], ['admin', 'u-luis']] as const) {
+      getClient.mockResolvedValue({ ...cliente, user_id: userId })
+      const { el, boton } = await mount(role)
+      expect(el.textContent).not.toContain('solo lo cambia él')
+      expect(boton('Rotar clave')).toBeDefined()
+      expect(el.querySelector('form input')!.matches(':disabled')).toBe(false)
+    }
+  })
+
+  it('si aun así llega un 403 owner_only, lo dice con una frase', async () => {
+    listUsers.mockRejectedValue(new ApiError('forbidden', 403, 'missing_scope'))
+    getClient.mockResolvedValue({ ...cliente, user_id: 'u-ana' })
+    updateClient.mockRejectedValue(new ApiError('forbidden', 403, 'owner_only'))
+    const { boton } = await mount('admin')
+    boton('Desactivar').click()
+    await flush()
+    expect(toasts.map((t) => t.body)).toEqual(['Es un aparato de un dueño: solo lo cambia él.'])
   })
 })

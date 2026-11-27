@@ -1,99 +1,6 @@
-import asyncio
 from unittest.mock import AsyncMock
 
-import pytest
-
-from fogar_gateway.services.openclaw.registry import (
-    ClientRegistry,
-    TurnInProgress,
-    TurnRegistry,
-)
-
-# --- TurnRegistry ---
-
-
-def test_register_returns_queue():
-    reg = TurnRegistry()
-    q = reg.register("req-1", "agent:main:client-a")
-    assert isinstance(q, asyncio.Queue)
-
-
-def test_get_queue_by_session():
-    reg = TurnRegistry()
-    q = reg.register("req-1", "agent:main:client-a")
-    assert reg.get_queue_by_session("agent:main:client-a") is q
-
-
-def test_get_queue_missing_returns_none():
-    reg = TurnRegistry()
-    assert reg.get_queue_by_session("nonexistent") is None
-    assert not reg.deliver_by_req("nonexistent", ("x", None))
-
-
-def test_unregister_clears_both():
-    reg = TurnRegistry()
-    reg.register("req-1", "agent:main:client-a")
-    reg.unregister("agent:main:client-a", "req-1")
-    assert reg.get_queue_by_session("agent:main:client-a") is None
-    assert not reg.deliver_by_req("req-1", ("x", None))
-
-
-def test_register_rejects_duplicate_session_key():
-    reg = TurnRegistry()
-    qa = reg.register("req-a", "agent:main:client-a")
-
-    with pytest.raises(TurnInProgress):
-        reg.register("req-b", "agent:main:client-a")
-
-    # The first caller's queue is untouched by the rejected attempt.
-    assert reg.get_queue_by_session("agent:main:client-a") is qa
-    # The rejected req_id was never registered.
-    assert not reg.deliver_by_req("req-b", ("x", None))
-
-
-def test_unregister_does_not_pop_unrelated_queue():
-    """Locks in the identity-confusion half of the bug: unregister() must
-    only remove a session_key's queue if the caller is still its current
-    owner, not just because the session_key string matches."""
-    reg = TurnRegistry()
-    reg.register("req-a", "agent:main:client-a")
-
-    # Simulate the desync a pre-fix duplicate registration would have left
-    # behind: the session_key's queue entry disappears (as if overwritten)
-    # while the stale req_id -> session_key mapping for A survives.
-    del reg._sessions["agent:main:client-a"]
-
-    qb = reg.register("req-b", "agent:main:client-a")
-
-    # A's belated cleanup call must not evict B's live queue.
-    reg.unregister("agent:main:client-a", "req-a")
-
-    assert reg.get_queue_by_session("agent:main:client-a") is qb
-    assert reg.deliver_by_req("req-b", ("x", None))
-    assert qb.get_nowait() == ("x", None)
-
-
-def test_two_sessions_independent():
-    reg = TurnRegistry()
-    qa = reg.register("req-a", "agent:main:client-a")
-    qb = reg.register("req-b", "agent:main:client-b")
-    assert reg.get_queue_by_session("agent:main:client-a") is qa
-    assert reg.get_queue_by_session("agent:main:client-b") is qb
-    assert qa is not qb
-
-
-def test_error_all_notifies_and_clears():
-    reg = TurnRegistry()
-    qa = reg.register("req-a", "agent:main:client-a")
-    qb = reg.register("req-b", "agent:main:client-b")
-    reg.error_all("reconnecting")
-    assert qa.get_nowait() == ("error", "reconnecting")
-    assert qb.get_nowait() == ("error", "reconnecting")
-    assert reg.get_queue_by_session("agent:main:client-a") is None
-    assert not reg.deliver_by_req("req-a", ("x", None))
-
-
-# --- ClientRegistry ---
+from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
 
 
 def test_client_registry_register_get():
@@ -176,3 +83,21 @@ async def test_broadcast_status_one_failure_does_not_block_others():
     await reg.broadcast_status("orchestrator", "unavailable")  # must not raise
 
     bridge_b.notify_service_status.assert_awaited_once_with("orchestrator", "unavailable")
+
+
+def test_an_owed_abort_is_taken_once_and_settled_by_an_abort_answer():
+    turns = TurnRegistry()
+    turns.owe_abort("sk", "r1")
+    turns.owe_abort("sk", "r2")
+    assert turns.take_owed_abort("r1") == "sk"
+    assert turns.take_owed_abort("r1") is None
+    turns.note_abort_result({"ok": True, "aborted": True, "runIds": ["r2"]})
+    assert turns.take_owed_abort("r2") is None
+
+
+def test_an_ended_push_is_remembered_until_a_new_start():
+    turns = TurnRegistry()
+    turns.end_push("r1")
+    assert turns.push_ended("r1") and not turns.push_ended("r2") and not turns.push_ended(None)
+    turns.reopen_push("r1")
+    assert not turns.push_ended("r1")

@@ -18,13 +18,13 @@ from fogar_gateway.services import tts_client as tts_mod
 from fogar_gateway.services.openclaw.client import OpenClawClient
 from fogar_gateway.services.openclaw.reconnecting import ReconnectingOpenClawClient
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
-from fogar_gateway.services.protocol import OrchestratorEvent
 from fogar_gateway.services.reconnection import ConnectionState, describe_error
 from fogar_gateway.services.speech.ports import SttCallbacks, SttParams
 from fogar_gateway.services.transcriber_client import TranscriberClient
 from fogar_gateway.services.transcriber_reconnecting import ReconnectingTranscriberClient
 from fogar_gateway.services.tts_client import TTSClient
-from tests.fakes.bridge import run_turn, sent
+from tests.fakes.bridge import push, run_turn, sent
+from tests.fakes.orchestrator import OrchestratorEvent
 
 SECRET = "SECRET-INTERNAL"
 
@@ -36,15 +36,11 @@ def _logged(caplog) -> str:
 
 
 async def test_turn_error_from_raw_runtime_error_is_internal_error(make_bridge, caplog):
+    """5.0 PR 2b: what can break with an arbitrary exception is the channel's chat.send."""
     caplog.set_level(logging.DEBUG)
     bridge, ws = make_bridge()
-
-    async def s(*a, **k):
-        raise RuntimeError(SECRET)
-        yield  # pragma: no cover
-
-    bridge.orchestrator.stream_response = s
-    await run_turn(bridge, "x")
+    bridge.orchestrator.send.side_effect = RuntimeError(SECRET)
+    await bridge.turns.start_user_turn("x")
     await sent(bridge)
 
     err = ws.of("error")[0]
@@ -65,6 +61,50 @@ async def test_turn_error_relays_orchestrator_error_code(make_bridge):
     await sent(bridge)
 
     assert ws.of("error")[0]["message"] == "turn_timeout"
+
+
+async def test_failed_push_gets_a_classified_turn_error_without_text(make_bridge, caplog):
+    """#397: un push cuyo agente falla recibe su TURN_ERROR con el código clasificado (aquí por
+    el `fallback_step` previo del mismo run); ningún texto de OpenClaw sale."""
+    caplog.set_level(logging.DEBUG)
+    bridge, ws = make_bridge()
+    step = {
+        "phase": "fallback_step",
+        "fallbackStepFromFailureReason": "auth",
+        "fallbackStepFromFailureDetail": SECRET,
+        "fallbackStepFinalOutcome": "chain_exhausted",
+    }
+    failed = {"phase": "error", "error": SECRET, "errorObservation": {"providerErrorMessagePreview": SECRET}}
+    await push(bridge, ("turn_start", "sk"), ("fallback", step), ("turn_error", failed))
+    await sent(bridge)
+
+    assert ws.types() == ["turn_start", "error", "turn_end"]
+    assert ws.of("error")[0]["message"] == "orchestrator_auth_failed"
+    assert ws.of("turn_end")[0]["reason"] == "error"
+    assert SECRET not in json.dumps(ws.sent, default=str)
+    assert SECRET not in _logged(caplog)
+    await bridge.close_all()
+
+
+async def test_agent_unavailable_is_a_turn_error_before_chat_send(make_bridge):
+    """#397 (decisión a): el agente de la sesión ya no está en `allowed_agents`: el turno acaba
+    con orchestrator_agent_unavailable sin llegar a chat.send."""
+    bridge, ws = make_bridge()
+    bridge.turns.allowed_agents = ["otro"]
+    called = []
+
+    async def s(*a, **k):
+        called.append(a)
+        yield OrchestratorEvent(type="status", content="done")
+
+    bridge.orchestrator.stream_response = s
+    await bridge.turns.start_user_turn("x")
+    await sent(bridge)
+
+    assert ws.types() == ["turn_start", "error", "turn_end"]
+    assert ws.of("error")[0]["message"] == "orchestrator_agent_unavailable"
+    assert ws.of("turn_end")[0]["reason"] == "error"
+    assert called == []
 
 
 async def test_openclaw_reconnect_last_error_has_no_raw_text(caplog):

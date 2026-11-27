@@ -9,9 +9,9 @@ import pytest
 import websockets
 
 from fogar_gateway.core.config import settings
-from fogar_gateway.services.protocol import OrchestratorEvent
 from fogar_gateway.services.tts_client import TTSClient
 from tests.fakes.bridge import sent, start_turn, tokens
+from tests.fakes.orchestrator import OrchestratorEvent
 
 
 @pytest.fixture
@@ -138,20 +138,22 @@ async def _cancel_turn_during(make_tts_bridge, monkeypatch, *, tokens_block):
         await asyncio.wait_for(entered.wait(), 2.0)
     else:
         await asyncio.sleep(0.2)  # tokens done, now waiting for audio
-    task.cancel()
-    try:
-        await asyncio.wait_for(task, 2.0)
-    except asyncio.CancelledError:
-        pass
+    assert (await bridge.turns.cancel("cancelled"))[0]
+    await asyncio.wait_for(bridge.turns.idle(), 2.0)
     tts_client.close.assert_awaited()
     await asyncio.sleep(0)
-    leftover = [t for t in asyncio.all_tasks() - before if not t.done() and t is not task]
+    # The session's worker waits for its next turn, the channel's for its next frame (5.0);
+    # nothing else is left behind.
+    leftover = [
+        t for t in asyncio.all_tasks() - before
+        if not t.done() and t is not task and t.get_name() not in ("turn_worker", "push_worker")
+    ]
     assert leftover == []
 
 
-async def test_barge_in_cancel_during_tokens_closes_tts_no_orphans(make_tts_bridge, monkeypatch):
+async def test_cancel_during_tokens_closes_tts_no_orphans(make_tts_bridge, monkeypatch):
     await _cancel_turn_during(make_tts_bridge, monkeypatch, tokens_block=True)
 
 
-async def test_barge_in_cancel_during_audio_wait_closes_tts_no_orphans(make_tts_bridge, monkeypatch):
+async def test_cancel_during_audio_wait_closes_tts_no_orphans(make_tts_bridge, monkeypatch):
     await _cancel_turn_during(make_tts_bridge, monkeypatch, tokens_block=False)

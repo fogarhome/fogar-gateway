@@ -1,244 +1,156 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createChatSession } from './chatSession'
+import { describe, expect, it, vi } from 'vitest'
+import { ref } from 'vue'
+import { ApiError } from '@/api/http'
+import type { ConversationLive } from '@/api/types'
+import { createChatSession, type ChatDeps } from './chatSession'
+import type { GatewayEvent, StreamState } from './events'
 
-// Un WebSocket de mentira: guarda lo enviado y deja simular lo que manda el gateway.
-class FakeSocket {
-  static all: FakeSocket[] = []
-  sent: unknown[] = []
-  closedWith: number | null = null
-  onopen: (() => void) | null = null
-  onmessage: ((e: { data: unknown }) => void) | null = null
-  onclose: ((e: { code: number; reason: string }) => void) | null = null
-  constructor(readonly url: string) {
-    FakeSocket.all.push(this)
-  }
-  send(data: string) {
-    this.sent.push(JSON.parse(data))
-  }
-  close(code: number) {
-    this.closedWith = code
-  }
-  // Lado del gateway
-  open() {
-    this.onopen?.()
-  }
-  receive(msg: object) {
-    this.onmessage?.({ data: JSON.stringify(msg) })
-  }
-  serverClose(code: number, reason = '') {
-    this.onclose?.({ code, reason })
-  }
-}
+// El chat de una conversación por HTTP (5.0): el estado al entrar, `as_of` y lo que llega por /events.
 
-const last = () => FakeSocket.all.at(-1)!
-const READY = { type: 'ready', session_id: 'panel-web:1', agent: 'main', conversation: { id: 'c1', agent: 'main' } }
+const LIVE = (extra: Partial<ConversationLive> = {}): ConversationLive =>
+  ({ id: 'c1', as_of: 10, turn: null, pending: [], ...extra }) as ConversationLive
+const message = (id: string, state = 'pending') => ({
+  type: 'message', id, conversation: 'c1', text: id, state, from: { source: 'device', device_id: 'yo', name: 'Mac', self: true },
+})
+const flush = () => new Promise((r) => setTimeout(r, 0))
 
-function session() {
-  const s = createChatSession({
-    conversationId: 'c1',
-    token: 'secreto',
-    url: 'ws://gw/ws/stream',
-    WebSocketImpl: FakeSocket as unknown as typeof WebSocket,
-  })
-  s.start()
-  last().open()
-  last().receive(READY)
-  return s
+function harness(live: ConversationLive = LIVE()) {
+  let listener: ((e: GatewayEvent, id: number | null) => void) | null = null
+  const stream = ref<StreamState>('ready')
+  const deps: ChatDeps = {
+    subscribe: (fn) => {
+      listener = fn
+      return () => (listener = null)
+    },
+    streamState: () => stream.value,
+    getLive: vi.fn(async () => live),
+    postMessage: vi.fn(async () => ({ message_id: 'run-1' })),
+    cancelTurn: vi.fn(async () => ({ cancelled: true })),
+    withdrawMessage: vi.fn(async () => undefined),
+  }
+  const chat = createChatSession('c1', deps)
+  const emit = (event: object, id: number | null = null) => listener?.(event as GatewayEvent, id)
+  return { chat, deps, stream, emit }
 }
 
 describe('createChatSession', () => {
-  beforeEach(() => {
-    FakeSocket.all = []
-    vi.useFakeTimers()
-  })
-  afterEach(() => vi.useRealTimers())
-
-  it('entra con el token de este navegador (su client_key) en su conversación, sin pedir agente', () => {
-    const s = session()
-    expect(last().sent[0]).toEqual({ client_key: 'secreto', input_mode: 'text', output_mode: ['text', 'status'], conversation: 'c1' })
-    expect(s.state.connection).toBe('ready')
-    expect(s.state.agent).toBe('main')
-  })
-
-  it('manda lo escrito y sigue la respuesta token a token', () => {
-    const s = session()
-    expect(s.send('  Hola  ')).toBe(true)
-    expect(last().sent.at(-1)).toEqual({ type: 'send', text: 'Hola' })
-    last().receive({ type: 'turn_start', turn_id: 't-1', turn_seq: 1, conversation: 'c1', origin: 'user' })
-    last().receive({ type: 'token', turn_id: 't-1', text: '¡Hola!' })
-    expect(s.state.log.turnOpen).toBe(true)
-    s.cancel()
-    expect(last().sent.at(-1)).toEqual({ type: 'cancel' })
-    last().receive({ type: 'turn_end', turn_id: 't-1', reason: 'cancelled' })
-    expect(s.state.log.lines.map((l) => [l.role, l.text, l.reason])).toEqual([
-      ['user', 'Hola', 'done'],
-      ['assistant', '¡Hola!', 'cancelled'],
-    ])
+  it('entra con el estado leído (turno en curso y pendientes) y descarta lo que ya traía (id ≤ as_of)', async () => {
+    const h = harness(LIVE({ turn: { turn_id: 'T', origin: 'user', text: 'lleva' }, pending: [message('m2')] }))
+    h.chat.start()
+    h.emit({ type: 'token', turn_id: 'T', conversation: 'c1', text: 'antes' }, 9) // mientras carga
+    await flush()
+    expect(h.chat.state.connection).toBe('ready')
+    h.emit({ type: 'token', turn_id: 'T', conversation: 'c1', text: ' más' }, 11)
+    h.emit({ type: 'token', turn_id: 'T', conversation: 'otra', text: 'ajeno' }, 12)
+    const lines = h.chat.state.log.lines
+    expect(lines.map((l) => l.text)).toEqual(['m2', 'lleva más'])
   })
 
-  it('limpia el texto como el gateway: lo que allí queda vacío no se manda', () => {
-    const s = session()
-    const before = last().sent.length
-    expect(s.send('\x85\x1c \x1f')).toBe(false)
-    expect(last().sent.length).toBe(before)
-    expect(s.send('\x1dHola\x85')).toBe(true)
-    expect(last().sent.at(-1)).toEqual({ type: 'send', text: 'Hola' })
+  it('escribe con un POST; la línea llega por su `message`', async () => {
+    const h = harness()
+    h.chat.start()
+    await flush()
+    expect(await h.chat.send('  hola  ')).toBe(true)
+    expect(h.deps.postMessage).toHaveBeenCalledWith('c1', 'hola', false)
+    expect(h.chat.state.log.lines).toHaveLength(0)
+    h.emit(message('run-1'), 11)
+    expect(h.chat.state.log.pending.map((l) => l.messageId)).toEqual(['run-1'])
+    expect(await h.chat.send('   ')).toBe(false)
   })
 
-  it('quita los surrogates sueltos como el gateway, antes de los espacios (G-r4-1)', () => {
-    const s = session()
-    const before = last().sent.length
-    expect(s.send('\uD800 \uDC00')).toBe(false)
-    expect(last().sent.length).toBe(before)
-    expect(s.send(' \uD800Hola \uDFFF')).toBe(true)
-    expect(last().sent.at(-1)).toEqual({ type: 'send', text: 'Hola' })
-    expect(s.send('\u{1F600}')).toBe(true) // un par válido no es un surrogate suelto
-    last().serverClose(1000) // camino pending: la conversación dormida tampoco lo guarda
-    expect(s.send('\uDC00')).toBe(false)
-    expect(FakeSocket.all).toHaveLength(1)
+  it('no escribe hasta que /events esté listo, y un fallo del POST se dice', async () => {
+    const h = harness()
+    h.stream.value = 'reconnecting'
+    h.chat.start()
+    await flush()
+    expect(h.chat.state.connection).toBe('reconnecting')
+    expect(await h.chat.send('hola')).toBe(false)
+    h.stream.value = 'ready'
+    h.deps.postMessage = vi.fn(async () => {
+      throw new ApiError('server', 502, 'orchestrator_error')
+    })
+    const chat = createChatSession('c1', h.deps)
+    chat.start()
+    await flush()
+    expect(await chat.send('hola')).toBe(false)
+    expect(chat.state.notice).toBe('OpenClaw rechazó la pregunta.')
   })
 
-  it('enseña en qué está la respuesta hasta el primer token; los pipeline_event no cambian nada', () => {
-    const s = session()
-    s.send('enciende la luz')
-    last().receive({ type: 'turn_start', turn_id: 't-1', turn_seq: 1, conversation: 'c1', origin: 'user' })
-    last().receive({ type: 'pipeline_event', stage: 'llm_start', elapsed_ms: 2, turn: 1 })
-    last().receive({ type: 'turn_progress', turn_id: 't-1', phase: 'tool', tool: 'ha_call_service' })
-    expect(s.state.log.lines[1]!.progress).toEqual({ phase: 'tool', tool: 'ha_call_service' })
-    last().receive({ type: 'token', turn_id: 't-1', text: 'Hecho.' })
-    expect(s.state.log.lines[1]).toMatchObject({ text: 'Hecho.', progress: null })
+  it('parar y quitar van por la API; quitar uno que ya no espera no es un error', async () => {
+    const h = harness()
+    h.chat.start()
+    await flush()
+    await h.chat.cancel()
+    expect(h.deps.cancelTurn).toHaveBeenCalledWith('c1', undefined) // «Parar»: sin turn_id, lo que haya
+    h.deps.withdrawMessage = vi.fn(async () => {
+      throw new ApiError('not-found', 404, 'not_pending')
+    })
+    const chat = createChatSession('c1', h.deps)
+    chat.start()
+    await flush()
+    await chat.withdraw('m1')
+    expect(chat.state.notice).toBeNull()
   })
 
-  it('un push llega como Fogar hablando primero', () => {
-    const s = session()
-    last().receive({ type: 'turn_start', turn_id: 't-1', turn_seq: 1, conversation: 'c1', origin: 'push' })
-    expect(s.state.log.lines[0]).toMatchObject({ role: 'assistant', origin: 'push', state: 'streaming' })
+  it('los códigos de error salen en una frase, también los desconocidos', async () => {
+    const h = harness()
+    h.deps.postMessage = vi.fn(async () => {
+      throw new ApiError('server', 502, 'orchestrator_rate_limited')
+    })
+    h.chat.start()
+    await flush()
+    await h.chat.send('hola')
+    expect(h.chat.state.notice).toBe('El modelo está saturado o sin cuota: prueba más tarde.')
+    h.deps.postMessage = vi.fn(async () => {
+      throw new ApiError('server', 502, 'codigo_nuevo')
+    })
+    const chat = createChatSession('c1', h.deps)
+    chat.start()
+    await flush()
+    await chat.send('hola')
+    expect(chat.state.notice).toBe('OpenClaw rechazó la pregunta.')
   })
 
-  it('«abierta en otro sitio» no reconecta sola; «seguir aquí» sí', () => {
-    const s = session()
-    last().receive({ type: 'turn_start', turn_id: 't-1', turn_seq: 1, conversation: 'c1', origin: 'user' })
-    last().receive({ type: 'turn_end', turn_id: 't-1', reason: 'closed' })
-    last().serverClose(4102, 'conversation opened elsewhere')
-    expect(s.state.connection).toBe('elsewhere')
-    vi.advanceTimersByTime(120_000)
-    expect(FakeSocket.all).toHaveLength(1)
-    expect(s.send('hola')).toBe(false)
-
-    s.retake()
-    expect(FakeSocket.all).toHaveLength(2)
-    expect(s.state.log.lines).toEqual([]) // se vuelve a leer lo dicho
-    last().open()
-    last().receive(READY)
-    expect(s.state.connection).toBe('ready')
+  it('«Enviar ahora» solo para si hay un turno abierto: sin él pararía el propio mensaje', async () => {
+    const h = harness()
+    h.chat.start()
+    await flush()
+    h.emit(message('m2'), 11)
+    await h.chat.sendNow()
+    expect(h.deps.cancelTurn).not.toHaveBeenCalled()
+    h.emit({ type: 'turn_start', turn_id: 'T', conversation: 'c1', origin: 'user' }, 12)
+    await h.chat.sendNow()
+    // con el turno que ve: si acaba antes de que llegue el POST, el gateway no para el mensaje
+    expect(h.deps.cancelTurn).toHaveBeenCalledWith('c1', 'T')
   })
 
-  it('tras una caída reintenta solo, con espera, y cierra el turno que quedó abierto', () => {
-    const s = session()
-    last().receive({ type: 'turn_start', turn_id: 't-1', turn_seq: 1, conversation: 'c1', origin: 'user' })
-    last().serverClose(1012)
-    expect(s.state.connection).toBe('reconnecting')
-    expect(s.state.log.lines[0]).toMatchObject({ state: 'ended', reason: 'closed' })
-    vi.advanceTimersByTime(999)
-    expect(FakeSocket.all).toHaveLength(1)
-    vi.advanceTimersByTime(1)
-    expect(FakeSocket.all).toHaveLength(2)
-    last().open()
-    expect(last().sent[0]).toMatchObject({ conversation: 'c1' }) // la misma conversación
-    last().receive(READY)
-    expect(s.state.connection).toBe('ready')
-    expect(s.state.failures).toBe(0)
+  it('«Enviar ahora» con solo un aviso de otra conversación abierto no para nada', async () => {
+    const h = harness()
+    h.chat.start()
+    await flush()
+    h.emit(message('m2'), 11)
+    h.emit({ type: 'turn_start', turn_id: 'P', conversation: 'otra', origin: 'push' }, 12)
+    await h.chat.sendNow()
+    expect(h.deps.cancelTurn).not.toHaveBeenCalled()
   })
 
-  it('cerrada por inactividad, se reabre al escribir y manda el mensaje al entrar', () => {
-    const s = session()
-    last().serverClose(1000)
-    expect(s.state.connection).toBe('idle')
-    vi.advanceTimersByTime(60_000)
-    expect(FakeSocket.all).toHaveLength(1)
-    expect(s.send('¿Sigues ahí?')).toBe(true)
-    expect(FakeSocket.all).toHaveLength(2)
-    last().open()
-    expect(last().sent).toHaveLength(1) // solo el handshake hasta el ready
-    last().receive(READY)
-    expect(last().sent.at(-1)).toEqual({ type: 'send', text: '¿Sigues ahí?' })
+  it('un resync cierra lo abierto, vuelve a leer el estado y pide releer lo dicho', async () => {
+    const h = harness()
+    h.chat.start()
+    await flush()
+    h.emit({ type: 'turn_start', turn_id: 'T', conversation: 'c1', origin: 'user' }, 11)
+    h.emit({ type: 'resync' }, 50)
+    expect(h.chat.state.epoch).toBe(1)
+    await flush()
+    expect(h.deps.getLive).toHaveBeenCalledTimes(2)
+    expect(h.chat.state.log.lines).toHaveLength(0)
   })
 
-  it('lo escrito con la conversación dormida se marca «no enviado» si no llega a entrar', () => {
-    const s = session()
-    last().serverClose(1000)
-    s.send('¿Hola?')
-    last().open()
-    last().serverClose(4102)
-    expect(s.state.connection).toBe('elsewhere')
-    expect(s.state.log.lines.at(-1)).toMatchObject({ text: '¿Hola?', unsent: true })
-  })
-
-  it('releer lo dicho con un mensaje esperando a la conversación dormida no lo quita', () => {
-    const s = session()
-    last().serverClose(1000)
-    s.send('¿Hola?')
-    s.historyReloaded(s.state.log.endedKeys())
-    expect(s.state.log.lines.map((l) => l.text)).toEqual(['¿Hola?'])
-  })
-
-  it('lo pendiente que sale en el ready durante una recarga no se quita', () => {
-    const s = session()
-    last().serverClose(1000)
-    s.send('¿Hola?')
-    const keys = s.state.log.endedKeys() // se pide la historia ahora…
-    last().open()
-    last().receive(READY) // …y sale mientras llega
-    s.historyReloaded(keys)
-    expect(s.state.log.lines.map((l) => l.text)).toEqual(['¿Hola?'])
-  })
-
-  it('una caída con un mensaje sin turn_start lo deja «no enviado»', () => {
-    const s = session()
-    s.send('¿Llegas?')
-    last().serverClose(1006)
-    expect(s.state.connection).toBe('reconnecting')
-    expect(s.state.log.lines.at(-1)).toMatchObject({ text: '¿Llegas?', unsent: true })
-  })
-
-  it('al volver a entrar, el aviso de OpenClaw caído empieza de cero', () => {
-    const s = session()
-    last().receive({ type: 'status', service: 'orchestrator', state: 'reconnecting' })
-    last().serverClose(1006)
-    vi.advanceTimersByTime(1000)
-    last().open()
-    last().receive(READY)
-    expect(s.state.orchestratorDown).toBe(false)
-  })
-
-  it('con el acceso retirado no reintenta solo', () => {
-    const s = session()
-    last().serverClose(4200, 'credential revoked')
-    expect(s.state.connection).toBe('stopped')
-    vi.advanceTimersByTime(60_000)
-    expect(FakeSocket.all).toHaveLength(1)
-  })
-
-  it('para con un 4xxx que no se arregla reconectando y dice por qué, por el código', () => {
-    const s = session()
-    last().serverClose(4100, 'texto que puede cambiar')
-    expect(s.state.connection).toBe('stopped')
-    expect(s.state.notice).toMatch(/ya no existe/)
-    vi.advanceTimersByTime(60_000)
-    expect(FakeSocket.all).toHaveLength(1)
-  })
-
-  it('sigue los avisos de OpenClaw y al salir cierra sin reintentar', () => {
-    const s = session()
-    last().receive({ type: 'status', service: 'orchestrator', state: 'reconnecting' })
-    expect(s.state.orchestratorDown).toBe(true)
-    last().receive({ type: 'status', service: 'orchestrator', state: 'restored' })
-    expect(s.state.orchestratorDown).toBe(false)
-    const socket = last()
-    s.dispose()
-    expect(socket.closedWith).toBe(1000)
-    socket.serverClose(1000)
-    vi.advanceTimersByTime(60_000)
-    expect(FakeSocket.all).toHaveLength(1)
+  it('con el token retirado, se para', async () => {
+    const h = harness()
+    h.stream.value = 'stopped'
+    h.chat.start()
+    await flush()
+    expect(h.chat.state.connection).toBe('stopped')
   })
 })

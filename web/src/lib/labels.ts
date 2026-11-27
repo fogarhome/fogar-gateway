@@ -53,10 +53,10 @@ export function ownText(texts: Record<string, string>, value: string): string | 
 export const CLOSE_REASON: Record<string, string> = {
   client_disconnect: 'Se fue el cliente',
   idle_timeout: 'Inactividad (5 min)',
-  silence_timeout: 'Silencio al hablar',
   slow_client: 'Cliente lento',
   revoked: 'Acceso retirado',
   agent_revoked: 'Agente retirado',
+  scope_revoked: 'Permiso retirado',
   shutdown: 'Apagado del gateway',
   error: 'Error',
   unknown: 'Desconocido',
@@ -77,15 +77,28 @@ export const TURN_ERROR: Record<string, string> = {
   orchestrator_unavailable: 'OpenClaw no está disponible',
   orchestrator_send_failed: 'No se pudo enviar a OpenClaw',
   orchestrator_error: 'OpenClaw rechazó la pregunta',
+  orchestrator_auth_failed: 'OpenClaw no puede usar el modelo: revisa su clave',
+  orchestrator_model_unavailable: 'El modelo del agente no está disponible',
+  orchestrator_rate_limited: 'El modelo está saturado o sin cuota: prueba más tarde',
+  orchestrator_timeout: 'El modelo tardó demasiado en responder',
+  orchestrator_agent_unavailable: 'Este agente ya no está disponible aquí',
   orchestrator_disconnected: 'OpenClaw se desconectó a mitad',
   turn_timeout: 'OpenClaw dejó de responder',
-  turn_overflow: 'El gateway no pudo seguir el ritmo de la respuesta',
-  turn_in_progress: 'Ya había un turno en marcha',
+  turn_overflow: 'OpenClaw dejó de responder',
+  turn_cancelled: 'Otro aparato paró la respuesta',
+  turn_absorbed: 'OpenClaw lo juntó con otra respuesta',
   internal_error: 'Error interno del gateway',
 }
 
+/** Un código de error de turno en una frase; uno desconocido cuenta como `orchestrator_error` (§9). */
+export const turnErrorText = (code: string): string => ownText(TURN_ERROR, code) ?? TURN_ERROR.orchestrator_error!
+
 /** Errores de turno con los que la pregunta no llegó a OpenClaw: no vendrá al releer lo dicho. */
-export const NOT_IN_OPENCLAW: ReadonlySet<string> = new Set(['orchestrator_unavailable', 'orchestrator_send_failed'])
+export const NOT_IN_OPENCLAW: ReadonlySet<string> = new Set([
+  'orchestrator_unavailable',
+  'orchestrator_send_failed',
+  'orchestrator_agent_unavailable',
+])
 
 /** En qué está un turno (`turn_progress`, docs/client-protocol.md §5); la herramienta va aparte. */
 export const TURN_PROGRESS: Record<string, string> = {
@@ -118,18 +131,23 @@ export const STAGE: Record<string, string> = {
   tts_start: 'Empieza la voz',
   tts_first_chunk: 'Primer audio',
   tts_done: 'Voz terminada',
-  barge_in: 'Interrupción',
   client_slow: 'Cliente lento',
   session_revoked: 'Acceso retirado',
   agent_revoked: 'Agente retirado',
+  scope_revoked: 'Permiso retirado',
   session_end: 'Fin de la sesión',
 }
 
-/** Estado de una sesión guardada (`/admin/sessions`). */
+/** Estado de una sesión guardada (`/system/sessions`). */
 export const SESSION_STATUS: Record<string, string> = {
   active: 'Abierta',
   completed: 'Cerrada',
   error: 'Con error',
   // G-r7-5: `revoked` cubre la clave retirada y el agente retirado (4020); la lista no trae el motivo
   revoked: 'Clave o agente retirado',
+}
+
+/** Errores estables de la API de administración que la web explica (el `detail` de la respuesta). */
+export const API_ERROR: Record<string, string> = {
+  invalid_notify_device: 'Ese dispositivo ya no puede recibir los avisos (retirado, desactivado o no permitido). Elige otro.',
 }

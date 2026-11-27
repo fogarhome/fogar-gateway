@@ -21,6 +21,8 @@ class Client(BaseModel):
     name: str = ""
     user_id: str | None = None  # M20: None = dispositivo del hogar; con valor, personal
     home_id: str = "home"
+    # 5.0 (#410): los efectivos ahora, lo concedido ∩ el tope de hoy (services/scopes.py).
+    scopes: frozenset[str] = frozenset()
 
     model_config = ConfigDict(extra="allow")
 
@@ -32,10 +34,7 @@ class ClientConfig(BaseModel):
     stt_vad_thold: float = 0.0
     tts_voice: str = "af_heart"
     tts_speed: float = 1.0
-    barge_in_enabled: bool = True
-    barge_in_min_chars: int = 5
     silence_timeout_s: float = 2.0
-    max_silence_turns: int = 3
     push_enabled: bool = True
     tool_calls_enabled: bool = False
     # En minúsculas, como OpenClaw: una fila anterior a la 3.0 puede guardar "Main" (C-1).
@@ -61,18 +60,26 @@ Capability = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$"
 Capabilities = Annotated[list[Capability], Field(max_length=32)]
 
 
+# Versión mayor del protocolo WebSocket cliente-gateway (docs/client-protocol.md). Sube solo si se
+# quita algo o cambia lo que hace; lo nuevo se añade sin subirla.
+PROTOCOL_VERSION: int = 5
+
+
 class Handshake(BaseModel):
     """
     Configuración inicial que el cliente envía al Gateway al conectar por WebSocket. Define
     qué patas internas del ecosistema se deben encender.
 
-    Credencial: `client_key`, la clave de un dispositivo emparejado o el token de uno con sesión
-    (`/auth/login`, M20). La web entra igual que cualquier otro dispositivo: ya no hay `admin_token`.
+    Credencial: `token`, la de cualquier aparato (5.0, #410): la clave de uno emparejado o el
+    token de uno con sesión (`/auth/login`, M20); la misma que va en `Authorization: Bearer`. Abrir
+    la sesión exige `conversations:write` (si no, cierre 4011).
     """
 
     # Con tope (como `conversation`): un valor enorme o un surrogate suelto ("\ud800") falla la
     # validación (cierre 4000) en vez de reventar al codificarlo (auditoría 3.0, D-5).
-    client_key: Annotated[str, StringConstraints(max_length=CREDENTIAL_MAX_LEN)]
+    token: Annotated[str, StringConstraints(max_length=CREDENTIAL_MAX_LEN)]
+    # La versión la comprueba routes.py sobre el JSON crudo (cierre 4003) antes de validar.
+    protocol: int | None = None
     input_mode: Literal["audio", "text"]
     output_mode: list[OutputMode]
     # Id de agente de OpenClaw, en minúsculas; None, "" o solo espacios → la cascada de

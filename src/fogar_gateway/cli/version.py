@@ -14,7 +14,7 @@ def version(ctx: click.Context) -> None:
     out = Out(ctx.find_root().obj["json"])
     answered = True
     try:
-        state = api.from_context(ctx).request("GET", "/admin/state")
+        state = api.from_context(ctx).request("GET", "/system/state")
         gateway = (state.get("gateway") or {}).get("version")
     except api.ApiError:
         answered, gateway = False, None  # sin gateway o sin token: basta con la de la CLI

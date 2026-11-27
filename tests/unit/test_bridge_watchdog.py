@@ -10,12 +10,12 @@ import pytest
 import fogar_gateway.services.bridge as bridge_module
 from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.pipeline_tracker import PipelineTracker
-from fogar_gateway.services.protocol import OrchestratorEvent
 from fogar_gateway.services.reconnection import ConnectionState
 from fogar_gateway.services.teardown import Teardown
-from tests.fakes.bridge import push, sent
+from tests.fakes.bridge import enqueue_push, push, sent
+from tests.fakes.orchestrator import OrchestratorEvent
 
-_CONFIG = ClientConfig(silence_timeout_s=1, max_silence_turns=3)
+_CONFIG = ClientConfig(silence_timeout_s=1)
 
 
 @pytest.fixture
@@ -43,25 +43,39 @@ def make_wd_bridge(make_bridge):
     return _make
 
 
+def _stop_after(transcriber, n, on_tick=None):
+    """`_sleep` falso: llama `on_tick(tick)` y degrada el transcriptor en el tick `n` (para el bucle)."""
+    ticks = {"n": 0}
+
+    async def _sleep(_):
+        ticks["n"] += 1
+        if on_tick:
+            on_tick(ticks["n"])
+        if ticks["n"] >= n:
+            transcriber.state = ConnectionState.DEGRADED
+
+    return _sleep
+
+
+def _degraded(msgs):
+    return [m for m in msgs if m.get("service") == "transcriber" and m.get("state") == "degraded"]
+
+
 @pytest.mark.asyncio
 async def test_watchdog_notifies_client_after_silence_timeout(make_wd_bridge):
     """After silence_timeout_s with no transcription, client gets degraded notice."""
-    config = ClientConfig(silence_timeout_s=1, max_silence_turns=1)
+    config = ClientConfig(silence_timeout_s=1)
     bridge, ws, transcriber = make_wd_bridge(config=config)
-    bridge._last_audio_at = bridge._audio_burst_start = time.monotonic() - 2
+    bridge._audio_burst_start = time.monotonic() - 2
     bridge._last_audio_at = float("inf")  # client streaming audio without gaps (#227)
     transcriber.last_transcript_at = None
     bridge.close_all = AsyncMock()
 
-    with patch("fogar_gateway.services.bridge._sleep", new=AsyncMock(return_value=None)):
+    with patch("fogar_gateway.services.bridge._sleep", new=_stop_after(transcriber, 3)):
         await asyncio.wait_for(bridge._transcription_watchdog(), timeout=3.0)
 
     msgs = await sent(bridge)
-    assert len(msgs) == 1
-    payload = msgs[0]
-    assert payload["type"] == "status"
-    assert payload["service"] == "transcriber"
-    assert payload["state"] == "degraded"
+    assert len(_degraded(msgs)) == 1
 
 
 @pytest.mark.asyncio
@@ -76,73 +90,51 @@ async def test_watchdog_exits_if_transcriber_disconnects(make_wd_bridge):
 
 
 @pytest.mark.asyncio
-async def test_watchdog_closes_session_after_max_silence_turns(make_wd_bridge):
-    """After max_silence_turns consecutive timeouts, close_all is called."""
-    config = ClientConfig(silence_timeout_s=1, max_silence_turns=2)
-    bridge, ws, transcriber = make_wd_bridge(config=config)
-    bridge._last_audio_at = bridge._audio_burst_start = time.monotonic() - 2
+async def test_silence_never_closes_the_session(make_wd_bridge):
+    """#394: audio entrando y el transcriptor sin devolver nada durante 5 sondeos: la sesión sigue abierta."""
+    bridge, ws, transcriber = make_wd_bridge(config=ClientConfig(silence_timeout_s=1))
+    bridge._audio_burst_start = time.monotonic() - 2
     bridge._last_audio_at = float("inf")  # client streaming audio without gaps (#227)
     transcriber.last_transcript_at = None
+    bridge.close_all = AsyncMock()
+    ticks = []
 
-    close_called = []
-
-    async def _fake_close():
-        close_called.append(True)
-
-    bridge.close_all = _fake_close
-
-    with patch("fogar_gateway.services.bridge._sleep", new=AsyncMock(return_value=None)):
+    with patch(
+        "fogar_gateway.services.bridge._sleep",
+        new=_stop_after(transcriber, 6, on_tick=ticks.append),
+    ):
         await asyncio.wait_for(bridge._transcription_watchdog(), timeout=3.0)
 
-    assert close_called, "close_all debería haberse llamado tras max_silence_turns"
-    assert len(await sent(bridge)) == 2  # una notificación por cada silencio
+    assert len(ticks) >= 5
+    bridge.close_all.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_watchdog_resets_count_when_transcription_arrives(make_wd_bridge):
-    """Un silencio seguido de transcripción reinicia el contador."""
-    config = ClientConfig(silence_timeout_s=1, max_silence_turns=2)
-    bridge, ws, transcriber = make_wd_bridge(config=config)
-    bridge._last_audio_at = bridge._audio_burst_start = time.monotonic() - 2
+async def test_silence_warns_once_per_burst(make_wd_bridge):
+    """#394: un tramo de silencio, un solo `degraded`; llega una transcripción y otro tramo, un segundo."""
+    bridge, ws, transcriber = make_wd_bridge(config=ClientConfig(silence_timeout_s=1))
+    bridge._audio_burst_start = time.monotonic() - 2
     bridge._last_audio_at = float("inf")  # client streaming audio without gaps (#227)
     transcriber.last_transcript_at = None
+    bridge.close_all = AsyncMock()
 
-    close_called = []
+    def on_tick(tick):
+        if tick == 4:  # tras 3 sondeos en silencio llega una transcripción y vuelve el silencio
+            transcriber.last_transcript_at = time.monotonic() - 10
 
-    async def _fake_close():
-        close_called.append(True)
+    with patch("fogar_gateway.services.bridge._sleep", new=_stop_after(transcriber, 7, on_tick)):
+        await asyncio.wait_for(bridge._transcription_watchdog(), timeout=3.0)
 
-    bridge.close_all = _fake_close
-
-    ticks = {"n": 0}
-
-    async def _controlled_sleep(n):
-        ticks["n"] += 1
-        # Tras el primer ciclo (1 silencio), simular que llega una transcripción
-        if ticks["n"] == 2:
-            transcriber.last_transcript_at = time.monotonic()
-        elif ticks["n"] == 4:
-            transcriber.state = ConnectionState.DEGRADED  # stop the loop cleanly
-
-    with patch("fogar_gateway.services.bridge._sleep", new=_controlled_sleep):
-        # NOTE: must directly `await` the watchdog coroutine, not wrap it in
-        # `asyncio.create_task` + an outer polling loop — a non-suspending
-        # `_sleep` never yields control back to the scheduler, so a separately-created task
-        # never gets to run at all (verified: deliberately breaking the
-        # watchdog's RECONNECTING handling didn't fail the old version of this
-        # test). Direct await drives the loop for real.
-        await asyncio.wait_for(bridge._transcription_watchdog(), timeout=2.0)
-
-    assert not close_called, "No debería haber cerrado — el contador se reinició"
+    assert len(_degraded(await sent(bridge))) == 2
 
 
 @pytest.mark.asyncio
 async def test_watchdog_pauses_but_does_not_exit_when_reconnecting(make_wd_bridge):
     """A transient RECONNECTING must not permanently kill the watchdog (the bug
     this task fixes: the old `if not _is_ready: return` treated any drop as final)."""
-    config = ClientConfig(silence_timeout_s=1, max_silence_turns=2)
+    config = ClientConfig(silence_timeout_s=1)
     bridge, ws, transcriber = make_wd_bridge(config=config)
-    bridge._last_audio_at = bridge._audio_burst_start = time.monotonic() - 2
+    bridge._audio_burst_start = time.monotonic() - 2
     bridge._last_audio_at = float("inf")  # client streaming audio without gaps (#227)
     transcriber.last_transcript_at = time.monotonic()  # fresh, no silence yet
 
@@ -182,9 +174,9 @@ async def test_watchdog_does_not_close_immediately_after_reconnect_with_stale_ti
     session the moment it observes CONNECTED again — it should grant a fresh
     baseline instead, exactly like a brand-new session would get on its first
     audio frame."""
-    config = ClientConfig(silence_timeout_s=1, max_silence_turns=2)
+    config = ClientConfig(silence_timeout_s=1)
     bridge, ws, transcriber = make_wd_bridge(config=config)
-    bridge._last_audio_at = bridge._audio_burst_start = time.monotonic() - 10
+    bridge._audio_burst_start = time.monotonic() - 10
     bridge._last_audio_at = float("inf")  # client streaming audio without gaps (#227)
     # A real transcription happened a while ago, then the transcriber dropped.
     transcriber.last_transcript_at = time.monotonic() - 10
@@ -396,7 +388,7 @@ async def test_idle_watchdog_closes_when_push_exceeds_grace_period(make_wd_bridg
     bridge._last_client_activity = time.monotonic() - 10  # idle-timeout would fire
 
     await push(bridge, ("turn_start", "sk"))
-    (worker,) = [t for t in bridge.tasks if t.get_name() == "push_worker"]
+    worker = bridge.channel._push_worker  # 5.0: the push worker is the channel's
     worker.cancel()  # wedged: nobody closes the push on its budget
     await asyncio.wait({worker})
     await asyncio.sleep(0.1)  # past TURN_TIMEOUT_S without progress
@@ -416,13 +408,13 @@ async def test_idle_watchdog_closes_when_push_exceeds_grace_period(make_wd_bridg
 async def _wedged_backlog(bridge):
     """A push event queued that the worker cannot handle yet: a turn being replaced holds
     the turn lock, so only the backlog keeps the session busy."""
-    await bridge.turns._lock.acquire()
-    bridge.enqueue_push("turn_start", "sk")
+    await bridge.channel._lock.acquire()
+    enqueue_push(bridge, "turn_start", "sk")
     await asyncio.sleep(0.01)
 
 
 async def _release(bridge):
-    bridge.turns._lock.release()
+    bridge.channel._lock.release()
     await bridge.turns.close(Teardown("test"), 1.0)
 
 
@@ -533,44 +525,16 @@ async def test_run_launches_idle_watchdog_that_closes_the_session(
 
 
 @pytest.mark.asyncio
-async def test_watchdog_counts_one_strike_per_poll_tick_not_per_timeout_window(make_wd_bridge, monkeypatch):
-    """#129: pins the documented semantics with REAL time (sleep is not patched).
-
-    Each poll tick with elapsed > silence_timeout_s is one strike, and each strike
-    sends one `degraded` notice — max_silence_turns counts ticks, not full
-    silence_timeout_s windows. Here the timeout (0.05s) is shorter than the tick
-    (0.1s), so a "window" model would still wait 3 × 0.05s; the tick model closes
-    after exactly 3 ticks.
-    """
-
-    monkeypatch.setattr(bridge_module, "_WATCHDOG_POLL_S", 0.1)
-    config = ClientConfig(silence_timeout_s=0.05, max_silence_turns=3)
-    bridge, ws, transcriber = make_wd_bridge(config=config)
-    bridge._last_audio_at = bridge._audio_burst_start = time.monotonic() - 1
-    bridge._last_audio_at = float("inf")  # client streaming audio without gaps (#227)
-    transcriber.last_transcript_at = None
-    bridge.close_all = AsyncMock()
-
-    await asyncio.wait_for(bridge._transcription_watchdog(), timeout=3.0)
-
-    await sent(bridge)
-    degraded = [m for m in ws.of("status") if m["state"] == "degraded"]
-    assert len(degraded) == 3
-    bridge.close_all.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_watchdog_extends_first_window_after_burst_by_stt_warmup(make_wd_bridge, monkeypatch):
-    """Un STT con arranque lento (warmup_s) no recibe strikes en la primera ventana tras abrir
-    ráfaga: solo se cuenta silencio pasado silence_timeout_s + warmup_s. Tiempo real."""
+    """Un STT con arranque lento (warmup_s) no recibe aviso en la primera ventana tras abrir
+    ráfaga: solo se avisa pasado silence_timeout_s + warmup_s. Tiempo real."""
     from fogar_gateway.services.speech.ports import SttCapabilities
 
     monkeypatch.setattr(bridge_module, "_WATCHDOG_POLL_S", 0.05)
-    config = ClientConfig(silence_timeout_s=0.05, max_silence_turns=1)
+    config = ClientConfig(silence_timeout_s=0.05)
     bridge, ws, transcriber = make_wd_bridge(config=config)
-    bridge._stt = SimpleNamespace(capabilities=SttCapabilities(partials=True, warmup_s=0.5))
+    bridge._stt = SimpleNamespace(capabilities=SttCapabilities(warmup_s=0.5))
     t0 = time.monotonic()
-    bridge._last_audio_at = bridge._audio_burst_start = t0
     bridge._audio_burst_start = t0
     bridge._last_audio_at = float("inf")
     transcriber.last_transcript_at = None
@@ -581,11 +545,11 @@ async def test_watchdog_extends_first_window_after_burst_by_stt_warmup(make_wd_b
         await asyncio.sleep(0.35)  # dentro de timeout + warmup (0.55 s)
         await sent(bridge)
         assert [m for m in ws.of("status") if m["state"] == "degraded"] == []
-        await asyncio.wait_for(task, timeout=2.0)  # pasada la ventana, los strikes vuelven
+        await asyncio.wait_for(_until(lambda: ws.of("status")), timeout=2.0)  # pasada la ventana, el aviso llega
     finally:
         task.cancel()
     assert time.monotonic() - t0 >= 0.55
-    bridge.close_all.assert_awaited_once()
+    bridge.close_all.assert_not_awaited()
 
 
 # ── turno en vuelo (#215, decisión de Sito), reloj virtual ──────────────────
@@ -596,12 +560,11 @@ class FakeClock:
         self.t = 1000.0
 
 
-async def test_watchdog_does_not_close_during_a_20s_turn_with_2s_timeout_3_strikes(
+async def test_watchdog_does_not_warn_during_a_20s_turn_with_2s_timeout(
     make_wd_bridge, monkeypatch
 ):
-    """Literal acceptance test: audio session, 20 s turn, silence_timeout_s=2,
-    max_silence_turns=3 -> not closed. Virtual clock; audio keeps flowing so the
-    only thing protecting the session is the in-flight turn."""
+    """Audio session, 20 s turn, silence_timeout_s=2 -> no warning during the turn. Virtual
+    clock; audio keeps flowing so the only thing protecting it is the in-flight turn."""
     clock = FakeClock()
 
     async def fake_sleep(d):
@@ -610,7 +573,7 @@ async def test_watchdog_does_not_close_during_a_20s_turn_with_2s_timeout_3_strik
 
     monkeypatch.setattr(bridge_module, "time", SimpleNamespace(monotonic=lambda: clock.t))
     monkeypatch.setattr(bridge_module, "_sleep", fake_sleep)
-    bridge, _, _ = make_wd_bridge(ClientConfig(silence_timeout_s=2, max_silence_turns=3))
+    bridge, _, _ = make_wd_bridge(ClientConfig(silence_timeout_s=2))
     start = clock.t
     bridge._last_audio_at = bridge._audio_burst_start = start
     bridge.transcriber.last_transcript_at = start
@@ -640,16 +603,15 @@ async def test_watchdog_does_not_close_during_a_20s_turn_with_2s_timeout_3_strik
     s = asyncio.create_task(streamer())
     wd = asyncio.create_task(bridge._transcription_watchdog())
     try:
-        await asyncio.wait_for(_until(lambda: any(e[0] == "close" for e in events)), 5.0)
+        await asyncio.wait_for(_until(lambda: any(e[0] == "degraded" for e in events)), 5.0)
     finally:
         s.cancel()
         wd.cancel()
     first = min(ts for _, ts in events)
-    assert first >= start + 20, f"silence strike/close at +{first - start}s, during the turn"
-    # the first window after the turn is a fresh one: no strike on the first tick after it ends
+    assert first >= start + 20, f"silence warning at +{first - start}s, during the turn"
+    # the first window after the turn is a fresh one: no warning on the first tick after it ends
     assert min(ts for st, ts in events if st == "degraded") >= start + 22
-    # ...and silence after the turn still closes the session
-    assert any(e[0] == "close" for e in events)
+    assert not any(e[0] == "close" for e in events)  # silence only warns (#394)
 
 
 async def _until(pred):
@@ -679,8 +641,8 @@ async def test_push_with_audio_playing_counts_as_in_flight(make_bridge, monkeypa
     tts.connect = AsyncMock(return_value=stream)
     tts.resolve_voice = lambda v: v
     bridge, _ = make_bridge(output_mode=("audio", "text"), tts=tts)
-    bridge.enqueue_push("turn_start", "sk")
-    bridge.enqueue_push("turn_end", "sk")  # the worker now drains its audio
+    enqueue_push(bridge, "turn_start", "sk")
+    enqueue_push(bridge, "turn_end", "sk")  # the worker now drains its audio
     try:
         await asyncio.sleep(0.15)  # past TURN_TIMEOUT_S since the last event
         assert bridge.turns.in_flight() is True
@@ -735,3 +697,31 @@ async def test_idle_watchdog_does_not_close_while_push_audio_progresses(make_wd_
         with pytest.raises(RuntimeError, match="stop-test"):
             await asyncio.wait_for(bridge._idle_watchdog(), timeout=2.0)
     assert not close_called
+
+
+@pytest.mark.asyncio
+async def test_silence_notice_has_its_code_and_ends_with_the_next_transcription(make_wd_bridge):
+    """#423: the silence warning carries `code: "silence"`, and the next transcription (a
+    partial is enough) sends its `restored` with the same code, once."""
+    bridge, ws, transcriber = make_wd_bridge(config=ClientConfig(silence_timeout_s=1))
+    bridge._audio_burst_start = time.monotonic() - 2
+    bridge._last_audio_at = float("inf")
+    transcriber.last_transcript_at = None
+    bridge.close_all = AsyncMock()
+    with patch("fogar_gateway.services.bridge._sleep", new=_stop_after(transcriber, 3)):
+        await asyncio.wait_for(bridge._transcription_watchdog(), timeout=3.0)
+
+    await bridge._on_transcription("hola", is_final=False)
+    await bridge._on_transcription("hola", is_final=True)
+    statuses = [m for m in await sent(bridge) if m.get("type") == "status"]
+    assert statuses == [
+        {"type": "status", "service": "transcriber", "state": "degraded", "code": "silence", "message": "silence"},
+        {"type": "status", "service": "transcriber", "state": "restored", "code": "silence", "message": "silence"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_transcription_without_a_silence_notice_sends_no_restored(make_wd_bridge):
+    bridge, ws, _ = make_wd_bridge()
+    await bridge._on_transcription("hola", is_final=True)
+    assert not [m for m in await sent(bridge) if m.get("type") == "status"]

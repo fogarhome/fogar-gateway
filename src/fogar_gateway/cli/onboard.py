@@ -3,7 +3,8 @@ onboard.py
 ~~~~~~~~~~
 `fogar-gw onboard`: el asistente de instalación. Pregunta lo mínimo, verifica cada proveedor
 contra el servicio real (`cli/verify.py`) antes de guardarlo con `cli/config.py::_apply`,
-instala o reinicia el servicio y termina en el dashboard: su URL desde otro aparato, el token
+instala o reinicia el servicio (salvo `--no-service`, o si la unidad es de otra base: se
+niega) y termina en el dashboard: su URL desde otro aparato, el token
 (solo en una terminal), dónde está y cómo verlo, y con terminal espera a que entres. El primer
 cliente se empareja desde el dashboard. Con `--answers FICHERO` (JSON 600) no pregunta ni espera
 nada, ni enseña el token: es el modo del CI (y su `first_client`, opcional, crea un cliente). Cortarlo a medias deja config.env
@@ -161,11 +162,20 @@ def _openclaw(out: Out, answers: Any, settings: Any) -> None:
     if found is not None:  # "" = encontrado, sin versión (OpenClaw 2026.11.1)
         version = f" {found}" if found else ""
         out.note(f"He encontrado OpenClaw{version} en este equipo.")
+    auto = found is not None  # el token de este equipo se lee solo, una vez; si falla, a mano
 
     def ask() -> tuple[str, int, str]:
+        nonlocal auto
         if answers:
             return answers.openclaw_host, answers.openclaw_port, answers.openclaw_token
         host, port = "127.0.0.1", 18789
+        if auto:
+            auto = False
+            with _busy(out, "Leyendo el token de OpenClaw…"):
+                token = verify.read_openclaw_token()
+            if token:
+                out.note("He leído el token de OpenClaw de este equipo.")
+                return host, port, token
         if found is None:
             host = _ask("text", "Host de OpenClaw", default=host, validate=_required).strip()
             port = int(_ask("text", "Puerto de OpenClaw", default=str(port),
@@ -270,7 +280,7 @@ def _owner(ctx: click.Context, out: Out, answers: Any) -> str | None:
     """La cuenta del dueño (M20): con ella se entra en el dashboard; el `ADMIN_TOKEN` queda para
     la CLI y la recuperación. Si ya hay un dueño activo, no pregunta. Devuelve su usuario."""
     client = api.from_context(ctx)
-    owner = next((u for u in client.request("GET", "/admin/users")
+    owner = next((u for u in client.request("GET", "/home/users")
                   if u["role"] == "owner" and u["is_active"]), None)
     if owner is not None:
         out.ok(f"Ya hay dueño: «{owner['username']}».")
@@ -280,7 +290,7 @@ def _owner(ctx: click.Context, out: Out, answers: Any) -> str | None:
             out.message("Sin dueño: créalo con `fogar-gw users add NOMBRE --role owner`.", MUTED)
             return None
         body = {**answers.owner.model_dump(), "role": "owner"}
-        return str(client.request("POST", "/admin/users", body)["username"])
+        return str(client.request("POST", "/home/users", body)["username"])
     import getpass
     import re
 
@@ -294,7 +304,7 @@ def _owner(ctx: click.Context, out: Out, answers: Any) -> str | None:
             out.warn("No coinciden; otra vez.")
             continue
         try:
-            created = client.request("POST", "/admin/users", {
+            created = client.request("POST", "/home/users", {
                 "username": username, "display_name": name, "password": password, "role": "owner",
             })
         except api.ApiError as e:  # contraseña corta, nombre no válido o ya usado: se repite
@@ -311,9 +321,9 @@ def _first_client(ctx: click.Context, out: Out, answers: Any) -> None:
     if not (answers and answers.first_client):
         return
     client = api.from_context(ctx)
-    if not client.request("GET", "/admin/clients"):
+    if not client.request("GET", "/home/devices"):
         body = {"name": answers.first_client.name, "client_type": answers.first_client.type}
-        clients._show_key(out, client.request("POST", "/admin/clients", body))
+        clients._show_key(out, client.request("POST", "/home/devices", body))
 
 
 def _enter_pressed(timeout: float) -> bool:
@@ -371,7 +381,7 @@ def _poll_dashboard(client: Any) -> bool:
     try:
         while True:
             try:
-                state = client.request("GET", "/admin/state")
+                state = client.request("GET", "/system/state")
             except api.ApiError:
                 state = {}
             if state.get("gateway", {}).get("dashboards"):
@@ -440,7 +450,7 @@ def _dashboard(ctx: click.Context, out: Out, answers: Any, settings: Any,
     """El final: cómo llegar al dashboard desde otro aparato y con qué token."""
     from fogar_gateway.cli import serve
 
-    port = serve.PORT
+    port = urlsplit(ctx.find_root().obj["url"]).port or serve.PORT  # --no-service: el de --url
     bind = settings.GATEWAY_HOST
     routes = collect(bind, port, configured_public_urls(),
                      gateway_instance_id(ctx.find_root().obj["url"]))
@@ -538,6 +548,7 @@ def _read_answers(path: Path) -> Any:
         first_client: FirstClient | None = None  # el CI; con terminal, desde el dashboard
         access: Access | None = None  # sin él, el paso no se ejecuta (el CI de siempre)
         owner: Owner | None = None  # sin él y sin dueño, se avisa: `fogar-gw users add`
+        service: bool = True  # false = --no-service
 
     try:
         answers = Answers.model_validate_json(raw)
@@ -573,11 +584,15 @@ def _doctor_summary(ctx: click.Context, out: Out) -> None:
     out.note("El asistente sigue. El detalle completo, con `fogar-gw doctor`.")
 
 
-def _run(ctx: click.Context, out: Out, answers: Any) -> None:
+def _run(ctx: click.Context, out: Out, answers: Any, no_service: bool = False) -> None:
     from fogar_gateway.cli import doctor, service
     from fogar_gateway.cli import init as init_mod
 
-    service.require_systemd()  # antes de crear o preguntar nada
+    use_service = not no_service and (answers is None or answers.service)
+    if use_service:  # antes de crear o preguntar nada
+        service.require_systemd()
+        service.own_unit_or_fail("Para configurar esta base sin servicio, "
+                                 "`fogar-gw --url http://127.0.0.1:<puerto> onboard --no-service`.")
     styled = out.styled  # --answers lo apaga en `onboard`
     if styled:
         from fogar_gateway.cli import linea_viva
@@ -609,7 +624,13 @@ def _run(ctx: click.Context, out: Out, answers: Any) -> None:
         out.step("Acceso")
         cli_access.access_step(out, answers and answers.access, settings)
     out.step("Servicio")
-    if not service.unit_path().exists():
+    url = ctx.find_root().obj["url"]
+    if not use_service:
+        out.message(f"Sin servicio (--no-service): ni se instala ni se reinicia. Lo que sigue "
+                    f"habla con el gateway de {url} (otro: `fogar-gw --url … onboard`); lo "
+                    "arrancas tú (`uvicorn fogar_gateway.main:app --port <puerto>`) y lo "
+                    "reinicias para aplicar lo nuevo de config.env.", MUTED)
+    elif not service.unit_path().exists():
         with _busy(out, "Instalando y arrancando el servicio…"), _hidden(out):
             ctx.invoke(service.install)
         if styled:
@@ -639,8 +660,10 @@ def _run(ctx: click.Context, out: Out, answers: Any) -> None:
 @click.command()
 @click.option("--answers", "answers_path", type=click.Path(dir_okay=False, path_type=Path),
               metavar="FICHERO", help="Respuestas en JSON (permisos 600): no pregunta nada.")
+@click.option("--no-service", is_flag=True,
+              help="Ni instala ni reinicia el servicio; sigue contra --url.")
 @click.pass_context
-def onboard(ctx: click.Context, answers_path: Path | None) -> None:
+def onboard(ctx: click.Context, answers_path: Path | None, no_service: bool) -> None:
     """Asistente: OpenClaw, voz, servicio y dashboard."""
     from fogar_gateway.cli import output
 
@@ -656,6 +679,6 @@ def onboard(ctx: click.Context, answers_path: Path | None) -> None:
     quiet = logging.NullHandler()
     logging.getLogger().addHandler(quiet)
     try:
-        _run(ctx, out, answers)
+        _run(ctx, out, answers, no_service)
     finally:
         logging.getLogger().removeHandler(quiet)

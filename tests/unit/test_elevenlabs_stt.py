@@ -466,7 +466,7 @@ async def test_bridge_watchdog_not_triggered_by_partials_without_commit(env, mon
 
     monkeypatch.setattr(bridge_module, "_WATCHDOG_POLL_S", 0.05)
     _fake, _p, s, _r = await env()
-    config = ClientConfig(silence_timeout_s=0.1, max_silence_turns=1)
+    config = ClientConfig(silence_timeout_s=0.1)
     bridge, ws = make_bridge(input_mode="audio", config=config, transcriber=s)
     bridge._audio_burst_start = time.monotonic()
     bridge._last_audio_at = float("inf")

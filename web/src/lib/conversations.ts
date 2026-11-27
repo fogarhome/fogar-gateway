@@ -15,11 +15,19 @@ export function conversationKind(kind: string): string | null {
   return null
 }
 
-/** Se escribe solo en las conversaciones empezadas en este navegador; las demás que puedes ver se
- * leen. Abrir aquí la de otro aparato lo cortaría (4102) mientras no haya varios en una (C3). */
-export const canWrite = (c: Pick<Conversation, 'client_id'>, deviceId: string | null) =>
-  deviceId !== null && c.client_id === deviceId
-
 /** De quién es (4.0): privada de su persona o del hogar, la ven todos los de casa. */
 export const conversationScope = (c: Pick<Conversation, 'owner_user_id'>) =>
   c.owner_user_id ? 'privada' : 'del hogar'
+
+/**
+ * Quién dijo una línea de lo leído de OpenClaw, que no trae quién la envió: en una privada tuya,
+ * lo del usuario es tuyo («Tú», como en vivo); en una del hogar puede ser de cualquier aparato.
+ */
+export function historyAuthor(
+  role: 'user' | 'assistant',
+  c: Pick<Conversation, 'owner_user_id'> | null,
+  userId: string | null | undefined,
+): string {
+  if (role !== 'user') return 'Fogar'
+  return userId && c?.owner_user_id === userId ? 'Tú' : 'Persona'
+}

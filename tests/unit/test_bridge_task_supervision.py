@@ -8,6 +8,7 @@ import pytest
 
 from fogar_gateway.models.schemas import ClientConfig
 from fogar_gateway.services.reconnection import ConnectionState
+from tests.fakes.bridge import enqueue_push
 
 
 @pytest.fixture
@@ -91,7 +92,7 @@ async def test_push_audio_failure_is_logged(make_bridge, caplog):
     tts.get_audio_stream = broken_stream
     bridge.tts.connect = AsyncMock(return_value=tts)
     with caplog.at_level(logging.WARNING, logger="fogar_gateway.services.bridge"):
-        bridge.enqueue_push("turn_start", "sk")
+        enqueue_push(bridge, "turn_start", "sk")
         await bridge.push_idle()
         await _settle()
     msgs = [r.getMessage() for r in caplog.records]

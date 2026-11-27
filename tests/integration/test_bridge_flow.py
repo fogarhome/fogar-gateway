@@ -1,17 +1,18 @@
 """Tests para el flujo de texto en FogarBridge.
 
-input_mode=text: sin transcriber. El cliente manda texto plano,
+input_mode=text: sin transcriber. El cliente manda el mensaje JSON `send`,
 recibe tokens del orchestrator.
 """
 
 import pytest
 
 from fogar_gateway.core.config import settings
-from fogar_gateway.services.protocol import OrchestratorEvent
+from tests.fakes.orchestrator import OrchestratorEvent
 from tests.integration.conftest import VALID_KEY
 
 HANDSHAKE_TEXT = {
-    "client_key": VALID_KEY,
+    "token": VALID_KEY,
+    "protocol": 5,
     "input_mode": "text",
     "output_mode": ["text"],
 }
@@ -22,7 +23,10 @@ def test_text_message_produces_token(client):
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_json(HANDSHAKE_TEXT)
         ws.receive_json()  # ready
-        ws.send_text("hola")
+        ws.send_json({"type": "send", "text": "hola"})
+        message = ws.receive_json()  # 5.0 PR 2b: the echo of the message, first
+        assert (message["type"], message["text"], message["state"]) == ("message", "hola", "delivered")
+        assert message["from"]["self"] is True
         turn_start = ws.receive_json()
         assert turn_start["type"] == "turn_start"
         assert turn_start["turn_id"] == "t-1"
@@ -50,7 +54,7 @@ def test_orchestrator_session_key_is_the_conversation_of_the_session(
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_json(HANDSHAKE_TEXT)
         ready = ws.receive_json()
-        ws.send_text("test")
+        ws.send_json({"type": "send", "text": "test"})
         ws.receive_json()  # turn_start
         ws.receive_json()  # token
 
@@ -75,7 +79,7 @@ def _receive_until(ws, kind: str) -> list[dict]:
 def test_session_with_voice_off_stays_open_in_text(voice_off, client):
     """Voz `off`: la sesión de voz arranca degradada como con los servicios caídos y sigue en texto."""
     with client.websocket_connect("/ws/stream") as ws:
-        ws.send_json({"client_key": VALID_KEY, "input_mode": "audio", "output_mode": ["text", "audio"]})
+        ws.send_json({"token": VALID_KEY, "protocol": 5, "input_mode": "audio", "output_mode": ["text", "audio"]})
         *before, ready = _receive_until(ws, "ready")
         assert ready["live_capabilities"]["transcriber"] is False
         assert ready["live_capabilities"]["tts"] is False
@@ -89,5 +93,5 @@ def test_session_with_voice_off_stays_open_in_text(voice_off, client):
         for turn_id in ("t-1", "t-2"):  # el segundo turno prueba que la sesión sigue abierta
             ws.send_json({"type": "send", "text": "hola"})
             msgs = _receive_until(ws, "turn_end")
-            assert [m["type"] for m in msgs] == ["turn_start", "token", "turn_end"]
+            assert [m["type"] for m in msgs] == ["message", "turn_start", "token", "turn_end"]
             assert msgs[-1]["turn_id"] == turn_id

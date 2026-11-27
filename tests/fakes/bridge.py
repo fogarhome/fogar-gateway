@@ -16,7 +16,8 @@ from fogar_gateway.services.bridge import FogarBridge
 from fogar_gateway.services.conversations import Conversation, SessionConversation
 from fogar_gateway.services.openclaw.registry import ClientRegistry, TurnRegistry
 from fogar_gateway.services.outbound import ClientGone, QueuedSender
-from fogar_gateway.services.protocol import OrchestratorEvent
+from fogar_gateway.services.scopes import DEFAULT_SCOPES
+from tests.fakes.orchestrator import OrchestratorEvent, wire_stream_orchestrator
 from tests.fakes.speech import speech_providers
 
 
@@ -36,8 +37,14 @@ class RecWS:
     async def receive(self):
         return await self.inbox.get()
 
-    def types(self):
-        return [m["type"] for m in self.sent if isinstance(m, dict)]
+    def types(self, messages: bool = False):
+        """The types of the JSON messages sent, in order. The `message` echo of each user
+        message (5.0 PR 2b) only with `messages=True`: most tests look at the turns."""
+        return [
+            m["type"]
+            for m in self.sent
+            if isinstance(m, dict) and (messages or m["type"] != "message")
+        ]
 
     def of(self, type_):
         return [m for m in self.sent if isinstance(m, dict) and m["type"] == type_]
@@ -60,22 +67,30 @@ def make_bridge(
     stt=None,
     transcriber=None,
     register=False,
+    attach=True,
+    notify=True,
     **overrides,
 ):
     """Return `(bridge, ws)`. Any `FogarBridge` argument can be overridden by name.
 
     Must run inside the event loop (the `QueuedSender` starts its writer task).
-    `register=True` adds the bridge to its `client_registry`, as `routes.py` does.
+    `register=True` adds the bridge to its `client_registry`, as `routes.py` does. The bridge
+    is attached to its conversation's channel (what `claim_conversation` does before `ready`);
+    `attach=False` leaves it out.
+
+    5.0 PR 2c.3: with its own hub (no `channel_hub` given) and `notify=True`, the bridge's
+    client is its conversation's notify device (the push audio plays there, as before 2c);
+    `notify=False` leaves the conversation without one.
     """
     ws = ws if ws is not None else RecWS()
     kwargs = dict(
-        client=Client(id=client_id, key_hash="k", is_active=True),
+        client=Client(id=client_id, key_hash="k", is_active=True, scopes=DEFAULT_SCOPES),
         config=ClientConfig(),
         client_ws=ws,
         orchestrator=AsyncMock(),
         speech=speech_providers(tts=tts, stt=stt),
         tracker=fake_tracker(),
-        handshake=Handshake(client_key="k", input_mode=input_mode, output_mode=list(output_mode)),
+        handshake=Handshake(token="k", input_mode=input_mode, output_mode=list(output_mode)),
         client_registry=ClientRegistry(),
         turn_registry=TurnRegistry(),
         conversation=fixed_conversation(client_id),
@@ -84,13 +99,44 @@ def make_bridge(
     if "sender" not in kwargs:  # not setdefault: it would start a writer task nobody closes
         kwargs["sender"] = QueuedSender(ws)
     bridge = FogarBridge(**kwargs)
+    # 5.0 PR 2b: the channel sends and reads frames; a mock's `stream_response` plays them.
+    wire_stream_orchestrator(bridge.channel_hub.orchestrator, bridge.channel_hub)
     bridge.transcriber = transcriber
+    if bridge._own_hub:
+        registry = kwargs["client_registry"]
+
+        def _sessions_of(cid: str) -> list:
+            live = [b.turns for b in registry.for_client(cid)]
+            if not live and cid == bridge.client_id:
+                live = [bridge.turns]  # not registered (`register=False`): still the device's session
+            return live
+
+        bridge.channel_hub.sessions_of = _sessions_of
+        if notify:
+            bridge.channel_hub.notify_device = notify_device_is(client_id)
     if register:
         kwargs["client_registry"].register(bridge.client_id, bridge, bridge.conversation.current)
+    if attach:
+        # As claim_conversation: its conversation is indexed (2c.3: a push has a notify device
+        # only on an indexed key), then the session attaches.
+        index = bridge.channel_hub.index
+        if index is not None and index.get(bridge.conversation.session_key) is None:
+            index.add(bridge.conversation.current)
+        bridge.turns.attach()
     return bridge, ws
 
 
 CONVERSATION_ID = "conv-1"
+
+
+def notify_device_is(client_id: str | None):
+    """A `ChannelHub.notify_device` for tests: every conversation's notify device is
+    `client_id` (None: none)."""
+
+    async def _lookup(conversation) -> str | None:
+        return client_id
+
+    return _lookup
 
 
 def fixed_conversation(client_id: str = "u", agent: str = "main", **kwargs) -> SessionConversation:
@@ -115,14 +161,19 @@ def keyed_conversation(client_id: str, agent: str = "main", id: str | None = Non
 async def sent(bridge) -> list:
     """Everything the client has received so far, after draining the sender.
 
+    The session paints its turns on its own worker (5.0: the channel only enqueues there), so
+    this waits for that queue first.
+
     Raises `ClientGone` if the sender broke: an empty list must mean "nothing was
     sent", not "the sender dropped it". With a broken sender, read `ws.sent`."""
+    await asyncio.wait_for(bridge.turns.idle(), 5.0)
     await bridge._sender.flush()
     return bridge.client_ws.sent
 
 
-async def start_turn(bridge, text: str = "x") -> asyncio.Task:
-    """Start a user turn as a `send` does (replacing the one in flight); return its task."""
+async def start_turn(bridge, text: str = "x") -> asyncio.Future:
+    """Start a user turn as a `send` does (5.0 PR 2b: queued behind the one in flight); return
+    a future done once its run ends."""
     await bridge.turns.start_user_turn(text)
     task = bridge.turns.user_task
     assert task is not None, "the turn did not start"
@@ -136,13 +187,22 @@ async def run_turn(bridge, text: str = "x", timeout: float = 5.0) -> None:
     if not done:
         task.cancel()
         raise AssertionError(f"the turn did not end in {timeout}s")
+    await asyncio.wait_for(bridge.turns.idle(), timeout)
+
+
+def enqueue_push(bridge, kind: str, arg, run_id: str | None = None) -> None:
+    """A push event `(kind, arg)` for the channel the bridge is attached to (what
+    FrameDispatcher does with `channel_for(sessionKey).enqueue_push`)."""
+    channel = bridge.channel
+    assert channel is not None, "the bridge is not attached to a channel"
+    channel.enqueue_push(kind, arg, run_id)
 
 
 async def push(bridge, *events) -> None:
-    """Feed OpenClaw push events `(kind, arg)` through the bridge's push worker and wait
-    until it handled them all (what FrameDispatcher does with `enqueue_push`)."""
+    """Feed OpenClaw push events `(kind, arg)` through the channel's push worker and wait
+    until the channel and the session handled them all."""
     for kind, arg in events:
-        bridge.enqueue_push(kind, arg)
+        enqueue_push(bridge, kind, arg)
     await bridge.push_idle()
 
 

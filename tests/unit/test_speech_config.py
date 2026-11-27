@@ -1,7 +1,7 @@
 import logging
 
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from fogar_gateway.core.config import Settings
 from fogar_gateway.core.startup_checks import SpeechConfigError, check_speech_settings
@@ -77,7 +77,23 @@ def test_rejects_v3_model_for_ws(model):
     assert "ELEVENLABS_TTS_MODEL" in str(e.value) and model not in str(e.value)
 
 
-def test_legacy_auto_audio_gate_means_energy(monkeypatch):
-    # "auto" was the documented default before #264; a production .env carrying it must still boot.
+def test_stt_audio_gate_auto_from_4x_is_energy_with_one_warning(monkeypatch, caplog):
+    """#422 quitó «auto» (era «energy»): un config.env de la 4.x arranca igual, con un aviso."""
+    from fogar_gateway.core import config as config_module
+
+    monkeypatch.setattr(config_module._logger, "auto_gate_warned", False, raising=False)
     monkeypatch.setenv("STT_AUDIO_GATE", "auto")
+    caplog.set_level(logging.WARNING)
     assert Settings().STT_AUDIO_GATE == "energy"
+    assert Settings().STT_AUDIO_GATE == "energy"
+    warnings = [r.getMessage() for r in caplog.records if "STT_AUDIO_GATE" in r.getMessage()]
+    assert warnings == [
+        "Config: STT_AUDIO_GATE=auto ya no existe desde la 5.0; uso energy "
+        "(cámbialo con `fogar-gw config set STT_AUDIO_GATE energy`)."
+    ]
+
+
+def test_stt_audio_gate_other_values_are_still_rejected(monkeypatch):
+    monkeypatch.setenv("STT_AUDIO_GATE", "loud")
+    with pytest.raises(ValidationError, match="STT_AUDIO_GATE"):
+        Settings()

@@ -19,6 +19,8 @@ from fogar_gateway.db.database import get_engine
 from fogar_gateway.db.models import ClientRecord, HomeRecord, MembershipRecord, UserRecord
 from fogar_gateway.models.schemas import Client, ClientConfig
 from fogar_gateway.services.auth import hash_key
+from fogar_gateway.services.notify_device import notify_client_for
+from fogar_gateway.services.scopes import normalize_scopes, scope_cap
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +89,16 @@ class DbClient:
             )
             session.commit()
 
+    async def notify_device(self, home_id: str, owner_user_id: str | None) -> str | None:
+        """El dispositivo de avisos de una conversación de `home_id` (privada si trae
+        `owner_user_id`), si vale ahora (`notify_device.notify_client_for`; 5.0 PR 2c.3). En un
+        hilo, como el resto: nunca para el event loop."""
+        return await asyncio.to_thread(self._notify_device, home_id, owner_user_id)
+
+    def _notify_device(self, home_id: str, owner_user_id: str | None) -> str | None:
+        with Session(self._get_engine()) as session:
+            return notify_client_for(session, home_id, owner_user_id)
+
     async def revalidate(self, key_hash: str) -> tuple[Client, ClientConfig]:
         """Como `get_session`, desde el hash que ya guarda la sesión (la clave no se guarda)."""
         return await asyncio.to_thread(self._lookup, key_hash)
@@ -99,6 +111,10 @@ class DbClient:
             # Un dispositivo personal vale lo que su usuario (M20): desactivarlo corta sus
             # sesiones en la siguiente revalidación, también por /v1 y el WebSocket.
             user = session.get(UserRecord, record.user_id) if record and record.user_id else None
+            membership = (
+                session.get(MembershipRecord, (record.user_id, record.home_id))
+                if record and record.user_id else None
+            )
             household_agent = _household_agent(session, record) if record is not None else None
 
         # Sin argumentos: el mensaje de la excepción no lleva ni el hash.
@@ -114,6 +130,7 @@ class DbClient:
             home_id=record.home_id,
             is_active=record.is_active,
             name=record.name,
+            scopes=_effective_scopes(record, membership),
         )
         # `include` explícito: ClientConfig es extra="allow" y no debe recibir id/client_key.
         config = ClientConfig(
@@ -125,6 +142,21 @@ class DbClient:
 
 
 _CONFIG_COLUMNS = set(ClientConfig.model_fields) - {"allowed_agents", "household_agent"}
+
+
+def _effective_scopes(record: ClientRecord, membership: MembershipRecord | None) -> frozenset[str]:
+    """Lo concedido ∩ el tope de hoy (#410): el rol se lee en cada consulta, así que bajárselo a
+    una persona recorta sus aparatos en la siguiente petición o revalidación. Un JSON roto no
+    concede nada (nunca de más)."""
+    try:
+        granted = json.loads(record.scopes)
+    except ValueError:
+        granted = None
+    if not isinstance(granted, list):
+        logger.error("Cliente %s: scopes ilegibles; sin permisos.", record.id)
+        return frozenset()
+    role = membership.role if membership is not None else None
+    return normalize_scopes(str(g) for g in granted) & scope_cap(record.user_id, role)
 
 
 def _household_agent(session: Session, record: ClientRecord) -> str | None:

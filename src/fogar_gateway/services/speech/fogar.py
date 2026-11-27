@@ -27,7 +27,7 @@ class FogarSttProvider:
     CONNECTED; `probe()` consulta `/ready` en vivo (local y gratis)."""
 
     name = "fogar"
-    capabilities = SttCapabilities(partials=True, warmup_s=0.0)
+    capabilities = SttCapabilities(warmup_s=0.0)
 
     def __init__(self, settings) -> None:
         self._settings = settings

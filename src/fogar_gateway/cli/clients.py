@@ -1,4 +1,4 @@
-"""`fogar-gw clients …`: gestión de clientes por la API /admin/clients."""
+"""`fogar-gw clients …`: gestión de clientes por la API /home/devices."""
 
 import json
 import sys
@@ -20,6 +20,10 @@ COLUMNS = [
 ]
 
 
+# Lo que un administrador puede conceder a un aparato del hogar (5.0, #410): nunca home:admin.
+HOUSEHOLD_SCOPES = ("conversations:read", "conversations:write", "home:read")
+
+
 def _out(ctx: click.Context) -> Out:
     return Out(ctx.find_root().obj["json"])
 
@@ -33,9 +37,11 @@ def _show_key(out: Out, data: dict[str, Any]) -> None:
         out.json(data)
         return
     # La clave primero: el servidor ya la ha creado o rotado y no se puede volver a pedir.
-    out.message(f"client_key: {data['client_key']}", ACCENT)
+    # En la 5.0 la credencial de un aparato se llama `token` (como en /pair); la API la sigue
+    # llamando `client_key` en /home/devices.
+    out.message(f"token: {data['client_key']}", ACCENT)
     out.pairs([("nombre", data["name"]), ("id", data["id"]), ("fp", data["key_fp"])])
-    out.message("Guárdala ahora: no se volverá a mostrar.", MUTED)
+    out.message("Guárdalo ahora: no se volverá a mostrar.", MUTED)
 
 
 # Campos que devuelve el gateway pero no se editan.
@@ -74,7 +80,7 @@ def _no_key(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _find(client: api.Api, ref: str) -> dict[str, Any]:
-    return refs.resolve(client.request("GET", "/admin/clients"), ref)
+    return refs.resolve(client.request("GET", "/home/devices"), ref)
 
 
 @click.group()
@@ -87,7 +93,7 @@ def clients() -> None:
 def list_(ctx: click.Context) -> None:
     """Lista los clientes."""
     out = _out(ctx)
-    rows = [_no_key(r) for r in api.from_context(ctx).request("GET", "/admin/clients")]
+    rows = [_no_key(r) for r in api.from_context(ctx).request("GET", "/home/devices")]
     if out.as_json:
         out.json(rows)
     elif not rows:
@@ -103,7 +109,7 @@ def show(ctx: click.Context, ref: str) -> None:
     """Enseña todos los datos de un cliente, salvo su clave."""
     out = _out(ctx)
     client = api.from_context(ctx)
-    data = _no_key(client.request("GET", f"/admin/clients/{_find(client, ref)['id']}"))
+    data = _no_key(client.request("GET", f"/home/devices/{_find(client, ref)['id']}"))
     if out.as_json:
         out.json(data)
     else:
@@ -115,6 +121,8 @@ def show(ctx: click.Context, ref: str) -> None:
 @click.option("--type", "client_type", help="Tipo: ha, esp32, web, app o screen.")
 @click.option("--agent", help="Agente por defecto.")
 @click.option("--allowed-agent", "allowed", multiple=True, help="Agente permitido (repetible).")
+@click.option("--scope", "scopes", multiple=True, type=click.Choice(HOUSEHOLD_SCOPES),
+              help="Permiso que se le concede (repetible). Sin ninguno, conversations:write.")
 @click.option("--import-key", is_flag=True, help="Importar una clave existente desde stdin.")
 @click.pass_context
 def add(
@@ -123,6 +131,7 @@ def add(
     client_type: str | None,
     agent: str | None,
     allowed: tuple[str, ...],
+    scopes: tuple[str, ...],
     import_key: bool,
 ) -> None:
     """Crea un cliente y enseña su clave una sola vez."""
@@ -133,6 +142,8 @@ def add(
         body["default_agent"] = agent
     if allowed:
         body["allowed_agents"] = list(allowed)
+    if scopes:
+        body["scopes"] = list(scopes)
     if import_key:
         # Por stdin, nunca por argumento: así no acaba en el historial de la shell.
         key = (
@@ -143,7 +154,7 @@ def add(
         if not key:
             raise api.ApiError("--import-key no ha recibido ninguna clave por stdin.", 2)
         body["client_key"] = key
-    _show_key(_out(ctx), api.from_context(ctx).request("POST", "/admin/clients", body))
+    _show_key(_out(ctx), api.from_context(ctx).request("POST", "/home/devices", body))
 
 
 @clients.command()
@@ -179,7 +190,7 @@ def edit(
     body.update(set_values(sets, set(target) - READ_ONLY))
     if not body:
         raise api.ApiError("Nada que cambiar: indica al menos una opción.", 2)
-    data = _no_key(client.request("PATCH", f"/admin/clients/{target['id']}", body))
+    data = _no_key(client.request("PATCH", f"/home/devices/{target['id']}", body))
     out = _out(ctx)
     if out.as_json:
         out.json(data)
@@ -190,7 +201,7 @@ def edit(
 def _set_active(ctx: click.Context, ref: str, active: bool) -> None:
     client = api.from_context(ctx)
     data = _no_key(
-        client.request("PATCH", f"/admin/clients/{_find(client, ref)['id']}", {"is_active": active})
+        client.request("PATCH", f"/home/devices/{_find(client, ref)['id']}", {"is_active": active})
     )
     out = _out(ctx)
     if out.as_json:
@@ -225,7 +236,7 @@ def rotate_key(ctx: click.Context, ref: str) -> None:
     client = api.from_context(ctx)
     target = _find(client, ref)
     confirm(ctx, f"¿Rotar la clave de «{target['name']}»? La actual dejará de valer.")
-    _show_key(_out(ctx), client.request("POST", f"/admin/clients/{target['id']}/rotate-key"))
+    _show_key(_out(ctx), client.request("POST", f"/home/devices/{target['id']}/rotate-key"))
 
 
 @clients.command()
@@ -236,7 +247,7 @@ def remove(ctx: click.Context, ref: str) -> None:
     client = api.from_context(ctx)
     target = _find(client, ref)
     confirm(ctx, f"¿Retirar el cliente «{target['name']}»? Su clave dejará de valer.")
-    client.request("DELETE", f"/admin/clients/{target['id']}")
+    client.request("DELETE", f"/home/devices/{target['id']}")
     out = _out(ctx)
     if out.as_json:
         out.json({"id": target["id"], "removed": True})

@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, shallowRef } from 'vue'
 import { useRouter } from 'vue-router'
-import { listMyDevices, retireMyDevice } from '@/api/admin'
+import { getMe, listMyDevices, retireMyDevice, updateMe } from '@/api/admin'
 import type { MyDevice } from '@/api/types'
+import AvisosEn from '@/components/AvisosEn.vue'
 import FgBoton from '@/components/FgBoton.vue'
 import FgEstado from '@/components/FgEstado.vue'
 import { formatRelative } from '@/lib/format'
+import { opcionAvisos } from '@/lib/notifyDevice'
 import { toast } from '@/lib/toasts'
 import { useSessionStore } from '@/stores/session'
 
@@ -17,10 +19,14 @@ const items = shallowRef<MyDevice[]>([])
 const loaded = ref(false)
 const error = ref<string | null>(null)
 const retirando = ref<string | null>(null)
+// Mi dispositivo de avisos (#407): `undefined` hasta leer /auth/me.
+const avisos = ref<string | null | undefined>(undefined)
 
 async function cargar(): Promise<void> {
   try {
-    items.value = await listMyDevices()
+    const [lista, me] = await Promise.all([listMyDevices(), getMe()])
+    items.value = lista
+    avisos.value = me.notify_client_id
     error.value = null
   } catch {
     error.value = 'No pude leer tus dispositivos.'
@@ -38,6 +44,14 @@ const filas = computed(() =>
   })),
 )
 
+// Mis avisos solo pueden sonar en uno de mis aparatos activos (el gateway lo comprueba igual).
+const opcionesAvisos = computed(() =>
+  items.value.flatMap((d) => opcionAvisos(d, d.current ? `${d.name} (este)` : d.name) ?? []),
+)
+async function guardarAvisos(id: string | null): Promise<void> {
+  avisos.value = (await updateMe({ notify_client_id: id })).notify_client_id
+}
+
 async function retirar(d: MyDevice): Promise<void> {
   const aviso = d.current
     ? 'Es este navegador: saldrás de la web.'
@@ -52,6 +66,7 @@ async function retirar(d: MyDevice): Promise<void> {
       return
     }
     toast('ok', `«${d.name}» retirado`)
+    // retirarlo lo quita de mis avisos si estaba elegido
     await cargar()
   } catch {
     toast('bad', 'No he podido retirarlo', 'Sigue con acceso. Prueba otra vez.')
@@ -95,6 +110,13 @@ async function retirar(d: MyDevice): Promise<void> {
       </table>
     </div>
     <p v-else-if="loaded" class="fg-meta">No hay ninguno.</p>
+    <AvisosEn
+      v-if="!error && avisos !== undefined"
+      etiqueta="Avisos en…"
+      :opciones="opcionesAvisos"
+      :elegido="avisos"
+      :guardar="guardarAvisos"
+    />
   </div>
 </template>
 

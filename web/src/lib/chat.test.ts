@@ -4,22 +4,38 @@ import { backoffMs, ChatLog, closeAction, endReasonText, progressText, stopText 
 const start = (turn_id: string, extra: object = {}) => ({ type: 'turn_start', turn_id, turn_seq: 1, conversation: 'c1', origin: 'user', ...extra })
 
 describe('ChatLog', () => {
-  it('junta los tokens de un turno y lo cierra con su turn_end', () => {
+  const msg = (id: string, state = 'pending', self = true, extra: object = {}) => ({
+    type: 'message', id, conversation: 'c1', text: `texto ${id}`, state,
+    from: { source: 'device', device_id: self ? 'yo' : 'tele', name: self ? 'Mac' : 'Tele', self }, ...extra,
+  })
+
+  it('el mensaje llega por su `message` y la respuesta junta sus tokens hasta su turn_end', () => {
     const log = new ChatLog('c1')
-    log.addUser('¿Qué tiempo hace?')
+    log.apply(msg('m1'))
+    log.apply(msg('m1', 'delivered'))
     log.apply(start('t-1'))
     log.apply({ type: 'token', turn_id: 't-1', text: 'Sol' })
     expect(log.turnOpen).toBe(true)
     log.apply({ type: 'token', turn_id: 't-1', text: ' y 20 grados.' })
     log.apply({ type: 'turn_end', turn_id: 't-1', reason: 'done' })
     expect(log.turnOpen).toBe(false)
-    expect(log.lines.map((l) => [l.role, l.text, l.state, l.reason])).toEqual([
-      ['user', '¿Qué tiempo hace?', 'ended', 'done'],
-      ['assistant', 'Sol y 20 grados.', 'ended', 'done'],
+    expect(log.lines.map((l) => [l.role, l.text, l.messageState ?? l.state])).toEqual([
+      ['user', 'texto m1', 'delivered'],
+      ['assistant', 'Sol y 20 grados.', 'ended'],
     ])
   })
 
-  it('guarda por qué terminó un turno: cancelado, sustituido, timeout tras su error', () => {
+  it('los mensajes de otro aparato llevan su nombre; los pendientes se pueden listar y se quitan', () => {
+    const log = new ChatLog('c1')
+    log.apply(msg('m1', 'pending', false))
+    log.apply(msg('m2', 'pending', true))
+    expect(log.lines.map((l) => l.from)).toEqual([{ name: 'Tele', self: false }, { name: 'Mac', self: true }])
+    expect(log.pending.map((l) => l.messageId)).toEqual(['m1', 'm2'])
+    log.apply(msg('m1', 'withdrawn', false))
+    expect(log.pending.map((l) => l.messageId)).toEqual(['m2'])
+  })
+
+  it('guarda por qué terminó un turno: cancelado, timeout tras su error', () => {
     const log = new ChatLog('c1')
     log.apply(start('t-1'))
     log.apply({ type: 'turn_end', turn_id: 't-1', reason: 'cancelled' })
@@ -32,13 +48,14 @@ describe('ChatLog', () => {
     ])
   })
 
-  it('no acepta tokens de un turno ya cerrado ni de uno desconocido', () => {
+  it('no acepta tokens de un turno ya cerrado ni de uno desconocido, ni repite un turn_start', () => {
     const log = new ChatLog('c1')
     log.apply(start('t-1'))
-    log.apply({ type: 'turn_end', turn_id: 't-1', reason: 'replaced' })
+    expect(log.apply(start('t-1'))).toBe(false)
+    log.apply({ type: 'turn_end', turn_id: 't-1', reason: 'interrupted' })
     expect(log.apply({ type: 'token', turn_id: 't-1', text: 'tarde' })).toBe(false)
     expect(log.apply({ type: 'token', turn_id: 't-9', text: 'nadie' })).toBe(false)
-    expect(log.lines[0]!.text).toBe('')
+    expect(log.lines).toHaveLength(1)
   })
 
   it('marca el push como Fogar hablando primero y avisa si es de otra conversación', () => {
@@ -50,123 +67,33 @@ describe('ChatLog', () => {
       ['push', 'ayer'],
     ])
   })
-
-  it('tras reconectar, un turn_id repetido es un turno nuevo', () => {
-    const log = new ChatLog('c1')
-    log.apply(start('t-1'))
-    log.apply({ type: 'token', turn_id: 't-1', text: 'uno' })
-    log.closeOpenTurns() // se cayó el socket sin turn_end
-    log.apply(start('t-1'))
-    log.apply({ type: 'token', turn_id: 't-1', text: 'dos' })
-    expect(log.lines.map((l) => [l.text, l.state, l.reason])).toEqual([
-      ['uno', 'ended', 'closed'],
-      ['dos', 'streaming', undefined],
-    ])
-    expect(new Set(log.lines.map((l) => l.key)).size).toBe(2)
-  })
 })
 
 describe('ChatLog al volver a leer lo dicho', () => {
-  const end = (turn_id: string, reason = 'done') => ({ type: 'turn_end', turn_id, reason })
-  const fail = (turn_id: string, code: string) => ({ type: 'error', code, message: code, fatal: false, turn_id })
   const texts = (log: ChatLog) => log.lines.map((l) => l.text)
 
-  it('quita lo terminado antes de pedir y deja lo que sigue llegando, para no enseñar nada dos veces', () => {
+  it('quita lo terminado y lo entregado antes de pedir; deja lo pendiente y lo que sigue llegando', () => {
     const log = new ChatLog('c1')
-    log.addUser('uno')
+    const message = (id: string, state: string) =>
+      ({ type: 'message', id, conversation: 'c1', text: id, state, from: { source: 'device', device_id: 'yo', name: 'Mac', self: true } })
+    log.apply(message('entregado', 'delivered'))
     log.apply(start('t-1'))
-    log.apply(end('t-1'))
-    log.addUser('dos')
+    log.apply({ type: 'token', turn_id: 't-1', text: 'respuesta' })
+    log.apply({ type: 'turn_end', turn_id: 't-1', reason: 'done' })
+    log.apply(message('pendiente', 'pending'))
     log.apply(start('t-2'))
-    log.dropReloaded(log.endedKeys())
-    expect(log.lines.map((l) => [l.role, l.state])).toEqual([['assistant', 'streaming']])
-    log.apply({ type: 'token', turn_id: 't-2', text: 'sigue' })
-    expect(log.lines[0]!.text).toBe('sigue')
-  })
-
-  it('lo que termina mientras llega la lectura se queda: no venía en ella', () => {
-    const log = new ChatLog('c1')
-    log.addUser('uno')
-    log.apply(start('t-1'))
     const keys = log.endedKeys()
-    log.apply({ type: 'token', turn_id: 't-1', text: 'tarde' })
-    log.apply(end('t-1'))
-    log.addUser('dos')
     log.dropReloaded(keys)
-    expect(texts(log)).toEqual(['tarde', 'dos'])
+    expect(texts(log)).toEqual(['pendiente', ''])
   })
 
-  it('se queda el push de otra conversación y lo que no salió', () => {
+  it('se queda con el turno que no llegó a OpenClaw', () => {
     const log = new ChatLog('c1')
-    log.apply(start('t-1', { conversation: 'c2', origin: 'push' }))
-    log.apply({ type: 'token', turn_id: 't-1', text: 'de otra' })
-    log.apply(end('t-1'))
-    log.markUnsent(log.addUser('no salió'))
-    log.dropReloaded(log.endedKeys())
-    expect(texts(log)).toEqual(['de otra', 'no salió'])
-  })
-
-  it('se queda lo que espera a salir (`keep`)', () => {
-    const log = new ChatLog('c1')
-    log.addUser('ya dicho')
-    const pending = log.addUser('esperando')
-    log.dropReloaded(log.endedKeys(), pending)
-    expect(texts(log)).toEqual(['esperando'])
-  })
-
-  it('se queda el turno que no llegó a OpenClaw con tu mensaje; los demás errores ya están en OpenClaw', () => {
-    const log = new ChatLog('c1')
-    const turns = ['orchestrator_unavailable', 'orchestrator_send_failed', 'orchestrator_error', 'turn_timeout']
-    turns.forEach((code, i) => {
-      log.sent(log.addUser(`pregunta ${code}`))
-      log.apply(start(`t-${i}`))
-      log.apply(fail(`t-${i}`, code))
-      log.apply(end(`t-${i}`, 'error'))
-    })
-    log.sent(log.addUser('cancelada'))
-    log.apply(start('t-9'))
-    log.apply(end('t-9', 'cancelled'))
-    log.dropReloaded(log.endedKeys())
-    expect(log.lines.map((l) => [l.role, l.text, l.error])).toEqual([
-      ['user', 'pregunta orchestrator_unavailable', undefined],
-      ['assistant', '', 'orchestrator_unavailable'],
-      ['user', 'pregunta orchestrator_send_failed', undefined],
-      ['assistant', '', 'orchestrator_send_failed'],
-    ])
-  })
-
-  it('cada respuesta va con tu mensaje más viejo sin responder, aunque un push se cuele en medio', () => {
-    const log = new ChatLog('c1')
-    const u1 = log.addUser('uno')
-    log.sent(u1)
-    const u2 = log.addUser('dos')
-    log.sent(u2)
-    log.apply(start('t-1', { origin: 'push' }))
-    log.apply(start('t-2'))
-    log.apply(start('t-3'))
-    expect(log.lines.map((l) => l.ask)).toEqual([undefined, undefined, undefined, u1, u2])
-  })
-
-  it('lo enviado sin turn_start todavía no cuenta como leído: OpenClaw quizá aún no lo tiene', () => {
-    const log = new ChatLog('c1')
-    log.sent(log.addUser('recién enviado'))
-    const keys = log.endedKeys()
-    expect(keys).toEqual([])
-    log.dropReloaded([...keys, 'u-1']) // aunque viniera en una lectura anterior
-    expect(texts(log)).toEqual(['recién enviado'])
-  })
-
-  it('al cerrarse el socket, lo enviado sin turn_start queda «no enviado»', () => {
-    const log = new ChatLog('c1')
-    log.sent(log.addUser('respondido'))
     log.apply(start('t-1'))
-    log.sent(log.addUser('perdido'))
-    log.closeOpenTurns()
-    expect(log.lines.map((l) => [l.text, l.unsent])).toEqual([
-      ['respondido', undefined],
-      ['', undefined],
-      ['perdido', true],
-    ])
+    log.apply({ type: 'error', code: 'TURN_ERROR', message: 'orchestrator_unavailable', fatal: false, turn_id: 't-1' })
+    log.apply({ type: 'turn_end', turn_id: 't-1', reason: 'error' })
+    log.dropReloaded(log.endedKeys())
+    expect(log.lines).toHaveLength(1)
   })
 })
 
@@ -245,10 +172,11 @@ describe('endReasonText', () => {
     expect(endReasonText({ reason: 'done' })).toBeNull()
   })
   it('cuenta cada motivo, con el error de turno si lo hubo', () => {
-    expect(endReasonText({ reason: 'cancelled' })).toBe('La paraste aquí.')
+    expect(endReasonText({ reason: 'cancelled' })).toBe('Se paró.')
     expect(endReasonText({ reason: 'interrupted' })).toMatch(/interrumpió/)
     expect(endReasonText({ reason: 'timeout' })).toMatch(/dejó de responder/)
     expect(endReasonText({ reason: 'error', error: 'orchestrator_unavailable' })).toBe('Falló: openclaw no está disponible.')
+    expect(endReasonText({ reason: 'error', error: 'codigo_nuevo' })).toBe('Falló: openclaw rechazó la pregunta.')
   })
   it('un motivo que la web no conoce es un error', () => {
     expect(endReasonText({ reason: 'algo_nuevo' })).toBe('Falló.')
@@ -256,8 +184,8 @@ describe('endReasonText', () => {
 })
 
 describe('closeAction', () => {
-  it('«conversation opened elsewhere» (4102) nunca reconecta solo', () => {
-    expect(closeAction(4102)).toBe('elsewhere')
+  it('el 4102 retirado (5.0) de un gateway viejo cae en la regla de su rango: no reconecta solo', () => {
+    expect(closeAction(4102)).toBe('stop')
   })
   it('para con 4000–4899 (también los que no conoce) y 1008, sin mirar el texto', () => {
     for (const code of [4000, 4001, 4002, 4010, 4020, 4021, 4100, 4101, 4200, 4350, 4899, 1008]) {

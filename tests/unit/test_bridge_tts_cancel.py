@@ -1,4 +1,4 @@
-"""Un cancel (barge-in) justo después de `tts.connect()` no deja el stream huérfano."""
+"""Un `cancel` justo después de `tts.connect()` no deja el stream huérfano."""
 
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
@@ -27,7 +27,7 @@ async def test_cancel_right_after_tts_connect_closes_the_stream(make_bridge):
     await bridge.turns.start_user_turn("hola")
     task = bridge.turns.user_task
     await asyncio.wait_for(in_record.wait(), 2)
-    task.cancel()
-    await asyncio.wait({task}, timeout=2)
+    assert (await bridge.turns.cancel("cancelled"))[0]
+    await asyncio.wait_for(bridge.turns.idle(), 2)
     assert task.cancelled()
     stream.close.assert_awaited_once()

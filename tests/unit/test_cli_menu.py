@@ -57,7 +57,7 @@ def test_ctrl_c_leaves_cleanly(answers):
 
 
 def test_status_from_the_menu(answers, use_api):
-    use_api(FakeApi({("GET", "/admin/state"): STATE, ("GET", "/admin/users"): []}))
+    use_api(FakeApi({("GET", "/system/state"): STATE, ("GET", "/home/users"): []}))
     answers.extend(["status", "exit"])
     r = run()
     assert r.exit_code == 0, r.output
@@ -65,28 +65,28 @@ def test_status_from_the_menu(answers, use_api):
 
 
 def test_disable_a_client_picked_from_a_list(answers, use_api):
-    fake = use_api(FakeApi({("GET", "/admin/clients"): [A],
-                            ("PATCH", f"/admin/clients/{A['id']}"): {**A, "is_active": False}}))
+    fake = use_api(FakeApi({("GET", "/home/devices"): [A],
+                            ("PATCH", f"/home/devices/{A['id']}"): {**A, "is_active": False}}))
     answers.extend(["clients", "disable", A["id"], "exit"])
     r = run()
     assert r.exit_code == 0, r.output
-    assert ("PATCH", f"/admin/clients/{A['id']}", {"is_active": False}) in fake.calls
+    assert ("PATCH", f"/home/devices/{A['id']}", {"is_active": False}) in fake.calls
 
 
 def test_edit_a_field_from_the_menu(answers, use_api):
-    fake = use_api(FakeApi({("GET", "/admin/clients"): [A],
-                            ("PATCH", f"/admin/clients/{A['id']}"): A}))
+    fake = use_api(FakeApi({("GET", "/home/devices"): [A],
+                            ("PATCH", f"/home/devices/{A['id']}"): A}))
     answers.extend(["clients", "edit", A["id"], "tts_speed", "1.3", "exit"])
     assert run().exit_code == 0
-    assert ("PATCH", f"/admin/clients/{A['id']}", {"tts_speed": "1.3"}) in fake.calls
+    assert ("PATCH", f"/home/devices/{A['id']}", {"tts_speed": "1.3"}) in fake.calls
 
 
 def test_create_a_client_from_the_menu(answers, use_api):
-    fake = use_api(FakeApi({("POST", "/admin/clients"): {**A, "client_key": "k" * 43}}))
+    fake = use_api(FakeApi({("POST", "/home/devices"): {**A, "client_key": "k" * 43}}))
     answers.extend(["clients", "add", "Tele", "web", "exit"])
     r = run()
     assert r.exit_code == 0, r.output
-    assert fake.calls[0] == ("POST", "/admin/clients", {"name": "Tele", "client_type": "web"})
+    assert fake.calls[0] == ("POST", "/home/devices", {"name": "Tele", "client_type": "web"})
     assert "k" * 43 in r.output
 
 

@@ -1,4 +1,8 @@
-"""Tests for barge-in: TurnController.cancel, _on_transcription, close_all."""
+"""TurnController.cancel, _on_transcription and close_all, seen from the session.
+
+5.0 (#406): the barge-in left the gateway. A transcription (partial or final) goes to the
+client and never cuts anything: cutting is always explicit (`cancel`, `send` with `interrupt`).
+"""
 
 import asyncio
 import logging
@@ -6,9 +10,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from fogar_gateway.models.schemas import ClientConfig
-from fogar_gateway.services.protocol import OrchestratorEvent
-from tests.fakes.bridge import GoneSender, blocking, sent, start_turn
+from tests.fakes.bridge import GoneSender, blocking, push, sent, start_turn
+from tests.fakes.orchestrator import OrchestratorEvent
 
 _AUDIO = dict(input_mode="audio", output_mode=("audio", "text", "status"))
 
@@ -67,13 +70,25 @@ async def _running_turn(bridge, stream=None) -> asyncio.Task:
 
 
 async def test_cancel_turn_caller_cancelled_while_waiting_is_not_swallowed(bridge):
-    """#221: a caller cancelled while it waits for the old turn to finish gets its
-    CancelledError, after the turn has finished (and sent its turn_end)."""
+    """#221: a caller cancelled while it waits for the turn's chat.abort (5.0 PR 2b: only
+    that run's) gets its CancelledError, after the abort finished and the turn ended (its
+    turn_end sent)."""
     turn = await _running_turn(bridge, _stream_cancelled_slowly)
+    aborting, release = asyncio.Event(), asyncio.Event()
+    abort_run = bridge.orchestrator.abort_run.side_effect
 
+    async def slow_abort(sk, run_id):
+        aborting.set()
+        await release.wait()
+        await abort_run(sk, run_id)
+
+    bridge.orchestrator.abort_run.side_effect = slow_abort
     caller = asyncio.create_task(bridge.turns.cancel("cancelled"))
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(aborting.wait(), 2)
     caller.cancel()
+    await asyncio.sleep(0.01)
+    assert not caller.done(), "the abort was abandoned"
+    release.set()
     await asyncio.gather(caller, return_exceptions=True)
 
     assert caller.cancelled()
@@ -82,10 +97,10 @@ async def test_cancel_turn_caller_cancelled_while_waiting_is_not_swallowed(bridg
     assert [m["turn_id"] for m in (await sent(bridge)) if m["type"] == "turn_end"] == ["t-1"]
 
 
-async def test_inherited_cancellation_does_not_kill_the_barge_in_caller(bridge):
+async def test_inherited_cancellation_does_not_kill_the_cancel_caller(bridge):
     """#221: only a cancellation received *while waiting* is re-raised. A task that
     carries an older, swallowed cancellation (cancelling() > 0) still completes the
-    barge-in instead of dying in it."""
+    cancel instead of dying in it."""
     turn = await _running_turn(bridge)
 
     async def caller_with_inherited_cancel():
@@ -104,11 +119,12 @@ async def test_inherited_cancellation_does_not_kill_the_barge_in_caller(bridge):
     assert bridge.turns.user_task is None
 
 
-async def test_cancel_turn_logs_the_turn_failure_by_type(bridge, caplog):
+async def test_cancel_turn_logs_the_abort_failure_by_type(bridge, caplog):
+    """5.0 PR 2b: what can fail when a turn is cut is its run's chat.abort: logged by type,
+    never by its text; the turn still ends once."""
     started = asyncio.Event()
-    bridge.orchestrator.stream_response = _stream_cancelled_slowly(
-        started, finally_raises=RuntimeError("secreto del turno")
-    )
+    bridge.orchestrator.stream_response = blocking(started)
+    bridge.orchestrator.abort_run.side_effect = RuntimeError("secreto del turno")
     await start_turn(bridge)
     await asyncio.wait_for(started.wait(), 2)
     with caplog.at_level(logging.DEBUG):
@@ -131,6 +147,7 @@ async def test_cancel_after_the_turn_ended_returns_false(bridge):
     bridge.orchestrator.stream_response = done
     task = await start_turn(bridge)
     await asyncio.wait({task})
+    await bridge.turns.idle()  # 5.0: the session's turn ends after the channel's (its audio)
 
     assert await bridge.turns.cancel("cancelled") == (False, None)
 
@@ -148,21 +165,26 @@ async def test_cancel_cancels_the_running_turn(bridge):
 # ── _on_transcription ────────────────────────────────────────────────────────
 
 
-async def test_partial_below_threshold_forwarded_but_no_barge_in(bridge):
-    """Partials shorter than BARGE_IN_MIN_CHARS are forwarded to client but don't trigger barge-in."""
+@pytest.mark.parametrize("text", ["hi", "hello world", "a" * 200])
+async def test_partial_never_cancels(bridge, text):
+    """#406: a partial, however long, is forwarded to the client and cuts nothing: the turn
+    goes on, no turn_end, no chat.abort."""
     turn = await _running_turn(bridge)
     await sent(bridge)
     bridge.client_ws.sent.clear()
 
-    await bridge._on_transcription("hi", False)  # 2 chars
+    await bridge._on_transcription(text, False)
+    await asyncio.sleep(0.01)
 
-    assert await sent(bridge) == [{"type": "transcription_partial", "text": "hi"}]
+    assert await sent(bridge) == [{"type": "transcription_partial", "text": text}]
     assert not turn.done()
+    assert bridge.turns.user_task is turn
+    bridge.orchestrator.abort_run.assert_not_called()
     turn.cancel()
 
 
-async def test_partial_above_threshold_with_no_active_turn_forwarded_only(bridge):
-    """Partial above threshold but no active turn — forwarded to client, no barge-in needed."""
+async def test_partial_with_no_active_turn_forwarded_only(bridge):
+    """A partial with no turn in flight is forwarded to the client and starts nothing."""
 
     await bridge._on_transcription("hello world", False)
 
@@ -171,7 +193,7 @@ async def test_partial_above_threshold_with_no_active_turn_forwarded_only(bridge
 
 
 async def test_partial_does_not_call_orchestrator(bridge):
-    """Partials — regardless of threshold — never call the orchestrator."""
+    """Partials never call the orchestrator."""
     calls = []
 
     async def s(*a, **k):
@@ -238,16 +260,47 @@ async def test_final_does_not_start_active_turn(bridge):
     assert [m["type"] for m in await sent(bridge)] == ["transcription"]
 
 
-async def test_final_cancels_previous_active_turn(bridge):
-    """Final transcription cancels any in-progress turn but does NOT start a new one."""
+async def test_final_transcription_does_not_cut_the_turn(bridge):
+    """#406 (was: the final cancelled the turn in flight): the final goes to the client and
+    the turn goes on; what was said joins the queue when the client sends it."""
     old_turn = await _running_turn(bridge)
+    await sent(bridge)
+    bridge.client_ws.sent.clear()
 
     await bridge._on_transcription("nueva frase", True)
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.01)
 
-    assert old_turn.cancelled()
-    assert bridge.turns.user_task is None
-    assert [m["type"] for m in await sent(bridge)][-2:] == ["turn_end", "transcription"]
+    assert await sent(bridge) == [{"type": "transcription", "text": "nueva frase"}]
+    assert not old_turn.done()
+    assert bridge.turns.user_task is old_turn
+    bridge.orchestrator.abort_run.assert_not_called()
+    old_turn.cancel()
+
+
+async def test_final_transcription_does_not_cut_push(make_bridge):
+    """#406 (was: a final cut this session's copy of a push): an open push goes on, here and
+    in its channel; the session still gets exactly one turn_end for it when it ends."""
+    sk = "agent:main:hab_sito"
+    bridge, ws = make_bridge(**_AUDIO, transcriber=_transcriber(), client_id="hab_sito")
+    await push(bridge, ("turn_start", sk), ("chat", {"sessionKey": sk, "deltaText": "Hola"}))
+    assert bridge.turns.snapshot(0.0)["turn"]["kind"] == "push"
+
+    await bridge._on_transcription("para ya", False)
+    await bridge._on_transcription("para ya", True)
+    await asyncio.sleep(0.01)
+
+    assert ws.of("turn_end") == []
+    assert bridge.turns.snapshot(0.0)["turn"]["kind"] == "push"
+    bridge.orchestrator.abort_run.assert_not_called()
+    await push(bridge, ("turn_end", sk))
+    msgs = [m for m in await sent(bridge) if isinstance(m, dict)]
+    assert [m["type"] for m in msgs if m["type"] in ("turn_start", "turn_end")] == [
+        "turn_start", "turn_end"
+    ]
+    assert ws.of("turn_end")[0]["reason"] == "done"
+    assert [m["type"] for m in msgs if m["type"].startswith("transcription")] == [
+        "transcription_partial", "transcription"
+    ]
 
 
 async def test_final_with_disconnected_client_does_not_start_turn(make_bridge):
@@ -259,8 +312,8 @@ async def test_final_with_disconnected_client_does_not_start_turn(make_bridge):
     assert bridge.turns.user_task is None
 
 
-async def test_barge_in_interrupted_send_failure_is_silent(make_bridge):
-    """If interrupted send fails, no exception propagates."""
+async def test_partial_send_failure_is_silent(make_bridge):
+    """If forwarding a partial fails (the client is gone), no exception propagates."""
     bridge, _ = make_bridge(**_AUDIO, transcriber=_transcriber(), sender=GoneSender())
     started = asyncio.Event()
 
@@ -291,53 +344,23 @@ async def test_close_all_ends_the_active_turn(bridge):
     assert bridge.turns.last_ended.end_reason == "closed"
 
 
-@pytest.mark.parametrize(
-    ("config", "text", "barges"),
-    [
-        pytest.param(ClientConfig(), "hello world", True, id="default-threshold"),
-        pytest.param(ClientConfig(barge_in_min_chars=5), "a" * 5, True, id="exactly-min-chars"),
-        pytest.param(ClientConfig(barge_in_min_chars=5), "a" * 4, False, id="one-below-min"),
-        pytest.param(ClientConfig(barge_in_min_chars=3), "hola", True, id="custom-threshold"),
-        # config.barge_in_min_chars, not settings.BARGE_IN_MIN_CHARS
-        pytest.param(ClientConfig(barge_in_min_chars=50), "hello world", False, id="config-not-global"),
-        # #108: disabled -> partial still forwarded, no cancellation, no turn_end
-        pytest.param(
-            ClientConfig(barge_in_enabled=False, barge_in_min_chars=3), "hola mundo", False, id="disabled"
-        ),
-    ],
-)
-async def test_partial_with_active_turn_barges_in_from_the_client_threshold(
-    make_bridge, config, text, barges
-):
-    bridge, ws = make_bridge(**_AUDIO, transcriber=_transcriber(), config=config)
-    turn = await _running_turn(bridge)
-    await sent(bridge)
-    ws.sent.clear()
-
-    await bridge._on_transcription(text, False)
-
-    msgs = [m for m in await sent(bridge) if isinstance(m, dict)]
-    assert msgs[0] == {"type": "transcription_partial", "text": text}
-    # M19: the barge-in is the turn_end's reason; there is no separate `interrupted` message.
-    expected = [{"type": "turn_end", "turn_id": "t-1", "reason": "interrupted"}]
-    assert msgs[1:] == (expected if barges else [])
-    assert turn.cancelled() is barges
-    assert (bridge.turns.user_task is None) is barges
-    turn.cancel()
-
-
-async def test_barge_in_before_turn_start_still_gives_the_send_its_pair(make_bridge):
-    """A send cancelled before its task started still gets its turn_start/turn_end pair
-    (auditoría 3.0 ronda 2, G-r2-1), ended `interrupted`."""
+async def test_partial_before_turn_start_keeps_the_send(make_bridge):
+    """#406 (was: a barge-in before turn_start withdrew the send): a delivered message whose
+    run has not started stays delivered; nothing is aborted."""
     bridge, ws = make_bridge(**_AUDIO, transcriber=_transcriber())
     bridge.orchestrator.stream_response = blocking()
-    await bridge.turns.start_user_turn("x")  # the task has not run yet
+    await bridge.turns.start_user_turn("x")  # its run has not sent anything yet
 
     await bridge._on_transcription("hello world", False)
+    await bridge._on_transcription("hello world", True)
 
     msgs = [m for m in await sent(bridge) if isinstance(m, dict)]
-    assert [m["type"] for m in msgs] == ["transcription_partial", "turn_start", "turn_end"]
-    assert msgs[2] == {"type": "turn_end", "turn_id": "t-1", "reason": "interrupted"}
+    assert [m["state"] for m in ws.of("message")] == ["delivered"]
+    assert [m["type"] for m in msgs if m["type"].startswith("transcription")] == [
+        "transcription_partial", "transcription"
+    ]
+    bridge.orchestrator.abort_run.assert_not_called()
+    await bridge.close_all()
 
 
 # ── _on_transcriber_warning ──────────────────────────────────────────────────

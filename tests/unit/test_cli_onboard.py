@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -55,7 +56,7 @@ def gw(monkeypatch, tmp_path, use_api):
     for name in ENV:
         monkeypatch.delenv(name, raising=False)
     st = SimpleNamespace(calls=[], verdicts={}, detected=None, env=base / "config.env",
-                         db=base / "data" / "gateway.db", active=True)
+                         db=base / "data" / "gateway.db", active=True, local_token=None)
     st.db.parent.mkdir()
     st.db.touch()
 
@@ -72,7 +73,7 @@ def gw(monkeypatch, tmp_path, use_api):
         if not st.db.exists():  # como el real: sin BD no instala
             raise ApiError("No existe la base de datos.", 1)
         service.unit_path().parent.mkdir(parents=True, exist_ok=True)
-        service.unit_path().write_text("[Unit]\n")
+        own_unit()
 
     def fake_verb(ctx, verb, state, wait):
         st.calls.append(verb)
@@ -104,12 +105,18 @@ def gw(monkeypatch, tmp_path, use_api):
     for name in ("verify_openclaw", "verify_fogar_stt", "verify_fogar_tts", "verify_elevenlabs"):
         monkeypatch.setattr(verify, name, verifier(name))
     monkeypatch.setattr(verify, "detect_openclaw", detect)
+
+    def read_token():
+        st.calls.append("read_openclaw_token")
+        return st.local_token
+
+    monkeypatch.setattr(verify, "read_openclaw_token", read_token)
     # Con terminal, el asistente acaba esperando al dashboard: aquí ya hay uno conectado.
-    st.api = use_api(FakeApi({("GET", "/admin/clients"): [],
+    st.api = use_api(FakeApi({("GET", "/home/devices"): [],
                               # M20: ya hay dueño (sus tests propios, abajo, lo quitan).
-                              ("GET", "/admin/users"): [OWNER],
-                              ("POST", "/admin/clients"): {**CLIENT, "client_key": CLIENT_KEY},
-                              ("GET", "/admin/state"): {"gateway": {"dashboards": 1}}}))
+                              ("GET", "/home/users"): [OWNER],
+                              ("POST", "/home/devices"): {**CLIENT, "client_key": CLIENT_KEY},
+                              ("GET", "/system/state"): {"gateway": {"dashboards": 1}}}))
     monkeypatch.setattr(onboard_mod, "_enter_pressed", lambda timeout: True)  # nunca espera
     # El paso de acceso tiene sus tests (test_cli_access_setup.py): aquí solo se anota, con
     # lo que ya había pasado (para comprobar el orden).
@@ -157,6 +164,14 @@ def write_answers(tmp_path, mode=0o600, **over):
     path.write_text(json.dumps(data))
     path.chmod(mode)
     return path
+
+
+def own_unit(home=None):
+    """La unidad del servicio, como la escribe `install`, para `home` (por defecto, esta base)."""
+    from fogar_gateway import paths
+
+    service.unit_path().write_text(
+        service.render_unit(Path("/opt/fogar-gw"), home or paths.home()))
 
 
 def run(*args):
@@ -207,7 +222,7 @@ def test_onboard_happy_path_answers_file(gw, tmp_path):
         ("verify_elevenlabs", "tts", EL_KEY),
         "install",
     ]
-    assert ("POST", "/admin/clients", {"name": "smoke", "client_type": "web"}) in gw.api.calls
+    assert ("POST", "/home/devices", {"name": "smoke", "client_type": "web"}) in gw.api.calls
     assert r.output.count(CLIENT_KEY) == 1  # la clave, una sola vez
     assert "Recomendado: deja este servicio accesible solo desde el gateway." in r.output
     assert "aviso del doctor" in r.output  # el doctor solo informa: no cambia el código
@@ -237,7 +252,7 @@ def test_onboard_voice_off_writes_off(gw, tmp_path):
 def test_onboard_rerun_restarts_not_installs(gw, tmp_path):
     gw.env.write_text(f"ADMIN_TOKEN={ADMIN}\n")
     service.unit_path().parent.mkdir(parents=True)
-    service.unit_path().write_text("[Unit]\n")
+    own_unit()
     r = onboard(write_answers(tmp_path))
     assert r.exit_code == 0, r.output
     assert installs(gw) == ["restart"]
@@ -247,7 +262,7 @@ def test_onboard_rerun_restarts_not_installs(gw, tmp_path):
 @pytest.mark.parametrize("why", ["clients_exist", "first_client_null"])
 def test_onboard_skips_first_client_when_clients_exist(gw, tmp_path, why):
     if why == "clients_exist":
-        gw.api.responses[("GET", "/admin/clients")] = [CLIENT]
+        gw.api.responses[("GET", "/home/devices")] = [CLIENT]
         path = write_answers(tmp_path)
     else:
         path = write_answers(tmp_path, first_client=None)
@@ -520,6 +535,99 @@ def test_interactive_ctrl_c_at_voice_keeps_openclaw(gw, tty):
     assert installs(gw) == []
 
 
+# --- #436: el token del OpenClaw de este equipo se lee solo ---------------------------------
+
+
+def test_local_openclaw_token_is_read_not_asked(gw, tty):
+    gw.env.write_text(f"ADMIN_TOKEN={ADMIN}\n")
+    gw.detected = ""
+    gw.local_token = OC_TOKEN
+    r = run("onboard")  # y Ctrl+C en el STT
+    assert_cancelled(r)
+    assert "He leído el token de OpenClaw de este equipo." in r.output
+    assert "auth-token" not in r.output and OC_TOKEN not in r.output
+    assert asked(tty, "password", "OpenClaw") == []
+    assert ("verify_openclaw", "127.0.0.1", 18789, OC_TOKEN) in gw.calls
+    assert dotenv_values(gw.env)["OPENCLAW_TOKEN"] == OC_TOKEN
+
+
+def test_local_openclaw_token_unreadable_is_asked(gw, tty):
+    gw.env.write_text(f"ADMIN_TOKEN={ADMIN}\n")
+    gw.detected = ""
+    tty.queue.append(OC_TOKEN)
+    r = run("onboard")
+    assert_cancelled(r)
+    assert gw.calls.count("read_openclaw_token") == 1
+    assert "`openclaw gateway auth-token --show`" in r.output
+    assert len(asked(tty, "password", "OpenClaw")) == 1
+    assert dotenv_values(gw.env)["OPENCLAW_TOKEN"] == OC_TOKEN
+
+
+def test_local_openclaw_token_rejected_then_asked(gw, tty):
+    gw.env.write_text(f"ADMIN_TOKEN={ADMIN}\n")
+    gw.detected = ""
+    gw.local_token = "token-leido-viejo"
+    gw.verdicts["verify_openclaw"] = [Verdict(False, "rejected", "OpenClaw rechazó el token."),
+                                      Verdict(True, "ok", "OpenClaw acepta el token.")]
+    tty.queue.extend(["change", OC_TOKEN])
+    r = run("onboard")
+    assert_cancelled(r)
+    assert gw.calls.count("read_openclaw_token") == 1  # el reintento ya es a mano
+    assert [c[3] for c in gw.calls if isinstance(c, tuple)] == ["token-leido-viejo", OC_TOKEN]
+    assert dotenv_values(gw.env)["OPENCLAW_TOKEN"] == OC_TOKEN
+    assert "token-leido-viejo" not in r.output
+
+
+def test_openclaw_not_found_never_reads_the_token(gw, tty):
+    gw.env.write_text(f"ADMIN_TOKEN={ADMIN}\n")
+    gw.local_token = OC_TOKEN
+    tty.queue.extend(["127.0.0.1", "18789", OC_TOKEN])
+    assert_cancelled(run("onboard"))
+    assert "read_openclaw_token" not in gw.calls
+
+
+def fake_openclaw(tmp_path, monkeypatch, body):
+    """Un `openclaw` en un PATH propio (y un HOME sin ~/.npm-global ni ~/.openclaw)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    exe = bin_dir / "openclaw"
+    exe.write_text(f"#!/bin/sh\n{body}\n")
+    exe.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+
+def test_read_token_runs_openclaw_in_a_terminal(tmp_path, monkeypatch):
+    # Como OpenClaw: se niega sin TTY en stdin y stdout; con TTY, banner, colores y \r\n.
+    fake_openclaw(tmp_path, monkeypatch, '[ -t 0 ] && [ -t 1 ] || exit 1\n'
+                  '[ "$*" = "gateway auth-token --show" ] || exit 2\n'
+                  "printf '\\033[1mOpenClaw 2026.11.7\\033[0m\\n'\nprintf 'tok-AbC_123\\n'")
+    assert verify.read_openclaw_token() == "tok-AbC_123"
+
+
+@pytest.mark.parametrize("body", ["echo 'Gateway auth token failed' && exit 1", "exit 0",
+                                  "echo 'dos palabras'"])
+def test_read_token_failure_is_none(tmp_path, monkeypatch, body):
+    fake_openclaw(tmp_path, monkeypatch, body)
+    assert verify.read_openclaw_token() is None
+
+
+def test_read_token_timeout_is_none(tmp_path, monkeypatch):
+    fake_openclaw(tmp_path, monkeypatch, "sleep 30")
+    monkeypatch.setattr(verify, "TOKEN_READ_TIMEOUT_S", 0.5)
+    assert verify.read_openclaw_token() is None
+
+
+def test_read_token_finds_npm_global(tmp_path, monkeypatch):
+    fake_openclaw(tmp_path, monkeypatch, "echo tok-npm")
+    npm = tmp_path / ".npm-global" / "bin"
+    npm.mkdir(parents=True)
+    (tmp_path / "bin" / "openclaw").rename(npm / "openclaw")
+    assert verify.read_openclaw_token() == "tok-npm"
+    (npm / "openclaw").unlink()
+    assert verify.read_openclaw_token() is None  # ni en el PATH ni en las rutas conocidas
+
+
 def test_menu_entry_runs_onboard(monkeypatch, tty):
     calls = []
     monkeypatch.setattr(menu, "interactive", lambda: True)
@@ -573,7 +681,7 @@ def _tts_already_on_elevenlabs(gw):
 
 def test_new_stt_key_is_verified_for_an_elevenlabs_tts_interactive(gw, tty):
     _tts_already_on_elevenlabs(gw)
-    gw.api.responses[("GET", "/admin/clients")] = [CLIENT]
+    gw.api.responses[("GET", "/home/devices")] = [CLIENT]
     gw.verdicts["verify_elevenlabs"] = [
         Verdict(True, "ok", "ElevenLabs acepta la clave."),                 # STT
         Verdict(False, "rejected", "ElevenLabs rechazó la clave."),         # la misma, para el TTS
@@ -653,8 +761,8 @@ def test_no_tts_check_when_the_key_does_not_change(gw, tmp_path):
 def test_interactive_rerun_asks_before_restarting(gw, tty, yes):
     gw.env.write_text(f"ADMIN_TOKEN={ADMIN}\n")
     service.unit_path().parent.mkdir(parents=True)
-    service.unit_path().write_text("[Unit]\n")
-    gw.api.responses[("GET", "/admin/clients")] = [CLIENT]
+    own_unit()
+    gw.api.responses[("GET", "/home/devices")] = [CLIENT]
     tty.queue.extend(["127.0.0.1", "18789", OC_TOKEN, "off", "off", yes])
     r = run("onboard")
     assert r.exit_code == 0, r.output
@@ -668,7 +776,7 @@ def test_interactive_rerun_asks_before_restarting(gw, tty, yes):
 def test_answers_rerun_restarts_without_asking(gw, tty, tmp_path):
     gw.env.write_text(f"ADMIN_TOKEN={ADMIN}\n")
     service.unit_path().parent.mkdir(parents=True)
-    service.unit_path().write_text("[Unit]\n")
+    own_unit()
     r = onboard(write_answers(tmp_path))
     assert r.exit_code == 0, r.output
     assert tty.asked == [] and installs(gw) == ["restart"]
@@ -739,7 +847,7 @@ def test_answers_never_show_the_admin_token(gw, tmp_path, monkeypatch):
     assert ADMIN not in r.output
     assert f"{gw.env}) es para la CLI" in r.output and "`fogar-gw token`" in r.output
     assert "tu usuario «sito» y tu contraseña" in r.output  # M20: se entra con la cuenta
-    assert ("GET", "/admin/state", None) not in gw.api.calls  # sin terminal no espera
+    assert ("GET", "/system/state", None) not in gw.api.calls  # sin terminal no espera
 
 
 @pytest.mark.parametrize("terminal", [False, True])
@@ -760,8 +868,8 @@ def test_the_dashboard_is_entered_with_the_account_never_the_token(gw, tty, monk
 
 
 def _no_owner(gw, created_username="ana"):
-    gw.api.responses[("GET", "/admin/users")] = []
-    gw.api.responses[("POST", "/admin/users")] = {**OWNER, "username": created_username}
+    gw.api.responses[("GET", "/home/users")] = []
+    gw.api.responses[("POST", "/home/users")] = {**OWNER, "username": created_username}
 
 
 def test_answers_create_the_owner(gw, tmp_path):
@@ -769,7 +877,7 @@ def test_answers_create_the_owner(gw, tmp_path):
     owner = {"username": "ana", "display_name": "Ana", "password": "contraseña larga"}
     r = onboard(write_answers(tmp_path, owner=owner))
     assert r.exit_code == 0, r.output
-    assert ("POST", "/admin/users", {**owner, "role": "owner"}) in gw.api.calls
+    assert ("POST", "/home/users", {**owner, "role": "owner"}) in gw.api.calls
     assert "contraseña larga" not in r.output
     assert "tu usuario «ana»" in r.output
 
@@ -778,7 +886,7 @@ def test_answers_without_owner_only_warn(gw, tmp_path):
     _no_owner(gw)
     r = onboard(write_answers(tmp_path))
     assert r.exit_code == 0, r.output
-    assert not [c for c in gw.api.calls if c[:2] == ("POST", "/admin/users")]
+    assert not [c for c in gw.api.calls if c[:2] == ("POST", "/home/users")]
     assert "fogar-gw users add NOMBRE --role owner" in r.output
 
 
@@ -807,7 +915,7 @@ def test_interactive_creates_the_owner_and_retries_on_mismatch(gw, tty, monkeypa
     r = run("onboard")
     assert r.exit_code == 0, r.output
     assert "No coinciden" in r.output
-    posts = [c[2] for c in gw.api.calls if c[:2] == ("POST", "/admin/users")]
+    posts = [c[2] for c in gw.api.calls if c[:2] == ("POST", "/home/users")]
     assert posts == [{"username": "ana.g", "display_name": "Ana.G", "password": "contraseña larga",
                       "role": "owner"}]
     assert "contraseña larga" not in r.output
@@ -815,7 +923,7 @@ def test_interactive_creates_the_owner_and_retries_on_mismatch(gw, tty, monkeypa
 
 @pytest.mark.parametrize("how", ["enter", "ctrl_c"])
 def test_interactive_wait_for_the_dashboard_can_be_skipped(gw, tty, monkeypatch, how):
-    gw.api.responses[("GET", "/admin/state")] = {"gateway": {"dashboards": 0}}
+    gw.api.responses[("GET", "/system/state")] = {"gateway": {"dashboards": 0}}
     polls = []
 
     def pressed(timeout):
@@ -840,7 +948,7 @@ def test_interactive_waits_until_a_dashboard_connects(gw, tty, monkeypatch):
         calls = gw.api.calls
 
         def request(self, method, path, body=None):
-            if path != "/admin/state":
+            if path != "/system/state":
                 return gw.api.request(method, path, body)
             state = states.pop(0)
             if state is None:
@@ -904,8 +1012,8 @@ def _configured_rerun(gw, env=CONFIGURED):
     """Un relanzamiento: config.env ya escrito, servicio instalado y clientes creados."""
     gw.env.write_text(env)
     service.unit_path().parent.mkdir(parents=True)
-    service.unit_path().write_text("[Unit]\n")
-    gw.api.responses[("GET", "/admin/clients")] = [CLIENT]
+    own_unit()
+    gw.api.responses[("GET", "/home/devices")] = [CLIENT]
 
 
 def test_interactive_rerun_keeps_everything_by_default(gw, tty):
@@ -1118,3 +1226,44 @@ def test_dashboard_waits_on_the_recommended_url_or_none(gw, tty, monkeypatch, st
     r = run("onboard")
     assert r.exit_code == 0, r.output
     assert "gw.example.com" in r.output and seen == [expected]
+
+
+# --- sin servicio o con la unidad de otra base (prueba en vivo 2026-11-25) ----------------
+
+
+@pytest.mark.parametrize("how", ["flag", "answers"])
+def test_no_service_skips_install_and_restart(gw, tmp_path, monkeypatch, how):
+    """--no-service (o `"service": false`): ni systemd ni la unidad; sigue contra --url."""
+    from fogar_gateway.cli.api import ApiError
+
+    def no_systemd():
+        raise ApiError("Este comando necesita Linux con systemd.", 1)
+
+    monkeypatch.setattr(service, "require_systemd", no_systemd)
+    service.unit_path().parent.mkdir(parents=True)
+    own_unit(tmp_path / "produccion")  # la de otro gateway: ni se mira
+    if how == "flag":
+        r = run("--url", "http://127.0.0.1:8014", "onboard", "--no-service", "--answers",
+                str(write_answers(tmp_path)))
+    else:
+        r = run("--url", "http://127.0.0.1:8014", "onboard", "--answers",
+                str(write_answers(tmp_path, service=False)))
+    assert r.exit_code == 0, r.output
+    assert installs(gw) == [] and "http://127.0.0.1:8014" in r.output
+    assert ":8014/ws/stream" in r.output and ":8004" not in r.output  # el final, también
+    assert dotenv_values(gw.env)["OPENCLAW_TOKEN"] == OC_TOKEN  # los demás pasos, igual
+    assert ("POST", "/home/devices") in [c[:2] for c in gw.api.calls]
+
+
+@pytest.mark.parametrize("unit_home", ["other", "missing"])
+def test_unit_of_another_base_is_refused_before_asking(gw, tty, tmp_path, unit_home):
+    """La unidad es de otra base (o sin FOGAR_GATEWAY_HOME, la de por defecto): ni se instala
+    ni se reinicia, y se dice antes de crear o preguntar nada."""
+    service.unit_path().parent.mkdir(parents=True)
+    if unit_home == "other":
+        own_unit(tmp_path / "produccion")
+    else:
+        service.unit_path().write_text("[Unit]\n")
+    for r in (run("onboard"), onboard(write_answers(tmp_path))):
+        assert r.exit_code == 1 and "otra base" in r.output and "--no-service" in r.output
+    assert gw.calls == [] and tty.asked == [] and not gw.env.exists()

@@ -1,8 +1,11 @@
+import json
 import uuid
 from datetime import UTC, date, datetime
 
-from sqlalchemy import DDL, ForeignKeyConstraint, Index, UniqueConstraint, event
+from sqlalchemy import DDL, ForeignKey, ForeignKeyConstraint, Index, UniqueConstraint, event
 from sqlmodel import Field, SQLModel
+
+from fogar_gateway.services.scopes import DEFAULT_SCOPES, to_list
 
 
 def _gen_uuid() -> str:
@@ -12,17 +15,29 @@ def _gen_uuid() -> str:
 # shortcut: un solo hogar por gateway (M20); su id es fijo y es el valor por defecto de
 # `home_id`. Cuando haya varios hogares (Cloud), cada alta tendrá que decir el suyo.
 DEFAULT_HOME_ID = "home"
+DEFAULT_SCOPES_JSON = json.dumps(to_list(DEFAULT_SCOPES))
 DEFAULT_HOME_NAME = "Mi hogar"
 
 
 class HomeRecord(SQLModel, table=True):
-    """El hogar (M20). `agent`: el que atiende lo común; NULL = la cascada de siempre."""
+    """El hogar (M20). `agent`: el que atiende lo común; NULL = la cascada de siempre.
+    `notify_client_id` (5.0, #407): el dispositivo de avisos de lo común, cualquier aparato activo
+    del hogar; NULL = ninguno. Retirar el aparato lo pone a NULL (`retire_client`)."""
 
     __tablename__ = "homes"
 
     id: str = Field(default_factory=_gen_uuid, primary_key=True)
     name: str
     agent: str | None = Field(default=None)
+    # `use_alter`: `clients` apunta a `homes` y esto a `clients`; sin él SQLAlchemy no ordena el
+    # ciclo (en SQLite la restricción sigue en línea, dentro del CREATE TABLE).
+    notify_client_id: str | None = Field(
+        default=None,
+        sa_column_args=[ForeignKey(
+            "clients.id", ondelete="SET NULL", use_alter=True,
+            name="fk_homes_notify_client_id_clients",
+        )],
+    )
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -42,7 +57,8 @@ class UserRecord(SQLModel, table=True):
 
 class MembershipRecord(SQLModel, table=True):
     """Usuario ↔ hogar con su rol (`owner`, `admin`, `member`) y su agente (NULL = el del
-    hogar)."""
+    hogar). `notify_client_id` (5.0, #407): su dispositivo de avisos, solo uno de sus aparatos
+    personales activos (un aviso privado nunca llega a un aparato del hogar); NULL = ninguno."""
 
     __tablename__ = "memberships"
 
@@ -50,6 +66,12 @@ class MembershipRecord(SQLModel, table=True):
     home_id: str = Field(foreign_key="homes.id", primary_key=True, ondelete="CASCADE")
     role: str
     agent: str | None = Field(default=None)
+    notify_client_id: str | None = Field(
+        default=None,
+        sa_column_args=[ForeignKey(
+            "clients.id", ondelete="SET NULL", name="fk_memberships_notify_client_id_clients"
+        )],
+    )
 
 
 class ClientRecord(SQLModel, table=True):
@@ -73,6 +95,9 @@ class ClientRecord(SQLModel, table=True):
     default_agent: str | None = Field(default=None)
     allowed_agents: str | None = Field(default=None)  # JSON list serializado
     capabilities: str | None = Field(default=None)  # JSON list serializado
+    # 5.0 (#410): los scopes concedidos, expandidos (services/scopes.py); JSON list serializado.
+    # Lo efectivo es esto ∩ el tope de hoy (rol de su persona o el del hogar).
+    scopes: str = Field(default=DEFAULT_SCOPES_JSON)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     last_seen_at: datetime | None = Field(default=None)
     retired_at: datetime | None = Field(default=None)
@@ -82,11 +107,8 @@ class ClientRecord(SQLModel, table=True):
     stt_vad_thold: float = Field(default=0.0)
     tts_voice: str = Field(default="af_heart")
     tts_speed: float = Field(default=1.0)
-    barge_in_enabled: bool = Field(default=True)
-    barge_in_min_chars: int = Field(default=5)
     output_mode: str | None = Field(default=None)  # JSON list, e.g. '["audio","text"]'
     silence_timeout_s: float = Field(default=2.0)
-    max_silence_turns: int = Field(default=3)
     push_enabled: bool = Field(default=True)
     tool_calls_enabled: bool = Field(default=False)
 
@@ -127,8 +149,10 @@ class ConversationRecord(SQLModel, table=True):
 
 
 # El hogar existe siempre: lo crea la migración inicial y, para `create_all` (tests), este DDL.
+# Tras crear `clients`, no `homes`: con foreign_keys=ON, SQLite no deja escribir en `homes`
+# mientras no exista la tabla a la que apunta `notify_client_id` (y `clients` va detrás de `homes`).
 event.listen(
-    HomeRecord.__table__,  # type: ignore[attr-defined]
+    ClientRecord.__table__,  # type: ignore[attr-defined]
     "after_create",
     DDL(f"INSERT INTO homes (id, name, created_at) VALUES "
         f"('{DEFAULT_HOME_ID}', '{DEFAULT_HOME_NAME}', CURRENT_TIMESTAMP)"),

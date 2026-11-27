@@ -1,7 +1,7 @@
 """
 admin_schemas.py
 ~~~~~~~~~~~~~~~~
-Schemas Pydantic para la API de administración /admin/clients/*.
+Schemas Pydantic para la API de administración /home/devices/*.
 
 Separados de schemas.py (modelos runtime del bridge) para no mezclar
 contratos internos con la interfaz HTTP de administración.
@@ -17,6 +17,10 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 from fogar_gateway.core.session_key import AGENT_ID_PATTERN
 from fogar_gateway.db.models import ClientRecord
 from fogar_gateway.models.schemas import CREDENTIAL_MAX_LEN, Capabilities, OutputMode
+from fogar_gateway.services.scopes import Scope
+
+# Scopes pedidos o concedidos (#410): sin repetir de más; `write`/`admin` incluyen su `read`.
+Scopes = Annotated[list[Scope], Field(max_length=8)]
 
 # Etiqueta de cliente. Solo se valida la ENTRADA (create/update/CLI); la respuesta
 # sigue siendo `str` para no romper la lectura de filas antiguas con valores libres (#122).
@@ -38,8 +42,6 @@ AgentName = Annotated[
 _VadThold = Annotated[float, Field(ge=0.0, le=1.0)]
 _Speed = Annotated[float, Field(gt=0.0, le=10.0)]
 _Seconds = Annotated[float, Field(gt=0.0, le=86_400.0)]
-_MinChars = Annotated[int, Field(ge=1, le=10_000)]
-_Turns = Annotated[int, Field(ge=1, le=10_000)]
 
 # Campos de PATCH que mapean a columnas NOT NULL: `null` explícito -> 422.
 _NOT_NULL_UPDATE_FIELDS = (
@@ -49,12 +51,10 @@ _NOT_NULL_UPDATE_FIELDS = (
     "stt_vad_thold",
     "tts_voice",
     "tts_speed",
-    "barge_in_enabled",
-    "barge_in_min_chars",
     "silence_timeout_s",
-    "max_silence_turns",
     "push_enabled",
     "tool_calls_enabled",
+    "scopes",
 )
 
 
@@ -71,13 +71,13 @@ class ClientCreate(BaseModel):
     stt_vad_thold: _VadThold = 0.0
     tts_voice: _Text = "af_heart"
     tts_speed: _Speed = 1.0
-    barge_in_enabled: bool = True
-    barge_in_min_chars: _MinChars = 5
     output_mode: list[OutputMode] | None = None
     silence_timeout_s: _Seconds = 2.0
-    max_silence_turns: _Turns = 3
     push_enabled: bool = True
     tool_calls_enabled: bool = False
+    # 5.0 (#410): los permisos que se le conceden; sin ellos, `conversations:write`. Un aparato
+    # del hogar llega como mucho a `home:read` (422 `scope_not_allowed`).
+    scopes: Scopes | None = None
 
 
 class ClientUpdate(BaseModel):
@@ -98,13 +98,11 @@ class ClientUpdate(BaseModel):
     stt_vad_thold: _VadThold | None = None
     tts_voice: _Text | None = None
     tts_speed: _Speed | None = None
-    barge_in_enabled: bool | None = None
-    barge_in_min_chars: _MinChars | None = None
     output_mode: list[OutputMode] | None = None
     silence_timeout_s: _Seconds | None = None
-    max_silence_turns: _Turns | None = None
     push_enabled: bool | None = None
     tool_calls_enabled: bool | None = None
+    scopes: Scopes | None = None
 
     @model_validator(mode="after")
     def _reject_null_for_not_null_columns(self) -> "ClientUpdate":
@@ -129,16 +127,14 @@ class ClientResponse(BaseModel):
     user_id: str | None = None
     capabilities: list[str] | None = None
     last_seen_at: datetime | None = None
+    scopes: list[str] = []  # concedidos (#410); lo efectivo los recorta el rol de su persona
     # Pipeline config
     stt_language: str
     stt_vad_thold: float
     tts_voice: str
     tts_speed: float
-    barge_in_enabled: bool
-    barge_in_min_chars: int
     output_mode: list[str] | None
     silence_timeout_s: float
-    max_silence_turns: int
     push_enabled: bool
     tool_calls_enabled: bool
 
@@ -158,18 +154,25 @@ class ClientResponse(BaseModel):
             user_id=r.user_id,
             capabilities=json.loads(r.capabilities) if r.capabilities else None,
             last_seen_at=r.last_seen_at,
+            scopes=_stored_scopes(r.scopes),
             stt_language=r.stt_language,
             stt_vad_thold=r.stt_vad_thold,
             tts_voice=r.tts_voice,
             tts_speed=r.tts_speed,
-            barge_in_enabled=r.barge_in_enabled,
-            barge_in_min_chars=r.barge_in_min_chars,
             output_mode=json.loads(r.output_mode) if r.output_mode else None,
             silence_timeout_s=r.silence_timeout_s,
-            max_silence_turns=r.max_silence_turns,
             push_enabled=r.push_enabled,
             tool_calls_enabled=r.tool_calls_enabled,
         )
+
+
+def _stored_scopes(raw: str) -> list[str]:
+    """Para enseñar: una fila con JSON roto no concede nada (db_client tampoco)."""
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return []
+    return sorted(str(v) for v in value) if isinstance(value, list) else []
 
 
 class ClientWithKey(ClientResponse):
@@ -203,6 +206,9 @@ class PairRequest(BaseModel):
     name: _Name | None = None
     client_type: ClientType | None = None
     output_mode: list[OutputMode] | None = None
+    # Los que pide (#410); se concede lo pedido ∩ lo que aprobó el administrador en el código.
+    # Sin la lista, lo aprobado.
+    scopes: Scopes | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -236,13 +242,28 @@ class UserUpdate(BaseModel):
     is_active: bool | None = None
 
 
+# El id de un dispositivo (un UUID). Que exista y valga lo comprueba el gateway
+# (services/notify_device.py).
+NotifyClientId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
+
+
 class HomeUpdate(BaseModel):
-    """`PATCH /admin/home`: `agent: null` vuelve a la cascada de siempre."""
+    """`PATCH /home`: `agent: null` vuelve a la cascada de siempre; `notify_client_id`, el
+    dispositivo de avisos del hogar (`null` lo quita)."""
 
     model_config = ConfigDict(extra="forbid")
 
     name: _Name | None = None
     agent: AgentName | None = None
+    notify_client_id: NotifyClientId | None = None
+
+
+class MeUpdate(BaseModel):
+    """`PATCH /auth/me`: el dispositivo de avisos de la persona (`null` lo quita)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    notify_client_id: NotifyClientId | None = None
 
 
 class PasswordSet(BaseModel):
@@ -257,6 +278,9 @@ class LoginRequest(BaseModel):
     device_name: _Name
     client_type: ClientType | None = None
     capabilities: Capabilities | None = None
+    # Los que pide este aparato (#410); se concede lo pedido ∩ el tope del rol de la persona.
+    # Sin la lista, `conversations:write`.
+    scopes: Scopes | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -266,17 +290,39 @@ class LoginRequest(BaseModel):
 # Parámetros de las rutas (FastAPI valida Path/Query, no un Field suelto).
 ConversationIdPath = Annotated[str, Path(min_length=1, max_length=200)]
 ClientIdFilter = Annotated[str | None, Query(min_length=1, max_length=200)]
-# Mensajes de `GET /admin/conversations/{id}/messages` (el tope de `chat.history` es 1000).
+# Mensajes de `GET /conversations/{id}/messages` (el tope de `chat.history` es 1000).
 HistoryLimit = Annotated[int, Query(ge=1, le=1000)]
 
 
 class ConversationCreate(BaseModel):
-    """`POST /admin/conversations`: una conversación nueva del usuario, de su dispositivo. Sin
+    """`POST /conversations`: una conversación nueva del usuario, de su dispositivo. Sin
     `agent`, el de la cascada (`default_agent` del dispositivo, `DEFAULT_AGENT`, el de OpenClaw)."""
 
     model_config = ConfigDict(extra="forbid")
 
     agent: AgentName | None = None
+    # 5.0 (#412): el primer mensaje, enviado nada más crearla (su `message_id` en la respuesta).
+    message: Annotated[str, StringConstraints(min_length=1)] | None = None
+
+
+class MessageCreate(BaseModel):
+    """`POST /conversations/{id}/messages` (5.0, #412): `interrupt` es «enviar ahora»."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: Annotated[str, StringConstraints(min_length=1)]
+    interrupt: bool = False
+    # 5c: voz para el turno que lo responde, solo para este aparato y por su /events.
+    speak: bool = False
+
+
+class CancelTurn(BaseModel):
+    """`POST /conversations/{id}/cancel`: `turn_id` (el de /events y del estado al entrar) para
+    solo ese turno; si ya no es el abierto, no se para nada (ni el siguiente pendiente)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    turn_id: Annotated[str, StringConstraints(min_length=1, max_length=64)] | None = None
 
 
 class ConversationResponse(BaseModel):
@@ -293,10 +339,20 @@ class ConversationResponse(BaseModel):
     turn_count: int
     title: str | None = None
     owner_user_id: str | None = None  # M20: null = del hogar; con valor, privada de ese usuario
+    message_id: str | None = None  # 5.0: solo al crearla con `message`
+
+
+class ConversationLive(ConversationResponse):
+    """`GET /conversations/{id}` (5.0, #412): su estado en vivo y `as_of`, el último id de
+    `/events` que incluye (el cliente descarta los eventos con id ≤ `as_of`)."""
+
+    turn: dict | None = None  # el turno en curso: turn_start de /events + `text` que lleva
+    pending: list[dict] = []  # sus mensajes pendientes (el `message` de /events)
+    as_of: int
 
 
 class ConversationAgents(BaseModel):
-    """`GET /admin/conversations/agents`: con qué agentes puede empezar quien llama una conversación
+    """`GET /conversations/agents`: con qué agentes puede empezar quien llama una conversación
     y cuál tocaría sin elegir (None si el de la cascada no le está permitido)."""
 
     agents: list[str]
@@ -304,6 +360,7 @@ class ConversationAgents(BaseModel):
 
 
 class ConversationMessage(BaseModel):
+    id: str | None = None  # el de OpenClaw (`__openclaw.id`), estable; 5.0
     role: Literal["user", "assistant"]
     text: str
     timestamp: datetime | None
