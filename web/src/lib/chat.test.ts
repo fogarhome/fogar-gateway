@@ -176,6 +176,7 @@ describe('endReasonText', () => {
     expect(endReasonText({ reason: 'interrupted' })).toMatch(/interrumpió/)
     expect(endReasonText({ reason: 'timeout' })).toMatch(/dejó de responder/)
     expect(endReasonText({ reason: 'error', error: 'orchestrator_unavailable' })).toBe('Falló: openclaw no está disponible.')
+    expect(endReasonText({ reason: 'error', error: 'codigo_nuevo' })).toBe('Falló: openclaw rechazó la pregunta.')
   })
   it('un motivo que la web no conoce es un error', () => {
     expect(endReasonText({ reason: 'algo_nuevo' })).toBe('Falló.')

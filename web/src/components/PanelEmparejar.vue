@@ -107,6 +107,12 @@ async function abrir(): Promise<void> {
   }
 }
 
+/** El permiso va en el código: cambiarlo abre otro y anula el que ya se veía. */
+async function cambiarPermiso(): Promise<void> {
+  await abrir()
+  if (estado.value === 'open') toast('ok', 'Código nuevo', 'Al cambiar el permiso, el anterior ya no vale: usa este.')
+}
+
 async function comprobar(): Promise<void> {
   const p = abierto.value
   if (!p || estado.value !== 'open') return
@@ -179,13 +185,13 @@ onBeforeUnmount(() => {
         <p class="fg-meta pie"><span>Esperando al aparato…</span><span>caduca en {{ cuenta }}</span></p>
       </div>
       <label class="permiso fg-meta">
-        <input v-model="verHogar" type="checkbox" :disabled="estado === 'abriendo'" @change="abrir" />
+        <input v-model="verHogar" type="checkbox" :disabled="estado === 'abriendo'" @change="cambiarPermiso" />
         Que también pueda ver el hogar y su estado (personas, aparatos, servicios). Nunca administrarlo.
       </label>
       <p class="fg-meta nota">El aparato pondrá su nombre y su tipo; después puedes cambiarlos. Un código vale una sola vez.</p>
     </template>
     <template v-else-if="estado === 'expired' || estado === 'cancelled'">
-      <p class="fg-suave">El código ha caducado sin que ningún aparato lo usara.</p>
+      <p class="fg-suave">{{ estado === 'cancelled' ? 'El código está anulado: ya no vale.' : 'El código ha caducado sin que ningún aparato lo usara.' }}</p>
       <FgBoton variante="principal" @click="abrir">Otro código</FgBoton>
     </template>
     <template v-else-if="estado === 'error'">

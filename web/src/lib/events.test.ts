@@ -50,6 +50,22 @@ describe('createEventStream', () => {
     expect(events).toEqual(['ready', 'token'])
   })
 
+  it('un corte limpio (cada ~25 s) sigue «listo» mientras reabre: solo un fallo dice que reconecta', async () => {
+    const states: string[] = []
+    let n = 0
+    const fetchImpl = vi.fn(async () => {
+      n += 1
+      if (n === 3) throw new Error('red')
+      if (n > 4) await new Promise(() => undefined)
+      return { ok: true, status: 200, body: body('data: {"type":"ready"}\n\n') } as unknown as Response
+    })
+    const stream = createEventStream({ token: 'x', fetchImpl: fetchImpl as unknown as typeof fetch, onEvent: () => undefined, onState: (s) => states.push(s) })
+    stream.start()
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(3))
+    stream.stop()
+    expect(states).toEqual(['ready', 'reconnecting'])
+  })
+
   it('un 401 lo para sin reintentar', async () => {
     const states: string[] = []
     const fetchImpl = vi.fn(async () => ({ ok: false, status: 401, body: null }) as unknown as Response)

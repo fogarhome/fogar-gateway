@@ -3,6 +3,7 @@ import { ApiError } from '@/api/http'
 import type { ConversationLive } from '@/api/types'
 import { ChatLog, type ServerMessage } from './chat'
 import type { GatewayEvent, StreamState } from './events'
+import { turnErrorText } from './labels'
 
 // Una conversación en vivo (5.0, docs/client-protocol.md §16): su estado al entrar
 // (`GET /conversations/{id}`, con `as_of`) y, desde ahí, lo que llega por el `/events` de la
@@ -46,7 +47,7 @@ function errorText(e: unknown, what: string): string {
   if (e instanceof ApiError) {
     if (e.status === 403) return `No tienes permiso para ${what} aquí.`
     if (e.status === 404) return 'Esta conversación ya no existe.'
-    if (e.status === 502) return `OpenClaw no aceptó el mensaje (${e.message}).`
+    if (e.status === 502) return `${turnErrorText(e.message)}.`
     if (e.status === 503) return 'La conversación está ocupada o OpenClaw no responde: prueba otra vez.'
     if (e.kind === 'network') return 'No llego al gateway.'
   }
@@ -119,6 +120,14 @@ export function createChatSession(conversationId: string, deps: ChatDeps) {
     }
   }
 
+  async function cancel(): Promise<void> {
+    try {
+      await deps.cancelTurn(conversationId)
+    } catch (e) {
+      state.notice = errorText(e, 'parar')
+    }
+  }
+
   return {
     state,
     start(): void {
@@ -141,12 +150,15 @@ export function createChatSession(conversationId: string, deps: ChatDeps) {
         state.sending = false
       }
     },
-    async cancel(): Promise<void> {
-      try {
-        await deps.cancelTurn(conversationId)
-      } catch (e) {
-        state.notice = errorText(e, 'parar')
-      }
+    cancel,
+    /**
+     * «Enviar ahora» en el primero de la cola: para el turno que se está respondiendo, y el mensaje
+     * sale detrás. Sin turno abierto no hace nada: el mensaje ya va a salir, y `/cancel` sin turno
+     * pararía justo ese (el siguiente pendiente, docs/client-protocol.md §4). `interrupt` no sirve:
+     * va en un POST nuevo, así que reenviaría el texto (duplicado) y en ese hueco también para el siguiente.
+     */
+    async sendNow(): Promise<void> {
+      if (state.log.turnOpen) await cancel()
     },
     async withdraw(messageId: string): Promise<void> {
       try {

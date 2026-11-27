@@ -84,8 +84,14 @@ export const TURN_ERROR: Record<string, string> = {
   orchestrator_agent_unavailable: 'Este agente ya no está disponible aquí',
   orchestrator_disconnected: 'OpenClaw se desconectó a mitad',
   turn_timeout: 'OpenClaw dejó de responder',
+  turn_overflow: 'OpenClaw dejó de responder',
+  turn_cancelled: 'Otro aparato paró la respuesta',
+  turn_absorbed: 'OpenClaw lo juntó con otra respuesta',
   internal_error: 'Error interno del gateway',
 }
+
+/** Un código de error de turno en una frase; uno desconocido cuenta como `orchestrator_error` (§9). */
+export const turnErrorText = (code: string): string => ownText(TURN_ERROR, code) ?? TURN_ERROR.orchestrator_error!
 
 /** Errores de turno con los que la pregunta no llegó a OpenClaw: no vendrá al releer lo dicho. */
 export const NOT_IN_OPENCLAW: ReadonlySet<string> = new Set([

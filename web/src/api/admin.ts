@@ -61,8 +61,13 @@ export const getConversationMessages = (id: string, limit = 200) =>
   api<ConversationMessages>(`/conversations/${enc(id)}/messages?limit=${limit}`, { timeoutMs: 20_000 })
 export const getConversationAgents = () => api<ConversationAgents>('/conversations/agents')
 export const getConversationLive = (id: string) => api<ConversationLive>(`/conversations/${enc(id)}`)
+/** El `202` puede tardar hasta TURN_TIMEOUT_S (120 s) si /v1 ocupa la conversación: rendirse antes duplica al reenviar. */
 export const postMessage = (id: string, text: string, interrupt = false) =>
-  api<{ message_id: string }>(`/conversations/${enc(id)}/messages`, { method: 'POST', body: json({ text, interrupt }) })
+  api<{ message_id: string }>(`/conversations/${enc(id)}/messages`, {
+    method: 'POST',
+    body: json({ text, interrupt }),
+    timeoutMs: 130_000,
+  })
 export const cancelTurn = (id: string) => api<{ cancelled: boolean }>(`/conversations/${enc(id)}/cancel`, { method: 'POST' })
 export const withdrawMessage = (id: string, messageId: string) =>
   api<void>(`/conversations/${enc(id)}/messages/${enc(messageId)}`, { method: 'DELETE' })

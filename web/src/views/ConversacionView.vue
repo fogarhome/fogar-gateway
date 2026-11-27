@@ -10,7 +10,7 @@ import FgIcono from '@/components/FgIcono.vue'
 import MensajeConversacion from '@/components/MensajeConversacion.vue'
 import MensajeVivo from '@/components/MensajeVivo.vue'
 import { createChatSession, type ChatSession } from '@/lib/chatSession'
-import { conversationTitle } from '@/lib/conversations'
+import { conversationTitle, historyAuthor } from '@/lib/conversations'
 import { formatClock, formatRelative } from '@/lib/format'
 import { useConversationsStore } from '@/stores/conversations'
 import { useEventsStore } from '@/stores/events'
@@ -101,6 +101,7 @@ watch(escribible, (si) => si && abrirChat(), { immediate: true })
 onBeforeUnmount(cerrarChat)
 
 async function reintentar(): Promise<void> {
+  events.ensure() // un /events parado (401/403) no vuelve solo: se reabre
   chat.value?.reconnect()
   await cargarHistoria()
 }
@@ -121,7 +122,7 @@ const pasados = computed(() =>
   (historia.value?.messages ?? []).map((m, i) => ({
     key: `h-${i}`,
     props: {
-      quien: m.role === 'user' ? 'Persona' : 'Fogar',
+      quien: historyAuthor(m.role, conv.value, session.user?.id),
       propio: m.role === 'user',
       texto: m.text,
       hora: m.timestamp ? formatClock(m.timestamp, ahora.value) : null,
@@ -222,7 +223,7 @@ watch(firma, () => {
           :ahora="ahora"
           :primero-en-cola="l.key === primeroEnCola && turnoAbierto"
           @quitar="(m) => chat?.withdraw(m)"
-          @ahora="chat?.cancel()"
+          @ahora="chat?.sendNow()"
         />
       </div>
     </section>
@@ -240,7 +241,6 @@ watch(firma, () => {
           v-model="texto"
           rows="1"
           placeholder="Escribe a Fogar"
-          :disabled="!puedeEscribir"
           @keydown="alTeclear"
         />
         <FgBoton v-if="turnoAbierto" icono="parar" @click="chat?.cancel()">Parar</FgBoton>
@@ -335,9 +335,6 @@ textarea {
   line-height: 1.4;
   resize: none;
   outline: none;
-}
-textarea:disabled {
-  opacity: 0.6;
 }
 .banner {
   display: flex;
