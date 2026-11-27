@@ -47,9 +47,11 @@ def test_env_sample_defaults_match_settings_defaults():
     assert mismatches == [], mismatches
 
 
-def test_retired_orchestrator_reconnect_key_is_rejected():
-    import pytest
-    from pydantic import ValidationError
+def test_retired_keys_are_ignored_and_not_in_env_sample():
+    """5.0: un ajuste retirado se ignora (con aviso) y no figura en .env.sample."""
+    from fogar_gateway.core.config import RETIRED_KEYS
 
-    with pytest.raises(ValidationError, match="ORCHESTRATOR_RECONNECT_MAX_DURATION"):
-        Settings(ORCHESTRATOR_RECONNECT_MAX_DURATION="300.0")  # type: ignore[call-arg]
+    settings = Settings(ORCHESTRATOR_RECONNECT_MAX_DURATION="300.0")  # type: ignore[call-arg]
+    assert not hasattr(settings, "ORCHESTRATOR_RECONNECT_MAX_DURATION")
+    sample = (Path(__file__).resolve().parents[2] / ".env.sample").read_text()
+    assert not [k for k in RETIRED_KEYS if re.search(rf"^#?\s*{k}=", sample, re.M)]
