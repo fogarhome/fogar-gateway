@@ -912,6 +912,9 @@ async def test_a_message_withdrawn_while_disconnected_never_runs_when_openclaw_r
     assert "r2" not in orchestrator.aborted  # sin conexión no salió
     subscriber.got.clear()
 
+    # Una caída de más de RUN_ABORT_TOMBSTONE_S: su lápida ya venció al reconectar.
+    del hub.turn_registry._aborted_runs["r2"]
+    del hub.turn_registry._finished_runs["r2"]
     orchestrator.connected = True
     hub.reconnected()
     await wait_until(lambda: "r2" in orchestrator.aborted)

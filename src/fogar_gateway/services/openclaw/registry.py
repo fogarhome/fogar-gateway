@@ -74,6 +74,8 @@ class TurnRegistry:
             r: v for r, v in self._owed_aborts.items() if v[1] > time.monotonic()
         }
         self._owed_aborts[run_id] = (session_key, time.monotonic() + RUN_ABORT_TOMBSTONE_S)
+        # Su lápida pudo vencer durante una caída larga: sin ella su frame no llegaría aquí.
+        self.abort_run(run_id)
 
     def take_owed_abort(self, run_id: object) -> str | None:
         """The session key of an owed abort of this run (once), or None."""
