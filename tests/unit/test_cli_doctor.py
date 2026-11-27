@@ -101,6 +101,15 @@ def test_doctor_warns_about_a_retired_key(base):
     assert "fogar-gw config unset SHUTDOWN_DRAIN_S" in found["SHUTDOWN_DRAIN_S"]["detail"]
 
 
+def test_doctor_warns_about_stt_audio_gate_auto(base):
+    """#422: `STT_AUDIO_GATE=auto` (4.x) no tumba nada; doctor avisa y dice cómo cambiarlo."""
+    (base / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nSTT_AUDIO_GATE=auto\n")
+    found = checks(run("--json", "doctor"))
+    assert found["configuración"]["level"] == "ok"
+    assert found["STT_AUDIO_GATE"]["level"] == "warn"
+    assert "fogar-gw config set STT_AUDIO_GATE energy" in found["STT_AUDIO_GATE"]["detail"]
+
+
 def test_invalid_config_is_a_failure_naming_the_field_only(base):
     (base / "config.env").write_text(f"ADMIN_TOKEN={SECRET}\nSTT_PROVIDER=valor-raro-xyz\n")
     r = run("--json", "doctor")

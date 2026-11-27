@@ -590,9 +590,18 @@ def test_config_validate_unknown_key_says_which_command_fixes_it(home):
     assert "fogar-gw config unset NO_EXISTE_XYZ" in r.output
 
 
-def test_config_validate_says_which_values_a_literal_takes(home):
-    """#422: `STT_AUDIO_GATE=auto` (4.x) names the valid values, not only `literal_error`."""
+def test_config_validate_warns_about_stt_audio_gate_auto(home):
+    """#422: `STT_AUDIO_GATE=auto` (4.x) ya no tumba nada: se usa energy y validate avisa con la orden."""
     _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nSTT_AUDIO_GATE=auto\n")
+    r = run("config", "validate")
+    assert r.exit_code == 0, r.output
+    assert "! STT_AUDIO_GATE:" in r.output
+    assert "fogar-gw config set STT_AUDIO_GATE energy" in r.output
+
+
+def test_config_validate_says_which_values_a_literal_takes(home):
+    """#422: a value outside the Literal names the valid values, not only `literal_error`."""
+    _env(home).write_text(f"ADMIN_TOKEN={SECRET}\nSTT_AUDIO_GATE=loud\n")
     r = run("config", "validate")
     assert r.exit_code == 1
     assert ("STT_AUDIO_GATE: literal_error (usa 'off' o 'energy' con `fogar-gw config set "

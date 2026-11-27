@@ -154,6 +154,9 @@ def validation_checks(settings: Any) -> list[dict[str, str]]:
     for name in _retired_in_config_env():
         checks.append(_check("warn", name, "Ya no se usa desde la 5.0 y se ignora: quítalo con "
                              f"`fogar-gw config unset {name}`."))
+    if _auto_gate_in_config_env():
+        checks.append(_check("warn", "STT_AUDIO_GATE", "«auto» ya no existe desde la 5.0 y se usa "
+                             "energy: cámbialo con `fogar-gw config set STT_AUDIO_GATE energy`."))
     for name in insecure_tokens(settings):
         empty = not getattr(settings, name)
         if name == "ADMIN_TOKEN":
@@ -184,16 +187,24 @@ def validation_checks(settings: Any) -> list[dict[str, str]]:
     return checks
 
 
-def _retired_in_config_env() -> list[str]:
-    """Ajustes retirados que siguen en config.env (el gateway los ignora con un aviso)."""
+def _config_env() -> dict[str, str]:
     path = paths.config_file()
     if not path.is_file():
-        return []
+        return {}
     try:
-        present = api.read_env_file(path)
+        return api.read_env_file(path)
     except api.ApiError:
-        return []  # sin permiso: load() ya lo ha dicho
-    return sorted(set(present) & _config_module().RETIRED_KEYS)
+        return {}  # sin permiso: load() ya lo ha dicho
+
+
+def _retired_in_config_env() -> list[str]:
+    """Ajustes retirados que siguen en config.env (el gateway los ignora con un aviso)."""
+    return sorted(set(_config_env()) & _config_module().RETIRED_KEYS)
+
+
+def _auto_gate_in_config_env() -> bool:
+    """`STT_AUDIO_GATE=auto` de la 4.x (#422): el gateway usa energy con un aviso."""
+    return _config_env().get("STT_AUDIO_GATE", "").strip().lower() == "auto"
 
 
 # Listas de IP/CIDR: sus entradas no son secretas y se muestran (F-r3-1).
