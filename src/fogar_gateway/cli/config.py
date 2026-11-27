@@ -70,7 +70,7 @@ def _errors(exc: Any) -> list[str]:
             out.append(f"{loc.upper()}: {e['type']} (ajuste desconocido: quítalo con "
                        f"`fogar-gw config unset {loc.upper()}`)")
         elif e["type"] == "literal_error":
-            # Los valores válidos son del esquema, no del usuario (#422: STT_AUDIO_GATE=auto, de la 4.x).
+            # Los valores válidos son del esquema, no del usuario (#422).
             expected = str(e.get("ctx", {}).get("expected", "")).replace(" or ", " o ")
             out.append(f"{loc}: {e['type']} (usa {expected} con `fogar-gw config set {loc}` "
                        f"o quítalo con `fogar-gw config unset {loc}`)")
