@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue'
 import { cancelPairing, getPairing, listPairings, openPairing } from '@/api/admin'
 import { ApiError } from '@/api/http'
 import type { PairingOpened, PairingState } from '@/api/types'
+import { copyText } from '@/lib/clipboard'
 import { toast } from '@/lib/toasts'
 import { useClientsStore } from '@/stores/clients'
 import FgBoton from './FgBoton.vue'
@@ -127,7 +128,13 @@ const restante = computed(() => {
 const cuenta = computed(() => `${Math.floor(restante.value / 60)}:${String(restante.value % 60).padStart(2, '0')}`)
 const progreso = computed(() => `${Math.min(100, ((restante.value * 1000) / (DURACION_MS - MARGEN_MS)) * 100)}%`)
 const codigo = computed(() => abierto.value?.code ?? '')
-const codigoVisible = computed(() => `${codigo.value.slice(0, 3)} ${codigo.value.slice(3)}`)
+// Las dos mitades van en dos spans y el hueco lo pone el CSS: al seleccionarlo se copian solo las cifras.
+const mitades = computed(() => (estado.value === 'abriendo' ? ['···', '···'] : [codigo.value.slice(0, 3), codigo.value.slice(3)]))
+
+async function copiarCodigo(): Promise<void> {
+  if (await copyText(codigo.value)) toast('ok', 'Código copiado')
+  else toast('warn', 'No he podido copiarlo', 'Selecciónalo y cópialo con el teclado.')
+}
 
 async function cerrar(): Promise<void> {
   fuera = true
@@ -163,7 +170,10 @@ onBeforeUnmount(() => {
     </div>
     <template v-if="estado === 'open' || estado === 'abriendo'">
       <p class="fg-suave">Escribe este código en el aparato nuevo, o díselo en voz alta si te lo pide.</p>
-      <p class="codigo" :aria-label="`Código ${codigo.split('').join(' ')}`">{{ estado === 'abriendo' ? '··· ···' : codigoVisible }}</p>
+      <div class="fila-codigo">
+        <p class="codigo" :aria-label="`Código ${codigo.split('').join(' ')}`"><span>{{ mitades[0] }}</span><span>{{ mitades[1] }}</span></p>
+        <FgBoton tam="sm" icono="copiar" :disabled="estado !== 'open'" @click="copiarCodigo">Copiar</FgBoton>
+      </div>
       <div class="tiempo">
         <div class="pista" aria-hidden="true"><div class="barra" :style="{ width: progreso }" /></div>
         <p class="fg-meta pie"><span>Esperando al aparato…</span><span>caduca en {{ cuenta }}</span></p>
@@ -216,7 +226,15 @@ onBeforeUnmount(() => {
 .cab h2 {
   flex: 1;
 }
+.fila-codigo {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+}
 .codigo {
+  display: flex;
+  gap: 0.35em;
   font: 500 56px/1 var(--font-texto);
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.06em;

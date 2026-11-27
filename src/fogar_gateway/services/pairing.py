@@ -99,7 +99,8 @@ class PairingStore:
         """Canjea `code` llamando a `create(plantilla)` con el candado tomado, así que dos
         canjes del mismo código crean un solo cliente. Si `create` falla, el código sigue
         abierto y no cuenta como fallo: no es culpa de quien lo escribió."""
-        code = "".join(code.split())  # «482 913» vale igual que «482913»
+        # «482 913», «482-913» o «482.913» valen igual que «482913»: copiar o dictar no falla por eso.
+        code = "".join(c for c in code if not (c.isspace() or c in "-.·"))
         with self._lock:
             self._sweep()
             match = None
