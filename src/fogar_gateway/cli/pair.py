@@ -11,12 +11,10 @@ from typing import Any
 import click
 
 from fogar_gateway.cli import api
-from fogar_gateway.cli.clients import set_values
+from fogar_gateway.cli.clients import HOUSEHOLD_SCOPES, set_values
 from fogar_gateway.cli.output import ACCENT, MUTED, Out
 
 POLL_S = 1.0
-# Lo que un administrador puede conceder a un aparato del hogar (5.0, #410): nunca home:admin.
-HOUSEHOLD_SCOPES = ("conversations:read", "conversations:write", "home:read")
 
 
 def _sleep(seconds: float) -> None:

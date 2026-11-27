@@ -82,7 +82,7 @@ async def test_full_client_lifecycle_through_the_cli(server):
 
     rotated = _cli(port, "--yes", "clients", "rotate-key", "Tele")
     new_key = next(line.split(": ", 1)[1] for line in rotated.splitlines()
-                   if line.startswith("client_key: "))
+                   if line.startswith("token: "))
     assert new_key != key
     ws = await _open(port, new_key)
     await ws.close()
