@@ -24,7 +24,8 @@ Chat por HTTP (5.0, #412; lo que pasa después llega por `GET /events`):
                                                    `{message_id}` en cuanto OpenClaw lo acepta
   DELETE /conversations/{id}/messages/{msg_id}   — quita un pendiente (204; 404 si ya no lo es)
   POST   /conversations/{id}/cancel              — para el turno en curso (o el siguiente sin
-                                                   empezar), para todos
+                                                   empezar), para todos; con `turn_id`, solo
+                                                   ese turno si sigue abierto
 
 El gateway no guarda texto: títulos y mensajes se leen de OpenClaw en cada petición y nunca se
 registran en el log.
@@ -43,6 +44,7 @@ from fogar_gateway.core.agent_policy import AgentPolicyError, resolve_agent
 from fogar_gateway.core.config import settings
 from fogar_gateway.core.exceptions import ClientInactive, ClientNotFound
 from fogar_gateway.models.admin_schemas import (
+    CancelTurn,
     ClientIdFilter,
     ConversationAgents,
     ConversationCreate,
@@ -367,16 +369,23 @@ async def withdraw_message(
 async def cancel_turn(
     conversation_id: ConversationIdPath,
     request: Request,
+    body: CancelTurn | None = None,
     principal: Principal = Depends(require_scope(CONVERSATIONS_WRITE)),
 ) -> dict:
     """Como el `cancel` del WebSocket: el turno abierto para todos o, sin turno abierto, el
-    siguiente run cuyo turno aún no empezó. `{"cancelled": false}` si no había nada."""
+    siguiente run cuyo turno aún no empezó. `{"cancelled": false}` si no había nada. Con
+    `turn_id`, solo ese turno: si ya no es el abierto, nada («Enviar ahora» no para el
+    mensaje que quería enviar si el turno acabó justo antes)."""
     caller = _device(principal)
     conversation = await _conversation(request, caller, conversation_id)
     channel = request.app.state.channel_hub.get(conversation.session_key)
     if channel is None:
         return {"cancelled": False}
     current = channel.current_turn
+    if body is not None and body.turn_id is not None:
+        if current is None or current.id != body.turn_id:
+            return {"cancelled": False}
+        return {"cancelled": await channel.cancel("cancelled", expected=current) is not None}
     if current is not None:
         return {"cancelled": await channel.cancel("cancelled", expected=current) is not None}
     return {"cancelled": await channel.cancel_head("cancelled")}
