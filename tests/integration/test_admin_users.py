@@ -101,6 +101,31 @@ def test_an_admin_never_touches_an_owner(http, admin_headers, owner_id):
                       headers=_bearer(http, "sito")).status_code == 200
 
 
+def test_an_admin_never_touches_an_owners_device(http, admin_headers, owner_id):
+    """El dispositivo personal de un dueño es del dueño: rotar su clave sería entrar como él."""
+    _create(http, admin_headers, "admi", "admin")
+    admin = _bearer(http, "admi")
+    r = http.post("/auth/login", json={"username": "sito", "password": PW, "device_name": "d"})
+    device = r.json()["client_id"]
+    owner = _bearer(http, "sito")
+    for call in (
+        lambda: http.post(f"/home/devices/{device}/rotate-key", headers=admin),
+        lambda: http.patch(f"/home/devices/{device}", json={"name": "X"}, headers=admin),
+        lambda: http.patch(f"/home/devices/{device}", json={"is_active": False}, headers=admin),
+        lambda: http.delete(f"/home/devices/{device}", headers=admin),
+    ):
+        r = call()
+        assert r.status_code == 403 and r.json()["detail"] == "owner_only"
+    # El dueño y la máquina, sí; y el administrador sigue con los del hogar.
+    assert http.patch(f"/home/devices/{device}", json={"name": "Mío"},
+                      headers=owner).status_code == 200
+    assert http.post(f"/home/devices/{device}/rotate-key", headers=admin_headers).status_code == 200
+    home = http.post("/home/devices", json={"name": "tele"}, headers=admin_headers).json()["id"]
+    assert http.post(f"/home/devices/{home}/rotate-key", headers=admin).status_code == 200
+    assert http.patch(f"/home/devices/{home}", json={"name": "TV"}, headers=admin).status_code == 200
+    assert http.delete(f"/home/devices/{home}", headers=admin).status_code == 204
+
+
 def test_a_member_cannot_manage_users(http, admin_headers, owner_id):
     _create(http, admin_headers, "ana")
     r = http.get("/home/users", headers=_bearer(http, "ana"))
