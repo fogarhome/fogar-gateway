@@ -112,6 +112,19 @@ def test_drops_database_url_and_uid_gid(env):
     assert text.startswith("# Docker\nexport ADMIN_TOKEN='tok en'\n\nOPENCLAW_HOST=\"host:1\"\n")
 
 
+def test_drops_retired_settings(env):
+    """Un .env de la 4.x con ajustes que la 5.0 ya no usa: no pasan al config nuevo."""
+    docker, native = env
+    with open(docker / ".env", "a") as f:
+        f.write("TRUST_LOOPBACK=true\nexport TRUSTED_NETWORKS=10.0.0.0/8\nSHUTDOWN_DRAIN_S=5\n")
+    r = run(docker)
+    assert r.exit_code == 0, r.output
+    dropped = json.loads(r.output)["config"]["dropped"]
+    assert dropped[-3:] == ["TRUST_LOOPBACK", "TRUSTED_NETWORKS", "SHUTDOWN_DRAIN_S"]
+    text = (native / "config.env").read_text()
+    assert "TRUST" not in text.replace("TRUSTED_PROXIES", "") and "SHUTDOWN_DRAIN_S" not in text
+
+
 def test_adds_log_format_json(env):
     docker, native = env
     out = json.loads(run(docker).output)
